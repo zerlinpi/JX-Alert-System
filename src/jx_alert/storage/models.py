@@ -35,8 +35,8 @@ class AnomalyEvent(Base):
     status: Mapped[str] = mapped_column(String(20), default="NEW")
     evaluation_scope: Mapped[str] = mapped_column(String(200), default="", index=True)
     recovered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    first_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    last_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     metrics: Mapped[dict] = mapped_column(JSON)
     reason: Mapped[str] = mapped_column(Text)
 
@@ -48,7 +48,7 @@ class NotificationLog(Base):
     status: Mapped[str] = mapped_column(String(20))
     message_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 
