@@ -1,6 +1,6 @@
 """At-least-once outbox worker for the Feishu custom-bot webhook."""
 from datetime import datetime, timedelta
-from sqlalchemy import or_, select, update
+from sqlalchemy import select, update
 
 from jx_alert.config import get_settings
 from jx_alert.notifications.feishu import FeishuClient
