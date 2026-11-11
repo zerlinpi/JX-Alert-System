@@ -31,17 +31,18 @@ def test_upgrade_schema_adds_missing_anomaly_columns_and_index():
     columns = {column["name"] for column in inspect(engine).get_columns("anomaly_events")}
     indexes = {index["name"] for index in inspect(engine).get_indexes("anomaly_events")}
 
-    assert {"entity_id", "evaluation_scope", "recovered_at"} <= columns
+    assert {"entity_id", "evaluation_scope", "recovered_at", "escalated_at"} <= columns
     assert "ix_anomaly_events_evaluation_scope" in indexes
     assert "anomaly_events.entity_id" in changes
     assert "anomaly_events.evaluation_scope" in changes
     with engine.connect() as connection:
         row = connection.execute(
-            text("SELECT entity_id, evaluation_scope, recovered_at FROM anomaly_events WHERE id=1")
+            text("SELECT entity_id, evaluation_scope, recovered_at, escalated_at FROM anomaly_events WHERE id=1")
         ).one()
         assert row.entity_id == ""
         assert row.evaluation_scope == ""
         assert row.recovered_at is None
+        assert row.escalated_at is None
 
     assert upgrade_schema(engine) == []
 
