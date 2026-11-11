@@ -107,7 +107,7 @@ def create_http_app(settings=None):
     )
     if allowed_origins:
         origin_pattern = "|".join(
-            re.escape(origin).replace(r"\\*", ".*").replace(r"\\?", ".")
+            re.escape(origin).replace(r"\*", ".*").replace(r"\?", ".")
             for origin in allowed_origins
         )
         app = CORSMiddleware(
