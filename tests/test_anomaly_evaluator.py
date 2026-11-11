@@ -157,3 +157,42 @@ def test_incomplete_coverage_does_not_recover_existing_anomaly():
         row = db.scalar(select(AnomalyEvent))
         assert row.status == "ONGOING"
         assert db.scalars(select(NotificationOutbox)).all() == []
+
+
+def test_evaluator_uses_each_stores_marketplace_local_report_date():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    store_dates = {
+        "us-store": date(2026, 11, 10),
+        "jp-store": date(2026, 11, 9),
+    }
+
+    with Session() as db:
+        for store_id, target in store_dates.items():
+            db.add(Store(sid=store_id, name=store_id, status=1))
+            _add_coverage(db, store_id, "store", target)
+            for offset in range(7, 0, -1):
+                _add_metric(
+                    db, store_id, "store", store_id, "orders",
+                    target - timedelta(days=offset), 10,
+                )
+            _add_metric(db, store_id, "store", store_id, "orders", target, 5)
+        db.commit()
+
+        result = evaluate_daily_anomalies(
+            db,
+            {store_id: target.isoformat() for store_id, target in store_dates.items()},
+        )
+
+        assert result["stores_seen"] == 2
+        assert result["report_date"] is None
+        assert result["report_dates"] == {
+            "us-store": "2026-11-10",
+            "jp-store": "2026-11-09",
+        }
+        events = db.scalars(select(AnomalyEvent).where(
+            AnomalyEvent.rule == "orders_decrease"
+        )).all()
+        assert {event.store_id for event in events} == {"us-store", "jp-store"}
+        assert all(event.metrics["current"] == 5 for event in events)
