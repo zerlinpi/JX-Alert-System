@@ -1,5 +1,9 @@
+import json
 from datetime import datetime
+
 from sqlalchemy import select
+
+from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.storage.models import AnomalyEvent
 
 
@@ -12,7 +16,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
     """Upsert one complete evaluation scope; only a complete scope can recover old events.
 
     evaluation_scope should identify the same store + metric family/date window each run.
-    If the collector failed or pagination was incomplete, pass scope_complete=False.
+    If collection failed or pagination was incomplete, pass scope_complete=False.
     """
     if not evaluation_scope:
         raise ValueError("evaluation_scope is required")
@@ -33,8 +37,11 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
             if (_SEVERITY_ORDER.get(event["severity"], 99)
                     < _SEVERITY_ORDER.get(previous_severity, 99)):
                 row.status = "ESCALATED"
+            if was_recovered:
+                row.first_seen = now
             row.last_seen = now
             row.severity = event["severity"]
+            row.entity_id = event.get("entity_key", "")
             row.metrics = event["metrics"]
             row.reason = event["reason"]
             row.evaluation_scope = evaluation_scope
@@ -44,6 +51,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
                 dedupe_key=event["dedupe_key"],
                 store_id=store_id,
                 rule=event["rule"],
+                entity_id=event.get("entity_key", ""),
                 severity=event["severity"],
                 status="NEW",
                 evaluation_scope=evaluation_scope,
@@ -56,17 +64,54 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
         saved.append(row)
 
     if scope_complete:
-        stale_rows = db.scalars(
-            select(AnomalyEvent).where(
-                AnomalyEvent.store_id == store_id,
-                AnomalyEvent.evaluation_scope == evaluation_scope,
-                AnomalyEvent.status.in_(["NEW", "ONGOING", "ESCALATED"]),
-                AnomalyEvent.dedupe_key.not_in(active_keys) if active_keys else True,
-            )
-        ).all()
-        for row in stale_rows:
+        conditions = [
+            AnomalyEvent.store_id == store_id,
+            AnomalyEvent.evaluation_scope == evaluation_scope,
+            AnomalyEvent.status.in_(["NEW", "ONGOING", "ESCALATED"]),
+        ]
+        if active_keys:
+            conditions.append(AnomalyEvent.dedupe_key.not_in(active_keys))
+        recovered_rows = db.scalars(select(AnomalyEvent).where(*conditions)).all()
+        for row in recovered_rows:
             row.status = "RECOVERED"
             row.recovered_at = now
             row.last_seen = now
+            saved.append(row)
 
+    db.flush()
     return saved
+
+
+def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
+    """Queue first-seen, escalated and recovered events; ongoing events stay quiet."""
+    queued = 0
+    for anomaly in anomalies:
+        if anomaly.status not in {"NEW", "ESCALATED", "RECOVERED"}:
+            continue
+        state_label = {
+            "NEW": "新异常",
+            "ESCALATED": "异常升级",
+            "RECOVERED": "异常恢复",
+        }[anomaly.status]
+        metrics = json.dumps(anomaly.metrics or {}, ensure_ascii=False, default=str)
+        message = (
+            f"【JX Alert】{state_label} · {anomaly.severity}\n"
+            f"店铺 ID：{anomaly.store_id}\n"
+            f"对象：{anomaly.entity_id or '未指定'}\n"
+            f"规则：{anomaly.rule}\n"
+            f"说明：{anomaly.reason}\n"
+            f"指标：{metrics}"
+        )
+        first_seen = anomaly.first_seen.isoformat() if anomaly.first_seen else "unknown"
+        enqueue_notification(
+            db,
+            idempotency_key=(
+                f"anomaly:{anomaly.dedupe_key}:{anomaly.status}:"
+                f"{anomaly.severity}:{first_seen}"
+            ),
+            text=message,
+            store_id=anomaly.store_id,
+            entity_id=anomaly.entity_id or None,
+        )
+        queued += 1
+    return queued
