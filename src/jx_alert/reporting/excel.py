@@ -292,11 +292,37 @@ def build_daily_report_rows(db, report_date: date | str, *,
         sales = value(campaign.store_id, target, dimension, campaign.campaign_id, "sales")
         clicks = value(campaign.store_id, target, dimension, campaign.campaign_id, "clicks")
         impressions = value(campaign.store_id, target, dimension, campaign.campaign_id, "impressions")
+        previous_complete = complete(campaign.store_id, dimension, previous_date)
+        baseline_complete = all(
+            complete(campaign.store_id, dimension, day) for day in baseline_dates
+        )
+        previous_spend = value(
+            campaign.store_id, previous_date, dimension, campaign.campaign_id, "spend"
+        )
+        previous_orders = value(
+            campaign.store_id, previous_date, dimension, campaign.campaign_id, "orders"
+        )
+        average_spend = (
+            sum(value(campaign.store_id, day, dimension, campaign.campaign_id, "spend") or 0.0
+                for day in baseline_dates) / 7
+            if baseline_complete else None
+        )
+        average_orders = (
+            sum(value(campaign.store_id, day, dimension, campaign.campaign_id, "orders") or 0.0
+                for day in baseline_dates) / 7
+            if baseline_complete else None
+        )
         rows["广告活动"].append([
             campaign.store_id, store.name, campaign.campaign_type.upper(),
             campaign.campaign_id, campaign.name, campaign.state, campaign.budget_type,
             campaign.budget, target.isoformat(), spend, orders, sales,
             _ratio(spend, sales), _roas(spend, sales), clicks, impressions,
+            previous_spend if previous_complete else None,
+            _change_ratio(spend, previous_spend) if previous_complete else None,
+            previous_orders if previous_complete else None,
+            _change_ratio(orders, previous_orders) if previous_complete else None,
+            average_spend, _change_ratio(spend, average_spend),
+            average_orders, _change_ratio(orders, average_orders),
             campaign.last_over_budget_at,
         ])
 
@@ -310,11 +336,33 @@ def build_daily_report_rows(db, report_date: date | str, *,
         sales = value(ad.store_id, target, dimension, ad.ad_id, "sales")
         clicks = value(ad.store_id, target, dimension, ad.ad_id, "clicks")
         impressions = value(ad.store_id, target, dimension, ad.ad_id, "impressions")
+        previous_complete = complete(ad.store_id, dimension, previous_date)
+        baseline_complete = all(
+            complete(ad.store_id, dimension, day) for day in baseline_dates
+        )
+        previous_spend = value(ad.store_id, previous_date, dimension, ad.ad_id, "spend")
+        previous_orders = value(ad.store_id, previous_date, dimension, ad.ad_id, "orders")
+        average_spend = (
+            sum(value(ad.store_id, day, dimension, ad.ad_id, "spend") or 0.0
+                for day in baseline_dates) / 7
+            if baseline_complete else None
+        )
+        average_orders = (
+            sum(value(ad.store_id, day, dimension, ad.ad_id, "orders") or 0.0
+                for day in baseline_dates) / 7
+            if baseline_complete else None
+        )
         rows["广告商品"].append([
             ad.store_id, store.name, ad.campaign_type.upper(), ad.ad_id,
             ad.campaign_id, ad.asin, ad.seller_sku, target.isoformat(),
             spend, orders, sales, _ratio(spend, sales), _roas(spend, sales),
             clicks, impressions,
+            previous_spend if previous_complete else None,
+            _change_ratio(spend, previous_spend) if previous_complete else None,
+            previous_orders if previous_complete else None,
+            _change_ratio(orders, previous_orders) if previous_complete else None,
+            average_spend, _change_ratio(spend, average_spend),
+            average_orders, _change_ratio(orders, average_orders),
         ])
 
     for anomaly in anomalies:
