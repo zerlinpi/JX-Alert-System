@@ -13,6 +13,20 @@ class Settings(BaseSettings):
     daily_sync_cron: str = "0 8 * * *"
     store_timezones_file: str = "/app/data/store-timezones.json"
 
+    # Remote MCP uses Streamable HTTP and is published on a loopback-only host port.
+    mcp_host: str = "0.0.0.0"
+    mcp_port: int = 8001
+    mcp_path: str = "/mcp"
+    mcp_bearer_token: str = ""
+    mcp_allowed_hosts: str = ""
+    mcp_allowed_origins: str = ""
+
+    def mcp_allowed_host_list(self) -> list[str]:
+        return [item.strip() for item in self.mcp_allowed_hosts.split(",") if item.strip()]
+
+    def mcp_allowed_origin_list(self) -> list[str]:
+        return [item.strip() for item in self.mcp_allowed_origins.split(",") if item.strip()]
+
     # Prefer DATABASE_URL when explicitly supplied; otherwise compose a URL safely
     # from DB_* fields so passwords containing URL-reserved characters are escaped.
     database_url: str | None = None
