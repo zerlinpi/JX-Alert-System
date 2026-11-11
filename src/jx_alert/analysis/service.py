@@ -119,18 +119,19 @@ def _notification_labels(db, anomaly: AnomalyEvent) -> tuple[str, str | None, st
         or anomaly.entity_id
     )
     if product_key:
-        product = db.scalar(select(Product).where(
+        products = db.scalars(select(Product).where(
             Product.store_id == anomaly.store_id,
             or_(
                 Product.seller_sku == str(product_key),
                 Product.asin == str(product_key),
             ),
-        ).limit(1))
-        if product:
-            product_label = (
+        ).order_by(Product.seller_sku)).all()
+        if products:
+            product_label = "; ".join(
                 f"MSKU {product.seller_sku}"
                 + (f" / ASIN {product.asin}" if product.asin else "")
                 + (f" / Local SKU {product.local_sku}" if product.local_sku else "")
+                for product in products
             )
         elif metrics.get("asin") or metrics.get("seller_sku"):
             product_label = (
