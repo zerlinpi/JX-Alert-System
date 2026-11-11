@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine, select
@@ -23,7 +23,7 @@ def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_pa
             payload={"text": "test alert", "open_ids": []},
             status="SENDING",
             attempts=1,
-            next_attempt_at=datetime.utcnow() - timedelta(minutes=10),
+            next_attempt_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10),
             claimed_at=None,
         ))
         db.commit()
