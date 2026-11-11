@@ -63,6 +63,8 @@ class Store(Base):
     region: Mapped[str | None] = mapped_column(String(20), nullable=True)
     country: Mapped[str | None] = mapped_column(String(80), nullable=True)
     marketplace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
     status: Mapped[int] = mapped_column(Integer, default=0)
     has_ads_setting: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(
