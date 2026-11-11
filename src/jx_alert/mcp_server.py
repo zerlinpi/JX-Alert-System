@@ -2,7 +2,7 @@
 
 No tool in this module contacts Lingxing or sends Feishu messages.
 """
-from datetime import date
+from datetime import date, timedelta
 import argparse
 import hmac
 import re
@@ -227,6 +227,169 @@ def get_all_anomalies(limit: int = 100, status: str | None = None,
         } for row in rows]
 
 
+
+def _daily_summary(db, store_id: str, target_date: date) -> dict:
+    store = db.get(Store, str(store_id))
+    if store is None:
+        raise ValueError(f"Unknown store_id: {store_id}")
+
+    dates = [target_date - timedelta(days=offset) for offset in range(8)]
+    metric_rows = db.scalars(select(DailyMetric).where(
+        DailyMetric.store_id == str(store_id),
+        DailyMetric.metric_date.in_(dates),
+    )).all()
+    metric_values = {
+        (row.dimension, row.entity_id, row.metric_name, row.metric_date): float(row.value)
+        for row in metric_rows
+    }
+    coverage_rows = db.scalars(select(DataCoverage).where(
+        DataCoverage.store_id == str(store_id),
+        DataCoverage.metric_date.in_(dates),
+    )).all()
+    coverage = {
+        (row.dimension, row.metric_date): row.status == "COMPLETE"
+        for row in coverage_rows
+    }
+
+    def is_complete(dimension: str, day: date) -> bool:
+        return coverage.get((dimension, day), False)
+
+    def value(dimension: str, entity_id: str, metric: str, day: date):
+        if not is_complete(dimension, day):
+            return None
+        return metric_values.get((dimension, entity_id, metric, day), 0.0)
+
+    sales = {}
+    for metric in ("orders", "units", "sales"):
+        current = value("store", str(store_id), metric, target_date)
+        previous_date = target_date - timedelta(days=1)
+        previous = value("store", str(store_id), metric, previous_date)
+        baseline_dates = [target_date - timedelta(days=offset) for offset in range(1, 8)]
+        baseline_complete = all(is_complete("store", day) for day in baseline_dates)
+        baseline_values = [
+            metric_values.get(("store", str(store_id), metric, day), 0.0)
+            for day in baseline_dates
+        ] if baseline_complete else []
+        average = sum(baseline_values) / 7 if baseline_complete else None
+        sales[metric] = {
+            "current": current,
+            "previous_day": previous,
+            "change_vs_previous_day": (
+                (current - previous) / previous
+                if current is not None and previous is not None and previous > 0 else None
+            ),
+            "average_7d": average,
+            "change_vs_7d_average": (
+                (current - average) / average
+                if current is not None and average is not None and average > 0 else None
+            ),
+            "baseline_complete": baseline_complete,
+        }
+
+    campaign_by_type = {}
+    all_campaign_types_complete = True
+    for campaign_type in ("sp", "sb", "sd"):
+        dimension = f"campaign_{campaign_type}"
+        complete = is_complete(dimension, target_date)
+        all_campaign_types_complete = all_campaign_types_complete and complete
+        campaigns = db.scalars(select(Campaign).where(
+            Campaign.store_id == str(store_id),
+            Campaign.campaign_type == campaign_type,
+        ).order_by(Campaign.name).limit(200)).all()
+        campaign_items = []
+        totals = {metric: 0.0 for metric in ("spend", "orders", "sales", "clicks", "impressions")}
+        for campaign in campaigns:
+            item_metrics = {}
+            for metric in totals:
+                metric_value = value(dimension, campaign.campaign_id, metric, target_date)
+                item_metrics[metric] = metric_value
+                if complete and metric_value is not None:
+                    totals[metric] += metric_value
+            campaign_items.append({
+                "campaign_id": campaign.campaign_id,
+                "name": campaign.name,
+                "state": campaign.state,
+                "serving_status": campaign.serving_status,
+                "daily_budget": (
+                    campaign.budget
+                    if (campaign.budget_type or "").lower() == "daily" else None
+                ),
+                "metrics": item_metrics,
+            })
+        campaign_by_type[campaign_type] = {
+            "complete": complete,
+            "totals": totals if complete else None,
+            "campaigns": campaign_items if complete else None,
+        }
+
+    campaign_total = None
+    if all_campaign_types_complete:
+        campaign_total = {
+            metric: sum(
+                campaign_by_type[kind]["totals"][metric]
+                for kind in ("sp", "sb", "sd")
+            )
+            for metric in ("spend", "orders", "sales", "clicks", "impressions")
+        }
+
+    product_ads = {}
+    all_product_types_complete = True
+    for campaign_type in ("sp", "sd"):
+        dimension = f"product_ad_{campaign_type}"
+        complete = is_complete(dimension, target_date)
+        all_product_types_complete = all_product_types_complete and complete
+        totals = {}
+        for metric in ("spend", "orders", "sales", "units", "clicks", "impressions"):
+            totals[metric] = (
+                sum(
+                    row.value for row in metric_rows
+                    if row.dimension == dimension
+                    and row.metric_date == target_date
+                    and row.metric_name == metric
+                ) if complete else None
+            )
+        product_ads[campaign_type] = {"complete": complete, "totals": totals}
+
+    required_dimensions = ["store", "sku_asin", "sku_msku"]
+    if store.has_ads_setting:
+        required_dimensions.extend([
+            "campaign_sp", "campaign_sb", "campaign_sd",
+            "product_ad_sp", "product_ad_sd",
+        ])
+    target_coverage = {
+        dimension: is_complete(dimension, target_date)
+        for dimension in required_dimensions
+    }
+
+    return {
+        "store": {
+            "sid": store.sid,
+            "name": store.name,
+            "country": store.country,
+            "region": store.region,
+            "timezone": store.timezone,
+            "currency_code": store.currency_code,
+            "has_ads_setting": bool(store.has_ads_setting),
+        },
+        "report_date": target_date.isoformat(),
+        "sales": sales,
+        "campaign_ads": {
+            "complete": all_campaign_types_complete,
+            "by_type": campaign_by_type,
+            "total": campaign_total,
+            "currency_code": store.currency_code,
+        },
+        "product_ads": {
+            "complete": all_product_types_complete,
+            "by_type": product_ads,
+            "currency_code": store.currency_code,
+            "note": "Product-ad metrics are a separate grain; do not add them to campaign totals.",
+        },
+        "coverage": target_coverage,
+        "data_complete": all(target_coverage.values()),
+    }
+
+
 @mcp.tool()
 def get_daily_metrics(store_id: str, report_date: str,
                       dimension: str | None = None,
@@ -261,6 +424,24 @@ def get_daily_metrics(store_id: str, report_date: str,
             "currency": row.currency,
             "source": row.source,
         } for row in rows]
+
+
+
+@mcp.tool()
+def get_daily_summary(store_id: str, report_date: str) -> dict:
+    """Return one store's daily sales comparison, ad totals, campaign detail and coverage.
+
+    report_date must be the marketplace-local date for this store. Missing data is
+    returned as null when coverage is incomplete; complete but absent metric rows
+    are treated as zero.
+    """
+    try:
+        target_date = date.fromisoformat(report_date)
+    except ValueError as exc:
+        raise ValueError("report_date must be YYYY-MM-DD") from exc
+    init_db()
+    with SessionLocal() as db:
+        return _daily_summary(db, str(store_id), target_date)
 
 
 @mcp.tool()
