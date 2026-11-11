@@ -411,9 +411,8 @@ def export_daily_report(path: str | Path,
             worksheet.column_dimensions[get_column_letter(column[0].column)].width = width
 
         header_indexes = {cell.value: cell.column for cell in worksheet[1]}
-        for header in ("订单变化率", "销售额变化率", "ACOS"):
-            column = header_indexes.get(header)
-            if column:
+        for header, column in header_indexes.items():
+            if "变化率" in str(header) or header == "ACOS":
                 for row in range(2, worksheet.max_row + 1):
                     worksheet.cell(row, column).number_format = "0.00%"
         roas_column = header_indexes.get("ROAS")
