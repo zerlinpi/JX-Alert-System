@@ -178,6 +178,11 @@ def test_excel_report_contains_store_sku_campaign_and_alert_rows(tmp_path):
             "店铺总览", "店铺绩效", "SKU销量", "广告活动", "广告商品", "异常记录", "采集日志"
         ]
         assert workbook["SKU销量"].max_row == 2
+        assert workbook["店铺总览"]["L2"].number_format == "0.00%"
+        assert workbook["店铺总览"]["N2"].number_format == "0.00%"
+        assert workbook["SKU销量"]["K2"].number_format == "0.00%"
+        assert workbook["广告活动"]["R2"].number_format == "0.00%"
+        assert workbook["广告活动"]["M2"].number_format == "0.00%"
         workbook.close()
 
         store_paths = export_daily_reports(
