@@ -1,0 +1,10 @@
+{
+  "stores": {
+    "LINGXING_STORE_ID_1": ["ou_store_manager_open_id"],
+    "LINGXING_STORE_ID_2": ["ou_another_store_manager_open_id"]
+  },
+  "entities": {
+    "LINGXING_STORE_ID_1:MSKU_OR_ASIN_1": ["ou_product_owner_open_id"],
+    "MSKU_OR_ASIN_2": ["ou_product_owner_open_id"]
+  }
+}
