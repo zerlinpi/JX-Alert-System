@@ -18,7 +18,7 @@ FEISHU_SIGN_SECRET=你的签名密钥
 
 如果机器人启用了自定义关键词，还要把关键词填写到 `FEISHU_KEYWORD`。如果没有启用关键词校验，留空即可。
 
-签名计算按飞书文档：以 `timestamp + "\\n" + secret` 作为 HMAC-SHA256 的 key，对空字符串签名，再 Base64 编码。请求体携带 `timestamp` 和 `sign`。服务器需保持时间同步。
+签名计算按飞书文档：以 `timestamp + "\n" + secret` 作为 HMAC-SHA256 的 key，对空字符串签名，再 Base64 编码。请求体携带 `timestamp` 和 `sign`。服务器需保持时间同步。
 
 ## 3. 指定人员 @ 与路由
 
