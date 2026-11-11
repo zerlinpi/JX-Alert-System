@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from jx_alert.storage.db import Base
 from jx_alert.storage import models  # noqa: F401
 from jx_alert.notifications.outbox import NotificationOutbox
-from jx_alert.storage.models import NotificationLog
+from jx_alert.storage.models import NotificationLog, Product
 import jx_alert.notifications.worker as worker
 
 
@@ -17,10 +17,19 @@ def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_pa
     Session = sessionmaker(bind=engine, expire_on_commit=False)
 
     with Session() as db:
+        db.add(Product(
+            store_id="store-1",
+            seller_sku="SKU-1",
+            asin="B000000001",
+            owner_open_ids=["ou_product_owner"],
+        ))
         db.add(NotificationOutbox(
             idempotency_key="stale-job",
             chat_id="default",
-            payload={"text": "test alert", "open_ids": []},
+            payload={
+                "text": "test alert", "open_ids": [],
+                "store_id": "store-1", "entity_id": "SKU-1",
+            },
             status="SENDING",
             attempts=1,
             next_attempt_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10),
@@ -56,7 +65,7 @@ def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_pa
 
     assert result["sent"] == 1
     assert result["claimed"] == 1
-    assert sent == [("test alert", [])]
+    assert sent == [("test alert", ["ou_product_owner"])]
     with Session() as db:
         row = db.scalar(select(NotificationOutbox))
         assert row.status == "DELIVERED"
