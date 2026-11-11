@@ -90,6 +90,18 @@ def collect_campaigns(client, db, *, stores_response: dict | None = None,
                 )
                 row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
+            # The fully paginated campaign list is authoritative for current
+            # membership. Do not leave deleted/archived campaigns marked enabled.
+            existing_campaigns = db.scalars(select(Campaign).where(
+                Campaign.store_id == store_id,
+                Campaign.campaign_type == campaign_type,
+            )).all()
+            for existing in existing_campaigns:
+                if existing.campaign_id not in seen_ids:
+                    existing.state = "not_returned"
+                    existing.serving_status = "not_returned"
+                    existing.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
             db.commit()
             total_campaigns[campaign_type] += len(rows)
 
