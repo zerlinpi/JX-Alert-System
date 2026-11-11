@@ -11,7 +11,7 @@ from pathlib import Path
 
 import httpx
 
-from jx_alert.lingxing.client import LingxingError
+from jx_alert.lingxing.client import LingxingError, LingxingTransientError
 
 
 def _render_placeholders(value, values):
@@ -111,19 +111,46 @@ class LingxingTokenProvider:
             "LINGXING_REFRESH_TOKEN": refresh_token,
         }
         payload = _json_payload(template, values)
-        with httpx.Client(timeout=s.lingxing_timeout) as client:
-            if method.upper() == "GET":
-                response = client.get(s.lingxing_base_url.rstrip("/") + "/" + path.lstrip("/"),
-                                      params=payload)
-            elif method.upper() == "POST":
-                response = client.post(s.lingxing_base_url.rstrip("/") + "/" + path.lstrip("/"),
-                                       json=payload)
-            else:
-                raise LingxingError("Token method must be GET or POST")
-            response.raise_for_status()
-            data = response.json()
+        try:
+            with httpx.Client(timeout=s.lingxing_timeout) as client:
+                if method.upper() == "GET":
+                    response = client.get(
+                        s.lingxing_base_url.rstrip("/") + "/" + path.lstrip("/"),
+                        params=payload,
+                    )
+                elif method.upper() == "POST":
+                    response = client.post(
+                        s.lingxing_base_url.rstrip("/") + "/" + path.lstrip("/"),
+                        json=payload,
+                    )
+                else:
+                    raise LingxingError("Token method must be GET or POST")
+                response.raise_for_status()
+                data = response.json()
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise LingxingTransientError(
+                f"Lingxing token endpoint network failure: {type(exc).__name__}"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 429 or status >= 500:
+                raise LingxingTransientError(
+                    f"Lingxing token endpoint transient HTTP status: {status}"
+                ) from exc
+            raise LingxingError(
+                f"Lingxing token endpoint HTTP status: {status}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise LingxingError(
+                f"Lingxing token endpoint request failed: {type(exc).__name__}"
+            ) from exc
+        except ValueError as exc:
+            raise LingxingError("Lingxing token endpoint returned invalid JSON") from exc
+
         if not isinstance(data, dict) or data.get("code") not in (None, 0, "0", 200, "200"):
             code = data.get("code") if isinstance(data, dict) else "invalid-response"
+            if str(code) == "3001008":
+                raise LingxingTransientError("Lingxing token endpoint rate limit: code=3001008")
             raise LingxingError(f"Lingxing token endpoint failed: code={code}")
         return data
 
@@ -144,17 +171,20 @@ class LingxingTokenProvider:
         refresh_expires_at = int(state.get("refresh_expires_at", 0) or 0)
         # Lingxing refresh tokens expire after two hours and are single-use.
         # Renew before their own expiry, even if the access token remains valid.
+        refresh_retry_after = int(state.get("refresh_retry_after", 0) or 0)
         refresh_is_due = bool(
             cached_refresh_token
             and s.lingxing_refresh_path
             and refresh_expires_at <= now + 900
+            and refresh_retry_after <= now
         )
 
         if access_is_valid and not refresh_is_due:
             return state["access_token"]
 
         data = None
-        if cached_refresh_token and s.lingxing_refresh_path:
+        if (cached_refresh_token and s.lingxing_refresh_path
+                and (not access_is_valid or refresh_is_due)):
             if not s.lingxing_refresh_response_path:
                 raise LingxingError(
                     "LINGXING_REFRESH_RESPONSE_PATH is required because Lingxing rotates refresh tokens."
@@ -167,9 +197,17 @@ class LingxingTokenProvider:
                     refresh_token=cached_refresh_token,
                     access_token=state.get("access_token", ""),
                 )
+            except LingxingTransientError:
+                # Keep a still-valid access token during a short network/provider
+                # outage. Persist a brief retry cooldown to avoid hammering refresh.
+                if access_is_valid:
+                    state["refresh_retry_after"] = now + 60
+                    self._save(state)
+                    return state["access_token"]
+                raise
             except LingxingError:
-                # A refresh token may have expired while the service was offline.
-                # Fall back to a fresh AppID/AppSecret token instead of becoming stuck.
+                # A permanently invalid/expired refresh token can be replaced
+                # by obtaining a fresh token with AppID/AppSecret.
                 data = None
 
         if data is None:
@@ -201,6 +239,7 @@ class LingxingTokenProvider:
             "refresh_token": refresh_token,
             "expires_at": expires_at,
             "refresh_expires_at": now + 7200 if refresh_token else 0,
+            "refresh_retry_after": 0,
         }
         self._save(new_state)
         return access_token
