@@ -24,6 +24,17 @@ def _load_routing(path: str) -> dict:
         raise RuntimeError("Feishu routing file cannot be read or parsed") from exc
     if not isinstance(data, dict):
         raise RuntimeError("Feishu routing file root must be a JSON object")
+    for section in ("stores", "entities"):
+        mapping = data.get(section, {})
+        if not isinstance(mapping, dict):
+            raise RuntimeError(f"Feishu routing section '{section}' must be a JSON object")
+        for key, ids in mapping.items():
+            if not isinstance(key, str) or not isinstance(ids, list) or not all(
+                isinstance(item, str) and item.startswith("ou_") for item in ids
+            ):
+                raise RuntimeError(
+                    f"Feishu routing section '{section}' must map keys to Open ID arrays"
+                )
     return data
 
 
