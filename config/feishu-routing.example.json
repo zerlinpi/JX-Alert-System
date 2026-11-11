@@ -1,10 +1,43 @@
 {
+  "default_chat_id": "main-ops",
+  "groups": {
+    "main-ops": {
+      "webhook_env": "FEISHU_WEBHOOK_URL",
+      "sign_secret_env": "FEISHU_SIGN_SECRET",
+      "keyword_env": "FEISHU_KEYWORD",
+      "admin_open_ids": ["ou_main_group_admin"]
+    },
+    "store-1-ops": {
+      "webhook_env": "FEISHU_WEBHOOK_URL_STORE1",
+      "sign_secret_env": "FEISHU_SIGN_SECRET_STORE1",
+      "keyword_env": "FEISHU_KEYWORD_STORE1",
+      "admin_open_ids": ["ou_store_1_group_admin"]
+    },
+    "store-2-ops": {
+      "webhook_env": "FEISHU_WEBHOOK_URL_STORE2",
+      "sign_secret_env": "FEISHU_SIGN_SECRET_STORE2",
+      "keyword_env": "FEISHU_KEYWORD_STORE2",
+      "admin_open_ids": ["ou_store_2_group_admin"]
+    }
+  },
   "stores": {
-    "LINGXING_STORE_ID_1": ["ou_store_manager_open_id"],
-    "LINGXING_STORE_ID_2": ["ou_another_store_manager_open_id"]
+    "LINGXING_STORE_ID_1": {
+      "chat_id": "store-1-ops",
+      "open_ids": ["ou_store_1_manager"]
+    },
+    "LINGXING_STORE_ID_2": {
+      "chat_id": "store-2-ops",
+      "open_ids": ["ou_store_2_manager"]
+    }
   },
   "entities": {
-    "LINGXING_STORE_ID_1:MSKU_OR_ASIN_1": ["ou_product_owner_open_id"],
-    "MSKU_OR_ASIN_2": ["ou_product_owner_open_id"]
+    "LINGXING_STORE_ID_1:MSKU_OR_ASIN_1": {
+      "chat_id": "store-1-ops",
+      "open_ids": ["ou_product_owner_open_id"]
+    },
+    "MSKU_OR_ASIN_2": {
+      "chat_id": "store-2-ops",
+      "open_ids": ["ou_product_owner_open_id"]
+    }
   }
 }
