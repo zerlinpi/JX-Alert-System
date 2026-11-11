@@ -1,59 +1,49 @@
 # 领星店铺绩效与业绩通知接入
 
-## 为什么需要独立接入
+## 当前实现方式
 
-当前 JX Alert 的日常销售、SP/SB/SD 广告快照走领星 OpenAPI。领星公开 OpenAPI 文档中尚未找到可直接用于本项目的店铺绩效列表、绩效详情和业绩通知请求/响应契约，因此不能自行猜测 HTTP 路径或参数。
+店铺绩效和业绩通知的三个只读采集器已经接入 JX Alert 每日流水线，当前使用领星 OpenAPI，不依赖领星 MCP URL 或 X-Mcp-Key。
 
-领星官方 MCP 工具清单列出了以下只读查询工具：
+| 功能 | Method / Path | 请求参数 |
+|---|---|---|
+| 店铺绩效列表 | POST /basicOpen/customerService/storeTarget/list | sids、offset、length |
+| 店铺绩效详情 | POST /basicOpen/customerService/storeTarget/detail | sid、pullDate |
+| 业绩通知列表 | POST /basicOpen/customerService/performanceNotice/list | sid、offset、length |
 
-- `customer_store_performance_list`：查询店铺绩效列表
-- `customer_store_target_detail`：查询店铺绩效详情
-- `customer_performance_notice_list`：查询业绩通知列表
+列表和通知均按 offset/length 分页；通知采集不附加状态、已读或日期过滤，避免过滤条件隐藏待处理通知。绩效详情使用列表返回的最新 pull_date。
 
-本项目提供了一个只做 `initialize` 和 `tools/list` 的 Schema 探测脚本。它不会调用这些业务工具，也不会修改领星数据。
+## 数据安全与判断规则
 
-## 在领星后台获取连接信息
+- 绩效列表 update_date 和通知响应 data.lastUpdateDate 是数据源更新时间，不使用 HTTP 请求时间代替。
+- 这两个时间字段没有显式时区。只有确认领星数据源的实际时区后，才设置 LINGXING_PERFORMANCE_SOURCE_TIMEZONE。
+- 未配置时区、缺少更新时间、数据过期、时间异常或采集失败时，系统保留 NOT_CONFIGURED / MISSING / STALE / FUTURE / FAILED 状态，不报“绩效正常”。
+- 通知状态 1=待处理，2=已处理，3=无需处理；状态 0 和未知值保持 UNKNOWN，不自动关闭待处理告警。
+- 详情 data.standard 作为平台标准保存。只有实际值和平台标准均可解析时才进行指标比较；缺失值不会转成 0。
+- 每次采集的原始响应同时保存到数据库 RawSnapshot，并归档到 RAW_DIR/YYYY/MM/DD，使用原子写入和受限文件权限。
+- 采集只读，不会修改 Amazon 店铺、绩效指标或广告活动。
 
-1. 由领星管理员确认帐号已开通 MCP 功能；官方帮助文档说明 MCP 功能需在「设置/业务配置 → 开放接口 → MCP」启用，且受套餐权限限制。
-2. 登录领星 ERP，打开 AI 助手中的「管理 MCP」。
-3. 复制当前帐号的 MCP Server URL。
-4. 复制对应的 `X-Mcp-Key` 鉴权密钥。
-5. 确认该帐号本身有权查看需要监控的店铺绩效数据。MCP URL 的数据范围与帐号权限绑定。
+## 启用前必须完成
 
-官方说明：
-- [领星 MCP 使用说明与工具清单](https://www.lingxing.com/help/article/mcp)
-- [领星店铺绩效数据说明](https://www.lingxing.com/help/article/performance)
-- [领星业绩通知说明](https://www.lingxing.com/help/article/PerformanceNotifications)
+默认 LINGXING_PERFORMANCE_ENABLED=false。请先通过领星当前账号文档和一份脱敏真实响应确认：
+1. update_date / lastUpdateDate 的源时区。
+2. 店铺绩效列表、详情、通知列表的实际字段名和分页总数字段。
+3. AHR 状态、各绩效指标和 data.standard 的真实结构。
+4. 店铺授权是否覆盖全部需要监控的 sid。
 
-## 在服务器配置
-
-只在服务器的 `.env` 文件中填写，不要把密钥提交到 Git，也不要贴到聊天窗口：
+确认后，在 Linux 服务器 .env 中设置：
 
 ```env
-LINGXING_MCP_URL=https://openmcp.lingxing.com/mcp-servers/lingxing-mcp
-LINGXING_MCP_KEY=替换为领星管理MCP页面复制的密钥
+LINGXING_PERFORMANCE_ENABLED=true
+LINGXING_PERFORMANCE_SOURCE_TIMEZONE=Asia/Shanghai
+LINGXING_PERFORMANCE_MAX_AGE_HOURS=8
+LINGXING_PERFORMANCE_PAGE_SIZE=200
+LINGXING_PERFORMANCE_MAX_PAGES=1000
 ```
 
-然后执行 Schema 探测：
+上面的时区仅为格式示例，必须替换为你确认的真实源时区，不能直接照抄。
 
-```bash
-docker compose run --rm app python scripts/inspect_lingxing_mcp_tools.py
-```
+重建并重启 scheduler 后，查看采集日志、数据库 performance_sync_states、performance_notices、store_performance 和 RAW_DIR 归档。首次真实联调建议只启用一个测试店铺，并检查飞书是否收到待处理通知且不会重复刷屏。
 
-脚本只输出目标工具名称、描述和 input schema，不会输出 URL 或密钥。把输出的 Schema 保存下来，下一步才能按真实参数实现自动采集与数据库字段映射。
+## 可选的领星 MCP
 
-## 数据更新与依赖边界
-
-- 领星帮助中心说明，店铺绩效页的数据来自亚马逊绩效接口，与 Seller Central 的 Performance / Account Health 数据保持一致，约每 4 小时更新一次。
-- 领星帮助中心说明，业绩通知数据由领星插件从店铺后台抓取；插件必须保持登录，系统在指定时段按小时同步。若插件掉线，通知列表可能不再更新。
-- 因此，JX Alert 不会把领星店铺状态码当作 Amazon Account Health，也不会把没有新数据误判为「无绩效异常」。
-- 正式接入后，绩效数据需保留 source timestamp / sync timestamp，并对过期数据标记 STALE；只有明确完整的响应才能把「没有事件」解释为正常。
-
-## 下一阶段验收标准
-
-1. 三个工具的真实 input schema 已保存并核对。
-2. 对每个店铺能读取绩效列表与详情，且保存评分、指标、目标值、状态、更新时间和原始响应。
-3. 能读取业绩通知，保存通知 ID、标题/类型、发生时间、处理状态和原始响应。
-4. 只有新增的 P0/P1 绩效风险立即通知；同一通知去重，恢复/处理状态可追踪。
-5. 插件同步时间过旧或 MCP 查询失败时，明确报数据过期/采集失败，不得报「绩效正常」。
-6. MCP 凭证只存在服务器环境变量，不进入日志、Excel、数据库原始快照或通知正文。
+仓库保留 scripts/inspect_lingxing_mcp_tools.py 和 LINGXING_MCP_URL / LINGXING_MCP_KEY 配置，用于将来探测其他尚未覆盖的领星 MCP 工具。它们不是上述三个 OpenAPI 采集器的运行前置条件。不要把 MCP Key、AppSecret 或 Token 写入 Git、日志、Excel 或原始业务数据快照。
