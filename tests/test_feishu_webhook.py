@@ -16,7 +16,7 @@ def test_custom_bot_payload_supports_open_id_mentions_and_keyword():
     payload = client._payload("订单异常", ["ou_test_member"])
     text = payload["content"]["text"]
     assert "告警" in text
-    assert '<at user_id="ou_test_member"></at>' in text
+    assert '<at user_id="ou_test_member">提醒</at>' in text
     assert payload["sign"] == build_feishu_signature(payload["timestamp"], "local-test-secret")
 
 
