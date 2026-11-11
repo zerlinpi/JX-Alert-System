@@ -1,0 +1,156 @@
+from datetime import date, datetime, timedelta
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+
+from jx_alert.storage.db import Base
+from jx_alert.storage import models  # noqa: F401
+from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.storage.models import (
+    AdProduct,
+    AnomalyEvent,
+    Campaign,
+    DailyMetric,
+    DataCoverage,
+    Product,
+    Store,
+)
+from jx_alert.analysis.evaluator import evaluate_daily_anomalies
+
+
+def _add_coverage(db, store_id, dimension, report_date):
+    for offset in range(7, -1, -1):
+        db.add(DataCoverage(
+            store_id=store_id,
+            metric_date=report_date - timedelta(days=offset),
+            dimension=dimension,
+            status="COMPLETE",
+            row_count=1,
+        ))
+
+
+def _add_metric(db, store_id, dimension, entity_id, metric_name, metric_date, value):
+    db.add(DailyMetric(
+        store_id=store_id,
+        metric_date=metric_date,
+        dimension=dimension,
+        entity_id=entity_id,
+        metric_name=metric_name,
+        value=value,
+        currency="USD",
+        source="test",
+    ))
+
+
+def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    target = date(2026, 11, 10)
+    store_id = "store-1"
+
+    with Session() as db:
+        db.add(Store(sid=store_id, name="Store A", status=1, has_ads_setting=1))
+        db.add(Product(
+            store_id=store_id, seller_sku="SKU-1", asin="B000000001",
+            product_name="Product",
+        ))
+        db.add(Campaign(
+            store_id=store_id, campaign_type="sp", campaign_id="campaign-1",
+            name="SP Campaign", state="enabled", budget=25, budget_type="daily",
+            last_over_budget_at="2026-11-10 12:00:00",
+        ))
+        db.add(AdProduct(
+            store_id=store_id, campaign_type="sp", ad_id="ad-1",
+            campaign_id="campaign-1", seller_sku="SKU-1", asin="B000000001",
+        ))
+
+        dimensions = [
+            "store", "sku_msku", "sku_asin",
+            "campaign_sp", "campaign_sb", "campaign_sd",
+            "product_ad_sp", "product_ad_sd",
+        ]
+        for dimension in dimensions:
+            _add_coverage(db, store_id, dimension, target)
+
+        for offset in range(7, 0, -1):
+            day = target - timedelta(days=offset)
+            for dimension, entity in (
+                ("store", store_id),
+                ("sku_msku", "SKU-1"),
+                ("sku_asin", "B000000001"),
+            ):
+                _add_metric(db, store_id, dimension, entity, "orders", day, 10)
+                _add_metric(db, store_id, dimension, entity, "units", day, 10)
+            _add_metric(db, store_id, "campaign_sp", "campaign-1", "spend", day, 10)
+            _add_metric(db, store_id, "campaign_sp", "campaign-1", "orders", day, 2)
+            _add_metric(db, store_id, "campaign_sp", "campaign-1", "clicks", day, 20)
+            _add_metric(db, store_id, "product_ad_sp", "ad-1", "spend", day, 10)
+            _add_metric(db, store_id, "product_ad_sp", "ad-1", "orders", day, 2)
+            _add_metric(db, store_id, "product_ad_sp", "ad-1", "clicks", day, 20)
+
+        for dimension, entity in (
+            ("store", store_id),
+            ("sku_msku", "SKU-1"),
+            ("sku_asin", "B000000001"),
+        ):
+            _add_metric(db, store_id, dimension, entity, "orders", target, 5)
+            _add_metric(db, store_id, dimension, entity, "units", target, 15)
+        _add_metric(db, store_id, "campaign_sp", "campaign-1", "spend", target, 30)
+        _add_metric(db, store_id, "campaign_sp", "campaign-1", "orders", target, 0)
+        _add_metric(db, store_id, "campaign_sp", "campaign-1", "clicks", target, 15)
+        _add_metric(db, store_id, "product_ad_sp", "ad-1", "spend", target, 25)
+        _add_metric(db, store_id, "product_ad_sp", "ad-1", "orders", target, 0)
+        _add_metric(db, store_id, "product_ad_sp", "ad-1", "clicks", target, 15)
+        db.commit()
+
+        result = evaluate_daily_anomalies(db, target)
+        assert result["evaluated_scopes"] == 8
+        assert result["skipped_incomplete_scopes"] == 0
+        events = db.scalars(select(AnomalyEvent)).all()
+        assert any(row.rule == "orders_decrease" and row.entity_id == "SKU-1" for row in events)
+        assert any(row.rule == "units_increase" and row.entity_id == "B000000001" for row in events)
+        assert any(row.rule == "high_ad_spend" and row.entity_id == "campaign-1" for row in events)
+        assert any(row.rule == "campaign_over_budget" for row in events)
+        assert any(row.rule == "spend_no_conversion" and row.entity_id == "SKU-1" for row in events)
+        assert db.scalars(select(NotificationOutbox)).all()
+
+
+def test_incomplete_coverage_does_not_recover_existing_anomaly():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    target = date(2026, 11, 10)
+    store_id = "store-1"
+
+    with Session() as db:
+        db.add(Store(sid=store_id, name="Store A", status=1))
+        db.add(Product(store_id=store_id, seller_sku="SKU-1", asin="B000000001"))
+        db.add(AnomalyEvent(
+            dedupe_key="store-1:SKU-1:orders_decrease",
+            store_id=store_id,
+            rule="orders_decrease",
+            entity_id="SKU-1",
+            severity="P1",
+            status="ONGOING",
+            evaluation_scope="store-1:sales:sku_msku",
+            first_seen=datetime.utcnow(),
+            last_seen=datetime.utcnow(),
+            metrics={"baseline_7d": 10},
+            reason="previous alert",
+        ))
+        for offset in range(7, 0, -1):
+            db.add(DataCoverage(
+                store_id=store_id,
+                metric_date=target - timedelta(days=offset),
+                dimension="sku_msku",
+                status="COMPLETE",
+                row_count=1,
+            ))
+        db.commit()
+
+        result = evaluate_daily_anomalies(db, target)
+        assert result["evaluated_scopes"] == 0
+        assert result["skipped_incomplete_scopes"] == 8
+        row = db.scalar(select(AnomalyEvent))
+        assert row.status == "ONGOING"
+        assert db.scalars(select(NotificationOutbox)).all() == []
