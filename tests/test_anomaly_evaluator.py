@@ -133,8 +133,8 @@ def test_incomplete_coverage_does_not_recover_existing_anomaly():
             severity="P1",
             status="ONGOING",
             evaluation_scope="store-1:sales:sku_msku",
-            first_seen=datetime.utcnow(),
-            last_seen=datetime.utcnow(),
+            first_seen=datetime.now(timezone.utc).replace(tzinfo=None),
+            last_seen=datetime.now(timezone.utc).replace(tzinfo=None),
             metrics={"baseline_7d": 10},
             reason="previous alert",
         ))
