@@ -74,7 +74,10 @@ class Settings(BaseSettings):
         return "sqlite:///./jxalert.db"
 
     def feishu_at_ids(self) -> list[str]:
-        return [item.strip() for item in self.feishu_default_at_open_ids.split(",") if item.strip()]
+        ids = [item.strip() for item in self.feishu_default_at_open_ids.split(",") if item.strip()]
+        if any(not item.startswith("ou_") for item in ids):
+            raise ValueError("FEISHU_DEFAULT_AT_OPEN_IDS must contain Feishu Open IDs (ou_...)")
+        return ids
 
 
 @lru_cache
