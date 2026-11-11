@@ -32,7 +32,9 @@
 | SP 活动日报 | POST `/pb/openapi/newad/spCampaignReports` |
 | SB 活动日报 | POST `/pb/openapi/newad/hsaCampaignReports` |
 | SD 活动日报 | POST `/pb/openapi/newad/sdCampaignReports` |
-| SP 商品广告资料 | POST `/pb/openapi/newad/spProductAds` |\n| SD 商品广告资料 | POST `/pb/openapi/newad/sdProductAds` |\n| SP 商品广告日报 | POST `/pb/openapi/newad/spProductAdReports` |
+| SP 商品广告资料 | POST `/pb/openapi/newad/spProductAds` |
+| SD 商品广告资料 | POST `/pb/openapi/newad/sdProductAds` |
+| SP 商品广告日报 | POST `/pb/openapi/newad/spProductAdReports` |
 | SD 商品广告日报 | POST `/pb/openapi/newad/sdProductAdReports` |
 
 广告接口使用 `X-API-VERSION: 2`。SP/SD 报表按 `next_token` 游标分页，SB 活动报表按 `offset/length` 分页；分页缺失或不完整时客户端会报错，不把部分结果当成完整日报。领星签名按 ASCII 排序，将业务参数、原始 `access_token`、`app_key`、`timestamp` 拼接后 MD5 大写，再使用 AppID 作为 AES 密钥执行 AES/ECB/PKCS5Padding。Bearer Token 通过 `Authorization` 头发送，但仍须参与签名；POST JSON 中的标量业务字段也须参与签名。当前客户端对嵌套对象/数组签名会 fail closed，不会猜测序列化规则。
@@ -48,7 +50,9 @@
 - [SP 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/spCampaigns/)
 - [SB 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/hsaCampaigns/)
 - [SD 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/sdCampaigns/)
-- [SP 商品广告资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/spProductAds/)\n- [SD 商品广告资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/sdProductAds/)\n- [SP 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/spProductAdReports/)
+- [SP 商品广告资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/spProductAds/)
+- [SD 商品广告资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/sdProductAds/)
+- [SP 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/spProductAdReports/)
 - [SD 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/sdProductAdReports/)
 
 ## 飞书自定义机器人
