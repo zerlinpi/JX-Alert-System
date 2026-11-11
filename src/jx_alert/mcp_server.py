@@ -21,6 +21,7 @@ from jx_alert.storage.models import (
     Campaign,
     DailyMetric,
     DataCoverage,
+    Product,
     Store,
     SyncJob,
 )
@@ -442,6 +443,35 @@ def get_daily_summary(store_id: str, report_date: str) -> dict:
     init_db()
     with SessionLocal() as db:
         return _daily_summary(db, str(store_id), target_date)
+
+
+
+@mcp.tool()
+def get_products(store_id: str | None = None, seller_sku: str | None = None,
+                 asin: str | None = None, limit: int = 200) -> list[dict]:
+    """Query synchronized MSKU/ASIN mappings and configured product-owner Open IDs."""
+    init_db()
+    with SessionLocal() as db:
+        query = select(Product)
+        if store_id:
+            query = query.where(Product.store_id == str(store_id))
+        if seller_sku:
+            query = query.where(Product.seller_sku == seller_sku)
+        if asin:
+            query = query.where(Product.asin == asin)
+        rows = db.scalars(
+            query.order_by(Product.store_id, Product.seller_sku).limit(_limit(limit))
+        ).all()
+        return [{
+            "store_id": row.store_id,
+            "seller_sku": row.seller_sku,
+            "asin": row.asin,
+            "local_sku": row.local_sku,
+            "product_name": row.product_name,
+            "currency_code": row.currency_code,
+            "owner_open_ids": row.owner_open_ids or [],
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        } for row in rows]
 
 
 @mcp.tool()
