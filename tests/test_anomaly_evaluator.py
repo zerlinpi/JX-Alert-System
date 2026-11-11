@@ -124,10 +124,11 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
             _add_metric(db, store_id, dimension, entity, "units", target, 15)
             _add_metric(db, store_id, dimension, entity, "sales", target, 50)
         _add_metric(db, store_id, "campaign_sp", "campaign-1", "spend", target, 30)
-        _add_metric(db, store_id, "campaign_sp", "campaign-1", "orders", target, 0)
+        # Today's orders are intentionally positive but still attribution-incomplete.
+        _add_metric(db, store_id, "campaign_sp", "campaign-1", "orders", target, 10)
         _add_metric(db, store_id, "campaign_sp", "campaign-1", "clicks", target, 15)
         _add_metric(db, store_id, "product_ad_sp", "ad-1", "spend", target, 25)
-        _add_metric(db, store_id, "product_ad_sp", "ad-1", "orders", target, 0)
+        _add_metric(db, store_id, "product_ad_sp", "ad-1", "orders", target, 10)
         _add_metric(db, store_id, "product_ad_sp", "ad-1", "clicks", target, 15)
         db.commit()
 
