@@ -72,3 +72,22 @@ python scripts/test_lingxing_connection.py --request
 ```
 
 该脚本不会打印 Token 或 AppSecret。不要把 AppSecret 或真实 Token 发给 ChatGPT。
+
+## 6. SP/SB/SD 活动日报只读采集
+
+Token 获取和店铺列表单接口验证成功后，可先运行采集命令 dry-run：
+```bash
+python scripts/collect_lingxing_ads.py
+```
+
+当前广告日报采集已按官方接口分别处理 SP/SD 的 `next_token` 游标分页和 SB 的 `offset/length` 分页，保存原始快照及 campaign 级 spend/orders/sales/units/clicks/impressions。若所有店铺同一站点日期，可显式执行：
+```bash
+APP_DRY_RUN=false python scripts/collect_lingxing_ads.py --collect --date YYYY-MM-DD
+```
+
+如果不同 sid 属于不同站点时区，请建立 `data/store-report-dates.json`，内容为 sid 到站点本地日期的映射，再运行：
+```bash
+APP_DRY_RUN=false python scripts/collect_lingxing_ads.py --collect --date-map data/store-report-dates.json
+```
+
+这一步会真实读取领星店铺列表和 SP/SB/SD 报表，但不会发送飞书消息，也不会修改广告。不要在尚未验证 Token 请求/响应字段之前执行。当前还没有 SKU 销量日报和商品级广告报表采集。
