@@ -32,6 +32,8 @@ class AnomalyEvent(Base):
     rule: Mapped[str] = mapped_column(String(80))
     severity: Mapped[str] = mapped_column(String(8))
     status: Mapped[str] = mapped_column(String(20), default="NEW")
+    evaluation_scope: Mapped[str] = mapped_column(String(200), default="", index=True)
+    recovered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     first_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     metrics: Mapped[dict] = mapped_column(JSON)
