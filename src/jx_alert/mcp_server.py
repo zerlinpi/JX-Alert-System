@@ -33,8 +33,11 @@ class BearerTokenMiddleware:
             raise ValueError("MCP_BEARER_TOKEN must contain at least 32 characters")
         if not path.startswith("/") or path == "/":
             raise ValueError("MCP_PATH must be an absolute non-root path")
+        try:
+            self.token = token.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("MCP_BEARER_TOKEN must be ASCII") from exc
         self.app = app
-        self.token = token
         self.protected_paths = {path, path.rstrip("/") + "/"}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
@@ -50,7 +53,7 @@ class BearerTokenMiddleware:
                 valid = (
                     separator == " "
                     and scheme.lower() == "bearer"
-                    and hmac.compare_digest(supplied, self.token)
+                    and hmac.compare_digest(supplied.encode("latin-1"), self.token)
                 )
             if not valid:
                 body = b'{"error":"unauthorized"}'
