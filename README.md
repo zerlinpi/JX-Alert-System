@@ -18,7 +18,7 @@
 - **Excel：** 已生成真实数据的七工作表日报，支持全店汇总和按店铺分别导出。
 - **调度/回补：** 每日调度已连接采集、异常分析和店铺 Excel 导出；广告归因成熟告警需要至少 22 天历史回补（覆盖 14 天归因窗口及其前七日基准）。提供 22–30 天显式历史回补 CLI。默认调度关闭。
 - **MCP：** JX Alert 自身提供只读店铺、产品/MSKU/ASIN负责人映射、SKU/ASIN、广告活动及 SP/SD 商品广告的前一日与七日表现、日报汇总、异常历史、飞书投递日志、coverage 和同步任务查询；支持本地 stdio 与可选的 Streamable HTTP 远程服务。远程服务使用 Bearer Token，并默认只绑定宿主机回环地址；不开放广告修改工具。
-- **店铺绩效：** 已接入领星 OpenAPI 的绩效列表、详情和业绩通知采集，保存评分、状态、指标标准、违规、通知状态及原始 JSON 快照；数据源更新时间缺失、过期或时区未配置时不会判为正常。功能默认关闭，服务器确认源时区并设置配置后启用。
+- **店铺绩效：** 已接入领星 OpenAPI 的绩效列表、详情和业绩通知采集，保存评分、状态、指标标准、违规、通知状态及数据库和文件系统双份原始 JSON 快照；数据源更新时间缺失、过期或时区未配置时不会判为正常。功能默认关闭，服务器确认源时区并设置配置后启用。
 
 ## 已核验的领星业务 API
 
@@ -165,7 +165,7 @@ python scripts/test_feishu_webhook.py --send
 ## 尚未达到生产完成的部分
 
 - 领星 Token 接口的准确路径、请求字段和响应字段路径尚需按你账号开放平台当前文档填写并验证。
-- 领星绩效三个 OpenAPI 接口已接入自动采集；仍需在服务器确认 update_date / lastUpdateDate 的源时区、配置 LINGXING_PERFORMANCE_SOURCE_TIMEZONE，并用真实脱敏响应核验字段及分页。默认 LINGXING_PERFORMANCE_ENABLED=false，验证后启用。
+- 领星绩效三个 OpenAPI 接口已接入自动采集；仍需在服务器确认 update_date / lastUpdateDate 的源时区、配置 LINGXING_PERFORMANCE_SOURCE_TIMEZONE，并用真实脱敏响应核验字段及分页。默认 LINGXING_PERFORMANCE_ENABLED=false，验证后启用。所有新采集的原始响应会同时归档到 RAW_DIR/YYYY/MM/DD/，使用原子写入和仅所有者可读写权限。
 - SB 商品级广告日报的公开 API 契约尚未确认；当前不将 SB 活动数据分摊到商品。
 - 产品表现异步报告（reportType=2）需要嵌套 reportOptions 的签名 canonicalizer；当前客户端对此类嵌套参数 fail closed，未猜测签名格式。
 - 业绩通知数据依赖领星插件同步状态；已加入 lastUpdateDate 新鲜度检查，未配置源时区或数据过期时保持未知/异常状态。
