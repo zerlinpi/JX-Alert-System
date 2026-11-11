@@ -19,6 +19,10 @@ class LingxingError(RuntimeError):
     pass
 
 
+class LingxingTransientError(LingxingError):
+    """A network or provider rate-limit condition safe to retry."""
+
+
 def _signature_scalar(value):
     if value is None:
         return "null"
@@ -93,42 +97,88 @@ class LingxingClient:
 
         query_business = dict(params or {})
         body_business = dict(json_body or {})
-        timestamp = int(time.time())
-        sign_params = {**query_business, **body_business, "timestamp": timestamp}
-        signature = build_signature(
-            sign_params, access_token=self.access_token,
-            app_key=self.app_key, app_id=self.app_id,
-        )
-        # The bearer token is signed exactly once but is not duplicated in the query.
-        query = {"app_key": self.app_key, "timestamp": timestamp, **query_business, "sign": signature}
-        headers = {"Authorization": f"Bearer {self.access_token}"}
-        if json_body is not None:
-            headers["Content-Type"] = "application/json"
-        if advertising:
-            headers["X-API-VERSION"] = "2"
+        for attempt in range(5):
+            timestamp = int(time.time())
+            sign_params = {**query_business, **body_business, "timestamp": timestamp}
+            signature = build_signature(
+                sign_params, access_token=self.access_token,
+                app_key=self.app_key, app_id=self.app_id,
+            )
+            query = {
+                "app_key": self.app_key,
+                "timestamp": timestamp,
+                **query_business,
+                "sign": signature,
+            }
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            if json_body is not None:
+                headers["Content-Type"] = "application/json"
+            if advertising:
+                headers["X-API-VERSION"] = "2"
 
-        try:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.request(
-                    method.upper(),
-                    urljoin(self.base_url, path.lstrip("/")),
-                    params=query,
-                    json=json_body,
-                    headers=headers,
+            try:
+                with httpx.Client(timeout=self.timeout) as client:
+                    response = client.request(
+                        method.upper(),
+                        urljoin(self.base_url, path.lstrip("/")),
+                        params=query,
+                        json=json_body,
+                        headers=headers,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                error = LingxingTransientError(
+                    f"Lingxing transient network failure: {type(exc).__name__}"
                 )
-                response.raise_for_status()
-                data = response.json()
-        except httpx.HTTPError as exc:
-            raise LingxingError(f"Lingxing HTTP request failed: {type(exc).__name__}") from exc
-        except ValueError as exc:
-            raise LingxingError("Lingxing API returned invalid JSON") from exc
+                if attempt == 4:
+                    raise error from exc
+                time.sleep(min(2 ** attempt, 16))
+                continue
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 429 or status >= 500:
+                    error = LingxingTransientError(
+                        f"Lingxing transient HTTP status: {status}"
+                    )
+                    if attempt == 4:
+                        raise error from exc
+                    time.sleep(min(2 ** attempt, 16))
+                    continue
+                raise LingxingError(f"Lingxing HTTP request failed: status={status}") from exc
+            except httpx.HTTPError as exc:
+                raise LingxingError(
+                    f"Lingxing HTTP request failed: {type(exc).__name__}"
+                ) from exc
+            except ValueError as exc:
+                raise LingxingError("Lingxing API returned invalid JSON") from exc
 
-        if isinstance(data, dict):
-            code = data.get("code")
-            if code not in (None, 0, "0", 200, "200"):
-                message = data.get("msg") or data.get("message") or "unknown"
-                raise LingxingError(f"Lingxing API error: code={code}, message={message}")
-        return data
+            if isinstance(data, dict):
+                code = data.get("code")
+                if code not in (None, 0, "0", 200, "200"):
+                    message = str(data.get("msg") or data.get("message") or "unknown")
+                    lowered = message.lower()
+                    rate_limited = (
+                        str(code) == "429"
+                        or any(token in lowered for token in (
+                            "rate limit", "too many requests", "频率限制",
+                            "请求过于频繁", "限流", "令牌桶",
+                        ))
+                    )
+                    if rate_limited:
+                        error = LingxingTransientError(
+                            f"Lingxing rate limit response: code={code}"
+                        )
+                        if attempt == 4:
+                            raise error
+                        time.sleep(min(2 ** attempt, 16))
+                        continue
+                    raise LingxingError(
+                        f"Lingxing API error: code={code}, message={message}"
+                    )
+            return data
+
+        raise LingxingTransientError("Lingxing request exhausted retry attempts")
 
     def get_stores(self):
         return self._request("GET", "/erp/sc/data/seller/lists")
