@@ -10,6 +10,11 @@ from jx_alert.storage.models import AnomalyEvent
 _SEVERITY_ORDER = {"P1": 1, "P2": 2, "P3": 3}
 
 
+def _scoped_dedupe_key(store_id: str, event_key: str) -> str:
+    prefix = f"{store_id}:"
+    return event_key if event_key.startswith(prefix) else prefix + event_key
+
+
 def upsert_anomalies(db, store_id: str, events: list[dict], *,
                      evaluation_scope: str, scope_complete: bool = False
                      ) -> list[AnomalyEvent]:
@@ -22,13 +27,14 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
         raise ValueError("evaluation_scope is required")
     saved = []
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    active_keys = {event["dedupe_key"] for event in events}
+    active_keys = {
+        _scoped_dedupe_key(store_id, event["dedupe_key"]) for event in events
+    }
 
     for event in events:
+        dedupe_key = _scoped_dedupe_key(store_id, event["dedupe_key"])
         row = db.scalar(
-            select(AnomalyEvent).where(
-                AnomalyEvent.dedupe_key == event["dedupe_key"]
-            )
+            select(AnomalyEvent).where(AnomalyEvent.dedupe_key == dedupe_key)
         )
         if row:
             previous_severity = row.severity
@@ -48,7 +54,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
             row.recovered_at = None
         else:
             row = AnomalyEvent(
-                dedupe_key=event["dedupe_key"],
+                dedupe_key=dedupe_key,
                 store_id=store_id,
                 rule=event["rule"],
                 entity_id=event.get("entity_key", ""),
