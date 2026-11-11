@@ -50,18 +50,51 @@ def _read_path(data: dict, dotted_path: str):
     return value
 
 
+def _send_token_request(client, *, url: str, method: str, payload: dict,
+                       request_format: str = "json"):
+    """Send a token request using the encoding required by the provider API.
+
+    For multipart/form-data, httpx builds the Content-Type boundary automatically.
+    Scalar fields are sent as regular form fields (filename=None), not file uploads.
+    """
+    method = method.upper()
+    if method == "GET":
+        return client.get(url, params=payload)
+    if method != "POST":
+        raise LingxingError("Token method must be GET or POST")
+
+    encoding = (request_format or "json").strip().lower()
+    if encoding in ("json", "application/json"):
+        return client.post(url, json=payload)
+    if encoding in ("form", "urlencoded", "application/x-www-form-urlencoded"):
+        return client.post(url, data=payload)
+    if encoding in ("multipart", "multipart/form-data"):
+        if any(
+            not isinstance(key, str)
+            or value is None
+            or isinstance(value, (dict, list, tuple, set))
+            for key, value in payload.items()
+        ):
+            raise LingxingError("Multipart token request fields must be non-null scalar values")
+        fields = {key: (None, str(value)) for key, value in payload.items()}
+        return client.post(url, files=fields)
+    raise LingxingError(
+        "Unsupported token request format; use json, form, or multipart"
+    )
+
+
 def request_token(*, base_url: str, path: str, request_json: str,
-                  timeout: int = 30, method: str = "POST") -> dict:
+                  timeout: int = 30, method: str = "POST",
+                  request_format: str = "json") -> dict:
     if not path:
         raise LingxingError("Token endpoint path is not configured")
     payload = _json_payload(request_json, {})
+    url = base_url.rstrip("/") + "/" + path.lstrip("/")
     with httpx.Client(timeout=timeout) as client:
-        if method.upper() == "GET":
-            response = client.get(base_url.rstrip("/") + "/" + path.lstrip("/"), params=payload)
-        elif method.upper() == "POST":
-            response = client.post(base_url.rstrip("/") + "/" + path.lstrip("/"), json=payload)
-        else:
-            raise LingxingError("Token method must be GET or POST")
+        response = _send_token_request(
+            client, url=url, method=method, payload=payload,
+            request_format=request_format,
+        )
         response.raise_for_status()
         data = response.json()
     if not isinstance(data, dict):
@@ -104,7 +137,8 @@ class LingxingTokenProvider:
                 os.unlink(temporary)
 
     def _call(self, *, path: str, template: str, method: str,
-              refresh_token: str = "", access_token: str = "") -> dict:
+              refresh_token: str = "", access_token: str = "",
+              request_format: str = "json") -> dict:
         s = self.settings
         values = {
             "LINGXING_APP_ID": s.lingxing_app_id,
@@ -115,18 +149,13 @@ class LingxingTokenProvider:
         payload = _json_payload(template, values)
         try:
             with httpx.Client(timeout=s.lingxing_timeout) as client:
-                if method.upper() == "GET":
-                    response = client.get(
-                        s.lingxing_base_url.rstrip("/") + "/" + path.lstrip("/"),
-                        params=payload,
-                    )
-                elif method.upper() == "POST":
-                    response = client.post(
-                        s.lingxing_base_url.rstrip("/") + "/" + path.lstrip("/"),
-                        json=payload,
-                    )
-                else:
-                    raise LingxingError("Token method must be GET or POST")
+                response = _send_token_request(
+                    client,
+                    url=s.lingxing_base_url.rstrip("/") + "/" + path.lstrip("/"),
+                    method=method,
+                    payload=payload,
+                    request_format=request_format,
+                )
                 response.raise_for_status()
                 data = response.json()
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -219,6 +248,7 @@ class LingxingTokenProvider:
                     method=s.lingxing_refresh_method,
                     refresh_token=cached_refresh_token,
                     access_token=state.get("access_token", ""),
+                    request_format=getattr(s, "lingxing_refresh_request_format", "json"),
                 )
             except LingxingTransientError:
                 # Keep a still-valid access token during a short network/provider
@@ -243,6 +273,7 @@ class LingxingTokenProvider:
                 path=s.lingxing_token_path,
                 template=s.lingxing_token_request_json,
                 method=s.lingxing_token_method,
+                request_format=getattr(s, "lingxing_token_request_format", "json"),
             )
 
         access_token = _read_path(data, s.lingxing_token_response_path)

@@ -20,35 +20,65 @@ AppSecret 有权访问企业数据，不能发到聊天、工单或公开仓库�
 
 ## 3. 配置 Token 获取与续约接口
 
-领星接入指南将 Token 获取和续约作为独立认证接口。由于不同版本文档页面中的路径、参数名和响应字段必须以你账号当前开放平台显示为准，本项目没有硬编码猜测路径。
+### 3.1 获取 access_token（已按官方文档确认）
 
-在领星 OpenAPI 文档中打开「获取接口令牌 access_token」和「续约接口令牌」页面，核对以下信息：
-1. 请求方法（GET 或 POST）。
-2. API Path。
-3. 必填请求字段及其准确名称。
-4. 响应中 access_token、refresh_token 和有效期字段的 JSON 层级。
-5. Token 续约是否使用 refresh_token，以及 refresh_token 是否轮换。
+当前领星 OpenAPI「获取 access-token 和 refresh-token」文档确认：
 
-将真实路径和请求模板填写到服务器本地 `.env`。请求模板支持以下字符串占位符：
+- Method：`POST`
+- API Path：`/api/auth-server/oauth/access-token`
+- Content-Type：`multipart/form-data`
+- 表单字段：`appId`、`appSecret`
+- 成功响应状态码：字符串 `"200"`
+- Access Token：`data.access_token`
+- Refresh Token：`data.refresh_token`
+- 有效期秒数：`data.expires_in`
+
+项目已支持三种 POST 编码：`json`、`form`（application/x-www-form-urlencoded）和 `multipart`。multipart 使用普通表单字段，并由 HTTP 客户端自动生成 boundary；不要手动设置 Content-Type。
+
+服务器 `.env` 中配置：
+
+```env
+LINGXING_TOKEN_PATH=/api/auth-server/oauth/access-token
+LINGXING_TOKEN_METHOD=POST
+LINGXING_TOKEN_REQUEST_FORMAT=multipart
+LINGXING_TOKEN_REQUEST_JSON={"appId":"${LINGXING_APP_ID}","appSecret":"${LINGXING_APP_SECRET}"}
+LINGXING_TOKEN_RESPONSE_PATH=data.access_token
+LINGXING_REFRESH_RESPONSE_PATH=data.refresh_token
+LINGXING_EXPIRES_IN_RESPONSE_PATH=data.expires_in
+```
+
+请求模板支持以下字符串占位符：
 - `${LINGXING_APP_ID}`
 - `${LINGXING_APP_SECRET}`
 - `${LINGXING_ACCESS_TOKEN}`
 - `${LINGXING_REFRESH_TOKEN}`
 
-例如，下面只是说明占位符写法的结构示意，不是领星真实 API 请求字段：
+不要把真实 AppSecret 或 Token 写入仓库。只在服务器本地 `.env` 中填写 AppID 和 AppSecret，并将文件权限限制为仅应用用户可读写（例如 `chown 10001:10001 .env && chmod 600 .env`）。
+
+### 3.2 Refresh Token 续约（仍需官方文档确认）
+
+不要猜测续约接口路径、请求方式或参数名。请在当前领星 OpenAPI 文档打开「续约接口令牌」，确认 Method、API Path、请求字段、成功响应 JSON、refresh_token 是否轮换及有效期字段后再配置。
+
+在续约接口核实之前，保持：
+
 ```env
-LINGXING_TOKEN_PATH=
-LINGXING_TOKEN_METHOD=POST
-LINGXING_TOKEN_REQUEST_JSON={}
-LINGXING_TOKEN_RESPONSE_PATH=
 LINGXING_REFRESH_PATH=
 LINGXING_REFRESH_METHOD=POST
+LINGXING_REFRESH_REQUEST_FORMAT=json
 LINGXING_REFRESH_REQUEST_JSON={}
-LINGXING_REFRESH_RESPONSE_PATH=
-LINGXING_EXPIRES_IN_RESPONSE_PATH=
 ```
 
-响应字段路径使用点分隔 JSON 路径，例如 `data.access_token`；只有在你实际 API 响应确实如此时才填写。有效期字段必须返回 TTL 秒数。不要把示例路径直接复制为真实配置。
+在没有配置续约路径时，Token Provider 会在 access_token 失效后使用 AppID/AppSecret 重新获取令牌；不会假定或调用未核实的 refresh 接口。拿到官方续约文档后，再配置 `LINGXING_REFRESH_PATH`、请求格式、请求模板和对应响应字段映射。
+
+### 3.3 Token 缓存与请求编码
+
+成功取得 Token 后，系统将 access_token、refresh_token 和 expires_at 写入 `LINGXING_TOKEN_STORE_PATH` 指定的本地 JSON 文件，默认位于 `/app/data/secrets/lingxing-token.json`，并设置文件权限 0600。该文件所在的 `data/` 目录必须持久化并限制主机访问权限。Token Provider 还会在同目录创建权限为 0600 的锁文件，通过 Linux 文件锁串行化 API、scheduler、MCP 多容器的刷新操作，避免两个进程同时消费同一个一次性 refresh_token。
+
+请求格式通过以下配置控制：
+- `LINGXING_TOKEN_REQUEST_FORMAT=multipart`：首次获取令牌使用 multipart/form-data。
+- `LINGXING_REFRESH_REQUEST_FORMAT=json`：续约请求默认 JSON；只有官方续约文档确认后才调整。
+
+GET 请求始终通过 URL Query 发送参数。POST 请求支持 JSON、URL-encoded form 和 multipart/form-data。multipart 字段必须是非空的标量值，不接受嵌套对象或数组。
 
 ## 4. Token 缓存
 
@@ -58,22 +88,21 @@ LINGXING_EXPIRES_IN_RESPONSE_PATH=
 
 ## 5. 真实 API 验证前的限制
 
-当前还没有对你的账号执行真实 Token 获取或数据接口请求。请先提供（可打码 AppID、AppSecret 和 Token）Token 获取/续约文档中的：
-- API Path 和请求方法；
-- 请求参数字段名称；
-- 成功响应 JSON 示例（凭据值全部打码）。
+当前只确认了 access-token 获取接口契约，尚未对任何真实账号执行 Token 获取或店铺列表请求。请先在服务器本地配置 AppID、AppSecret 和第 3.1 节的 multipart 参数；不要把凭据发送到聊天或提交到 Git。
 
-根据这三项信息核对本项目配置后，先在 Linux 服务器本地执行 dry-run 检查：
+先运行不访问领星的本地配置检查：
 ```bash
 python scripts/test_lingxing_connection.py
 ```
 
-确认 Token 路径、请求参数和响应字段路径已按官方文档填写后，才执行一次真实的只读店铺列表请求：
+确认 dry-run 通过后，更新应用镜像并只重建 app 服务，再执行一次真实的只读店铺列表请求。真实请求会访问领星、获取并在本地受保护的 Token 缓存文件中保存令牌：
 ```bash
-python scripts/test_lingxing_connection.py --request
+docker compose -p jx-alert build app
+docker compose -p jx-alert up -d --no-deps app
+docker compose -p jx-alert run --rm --no-deps app python scripts/test_lingxing_connection.py --request
 ```
 
-该脚本不会打印 Token 或 AppSecret。不要把 AppSecret 或真实 Token 发给 ChatGPT。
+测试脚本不会打印 Token 或 AppSecret。成功标准是输出 `Lingxing read-only store-list request succeeded.`。在续约接口的官方契约确认之前，系统只能在 access_token 失效后用 AppID/AppSecret 重新获取令牌；不要声称 refresh-token 自动续约已经验证。
 
 ## 6. 已接入的只读数据采集
 

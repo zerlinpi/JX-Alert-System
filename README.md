@@ -6,7 +6,7 @@
 
 ## 当前架构
 
-- **领星：** AppID / AppSecret 用于按账户文档配置 Token 获取和续约；业务 API 使用 Bearer Token + URL Query 签名。Token 路径、请求体和响应字段路径必须从当前领星开放平台文档确认后填写。
+- **领星：** access-token 获取接口已按官方文档配置为 POST `/api/auth-server/oauth/access-token` + `multipart/form-data`（`appId`、`appSecret`）；响应映射为 `data.access_token`、`data.refresh_token`、`data.expires_in`。Refresh-token 续约接口仍待用户提供官方契约，不猜测路径或字段。业务 API 使用 Bearer Token + URL Query 签名。
 - **飞书：** 使用群自定义机器人 Webhook 单向推送；支持按店铺和 SKU/ASIN 路由到不同群，并分别 @ 群管理员与负责人；不使用飞书应用机器人或 tenant_access_token。
 - **数据库：** MariaDB 11；本地测试支持 SQLite。保留原始快照、日指标、异常事件、通知日志和 outbox。
 - **销售采集：** 已接入领星 ASIN/MSKU 日销量接口，分别采集销售额、销量、订单量，并保存店铺汇总和原始响应。
