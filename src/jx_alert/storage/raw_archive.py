@@ -35,16 +35,19 @@ def archive_raw_snapshots(db, raw_dir: str | Path, *, after_id: int = 0) -> dict
         captured_at = row.captured_at
         if captured_at is None:
             raise RuntimeError(f"RawSnapshot {row.id} is missing captured_at")
-        folder = (
-            root
-            / captured_at.strftime("%Y")
-            / captured_at.strftime("%m")
-            / captured_at.strftime("%d")
-            / _safe_segment(row.source)
-        )
+        folder = root
+        segments = [
+            captured_at.strftime("%Y"),
+            captured_at.strftime("%m"),
+            captured_at.strftime("%d"),
+            _safe_segment(row.source),
+        ]
         if row.store_id is not None:
-            folder = folder / _safe_segment(row.store_id)
-        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+            segments.append(_safe_segment(row.store_id))
+        for segment in segments:
+            folder = folder / segment
+            folder.mkdir(exist_ok=True, mode=0o700)
+            os.chmod(folder, 0o700)
         target = folder / (
             f"{captured_at.strftime('%H%M%S_%f')}_{int(row.id):012d}.json"
         )
