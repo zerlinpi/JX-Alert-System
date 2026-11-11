@@ -115,7 +115,11 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
         assert any(row.rule == "high_ad_spend" and row.entity_id == "campaign-1" for row in events)
         assert any(row.rule == "campaign_over_budget" for row in events)
         assert any(row.rule == "spend_no_conversion" and row.entity_id == "SKU-1" for row in events)
-        assert db.scalars(select(NotificationOutbox)).all()
+        outbox_rows = db.scalars(select(NotificationOutbox)).all()
+        assert outbox_rows
+        notification_texts = [row.payload["text"] for row in outbox_rows]
+        assert any("Store A" in text and "SP Campaign" in text for text in notification_texts)
+        assert any("SKU-1" in text and "B000000001" in text for text in notification_texts)
 
 
 def test_incomplete_coverage_does_not_recover_existing_anomaly():
