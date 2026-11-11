@@ -1,22 +1,84 @@
+"""Feishu group custom-bot webhook client (not an app bot)."""
+import base64
+import hashlib
+import hmac
+import html
+import time
+from urllib.parse import urlparse
+
 import httpx
 
+
+class FeishuWebhookError(RuntimeError):
+    pass
+
+
+def build_feishu_signature(timestamp: str, secret: str) -> str:
+    """Feishu custom-bot signature: HMAC-SHA256(key=timestamp + '\\n' + secret, msg='')."""
+    key = f"{timestamp}\\n{secret}".encode("utf-8")
+    digest = hmac.new(key, b"", digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
 class FeishuClient:
-    def __init__(self, app_id: str, app_secret: str, base_url: str = "https://open.feishu.cn"):
-        self.app_id, self.app_secret, self.base_url = app_id, app_secret, base_url.rstrip("/")
-    def send_text(self, chat_id: str, text: str, open_ids: list[str] | None = None) -> dict:
-        if not self.app_id or not self.app_secret: raise RuntimeError("Feishu app credentials missing")
-        with httpx.Client(timeout=20) as c:
-            token_resp = c.post(self.base_url + "/open-apis/auth/v3/tenant_access_token/internal",
-                                json={"app_id": self.app_id, "app_secret": self.app_secret})
-            token_resp.raise_for_status(); token_data = token_resp.json()
-            if token_data.get("code") != 0: raise RuntimeError(f"Feishu token error: {token_data}")
-            mentions = "".join(f'<at user_id="{uid}"></at> ' for uid in (open_ids or []))
-            content = {"text": mentions + text}
-            resp = c.post(self.base_url + "/open-apis/im/v1/messages",
-                params={"receive_id_type": "chat_id"},
-                headers={"Authorization": f"Bearer {token_data['tenant_access_token']}"},
-                json={"receive_id": chat_id, "msg_type": "text",
-                      "content": __import__("json").dumps(content, ensure_ascii=False)})
-            resp.raise_for_status(); data = resp.json()
-            if data.get("code") != 0: raise RuntimeError(f"Feishu send error: {data}")
-            return data.get("data", {})
+    """Send messages to the single group bound to a Feishu custom-bot webhook."""
+
+    def __init__(self, webhook_url: str, sign_secret: str = "", keyword: str = "",
+                 timeout: int = 20):
+        parsed = urlparse(webhook_url)
+        if parsed.scheme != "https" or parsed.hostname not in {
+            "open.feishu.cn", "open.larksuite.com"
+        } or not parsed.path.startswith("/open-apis/bot/v2/hook/"):
+            raise ValueError("FEISHU_WEBHOOK_URL must be a Feishu/Lark custom-bot HTTPS webhook")
+        self.webhook_url = webhook_url
+        self.sign_secret = sign_secret
+        self.keyword = keyword.strip()
+        self.timeout = timeout
+
+    def _payload(self, text: str, open_ids: list[str] | None = None) -> dict:
+        mentions = "".join(
+            f'<at user_id="{html.escape(uid, quote=True)}"></at> '
+            for uid in (open_ids or [])
+        )
+        message = mentions + text
+        if self.keyword and self.keyword not in message:
+            message = f"{self.keyword}\\n{message}"
+        payload = {"msg_type": "text", "content": {"text": message}}
+        if self.sign_secret:
+            timestamp = str(int(time.time()))
+            payload["timestamp"] = timestamp
+            payload["sign"] = build_feishu_signature(timestamp, self.sign_secret)
+        return payload
+
+    def send_text(self, text: str, open_ids: list[str] | None = None) -> dict:
+        if not text.strip():
+            raise ValueError("Feishu message text cannot be empty")
+        payload = self._payload(text, open_ids)
+        # Feishu custom-bot webhook payloads are limited to 20 KB.
+        import json
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if len(encoded) > 20 * 1024:
+            raise ValueError("Feishu custom-bot message exceeds the 20 KB payload limit")
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(
+                    self.webhook_url,
+                    content=encoded,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPError as exc:
+            # Do not include the URL: it contains the secret webhook token.
+            raise FeishuWebhookError(f"Feishu webhook HTTP request failed: {type(exc).__name__}") from exc
+        except ValueError as exc:
+            raise FeishuWebhookError("Feishu webhook returned invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise FeishuWebhookError("Feishu webhook returned an unexpected response")
+        code = data.get("code", data.get("StatusCode", 0))
+        if code not in (0, "0", None):
+            raise FeishuWebhookError(
+                f"Feishu webhook rejected message: code={code}, "
+                f"message={data.get('msg') or data.get('StatusMessage') or 'unknown'}"
+            )
+        return data
