@@ -12,7 +12,8 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def collect_daily_snapshot(client, db, report_dates: str | dict[str, str]) -> dict:
+def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
+                           stores_response: dict | None = None) -> dict:
     """Collect sales, campaign masters, campaign ads and SP/SD product ads.
 
     Each collector is idempotent for its store/date grain. A failed later step
@@ -32,7 +33,7 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str]) -> di
     results: dict = {}
 
     try:
-        stores_response = client.get_stores()
+        stores_response = stores_response or client.get_stores()
         results["stores"] = {
             "count": len(stores_response.get("data", []))
             if isinstance(stores_response, dict)
