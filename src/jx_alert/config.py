@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     lingxing_refresh_method: str = "POST"
     lingxing_timeout: int = 30
 
+    # Performance source timestamps have no UTC offset; configure their real IANA timezone.
+    lingxing_performance_enabled: bool = True
+    lingxing_performance_source_timezone: str = ""
+    lingxing_performance_max_age_hours: int = Field(default=8, ge=1, le=168)
+    lingxing_performance_page_size: int = Field(default=200, ge=1, le=200)
+    lingxing_performance_max_pages: int = Field(default=1000, ge=1, le=10000)
+
     # A Feishu custom bot is a one-way webhook bound to one group.
     feishu_enabled: bool = False
     feishu_webhook_url: str = ""

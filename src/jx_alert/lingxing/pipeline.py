@@ -5,6 +5,8 @@ from jx_alert.analysis.evaluator import evaluate_store_status_events
 from jx_alert.lingxing.campaign_collector import collect_campaigns
 from jx_alert.lingxing.collector import collect_ads_for_day
 from jx_alert.lingxing.product_ads_collector import collect_product_ads_for_day
+from jx_alert.lingxing.performance_openapi import collect_store_performance
+from jx_alert.config import get_settings
 from jx_alert.lingxing.report_dates import normalize_store_report_dates
 from jx_alert.lingxing.sales_collector import collect_sales_for_day
 from jx_alert.storage.models import SyncJob
@@ -16,7 +18,8 @@ def _utcnow():
 
 def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
                            stores_response: dict | None = None,
-                           ad_attribution_refresh_days: int = 22) -> dict:
+                           ad_attribution_refresh_days: int = 22,
+                           settings=None) -> dict:
     """Collect sales, campaign masters, campaign ads and SP/SD product ads.
 
     Each collector is idempotent for its store/date grain. A failed later step
@@ -25,6 +28,7 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
     """
     if not 1 <= ad_attribution_refresh_days <= 31:
         raise ValueError("ad_attribution_refresh_days must be between 1 and 31")
+    settings = settings or get_settings()
     stores_response = stores_response or client.get_stores()
     store_rows = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(store_rows, list):
@@ -87,14 +91,25 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         )
         completed_steps.append("product_ad_reports")
 
+        if settings.lingxing_performance_enabled:
+            results["performance"] = collect_store_performance(
+                client, db, stores_response=stores_response, settings=settings
+            )
+            completed_steps.append("performance")
+        else:
+            results["performance"] = {"status": "DISABLED", "stores_seen": 0}
+
         record_count = (
             int(results["sales"].get("sales_rows", 0))
             + sum(results["campaigns"].get("campaigns", {}).values())
             + sum(results["campaign_reports"].get("rows", {}).values())
             + sum(results["product_ad_reports"].get("rows", {}).values())
+            + int(results.get("performance", {}).get("performance_rows", 0))
+            + int(results.get("performance", {}).get("notice_rows", 0))
         )
         job = db.get(SyncJob, job_id)
-        job.status = "SUCCEEDED"
+        performance_status = results.get("performance", {}).get("status", "DISABLED")
+        job.status = "PARTIAL_FAILED" if performance_status in {"PARTIAL_FAILED", "SUCCEEDED_WITH_WARNINGS"} else "SUCCEEDED"
         job.finished_at = _utcnow()
         job.store_count = int(results["sales"].get("stores_seen", 0))
         job.record_count = record_count
@@ -108,7 +123,7 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         db.commit()
         return {
             "job_id": job_id,
-            "status": "SUCCEEDED",
+            "status": job.status,
             "store_count": job.store_count,
             "record_count": record_count,
             "steps": results,
