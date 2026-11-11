@@ -10,7 +10,7 @@
 - **飞书：** 使用群自定义机器人 Webhook 单向推送；支持按店铺和 SKU/ASIN 路由到不同群，并分别 @ 群管理员与负责人；不使用飞书应用机器人或 tenant_access_token。
 - **数据库：** MariaDB 11；本地测试支持 SQLite。保留原始快照、日指标、异常事件、通知日志和 outbox。
 - **销售采集：** 已接入领星 ASIN/MSKU 日销量接口，分别采集销售额、销量、订单量，并保存店铺汇总和原始响应。
-- **广告采集：** 已接入 SP/SB/SD 活动日报、SP/SB/SD 活动基础资料，以及 SP/SD 商品广告日报。SB 商品级报表接口尚未确认，不猜测接口路径。
+- **广告采集：** 已接入 SP/SB/SD 活动日报、活动基础资料、SP/SD 商品广告日报，以及 SP/SD 商品广告基础状态（enabled/paused/archived）。SB 商品级报表接口尚未确认，不猜测接口路径。
 - **数据完整性：** 按店铺、日期、数据维度写入 coverage 标记；只有完整采集日才能把未返回的指标解释为零。
 - **时区：** 每个 sid 单独配置 IANA 时区和币种，日报按站点本地前一完整自然日计算。
 - **异常：** 店铺状态异常事件；店铺、ASIN、MSKU 订单量、销量和销售额相对前七个完整自然日均值变化默认 ±15%；广告高花费、花费/点击达到门槛但无转化、低花费无转化、预算消耗和领星超预算事件。
@@ -32,7 +32,7 @@
 | SP 活动日报 | POST `/pb/openapi/newad/spCampaignReports` |
 | SB 活动日报 | POST `/pb/openapi/newad/hsaCampaignReports` |
 | SD 活动日报 | POST `/pb/openapi/newad/sdCampaignReports` |
-| SP 商品广告日报 | POST `/pb/openapi/newad/spProductAdReports` |
+| SP 商品广告资料 | POST `/pb/openapi/newad/spProductAds` |\n| SD 商品广告资料 | POST `/pb/openapi/newad/sdProductAds` |\n| SP 商品广告日报 | POST `/pb/openapi/newad/spProductAdReports` |
 | SD 商品广告日报 | POST `/pb/openapi/newad/sdProductAdReports` |
 
 广告接口使用 `X-API-VERSION: 2`。SP/SD 报表按 `next_token` 游标分页，SB 活动报表按 `offset/length` 分页；分页缺失或不完整时客户端会报错，不把部分结果当成完整日报。领星签名按 ASCII 排序，将业务参数、原始 `access_token`、`app_key`、`timestamp` 拼接后 MD5 大写，再使用 AppID 作为 AES 密钥执行 AES/ECB/PKCS5Padding。Bearer Token 通过 `Authorization` 头发送，但仍须参与签名；POST JSON 中的标量业务字段也须参与签名。当前客户端对嵌套对象/数组签名会 fail closed，不会猜测序列化规则。
@@ -48,7 +48,7 @@
 - [SP 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/spCampaigns/)
 - [SB 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/hsaCampaigns/)
 - [SD 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/sdCampaigns/)
-- [SP 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/spProductAdReports/)
+- [SP 商品广告资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/spProductAds/)\n- [SD 商品广告资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/sdProductAds/)\n- [SP 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/spProductAdReports/)
 - [SD 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/sdProductAdReports/)
 
 ## 飞书自定义机器人
