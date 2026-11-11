@@ -65,9 +65,9 @@
 4. 创建可由容器非 root 用户写入的数据目录：
    ```bash
    mkdir -p data
+   cp config/feishu-routing.example.json data/feishu-routing.json
    sudo chown -R 10001:10001 data
    chmod 700 data
-   cp config/feishu-routing.example.json data/feishu-routing.json
    chmod 600 data/feishu-routing.json
    ```
 5. 先保持 dry-run，验证 Compose 配置并启动 API 与数据库：
