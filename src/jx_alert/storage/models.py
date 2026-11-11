@@ -87,3 +87,55 @@ class Product(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )
+
+
+
+class Campaign(Base):
+    __tablename__ = "campaigns"
+    __table_args__ = (
+        UniqueConstraint(
+            "store_id", "campaign_type", "campaign_id",
+            name="uq_campaigns_store_type_campaign",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(100), index=True)
+    campaign_type: Mapped[str] = mapped_column(String(8))
+    campaign_id: Mapped[str] = mapped_column(String(100))
+    profile_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    serving_status: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    budget: Mapped[float | None] = mapped_column(Float, nullable=True)
+    budget_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    start_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    end_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    last_over_budget_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+
+
+class AdProduct(Base):
+    __tablename__ = "ad_products"
+    __table_args__ = (
+        UniqueConstraint(
+            "store_id", "campaign_type", "ad_id",
+            name="uq_ad_products_store_type_ad",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(100), index=True)
+    campaign_type: Mapped[str] = mapped_column(String(8))
+    ad_id: Mapped[str] = mapped_column(String(100))
+    campaign_id: Mapped[str] = mapped_column(String(100), index=True)
+    ad_group_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    asin: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    seller_sku: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    state: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    serving_status: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
