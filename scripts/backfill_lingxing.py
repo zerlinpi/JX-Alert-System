@@ -9,6 +9,7 @@ from jx_alert.lingxing.client import LingxingClient
 from jx_alert.lingxing.pipeline import collect_daily_snapshot
 from jx_alert.storage.db import SessionLocal, init_db
 from jx_alert.storage.store_config import build_store_report_dates, sync_store_config
+from jx_alert.reporting.excel import export_daily_reports
 
 
 def main():
@@ -41,6 +42,7 @@ def main():
         raise SystemExit("No active Lingxing stores were returned.")
 
     analysis_dates: set[str] = set()
+    history_maps = []
     collected = []
     with SessionLocal() as db:
         for offset in range(args.days - 1, -1, -1):
@@ -52,6 +54,7 @@ def main():
                 client, db, report_dates, stores_response=stores_response
             )
             collected.append(result)
+            history_maps.append(report_dates)
             sync_store_config(db, settings.store_timezones_file)
             db.commit()
             if offset <= args.days - 8:
@@ -61,6 +64,12 @@ def main():
             evaluate_daily_anomalies(db, report_date)
             for report_date in sorted(analysis_dates)
         ]
+        report_files = []
+        for date_map in history_maps:
+            for sid, report_date in date_map.items():
+                report_files.extend(str(path) for path in export_daily_reports(
+                    db, report_date, settings.report_dir, store_id=sid
+                ))
 
     print(json.dumps({
         "status": "COMPLETED",
@@ -68,6 +77,7 @@ def main():
         "daily_jobs": len(collected),
         "analysis_dates": sorted(analysis_dates),
         "analyses": analyses,
+        "report_files": report_files,
     }, ensure_ascii=False, default=str))
 
 
