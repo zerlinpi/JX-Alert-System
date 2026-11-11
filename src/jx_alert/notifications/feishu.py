@@ -75,8 +75,13 @@ class FeishuClient:
             raise FeishuWebhookError("Feishu webhook returned invalid JSON") from exc
         if not isinstance(data, dict):
             raise FeishuWebhookError("Feishu webhook returned an unexpected response")
-        code = data.get("code", data.get("StatusCode", 0))
-        if code not in (0, "0", None):
+        if "code" in data:
+            code = data["code"]
+        elif "StatusCode" in data:
+            code = data["StatusCode"]
+        else:
+            raise FeishuWebhookError("Feishu webhook response did not contain a status code")
+        if code not in (0, "0"):
             raise FeishuWebhookError(
                 f"Feishu webhook rejected message: code={code}, "
                 f"message={data.get('msg') or data.get('StatusMessage') or 'unknown'}"
