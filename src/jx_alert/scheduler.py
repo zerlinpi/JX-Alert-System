@@ -5,7 +5,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from jx_alert.config import get_settings
-from jx_alert.storage.db import init_db
+from jx_alert.storage.db import SessionLocal, init_db
+from jx_alert.lingxing.client import LingxingClient
+from jx_alert.lingxing.pipeline import collect_daily_snapshot
+from jx_alert.analysis.evaluator import evaluate_daily_anomalies
+from jx_alert.storage.store_config import build_store_report_dates, sync_store_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,12 +23,34 @@ def daily_job():
     if settings.app_dry_run:
         logger.info("DRY RUN: daily collection/anomaly pipeline not executed.")
         return
-    # Intentionally fail closed until the endpoint-specific collection adapters,
-    # response schemas and historical backfill have been verified.
-    logger.warning(
-        "Live collection is not enabled: the verified data pipeline is not configured. "
-        "No Lingxing API request was sent."
-    )
+
+    try:
+        init_db()
+        client = LingxingClient.from_settings()
+        stores_response = client.get_stores()
+        report_dates = build_store_report_dates(
+            stores_response, settings.store_timezones_file
+        )
+        if not report_dates:
+            logger.warning("No active Lingxing stores found; daily pipeline skipped.")
+            return
+
+        with SessionLocal() as db:
+            collection = collect_daily_snapshot(
+                client, db, report_dates, stores_response=stores_response
+            )
+            configured_stores = sync_store_config(db, settings.store_timezones_file)
+            db.commit()
+            analyses = []
+            for report_date in sorted(set(report_dates.values())):
+                analyses.append(evaluate_daily_anomalies(db, report_date))
+
+        logger.info(
+            "Daily pipeline complete: job_id=%s stores=%s timezone_configs=%s analyses=%s",
+            collection["job_id"], collection["store_count"], configured_stores, analyses,
+        )
+    except Exception:
+        logger.exception("Daily Lingxing collection/analysis failed; no partial data is treated as complete.")
 
 
 def outbox_job():
