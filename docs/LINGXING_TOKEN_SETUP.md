@@ -10,10 +10,12 @@ AppSecret 有权访问企业数据，不能发到聊天、工单或公开仓库�
 
 业务接口请求：
 - API Host：`https://openapi.lingxing.com`
-- `Authorization: Bearer <access_token>`
-- Query 包含 `app_key`、`timestamp`、`sign`
+- `app_key` 就是领星 AppID，不需要额外申请第三个凭据；代码默认使用 AppID，只有显式配置 LINGXING_APP_KEY 时才覆盖。
+- `Authorization: Bearer <access_token>`（官方当前推荐方式；2027-01-01 起 URL Query 传 access_token 将下线）。
+- Query 包含 `app_key`、`timestamp`、`sign`；签名集合仍必须包含原始 access_token 一次，但 Authorization 字段名和 Bearer 前缀不参与签名。
 - 签名参数包含业务参数、原始 `access_token`、`app_key`、`timestamp`，ASCII 排序后拼接，MD5 大写，再使用 AppID 做 AES/ECB/PKCS5Padding。
 - POST JSON 的标量字段也参与签名。
+- 领星令牌桶限流错误码 3001008 会进行有界指数退避重试；网络超时、HTTP 429 和 5xx 也会重试。
 - 当前客户端对嵌套对象或数组参数拒绝猜测签名序列化方式；遇到此类 API 必须根据领星官方示例增加专用 canonicalizer 后再启用。
 
 ## 3. 配置 Token 获取与续约接口
