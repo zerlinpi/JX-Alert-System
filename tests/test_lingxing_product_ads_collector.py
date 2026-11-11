@@ -77,3 +77,19 @@ def test_product_ads_collector_replaces_same_day_metrics_idempotently():
         collect_product_ads_for_day(client, db, "2026-11-10")
         collect_product_ads_for_day(client, db, "2026-11-10")
         assert db.scalar(select(func.count()).select_from(DailyMetric)) == 12
+
+
+
+def test_product_ads_collector_refreshes_multiple_report_dates():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        result = collect_product_ads_for_day(
+            FakeProductAdsClient(),
+            db,
+            {"101": ["2026-11-09", "2026-11-10"]},
+        )
+        assert result["rows"] == {"sp": 2, "sd": 2}
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 36
+        assert db.scalar(select(func.count()).select_from(DataCoverage)) == 4
