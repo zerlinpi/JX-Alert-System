@@ -177,9 +177,9 @@ def collect_sales_for_day(client, db, report_dates: str | dict[str, str], *,
             product.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             product_count += 1
 
-        for asin_type, dimension, key_field in (
-            (1, "sku_asin", "asin"),
-            (2, "sku_msku", "seller_sku"),
+        for asin_type, dimension in (
+            (1, "sku_asin"),
+            (2, "sku_msku"),
         ):
             db.execute(delete(DailyMetric).where(
                 DailyMetric.store_id == store_id,
