@@ -191,6 +191,21 @@ class LingxingClient:
             "POST", "/erp/sc/data/sales_report/asinDailyLists", json_body=payload
         )
 
+    def store_performance_list(self, payload: dict):
+        return self._request(
+            "POST", "/basicOpen/customerService/storeTarget/list", json_body=payload
+        )
+
+    def store_performance_detail(self, payload: dict):
+        return self._request(
+            "POST", "/basicOpen/customerService/storeTarget/detail", json_body=payload
+        )
+
+    def performance_notice_list(self, payload: dict):
+        return self._request(
+            "POST", "/basicOpen/customerService/performanceNotice/list", json_body=payload
+        )
+
     def advertising_report(self, report_type: str, payload: dict):
         paths = {
             "sp": "/pb/openapi/newad/spCampaignReports",

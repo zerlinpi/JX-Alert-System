@@ -13,6 +13,9 @@ from jx_alert.storage.models import (
     Campaign,
     DailyMetric,
     DataCoverage,
+    PerformanceNotice,
+    PerformanceSyncState,
+    StorePerformance,
     Product,
     Store,
     SyncJob,
@@ -31,7 +34,8 @@ SHEETS = {
     ],
     "店铺绩效": [
         "店铺ID", "店铺", "领星店铺状态码", "广告授权", "账户健康评分",
-        "绩效事件状态", "说明",
+        "账户健康状态", "绩效拉取日期", "绩效源更新时间", "绩效新鲜度",
+        "政策/指标违规数", "待处理通知数", "最近通知标题",
     ],
     "SKU销量": [
         "店铺ID", "店铺", "ASIN", "MSKU", "Local SKU", "日期", "订单",
@@ -232,10 +236,36 @@ def build_daily_report_rows(db, report_date: date | str, *,
             _change_ratio(ad_orders, average_ad_orders),
             "完整" if sales_complete and (ad_complete or not store.has_ads_setting) else "部分/缺失",
         ])
+        performance = db.scalar(
+            select(StorePerformance).where(StorePerformance.store_id == sid)
+            .order_by(StorePerformance.pull_date.desc()).limit(1)
+        )
+        performance_state = db.scalar(select(PerformanceSyncState).where(
+            PerformanceSyncState.store_id == sid,
+            PerformanceSyncState.dataset == "store_performance",
+        ))
+        notice_state = db.scalar(select(PerformanceSyncState).where(
+            PerformanceSyncState.store_id == sid,
+            PerformanceSyncState.dataset == "performance_notices",
+        ))
+        pending_notices = db.scalars(select(PerformanceNotice).where(
+            PerformanceNotice.store_id == sid,
+            PerformanceNotice.status_code == 1,
+        ).order_by(PerformanceNotice.occurred_at.desc())).all()
+        latest_notice = pending_notices[0].subject if pending_notices else None
         rows["店铺绩效"].append([
             sid, store.name, store.status,
             "已配置" if store.has_ads_setting else "未配置",
-            None, "未接入", "领星账户健康评分及绩效通知接口尚未接入",
+            performance.ahr_score if performance else None,
+            performance.ahr_status if performance else None,
+            performance.pull_date.isoformat() if performance else None,
+            performance.source_updated_at if performance else None,
+            performance.freshness_status if performance else (
+                performance_state.status if performance_state else "UNKNOWN"
+            ),
+            len(performance.breaches or []) if performance else None,
+            len(pending_notices) if notice_state else None,
+            latest_notice,
         ])
 
         store_products = [product for product in products if product.store_id == sid]

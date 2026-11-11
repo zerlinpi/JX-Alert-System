@@ -180,3 +180,69 @@ class DataCoverage(Base):
     completed_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )
+
+
+
+class StorePerformance(Base):
+    __tablename__ = "store_performance"
+    __table_args__ = (
+        UniqueConstraint("store_id", "pull_date", name="uq_store_performance_store_pull_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(100), index=True)
+    pull_date: Mapped[date] = mapped_column(Date, index=True)
+    source_updated_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+    ahr_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ahr_status: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    indicators: Mapped[dict] = mapped_column(JSON, default=dict)
+    standards: Mapped[dict] = mapped_column(JSON, default=dict)
+    breaches: Mapped[list] = mapped_column(JSON, default=list)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    freshness_status: Mapped[str] = mapped_column(String(24), default="UNKNOWN")
+
+
+class PerformanceNotice(Base):
+    __tablename__ = "performance_notices"
+    __table_args__ = (
+        UniqueConstraint("store_id", "notice_key", name="uq_performance_notices_store_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(100), index=True)
+    notice_key: Mapped[str] = mapped_column(String(128))
+    external_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    subject: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status_label: Mapped[str] = mapped_column(String(24), default="UNKNOWN")
+    occurred_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    is_read: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_updated_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+
+
+class PerformanceSyncState(Base):
+    __tablename__ = "performance_sync_states"
+    __table_args__ = (
+        UniqueConstraint("store_id", "dataset", name="uq_performance_sync_store_dataset"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(100), index=True)
+    dataset: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(24), default="UNKNOWN")
+    source_updated_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+    record_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

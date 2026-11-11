@@ -1,13 +1,18 @@
 """Durable daily read-only collection orchestration."""
 from datetime import date, datetime, timedelta, timezone
 
+from sqlalchemy import func, select
+
 from jx_alert.analysis.evaluator import evaluate_store_status_events
 from jx_alert.lingxing.campaign_collector import collect_campaigns
 from jx_alert.lingxing.collector import collect_ads_for_day
 from jx_alert.lingxing.product_ads_collector import collect_product_ads_for_day
+from jx_alert.lingxing.performance_openapi import collect_store_performance
+from jx_alert.config import get_settings
 from jx_alert.lingxing.report_dates import normalize_store_report_dates
 from jx_alert.lingxing.sales_collector import collect_sales_for_day
-from jx_alert.storage.models import SyncJob
+from jx_alert.storage.models import RawSnapshot, SyncJob
+from jx_alert.storage.raw_archive import archive_raw_snapshots
 
 
 def _utcnow():
@@ -16,7 +21,8 @@ def _utcnow():
 
 def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
                            stores_response: dict | None = None,
-                           ad_attribution_refresh_days: int = 22) -> dict:
+                           ad_attribution_refresh_days: int = 22,
+                           settings=None) -> dict:
     """Collect sales, campaign masters, campaign ads and SP/SD product ads.
 
     Each collector is idempotent for its store/date grain. A failed later step
@@ -25,6 +31,7 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
     """
     if not 1 <= ad_attribution_refresh_days <= 31:
         raise ValueError("ad_attribution_refresh_days must be between 1 and 31")
+    settings = settings or get_settings()
     stores_response = stores_response or client.get_stores()
     store_rows = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(store_rows, list):
@@ -42,6 +49,8 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             (latest_date - timedelta(days=offset)).isoformat()
             for offset in range(ad_attribution_refresh_days - 1, -1, -1)
         ]
+
+    snapshot_start_id = db.scalar(select(func.max(RawSnapshot.id))) or 0
 
     job = SyncJob(
         job_type="daily_collection",
@@ -87,14 +96,25 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         )
         completed_steps.append("product_ad_reports")
 
+        if settings.lingxing_performance_enabled:
+            results["performance"] = collect_store_performance(
+                client, db, stores_response=stores_response, settings=settings
+            )
+            completed_steps.append("performance")
+        else:
+            results["performance"] = {"status": "DISABLED", "stores_seen": 0}
+
         record_count = (
             int(results["sales"].get("sales_rows", 0))
             + sum(results["campaigns"].get("campaigns", {}).values())
             + sum(results["campaign_reports"].get("rows", {}).values())
             + sum(results["product_ad_reports"].get("rows", {}).values())
+            + int(results.get("performance", {}).get("performance_rows", 0))
+            + int(results.get("performance", {}).get("notice_rows", 0))
         )
         job = db.get(SyncJob, job_id)
-        job.status = "SUCCEEDED"
+        performance_status = results.get("performance", {}).get("status", "DISABLED")
+        job.status = "PARTIAL_FAILED" if performance_status in {"PARTIAL_FAILED", "SUCCEEDED_WITH_WARNINGS"} else "SUCCEEDED"
         job.finished_at = _utcnow()
         job.store_count = int(results["sales"].get("stores_seen", 0))
         job.record_count = record_count
@@ -106,26 +126,48 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             "results": results,
         }
         db.commit()
+        results["raw_archive"] = archive_raw_snapshots(
+            db, settings.raw_dir, after_id=snapshot_start_id
+        )
+        completed_steps.append("raw_archive")
+        job = db.get(SyncJob, job_id)
+        job.metadata_json = {
+            **(job.metadata_json or {}),
+            "completed_steps": completed_steps,
+            "results": results,
+        }
+        db.commit()
         return {
             "job_id": job_id,
-            "status": "SUCCEEDED",
+            "status": job.status,
             "store_count": job.store_count,
             "record_count": record_count,
             "steps": results,
         }
     except Exception as exc:
         db.rollback()
+        archive_error = None
+        try:
+            results["raw_archive"] = archive_raw_snapshots(
+                db, settings.raw_dir, after_id=snapshot_start_id
+            )
+        except Exception as archive_exc:
+            archive_error = f"raw archive: {type(archive_exc).__name__}: {str(archive_exc)[:500]}"
         job = db.get(SyncJob, job_id)
         if job is not None:
             job.status = "PARTIAL_FAILED" if completed_steps else "FAILED"
             job.finished_at = _utcnow()
-            job.error_message = f"{type(exc).__name__}: {str(exc)[:1500]}"
+            error_text = f"{type(exc).__name__}: {str(exc)[:1200]}"
+            if archive_error:
+                error_text = f"{error_text}; {archive_error}"
+            job.error_message = error_text[:1500]
             job.metadata_json = {
                 "report_dates": report_dates,
                 "ad_report_dates": ad_report_dates,
                 "ad_attribution_refresh_days": ad_attribution_refresh_days,
                 "completed_steps": completed_steps,
                 "results": results,
+                "raw_archive_error": archive_error,
             }
             db.commit()
         raise
