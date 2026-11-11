@@ -47,6 +47,7 @@ def test_collect_ads_persists_raw_and_normalized_rows():
             "report_date": "2026-11-10",
             "stores_seen": 2,
             "active_ad_stores": 1,
+            "report_days_per_store": 1,
             "rows": {"sp": 1, "sb": 1, "sd": 1},
         }
         assert db.scalar(select(func.count()).select_from(DailyMetric)) == 23
@@ -70,7 +71,7 @@ def test_collect_ads_replaces_same_day_metrics_idempotently():
         client = FakeLingxingClient()
         collect_ads_for_day(client, db, "2026-11-10")
         collect_ads_for_day(client, db, "2026-11-10")
-        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 18
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 23
 
 
 
@@ -82,7 +83,7 @@ def test_collect_ads_accepts_store_local_date_map():
         result = collect_ads_for_day(
             FakeLingxingClient(), db, {"101": "2026-11-09"}
         )
-        assert result["report_date"] == "per-store mapping"
+        assert result["report_date"] == "per-store date window"
         metric = db.scalar(select(DailyMetric))
         assert metric.metric_date == date(2026, 11, 9)
 
