@@ -14,7 +14,11 @@ from jx_alert.storage.models import (
     Product,
     Store,
 )
-from jx_alert.analysis.evaluator import evaluate_daily_anomalies
+from jx_alert.analysis.evaluator import (
+    _evaluate_product_ad_dimension,
+    evaluate_daily_anomalies,
+)
+from jx_alert.analysis.rules import RuleConfig
 
 
 def _add_coverage(db, store_id, dimension, report_date):
@@ -200,3 +204,58 @@ def test_evaluator_uses_each_stores_marketplace_local_report_date():
         )).all()
         assert {event.store_id for event in events} == {"us-store", "jp-store"}
         assert all(event.metrics["current"] == 5 for event in events)
+
+
+
+def test_product_ad_anomaly_uses_configured_escalation_window():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    target = date(2026, 11, 10)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    with Session() as db:
+        db.add(Campaign(
+            store_id="store-1", campaign_type="sp", campaign_id="campaign-1",
+            name="SP", state="enabled",
+        ))
+        db.add(AdProduct(
+            store_id="store-1", campaign_type="sp", ad_id="ad-1",
+            campaign_id="campaign-1", seller_sku="SKU-1", asin="B000000001",
+        ))
+        _add_coverage(db, "store-1", "product_ad_sp", target)
+        for offset in range(7, 0, -1):
+            day = target - timedelta(days=offset)
+            _add_metric(db, "store-1", "product_ad_sp", "ad-1", "spend", day, 10)
+            _add_metric(db, "store-1", "product_ad_sp", "ad-1", "orders", day, 2)
+            _add_metric(db, "store-1", "product_ad_sp", "ad-1", "clicks", day, 20)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "spend", target, 25)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "orders", target, 0)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "clicks", target, 15)
+        existing = AnomalyEvent(
+            dedupe_key="store-1:ad-1:spend_no_conversion",
+            store_id="store-1",
+            rule="spend_no_conversion",
+            entity_id="SKU-1",
+            severity="P1",
+            status="ONGOING",
+            evaluation_scope="store-1:product_ad:sp",
+            first_seen=now - timedelta(days=3),
+            last_seen=now - timedelta(days=1),
+            metrics={"spend": 25},
+            reason="existing product-ad anomaly",
+        )
+        db.add(existing)
+        db.commit()
+
+        saved, complete = _evaluate_product_ad_dimension(
+            db,
+            "store-1",
+            "sp",
+            target,
+            RuleConfig(escalate_after_days=5, min_spend=20, min_clicks=10),
+        )
+        assert complete is True
+        updated = next(row for row in saved if row.rule == "spend_no_conversion")
+        assert updated.status == "ONGOING"
+        assert updated.escalated_at is None
