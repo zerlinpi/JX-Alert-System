@@ -43,6 +43,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      app:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
 
