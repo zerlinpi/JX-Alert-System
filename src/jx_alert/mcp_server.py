@@ -139,6 +139,9 @@ def system_health() -> dict:
         "lingxing_token_mode": token_mode,
         "feishu_enabled": settings.feishu_enabled,
         "feishu_webhook_configured": bool(settings.feishu_webhook_url),
+        "remote_mcp_bearer_configured": bool(settings.mcp_bearer_token),
+        "remote_mcp_path": settings.mcp_path,
+        "remote_mcp_port": settings.mcp_port,
     }
 
 
