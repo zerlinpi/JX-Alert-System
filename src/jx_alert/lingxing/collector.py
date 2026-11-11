@@ -17,7 +17,8 @@ AD_METRICS = {
 }
 
 
-def collect_ads_for_day(client, db, report_date: str | dict[str, str]) -> dict:
+def collect_ads_for_day(client, db, report_date: str | dict[str, str], *,
+                        stores_response: dict | None = None) -> dict:
     """Fetch store list and SP/SB/SD campaign reports, storing raw + normalized data.
 
     The caller must supply the store-local report date. This function deliberately
@@ -39,7 +40,7 @@ def collect_ads_for_day(client, db, report_date: str | dict[str, str]) -> dict:
             raise ValueError(f"Invalid store-local report date for sid={sid}") from exc
         return value
 
-    stores_response = client.get_stores()
+    stores_response = stores_response or client.get_stores()
     stores = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(stores, list):
         raise RuntimeError("Lingxing seller-list response data must be an array")
