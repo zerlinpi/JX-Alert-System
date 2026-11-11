@@ -56,7 +56,7 @@ def _evaluate_sales_dimension(db, store_id: str, dimension: str,
         return [], False
 
     events = []
-    for metric_name in ("orders", "units"):
+    for metric_name in ("orders", "units", "sales"):
         values = _metric_values(db, store_id, dimension, metric_name, required_dates)
         for entity_id in entities:
             current = values.get((entity_id, report_date), 0.0)
@@ -230,7 +230,18 @@ def evaluate_daily_anomalies(db, report_date: date | str,
     enter the baseline and never recover an existing anomaly.
     """
     target_date = _parse_date(report_date)
-    config = config or RuleConfig()
+    if config is None:
+        from jx_alert.config import get_settings
+        settings = get_settings()
+        config = RuleConfig(
+            order_change_ratio=settings.alert_order_change_ratio,
+            high_spend_ratio=settings.alert_high_spend_ratio,
+            low_spend_ratio=settings.alert_low_spend_ratio,
+            budget_ratio=settings.alert_budget_ratio,
+            min_spend=settings.alert_min_spend,
+            min_clicks=settings.alert_min_clicks,
+            min_orders_baseline=settings.alert_min_orders_baseline,
+        )
     stores = db.scalars(select(Store)).all()
     evaluated_scopes = 0
     skipped_scopes = 0
