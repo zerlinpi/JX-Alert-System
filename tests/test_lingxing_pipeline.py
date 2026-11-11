@@ -85,7 +85,8 @@ def test_daily_pipeline_records_successful_job_and_all_steps():
     Session = sessionmaker(bind=engine)
     with Session() as db:
         result = collect_daily_snapshot(
-            FakeDailyClient(), db, "2026-11-10"
+            FakeDailyClient(), db, "2026-11-10",
+            ad_attribution_refresh_days=1,
         )
         assert result["status"] == "SUCCEEDED"
         assert result["store_count"] == 1
@@ -106,7 +107,8 @@ def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps():
     with Session() as db:
         with pytest.raises(RuntimeError, match="simulated SD product report failure"):
             collect_daily_snapshot(
-                FakeDailyClient(fail_product_sd=True), db, "2026-11-10"
+                FakeDailyClient(fail_product_sd=True), db, "2026-11-10",
+                ad_attribution_refresh_days=1,
             )
         job = db.scalar(select(SyncJob))
         assert job.status == "PARTIAL_FAILED"
