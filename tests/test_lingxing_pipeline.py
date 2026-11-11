@@ -49,6 +49,17 @@ class FakeDailyClient:
             "impressions": 500,
         }])
 
+    def iter_advertising_product_ads(self, report_type, payload, **kwargs):
+        return iter([{
+            "ad_id": 5001 if report_type == "sp" else 6001,
+            "campaign_id": 1001 if report_type == "sp" else 3001,
+            "ad_group_id": 9001,
+            "sku": "SKU-1",
+            "asin": "B000000001",
+            "state": "enabled",
+            "serving_status": "AD_STATUS_LIVE",
+        }])
+
     def iter_advertising_product_report(self, report_type, payload, **kwargs):
         if self.fail_product_sd and report_type == "sd":
             raise RuntimeError("simulated SD product report failure")
