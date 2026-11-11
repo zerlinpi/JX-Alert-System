@@ -1,5 +1,9 @@
 """At-least-once outbox worker for the Feishu custom-bot webhook."""
+import json
+import logging
 from datetime import datetime, timedelta
+from pathlib import Path
+
 from sqlalchemy import select, update
 
 from jx_alert.config import get_settings
@@ -7,6 +11,35 @@ from jx_alert.notifications.feishu import FeishuClient
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import NotificationLog
+
+logger = logging.getLogger(__name__)
+
+
+def _load_routing(path: str) -> dict:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Feishu routing file cannot be read or parsed") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Feishu routing file root must be a JSON object")
+    return data
+
+
+def _routed_open_ids(routing: dict, store_id: str | None,
+                     entity_id: str | None) -> list[str]:
+    ids: list[str] = []
+    stores = routing.get("stores", {})
+    entities = routing.get("entities", {})
+    if store_id and isinstance(stores, dict):
+        ids.extend(stores.get(str(store_id), []))
+    if entity_id and isinstance(entities, dict):
+        ids.extend(entities.get(f"{store_id}:{entity_id}", []))
+        ids.extend(entities.get(str(entity_id), []))
+    if not all(isinstance(item, str) and item for item in ids):
+        raise RuntimeError("Feishu routing entries must be non-empty Open ID strings")
+    return list(dict.fromkeys(ids))
 
 
 def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
@@ -16,6 +49,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
     if not settings.feishu_webhook_url:
         raise RuntimeError("FEISHU_WEBHOOK_URL is required when FEISHU_ENABLED=true")
 
+    routing = _load_routing(settings.feishu_routing_file)
     now = datetime.utcnow()
     stale_before = now - timedelta(minutes=5)
     client = FeishuClient(
@@ -45,7 +79,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
                 NotificationOutbox.next_attempt_at <= now,
             )
             .order_by(NotificationOutbox.created_at, NotificationOutbox.id)
-            .limit(max(1, min(batch_size, 100)))
+            .limit(max(1, min(batch_size, 5)))
             .with_for_update(skip_locked=True)
         ).all()
         jobs = []
@@ -60,18 +94,23 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
     failed = 0
     default_ids = settings.feishu_at_ids()
     for row_id, dedupe_key, payload, attempts in jobs:
-        open_ids = list(dict.fromkeys(default_ids + list(payload.get("open_ids") or [])))
+        open_ids = list(dict.fromkeys(
+            default_ids
+            + _routed_open_ids(routing, payload.get("store_id"), payload.get("entity_id"))
+            + list(payload.get("open_ids") or [])
+        ))
         try:
-            result = client.send_text(str(payload.get("text") or ""), open_ids=open_ids)
+            client.send_text(str(payload.get("text") or ""), open_ids=open_ids)
             status = "DELIVERED"
             error = None
             delivered_at = datetime.utcnow()
             sent += 1
-        except Exception as exc:  # store a sanitized exception string; never store webhook URL
+        except Exception as exc:  # sanitized client errors never include the webhook URL
             status = "DEAD" if attempts >= max_attempts else "RETRY"
             error = f"{type(exc).__name__}: {str(exc)[:1000]}"
             delivered_at = None
             failed += 1
+            logger.warning("Feishu delivery failed for outbox id=%s (%s)", row_id, type(exc).__name__)
 
         with SessionLocal() as db:
             row = db.get(NotificationOutbox, row_id)
