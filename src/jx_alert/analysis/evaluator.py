@@ -338,8 +338,13 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
     }
 
 
-def evaluate_store_status_events(db, stores_response: dict) -> dict:
+def evaluate_store_status_events(
+    db, stores_response: dict, escalation_after_days: int | None = None
+) -> dict:
     """Create/recover store-status events directly from the authoritative seller list."""
+    if escalation_after_days is None:
+        from jx_alert.config import get_settings
+        escalation_after_days = get_settings().alert_escalate_after_days
     records = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(records, list):
         raise RuntimeError("Lingxing seller-list response data must be an array")
@@ -386,6 +391,7 @@ def evaluate_store_status_events(db, stores_response: dict) -> dict:
             events,
             evaluation_scope=f"{store_id}:store_status",
             scope_complete=True,
+            escalation_after_days=escalation_after_days,
         ))
 
     queued = enqueue_anomaly_notifications(db, saved_events)
