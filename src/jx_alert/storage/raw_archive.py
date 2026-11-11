@@ -24,6 +24,8 @@ def archive_raw_snapshots(db, raw_dir: str | Path, *, after_id: int = 0) -> dict
     to a same-directory temporary file and atomically renamed into place.
     """
     root = Path(raw_dir).expanduser()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
     rows = db.scalars(
         select(RawSnapshot)
         .where(RawSnapshot.id > int(after_id))
