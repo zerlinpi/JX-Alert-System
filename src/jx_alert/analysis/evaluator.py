@@ -204,7 +204,7 @@ def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
             daily_budget=None,
             config=config,
             campaign_enabled=bool(campaign and (campaign.state or "").lower() == "enabled"),
-        )
+        ))
         for event in detected:
             event["entity_key"] = ad.seller_sku or ad.asin or ad_id
             event["dedupe_key"] = f"{ad_id}:{event['rule']}"
