@@ -6,5 +6,5 @@ COPY src ./src
 RUN pip install --no-cache-dir .
 RUN useradd --create-home --uid 10001 appuser && mkdir -p /app/data/raw /app/data/reports && chown -R appuser:appuser /app
 USER appuser
-EXPOSE 8000
+EXPOSE 8000 8001
 CMD ["uvicorn", "jx_alert.api:app", "--host", "0.0.0.0", "--port", "8000"]
