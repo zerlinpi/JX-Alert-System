@@ -120,8 +120,7 @@ def _route_chat_id(routing: dict, store_id: str | None,
     return (
         entity_route.get("chat_id")
         or store_route.get("chat_id")
-        or fallback
-        or routing.get("default_chat_id", "default")
+        or (routing.get("default_chat_id", "default") if fallback == "default" else fallback)
     )
 
 
@@ -244,6 +243,11 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
     sent = 0
     failed = 0
     for row_id, dedupe_key, payload, attempts, existing_chat_id in jobs:
+        chat_id = (
+            default_chat_id
+            if existing_chat_id in (None, "", "default")
+            else existing_chat_id
+        )
         try:
             payload_ids = payload.get("open_ids") or []
             if not isinstance(payload_ids, list) or not all(
@@ -254,7 +258,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
                 routing,
                 payload.get("store_id"),
                 payload.get("entity_id"),
-                fallback=existing_chat_id or default_chat_id,
+                fallback=chat_id,
             )
             group = _feishu_group_config(routing, chat_id, settings)
             if chat_id not in client_cache:
@@ -288,7 +292,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
         with SessionLocal() as db:
             row = db.get(NotificationOutbox, row_id)
             if row:
-                row.chat_id = chat_id if status == "DELIVERED" or "chat_id" in locals() else row.chat_id
+                row.chat_id = chat_id
                 row.status = status
                 row.last_error = error
                 row.claimed_at = None
