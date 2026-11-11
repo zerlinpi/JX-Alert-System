@@ -73,21 +73,95 @@ python scripts/test_lingxing_connection.py --request
 
 该脚本不会打印 Token 或 AppSecret。不要把 AppSecret 或真实 Token 发给 ChatGPT。
 
-## 6. SP/SB/SD 活动日报只读采集
+## 6. 已接入的只读数据采集
 
-Token 获取和店铺列表单接口验证成功后，可先运行采集命令 dry-run：
+Token 获取和只读店铺列表验证成功后，当前每日流水线会采集：
+
+- 店铺列表和店铺状态；
+- ASIN/MSKU 销售额、销量、订单量（type=1/2/3）；
+- SP/SB/SD 广告活动基础资料与预算；
+- SP/SB/SD 广告活动级日报；
+- SP/SD 商品广告日报（按广告商品 ID 映射到 ASIN/MSKU）；
+- 原始响应、标准化日指标和每日 coverage 完整性标记。
+
+SB 商品级广告报表的公开 API 契约尚未核实，因此当前不将 SB 活动级花费或订单分摊到 SKU。账户健康/店铺绩效、绩效详情和业绩通知 API 也尚未接入。
+
+## 7. 配置站点时区
+
+自动调度不会猜测站点日期。先复制时区模板并按真实 sid 修改：
 ```bash
-python scripts/collect_lingxing_ads.py
+cp config/store-timezones.example.json data/store-timezones.json
+chmod 600 data/store-timezones.json
+nano data/store-timezones.json
 ```
 
-当前广告日报采集已按官方接口分别处理 SP/SD 的 `next_token` 游标分页和 SB 的 `offset/length` 分页，保存原始快照及 campaign 级 spend/orders/sales/units/clicks/impressions。若所有店铺同一站点日期，可显式执行：
-```bash
-APP_DRY_RUN=false python scripts/collect_lingxing_ads.py --collect --date YYYY-MM-DD
+示例：
+```json
+{
+  "stores": {
+    "101": {
+      "timezone": "America/Los_Angeles",
+      "currency_code": "USD"
+    }
+  }
+}
 ```
 
-如果不同 sid 属于不同站点时区，请建立 `data/store-report-dates.json`，内容为 sid 到站点本地日期的映射，再运行：
+每个正常同步的店铺都必须填写正确的 IANA 时区。日报使用该店铺本地前一完整自然日。不同站点时区不同，不要用单一北京时间替代。
+
+## 8. 只读连通性与历史回补
+
+先运行不发请求的本地配置检查：
 ```bash
-APP_DRY_RUN=false python scripts/collect_lingxing_ads.py --collect --date-map data/store-report-dates.json
+python scripts/test_lingxing_connection.py
 ```
 
-这一步会真实读取领星店铺列表和 SP/SB/SD 报表，但不会发送飞书消息，也不会修改广告。不要在尚未验证 Token 请求/响应字段之前执行。当前还没有 SKU 销量日报和商品级广告报表采集。
+Token 路径、请求参数和响应字段均已按当前账号开放平台文档核对后，才运行一次只读店铺列表请求：
+```bash
+python scripts/test_lingxing_connection.py --request
+```
+
+首次启用前建议回补至少 8 天，默认 14 天，最多 30 天。回补命令默认 dry-run：
+```bash
+python scripts/backfill_lingxing.py
+```
+
+确认 APP_DRY_RUN=false、Token 已验证、时区映射完整后，显式执行：
+```bash
+python scripts/backfill_lingxing.py --collect --days 14
+```
+
+回补会按每个 sid 的站点日期采集数据，生成每日任务日志、coverage 标记、异常分析和每店 Excel 文件。它只读取领星，不会修改广告或店铺数据。采集任务失败时会记录 FAILED/PARTIAL_FAILED；不完整日期不会触发异常自动恢复。
+
+## 9. 每日调度
+
+历史回补、规则和报表检查通过后，才在 .env 中设置：
+```env
+APP_DRY_RUN=false
+SCHEDULER_ENABLED=true
+DAILY_SYNC_CRON=0 8 * * *
+STORE_TIMEZONES_FILE=/app/data/store-timezones.json
+```
+
+如需向飞书真实群发送通知，再单独配置并测试：
+```env
+FEISHU_ENABLED=true
+FEISHU_WEBHOOK_URL=你的群自定义机器人Webhook
+FEISHU_SIGN_SECRET=机器人签名密钥（若启用）
+```
+
+启动 scheduler：
+```bash
+docker compose --profile scheduler up -d --build scheduler
+docker compose logs -f scheduler
+```
+
+只允许一个 scheduler 实例。它会按店铺时区执行日报采集、异常分析、每店 Excel 导出，并每 10 秒处理通知 outbox。
+
+## 10. 当前未完成的领星接口
+
+- 产品表现异步报告（reportType=2）需要 reportOptions 嵌套对象的签名 canonicalizer；当前客户端对嵌套对象/数组 fail closed，未猜测签名格式。
+- 账户健康/店铺绩效列表、绩效详情和业绩通知列表的准确路径、请求参数和响应结构尚未核对。
+- SB 商品级广告报表接口尚未核实。
+
+如需继续接入这些接口，请从领星 OpenAPI 文档复制对应页面的 API Path、请求参数表和成功响应 JSON 示例；打码账号、Token 和其他凭据即可。不要发送 AppSecret 或真实 Token。
