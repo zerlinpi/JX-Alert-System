@@ -318,6 +318,63 @@ class LingxingClient:
 
         raise LingxingError(f"Campaign list exceeded max_pages={max_pages}")
 
+    def advertising_product_ads(self, campaign_type: str, payload: dict):
+        paths = {
+            "sp": "/pb/openapi/newad/spProductAds",
+            "sd": "/pb/openapi/newad/sdProductAds",
+        }
+        campaign_type = campaign_type.lower()
+        if campaign_type not in paths:
+            raise ValueError("campaign_type must be sp or sd")
+        return self._request(
+            "POST", paths[campaign_type], json_body=payload, advertising=True
+        )
+
+    def iter_advertising_product_ads(self, campaign_type: str, payload: dict, *,
+                                     length: int = 100, max_pages: int = 1000
+                                     ) -> Iterator[dict]:
+        """Yield all SP/SD product-ad master rows using the v2 next_token cursor."""
+        campaign_type = campaign_type.lower()
+        if campaign_type not in {"sp", "sd"}:
+            raise ValueError("campaign_type must be sp or sd")
+        if not payload.get("sid") and not payload.get("profile_id"):
+            raise ValueError("product-ad list requires sid or profile_id")
+        request = {**payload, "offset": 0, "length": length}
+        seen_tokens: set[str] = set()
+        offset = 0
+
+        for _ in range(max_pages):
+            result = self.advertising_product_ads(campaign_type, request)
+            rows = result.get("data") if isinstance(result, dict) else None
+            if not isinstance(rows, list):
+                raise LingxingError("Product-ad list response data must be an array")
+            try:
+                total = int(result["total"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise LingxingError("Product-ad list response total is missing or invalid") from exc
+            yield from rows
+            offset += len(rows)
+            if offset > total:
+                raise LingxingError("Product-ad list returned more rows than its reported total")
+            if offset == total:
+                return
+            if not rows:
+                raise LingxingError(
+                    f"{campaign_type.upper()} product-ad list pagination incomplete"
+                )
+            next_token = result.get("next_token")
+            if not isinstance(next_token, str) or not next_token:
+                raise LingxingError(
+                    f"{campaign_type.upper()} product-ad list missing next_token"
+                )
+            if next_token in seen_tokens:
+                raise LingxingError("Product-ad list returned a repeated next_token")
+            seen_tokens.add(next_token)
+            request.pop("offset", None)
+            request["next_token"] = next_token
+
+        raise LingxingError(f"Product-ad list exceeded max_pages={max_pages}")
+
     def advertising_product_report(self, report_type: str, payload: dict):
         paths = {
             "sp": "/pb/openapi/newad/spProductAdReports",
