@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     app_timezone: str = "Asia/Shanghai"
     scheduler_enabled: bool = False
     daily_sync_cron: str = "0 8 * * *"
+    store_timezones_file: str = "/app/data/store-timezones.json"
 
     # Prefer DATABASE_URL when explicitly supplied; otherwise compose a URL safely
     # from DB_* fields so passwords containing URL-reserved characters are escaped.
