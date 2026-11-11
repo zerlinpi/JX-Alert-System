@@ -3,7 +3,10 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import select
 
-from jx_alert.analysis.rules import RuleConfig, detect_campaign_anomalies, detect_order_anomaly, _event
+from jx_alert.analysis.rules import RuleConfig, detect_campaign_anomalies, detect_order_anomaly
+
+# Amazon Ads default attribution windows: SP 7 days; SB/SD 14 days.
+AD_ATTRIBUTION_DAYS = {"sp": 7, "sb": 14, "sd": 14}, _event
 from jx_alert.analysis.service import enqueue_anomaly_notifications, upsert_anomalies
 from jx_alert.storage.models import (
     AdProduct,
@@ -83,9 +86,18 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
                                  report_date: date, config: RuleConfig
                                  ) -> tuple[list[AnomalyEvent], bool]:
     dimension = f"campaign_{campaign_type}"
-    baseline_dates = [report_date - timedelta(days=offset) for offset in range(7, 0, -1)]
-    previous_date = report_date - timedelta(days=1)
-    required_dates = baseline_dates + [report_date]
+    attribution_days = AD_ATTRIBUTION_DAYS[campaign_type]
+    spend_baseline_dates = [
+        report_date - timedelta(days=offset) for offset in range(7, 0, -1)
+    ]
+    attribution_date = report_date - timedelta(days=attribution_days)
+    attribution_baseline_dates = [
+        attribution_date - timedelta(days=offset) for offset in range(7, 0, -1)
+    ]
+    required_dates = sorted(set(
+        spend_baseline_dates + [report_date]
+        + attribution_baseline_dates + [attribution_date]
+    ))
     if not _has_complete_coverage(db, store_id, dimension, required_dates):
         return [], False
 
@@ -101,35 +113,79 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
     for campaign in campaigns:
         entity_id = campaign.campaign_id
         current_spend = metrics["spend"].get((entity_id, report_date), 0.0)
-        previous_orders = metrics["orders"].get((entity_id, previous_date), 0.0)
-        current_orders = metrics["orders"].get((entity_id, report_date), 0.0)
-        prior_spend = [metrics["spend"].get((entity_id, day), 0.0) for day in baseline_dates]
-        prior_orders = [metrics["orders"].get((entity_id, day), 0.0) for day in baseline_dates]
+        prior_spend = [
+            metrics["spend"].get((entity_id, day), 0.0)
+            for day in spend_baseline_dates
+        ]
         current_clicks = int(metrics["clicks"].get((entity_id, report_date), 0.0))
+        mature_spend = metrics["spend"].get((entity_id, attribution_date), 0.0)
+        mature_orders = metrics["orders"].get((entity_id, attribution_date), 0.0)
+        mature_clicks = int(metrics["clicks"].get((entity_id, attribution_date), 0.0))
+        mature_prior_spend = [
+            metrics["spend"].get((entity_id, day), 0.0)
+            for day in attribution_baseline_dates
+        ]
+        mature_prior_orders = [
+            metrics["orders"].get((entity_id, day), 0.0)
+            for day in attribution_baseline_dates
+        ]
+        mature_previous_orders = metrics["orders"].get(
+            (entity_id, attribution_date - timedelta(days=1)), 0.0
+        )
 
         campaign_enabled = (campaign.state or "").lower() == "enabled"
         if campaign_enabled:
-            events.extend(detect_order_anomaly(
+            order_events = detect_order_anomaly(
                 entity_key=entity_id,
-                current_orders=current_orders,
-                previous_orders=previous_orders,
-                prior_7_days=prior_orders,
+                current_orders=mature_orders,
+                previous_orders=mature_previous_orders,
+                prior_7_days=mature_prior_orders,
                 config=config,
                 metric_name="orders",
-            ))
-        events.extend(detect_campaign_anomalies(
+            )
+            for event in order_events:
+                event["metrics"]["attribution_window_days"] = attribution_days
+                event["metrics"]["attribution_complete_report_date"] = attribution_date.isoformat()
+            events.extend(order_events)
+
+        # Spend/budget alerts use the latest report date; conversion-dependent
+        # alerts use a report date old enough for the campaign type's attribution.
+        spend_events = detect_campaign_anomalies(
             entity_key=entity_id,
             spend=current_spend,
-            orders=current_orders,
+            orders=None,
             clicks=current_clicks,
             prior_7_spend=prior_spend,
-            prior_7_orders=prior_orders,
+            prior_7_orders=mature_prior_orders,
             daily_budget=(
                 campaign.budget if (campaign.budget_type or "").lower() == "daily" else None
             ),
             config=config,
             campaign_enabled=campaign_enabled,
-        ))
+            conversion_enabled=False,
+        )
+        for event in spend_events:
+            event["metrics"]["report_date"] = report_date.isoformat()
+        events.extend(spend_events)
+
+        conversion_events = detect_campaign_anomalies(
+            entity_key=entity_id,
+            spend=mature_spend,
+            orders=mature_orders,
+            clicks=mature_clicks,
+            prior_7_spend=mature_prior_spend,
+            prior_7_orders=mature_prior_orders,
+            daily_budget=None,
+            config=config,
+            campaign_enabled=campaign_enabled,
+            high_spend_enabled=False,
+            budget_enabled=False,
+        )
+        for event in conversion_events:
+            event["metrics"]["attribution_window_days"] = attribution_days
+            event["metrics"]["attribution_complete_report_date"] = attribution_date.isoformat()
+        events.extend(conversion_events)
+
         if campaign.last_over_budget_at and str(campaign.last_over_budget_at).startswith(
             report_date.isoformat()
         ):
@@ -143,6 +199,7 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
                     "last_over_budget_at": campaign.last_over_budget_at,
                     "daily_budget": campaign.budget,
                     "budget_type": campaign.budget_type,
+                    "report_date": report_date.isoformat(),
                 },
                 "领星广告活动资料记录该活动在报告日发生过超预算事件",
             ))
@@ -159,8 +216,18 @@ def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
                                    report_date: date, config: RuleConfig
                                    ) -> tuple[list[AnomalyEvent], bool]:
     dimension = f"product_ad_{campaign_type}"
-    baseline_dates = [report_date - timedelta(days=offset) for offset in range(7, 0, -1)]
-    required_dates = baseline_dates + [report_date]
+    attribution_days = AD_ATTRIBUTION_DAYS[campaign_type]
+    spend_baseline_dates = [
+        report_date - timedelta(days=offset) for offset in range(7, 0, -1)
+    ]
+    attribution_date = report_date - timedelta(days=attribution_days)
+    attribution_baseline_dates = [
+        attribution_date - timedelta(days=offset) for offset in range(7, 0, -1)
+    ]
+    required_dates = sorted(set(
+        spend_baseline_dates + [report_date]
+        + attribution_baseline_dates + [attribution_date]
+    ))
     if not _has_complete_coverage(db, store_id, dimension, required_dates):
         return [], False
 
@@ -183,38 +250,80 @@ def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
     for ad in ads:
         ad_id = ad.ad_id
         current_spend = metrics["spend"].get((ad_id, report_date), 0.0)
-        current_orders = metrics["orders"].get((ad_id, report_date), 0.0)
         current_clicks = int(metrics["clicks"].get((ad_id, report_date), 0.0))
-        prior_spend = [metrics["spend"].get((ad_id, day), 0.0) for day in baseline_dates]
-        prior_orders = [metrics["orders"].get((ad_id, day), 0.0) for day in baseline_dates]
+        prior_spend = [
+            metrics["spend"].get((ad_id, day), 0.0)
+            for day in spend_baseline_dates
+        ]
+        mature_spend = metrics["spend"].get((ad_id, attribution_date), 0.0)
+        mature_orders = metrics["orders"].get((ad_id, attribution_date), 0.0)
+        mature_clicks = int(metrics["clicks"].get((ad_id, attribution_date), 0.0))
+        mature_prior_spend = [
+            metrics["spend"].get((ad_id, day), 0.0)
+            for day in attribution_baseline_dates
+        ]
+        mature_prior_orders = [
+            metrics["orders"].get((ad_id, day), 0.0)
+            for day in attribution_baseline_dates
+        ]
+        mature_previous_orders = metrics["orders"].get(
+            (ad_id, attribution_date - timedelta(days=1)), 0.0
+        )
         campaign = campaigns.get(ad.campaign_id)
         ad_enabled = (ad.state or "").lower() == "enabled"
         campaign_enabled = bool(
             ad_enabled and campaign and (campaign.state or "").lower() == "enabled"
         )
+
         detected = []
         if campaign_enabled:
-            detected.extend(detect_order_anomaly(
+            order_events = detect_order_anomaly(
                 entity_key=ad_id,
-                current_orders=current_orders,
-                previous_orders=metrics["orders"].get(
-                    (ad_id, report_date - timedelta(days=1)), 0.0
-                ),
-                prior_7_days=prior_orders,
+                current_orders=mature_orders,
+                previous_orders=mature_previous_orders,
+                prior_7_days=mature_prior_orders,
                 config=config,
                 metric_name="orders",
-            ))
-        detected.extend(detect_campaign_anomalies(
+            )
+            for event in order_events:
+                event["metrics"]["attribution_window_days"] = attribution_days
+                event["metrics"]["attribution_complete_report_date"] = attribution_date.isoformat()
+            detected.extend(order_events)
+
+        spend_events = detect_campaign_anomalies(
             entity_key=ad_id,
             spend=current_spend,
-            orders=current_orders,
+            orders=None,
             clicks=current_clicks,
             prior_7_spend=prior_spend,
-            prior_7_orders=prior_orders,
+            prior_7_orders=mature_prior_orders,
             daily_budget=None,
             config=config,
             campaign_enabled=campaign_enabled,
-        ))
+            conversion_enabled=False,
+        )
+        for event in spend_events:
+            event["metrics"]["report_date"] = report_date.isoformat()
+        detected.extend(spend_events)
+
+        conversion_events = detect_campaign_anomalies(
+            entity_key=ad_id,
+            spend=mature_spend,
+            orders=mature_orders,
+            clicks=mature_clicks,
+            prior_7_spend=mature_prior_spend,
+            prior_7_orders=mature_prior_orders,
+            daily_budget=None,
+            config=config,
+            campaign_enabled=campaign_enabled,
+            high_spend_enabled=False,
+            budget_enabled=False,
+        )
+        for event in conversion_events:
+            event["metrics"]["attribution_window_days"] = attribution_days
+            event["metrics"]["attribution_complete_report_date"] = attribution_date.isoformat()
+        detected.extend(conversion_events)
+
         for event in detected:
             event["entity_key"] = ad.seller_sku or ad.asin or ad_id
             event["dedupe_key"] = f"{ad_id}:{event['rule']}"
