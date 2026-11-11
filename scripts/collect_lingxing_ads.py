@@ -33,7 +33,7 @@ def main():
     if args.date_map:
         report_dates = json.loads(Path(args.date_map).read_text(encoding="utf-8"))
         if not isinstance(report_dates, dict):
-            raise SystemExit("--date-map JSON must be an object: {\\"sid\\": \\"YYYY-MM-DD\\"}")
+            raise SystemExit("date-map must be a JSON object mapping seller IDs to YYYY-MM-DD dates")
     else:
         report_dates = args.date
 
