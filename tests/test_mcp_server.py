@@ -7,6 +7,7 @@ from jx_alert.storage import models  # noqa: F401
 from jx_alert.notifications.outbox import NotificationOutbox  # noqa: F401
 from jx_alert.storage.models import (
     AnomalyEvent,
+    NotificationLog,
     Campaign,
     DailyMetric,
     DataCoverage,
@@ -52,6 +53,28 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
             last_seen=datetime(2026, 11, 11, 8),
             metrics={"current": 5}, reason="test alert",
         ))
+        db.add(NotificationOutbox(
+            idempotency_key="mcp-test-alert",
+            chat_id="default",
+            payload={
+                "text": "test notification",
+                "store_id": "101",
+                "entity_id": "SKU-1",
+                "open_ids": [],
+            },
+            status="DELIVERED",
+            attempts=1,
+            next_attempt_at=datetime(2026, 11, 11, 8),
+            delivered_at=datetime(2026, 11, 11, 8),
+        ))
+        db.add(NotificationLog(
+            dedupe_key="mcp-test-alert",
+            channel="feishu_webhook",
+            status="DELIVERED",
+            message_id=None,
+            error=None,
+            created_at=datetime(2026, 11, 11, 8),
+        ))
         db.add(SyncJob(
             job_type="daily_collection", status="SUCCEEDED",
             started_at=datetime(2026, 11, 11, 8),
@@ -91,6 +114,45 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
             entity_id="ad-1", metric_name="spend", value=8,
             currency="USD", source="test",
         ))
+        for dimension in ("sku_msku", "sku_asin", "campaign_sp"):
+            for offset in range(1, 8):
+                day = target - timedelta(days=offset)
+                db.add(DataCoverage(
+                    store_id="101", metric_date=day, dimension=dimension,
+                    status="COMPLETE", row_count=1,
+                ))
+                if dimension == "sku_msku":
+                    entity_id = "SKU-1"
+                    metrics_for_day = {"orders": 10, "units": 12, "sales": 100}
+                elif dimension == "sku_asin":
+                    entity_id = "B000000001"
+                    metrics_for_day = {"orders": 8, "units": 9, "sales": 80}
+                else:
+                    entity_id = "campaign-1"
+                    metrics_for_day = {"spend": 10, "orders": 1, "sales": 40, "clicks": 8, "impressions": 800}
+                for metric_name, metric_value in metrics_for_day.items():
+                    db.add(DailyMetric(
+                        store_id="101", metric_date=day, dimension=dimension,
+                        entity_id=entity_id, metric_name=metric_name, value=metric_value,
+                        currency="USD", source="test",
+                    ))
+        for metric_name, metric_value in {
+            "orders": 5, "units": 6, "sales": 50,
+        }.items():
+            db.add(DailyMetric(
+                store_id="101", metric_date=target, dimension="sku_msku",
+                entity_id="SKU-1", metric_name=metric_name, value=metric_value,
+                currency="USD", source="test",
+            ))
+        for metric_name, metric_value in {
+            "orders": 12, "units": 13, "sales": 120,
+        }.items():
+            db.add(DailyMetric(
+                store_id="101", metric_date=target, dimension="sku_asin",
+                entity_id="B000000001", metric_name=metric_name, value=metric_value,
+                currency="USD", source="test",
+            ))
+
         db.commit()
 
     monkeypatch.setattr(mcp_server, "SessionLocal", Session)
@@ -128,6 +190,24 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
 
     anomalies = mcp_server.get_all_anomalies(store_id="101", severity="P1")
     assert anomalies[0]["rule"] == "orders_decrease"
+
+    sku_rows = mcp_server.get_sku_performance("101", "2026-11-10")
+    sku_row = next(row for row in sku_rows if row["entity_id"] == "SKU-1")
+    assert sku_row["metrics"]["orders"]["current"] == 5
+    assert sku_row["metrics"]["orders"]["average_7d"] == 10
+    assert sku_row["metrics"]["orders"]["change_vs_7d_average"] == -0.5
+
+    campaign_rows = mcp_server.get_campaign_performance("101", "2026-11-10", "sp")
+    assert campaign_rows[0]["metrics"]["spend"]["current"] == 12
+    assert campaign_rows[0]["metrics"]["spend"]["average_7d"] == 10
+
+    history = mcp_server.get_anomaly_history(store_id="101", entity_id="101")
+    assert history[0]["rule"] == "orders_decrease"
+
+    notifications = mcp_server.get_notification_logs(store_id="101")
+    assert notifications[0]["attempt_status"] == "DELIVERED"
+    assert notifications[0]["outbox_status"] == "DELIVERED"
+    assert notifications[0]["attempts"] == 1
 
     jobs = mcp_server.get_sync_jobs()
     assert jobs[0]["status"] == "SUCCEEDED"
