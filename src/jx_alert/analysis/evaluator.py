@@ -121,10 +121,28 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
             clicks=current_clicks,
             prior_7_spend=prior_spend,
             prior_7_orders=prior_orders,
-            daily_budget=campaign.budget,
+            daily_budget=(
+                campaign.budget if (campaign.budget_type or "").lower() == "daily" else None
+            ),
             config=config,
             campaign_enabled=(campaign.state or "").lower() == "enabled",
         ))
+        if campaign.last_over_budget_at and str(campaign.last_over_budget_at).startswith(
+            report_date.isoformat()
+        ):
+            from jx_alert.analysis.rules import _event
+            events.append(_event(
+                "campaign_over_budget",
+                "P1",
+                entity_id,
+                f"{entity_id}:campaign_over_budget",
+                {
+                    "last_over_budget_at": campaign.last_over_budget_at,
+                    "daily_budget": campaign.budget,
+                    "budget_type": campaign.budget_type,
+                },
+                "领星广告活动资料记录该活动在报告日发生过超预算事件",
+            ))
 
     scope = f"{store_id}:campaign:{campaign_type}"
     saved = upsert_anomalies(
@@ -166,7 +184,17 @@ def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
         prior_spend = [metrics["spend"].get((ad_id, day), 0.0) for day in baseline_dates]
         prior_orders = [metrics["orders"].get((ad_id, day), 0.0) for day in baseline_dates]
         campaign = campaigns.get(ad.campaign_id)
-        detected = detect_campaign_anomalies(
+        detected = detect_order_anomaly(
+            entity_key=ad_id,
+            current_orders=current_orders,
+            previous_orders=metrics["orders"].get(
+                (ad_id, report_date - timedelta(days=1)), 0.0
+            ),
+            prior_7_days=prior_orders,
+            config=config,
+            metric_name="orders",
+        )
+        detected.extend(detect_campaign_anomalies(
             entity_key=ad_id,
             spend=current_spend,
             orders=current_orders,
