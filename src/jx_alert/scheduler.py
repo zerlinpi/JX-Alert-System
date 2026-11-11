@@ -5,6 +5,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from jx_alert.config import get_settings
+from jx_alert.storage.db import init_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +40,7 @@ def main():
         logger.info("SCHEDULER_ENABLED=false; scheduler process exits without starting jobs.")
         return
 
+    init_db()
     scheduler = BlockingScheduler(timezone=settings.app_timezone)
     scheduler.add_job(
         daily_job,
