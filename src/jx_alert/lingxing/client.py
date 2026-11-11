@@ -159,7 +159,7 @@ class LingxingClient:
                     message = str(data.get("msg") or data.get("message") or "unknown")
                     lowered = message.lower()
                     rate_limited = (
-                        str(code) == "429"
+                        str(code) in {"429", "3001008"}
                         or any(token in lowered for token in (
                             "rate limit", "too many requests", "频率限制",
                             "请求过于频繁", "限流", "令牌桶",
