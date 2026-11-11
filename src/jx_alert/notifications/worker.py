@@ -1,7 +1,7 @@
 """At-least-once outbox worker for the Feishu custom-bot webhook."""
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import select, update
@@ -62,7 +62,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
 
     routing = _load_routing(settings.feishu_routing_file)
     default_ids = settings.feishu_at_ids()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     stale_before = now - timedelta(minutes=5)
     client = FeishuClient(
         webhook_url=settings.feishu_webhook_url,
