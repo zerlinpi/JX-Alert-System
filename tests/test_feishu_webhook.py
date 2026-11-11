@@ -1,3 +1,7 @@
+import base64
+import hashlib
+import hmac
+
 from jx_alert.notifications.feishu import FeishuClient, build_feishu_signature
 
 
@@ -27,3 +31,14 @@ def test_custom_bot_rejects_non_feishu_webhook():
         assert "FEISHU_WEBHOOK_URL" in str(exc)
     else:
         raise AssertionError("invalid webhook URL should be rejected")
+
+
+
+def test_feishu_signature_matches_official_newline_formula():
+    timestamp = "1700000000"
+    secret = "local-test-secret"
+    string_to_sign = f"{timestamp}\n{secret}".encode("utf-8")
+    expected = base64.b64encode(
+        hmac.new(string_to_sign, b"", digestmod=hashlib.sha256).digest()
+    ).decode("ascii")
+    assert build_feishu_signature(timestamp, secret) == expected
