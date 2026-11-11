@@ -42,8 +42,16 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
         if row:
             previous_severity = row.severity
             was_recovered = row.status == "RECOVERED"
+            incoming_severity = event["severity"]
+            if (
+                not was_recovered
+                and row.escalated_at is not None
+                and _SEVERITY_ORDER.get(previous_severity, 99)
+                < _SEVERITY_ORDER.get(incoming_severity, 99)
+            ):
+                incoming_severity = previous_severity
             severity_increased = (
-                _SEVERITY_ORDER.get(event["severity"], 99)
+                _SEVERITY_ORDER.get(incoming_severity, 99)
                 < _SEVERITY_ORDER.get(previous_severity, 99)
             )
             persisted_long_enough = (
@@ -55,7 +63,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
                 row.status = "NEW"
                 row.first_seen = now
                 row.escalated_at = None
-                row.severity = event["severity"]
+                row.severity = incoming_severity
             elif severity_increased:
                 row.status = "ESCALATED"
                 row.escalated_at = now
@@ -63,7 +71,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
             elif persisted_long_enough:
                 row.status = "ESCALATED"
                 row.escalated_at = now
-                row.severity = _ESCALATED_SEVERITY.get(event["severity"], event["severity"])
+                row.severity = _ESCALATED_SEVERITY.get(incoming_severity, incoming_severity)
             else:
                 row.status = "ONGOING"
                 row.severity = event["severity"]
