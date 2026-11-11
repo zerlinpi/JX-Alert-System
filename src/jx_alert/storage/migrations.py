@@ -52,7 +52,6 @@ def upgrade_schema(engine) -> list[str]:
                 changes.append("ix_anomaly_events_evaluation_scope")
 
         if "stores" in tables:
-            before = set(changes)
             _add_missing_columns(connection, inspector, "stores", {
                 "mid": "VARCHAR(100) NULL",
                 "seller_id": "VARCHAR(100) NULL",
