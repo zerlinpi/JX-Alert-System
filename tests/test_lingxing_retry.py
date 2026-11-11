@@ -77,3 +77,34 @@ def test_non_retryable_business_error_fails_immediately(monkeypatch):
     else:
         raise AssertionError("business error should not be retried")
     assert len(calls) == 1
+
+
+
+def test_missing_business_response_code_fails_closed(monkeypatch):
+    calls = []
+    responses = [FakeResponse({"data": []})]
+    monkeypatch.setattr(
+        lingxing_module.httpx, "Client",
+        lambda timeout: FakeHttpClient(responses, calls),
+    )
+    try:
+        _client()._request("GET", "/test")
+    except LingxingError as exc:
+        assert "missing its required code" in str(exc)
+    else:
+        raise AssertionError("response without required code must fail")
+
+
+def test_non_object_business_response_fails_closed(monkeypatch):
+    calls = []
+    responses = [FakeResponse([{"id": 1}])]
+    monkeypatch.setattr(
+        lingxing_module.httpx, "Client",
+        lambda timeout: FakeHttpClient(responses, calls),
+    )
+    try:
+        _client()._request("GET", "/test")
+    except LingxingError as exc:
+        assert "JSON object" in str(exc)
+    else:
+        raise AssertionError("non-object response must fail")
