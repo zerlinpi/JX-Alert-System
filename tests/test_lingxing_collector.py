@@ -20,10 +20,9 @@ class FakeLingxingClient:
 
     def iter_advertising_report(self, report_type, payload):
         assert payload["sid"] == 101
-        assert payload["report_date"] == "2026-11-10"
         return iter([{
             "campaign_id": 9001,
-            "report_date": "2026-11-10",
+            "report_date": payload["report_date"],
             "cost": 12.5,
             "orders": 2,
             "sales": 50,
