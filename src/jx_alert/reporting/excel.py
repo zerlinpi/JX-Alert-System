@@ -276,9 +276,19 @@ def export_daily_report(path: str | Path,
             width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 42)
             worksheet.column_dimensions[get_column_letter(column[0].column)].width = width
 
+        header_indexes = {cell.value: cell.column for cell in worksheet[1]}
+        for header in ("订单变化率", "ACOS"):
+            column = header_indexes.get(header)
+            if column:
+                for row in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row, column).number_format = "0.00%"
+        roas_column = header_indexes.get("ROAS")
+        if roas_column:
+            for row in range(2, worksheet.max_row + 1):
+                worksheet.cell(row, roas_column).number_format = '0.00"x"'
         for row in worksheet.iter_rows(min_row=2):
             for cell in row:
-                if isinstance(cell.value, float):
+                if isinstance(cell.value, float) and cell.number_format == "General":
                     cell.number_format = "0.00"
 
     workbook.save(output_path)
@@ -286,16 +296,21 @@ def export_daily_report(path: str | Path,
 
 
 def export_daily_reports(db, report_date: date | str, output_dir: str | Path, *,
-                         per_store: bool = True) -> list[Path]:
+                         per_store: bool = True,
+                         store_id: str | None = None) -> list[Path]:
     target = date.fromisoformat(report_date) if isinstance(report_date, str) else report_date
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    outputs = [
-        export_daily_report(
-            directory / f"JX-Alert-{target.isoformat()}-ALL.xlsx",
-            build_daily_report_rows(db, target),
-        )
-    ]
+    if store_id is not None:
+        return [export_daily_report(
+            directory / f"JX-Alert-{store_id}-{target.isoformat()}.xlsx",
+            build_daily_report_rows(db, target, store_id=store_id),
+        )]
+
+    outputs = [export_daily_report(
+        directory / f"JX-Alert-{target.isoformat()}-ALL.xlsx",
+        build_daily_report_rows(db, target),
+    )]
     if per_store:
         for store in db.scalars(select(Store).order_by(Store.name)).all():
             outputs.append(export_daily_report(
