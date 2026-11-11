@@ -25,9 +25,9 @@ chmod 600 .env
 容器以 UID/GID 10001 的非 root 用户运行：
 ```bash
 mkdir -p data
+cp config/feishu-routing.example.json data/feishu-routing.json
 sudo chown -R 10001:10001 data
 chmod 700 data
-cp config/feishu-routing.example.json data/feishu-routing.json
 chmod 600 data/feishu-routing.json
 ```
 
