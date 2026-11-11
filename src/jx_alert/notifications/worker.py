@@ -57,22 +57,23 @@ def _database_entity_open_ids(store_id: str | None, entity_id: str | None) -> li
     if not store_id or not entity_id:
         return []
     with SessionLocal() as db:
-        product = db.scalar(select(Product).where(
+        products = db.scalars(select(Product).where(
             Product.store_id == str(store_id),
             or_(
                 Product.seller_sku == str(entity_id),
                 Product.asin == str(entity_id),
             ),
-        ).limit(1))
-        if product is None:
-            return []
-        ids = product.owner_open_ids or []
-        if not isinstance(ids, list) or not all(
-            isinstance(item, str) and item.startswith("ou_") for item in ids
-        ):
-            raise RuntimeError(
-                "Product owner_open_ids must be a list of Feishu Open IDs"
-            )
+        )).all()
+        ids: list[str] = []
+        for product in products:
+            owners = product.owner_open_ids or []
+            if not isinstance(owners, list) or not all(
+                isinstance(item, str) and item.startswith("ou_") for item in owners
+            ):
+                raise RuntimeError(
+                    "Product owner_open_ids must be a list of Feishu Open IDs"
+                )
+            ids.extend(owners)
         return list(dict.fromkeys(ids))
 
 
