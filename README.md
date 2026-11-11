@@ -7,7 +7,7 @@
 ## 当前架构
 
 - **领星：** AppID / AppSecret 用于按账户文档配置 Token 获取和续约；业务 API 使用 Bearer Token + URL Query 签名。Token 路径、请求体和响应字段路径必须从当前领星开放平台文档确认后填写。
-- **飞书：** 使用群自定义机器人 Webhook 单向推送到一个指定群，不使用飞书应用机器人或 tenant_access_token。
+- **飞书：** 使用群自定义机器人 Webhook 单向推送；支持按店铺和 SKU/ASIN 路由到不同群，并分别 @ 群管理员与负责人；不使用飞书应用机器人或 tenant_access_token。
 - **数据库：** MariaDB 11；本地测试支持 SQLite。保留原始快照、日指标、异常事件、通知日志和 outbox。
 - **销售采集：** 已接入领星 ASIN/MSKU 日销量接口，分别采集销售额、销量、订单量，并保存店铺汇总和原始响应。
 - **广告采集：** 已接入 SP/SB/SD 活动日报、SP/SB/SD 活动基础资料，以及 SP/SD 商品广告日报。SB 商品级报表接口尚未确认，不猜测接口路径。
@@ -59,7 +59,7 @@
 - `FEISHU_KEYWORD` 用于满足机器人安全设置中的自定义关键词校验（若启用）。
 - `FEISHU_SIGN_SECRET` 用于签名校验（若启用）。
 - `config/feishu-routing.example.json` 可复制为服务器本地 `data/feishu-routing.json`，按店铺 ID 和 MSKU/ASIN 配置负责人 Open ID。
-- 一个 Webhook 对应一个群；当前配置面向一个主告警群。
+- 一个 Webhook 对应一个群；可在路由配置中为多个群分别设置 Webhook 环境变量、群管理员 Open ID，并按店铺/SKU 指定目标群。
 
 官方文档：[飞书自定义机器人使用指南](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)。
 
