@@ -3,19 +3,12 @@ from datetime import date
 
 from sqlalchemy import delete
 
+from jx_alert.lingxing.report_metrics import AD_REPORT_METRICS
 from jx_alert.storage.coverage import mark_coverage
 from jx_alert.storage.models import DailyMetric, RawSnapshot
 
 
-AD_METRICS = {
-    "cost": "spend",
-    "orders": "orders",
-    "sales": "sales",
-    "units": "units",
-    "clicks": "clicks",
-    "impressions": "impressions",
-}
-
+AD_METRICS = AD_REPORT_METRICS
 
 def collect_ads_for_day(client, db, report_date: str | dict[str, str], *,
                         stores_response: dict | None = None) -> dict:
