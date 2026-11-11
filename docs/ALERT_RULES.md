@@ -33,7 +33,7 @@ SP/SD 商品广告日报已接入，可按 ad_id 保存商品级花费、订单�
 注意：这是**领星 ERP 授权/同步状态**，不等于 Amazon Seller Central 的 Account Health、政策违规或绩效通知。账户健康评分、绩效事件和业绩通知仍需接入其独立且已核实的领星接口，不能用店铺同步状态代替。官方字段枚举见：[查询亚马逊店铺列表](https://apidoc.lingxing.com/new/api-docs/BasicData/SellerLists/)。
 
 ## 尚未接入的数据源
-- 账户健康/店铺绩效列表、绩效详情、业绩通知列表接口的准确请求路径、字段和响应结构尚未核对。
+- 账户健康/店铺绩效列表、绩效详情、业绩通知列表尚未进入自动采集。领星官方 MCP 工具清单已确认存在 `customer_store_performance_list`、`customer_store_target_detail`、`customer_performance_notice_list`；真实 input schema 需通过 `scripts/inspect_lingxing_mcp_tools.py` 使用企业自己的 MCP URL 与 X-Mcp-Key 探测后再开发。详见 `docs/LINGXING_PERFORMANCE_MCP.md`。
 - 产品表现异步报告 `reportType=2` 需要 `reportOptions` 嵌套对象的签名 canonicalizer；当前客户端拒绝猜测嵌套对象签名。
 - SB 商品级广告报表接口尚未核实。
 
