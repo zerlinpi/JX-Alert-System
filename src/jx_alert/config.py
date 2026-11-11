@@ -1,6 +1,6 @@
 from functools import lru_cache
 from sqlalchemy.engine import URL
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     db_password: str = ""
 
     lingxing_base_url: str = "https://openapi.lingxing.com"
+    # Optional official Lingxing MCP for performance/notice tools not exposed
+    # through the public OpenAPI contract used by the daily collector.
+    lingxing_mcp_url: str = ""
+    lingxing_mcp_key: SecretStr = SecretStr("")
     lingxing_app_id: str = ""
     lingxing_app_key: str = ""
     lingxing_app_secret: str = ""
