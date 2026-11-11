@@ -76,8 +76,13 @@ def collect_campaigns(client, db, *, stores_response: dict | None = None,
                 row.name = record.get("name")
                 row.state = record.get("state")
                 row.serving_status = record.get("serving_status")
-                row.budget = _float_or_none(record.get("budget"), "budget")
-                row.budget_type = record.get("budget_type")
+                budget_value = record.get("budget")
+                budget_type = record.get("budget_type")
+                if budget_value is None and record.get("daily_budget") is not None:
+                    budget_value = record.get("daily_budget")
+                    budget_type = budget_type or "daily"
+                row.budget = _float_or_none(budget_value, "budget/daily_budget")
+                row.budget_type = budget_type
                 row.start_date = record.get("start_date")
                 row.end_date = record.get("end_date")
                 row.last_over_budget_at = (
