@@ -225,6 +225,7 @@ def get_all_anomalies(limit: int = 100, status: str | None = None,
             "first_seen": row.first_seen.isoformat() if row.first_seen else None,
             "last_seen": row.last_seen.isoformat() if row.last_seen else None,
             "recovered_at": row.recovered_at.isoformat() if row.recovered_at else None,
+            "escalated_at": row.escalated_at.isoformat() if row.escalated_at else None,
             "reason": row.reason,
             "metrics": row.metrics,
         } for row in rows]
@@ -785,6 +786,9 @@ def get_notification_logs(store_id: str | None = None,
             "message_id": row.message_id,
             "error": row.error,
             "created_at": row.created_at.isoformat() if row.created_at else None,
+            "chat_id": (
+                outbox_by_key[row.dedupe_key].chat_id if row.dedupe_key in outbox_by_key else None
+            ),
             "outbox_status": (
                 outbox_by_key[row.dedupe_key].status if row.dedupe_key in outbox_by_key else None
             ),
