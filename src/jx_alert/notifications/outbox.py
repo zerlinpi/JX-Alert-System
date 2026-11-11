@@ -22,6 +22,7 @@ class NotificationOutbox(Base):
 
 
 def enqueue_notification(db, *, idempotency_key: str, text: str,
+                         store_id: str | None = None, entity_id: str | None = None,
                          open_ids: list[str] | None = None) -> NotificationOutbox:
     """Insert once per idempotency key; caller commits the surrounding transaction."""
     existing = db.scalar(
@@ -34,7 +35,8 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
     row = NotificationOutbox(
         idempotency_key=idempotency_key,
         chat_id="default",
-        payload={"text": text, "open_ids": open_ids or []},
+        payload={"text": text, "store_id": store_id, "entity_id": entity_id,
+                 "open_ids": open_ids or []},
         status="PENDING",
     )
     db.add(row)
