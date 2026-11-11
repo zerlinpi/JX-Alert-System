@@ -17,7 +17,7 @@
 - **可靠通知：** 幂等 outbox、worker claim、失败退避重试和投递日志。Webhook 本身不支持外部幂等键，因此进程在“飞书已接收、数据库尚未标记成功”之间崩溃时，重试可能产生重复消息（at-least-once）。
 - **Excel：** 已生成真实数据的七工作表日报，支持全店汇总和按店铺分别导出。
 - **调度/回补：** 每日调度已连接采集、异常分析和店铺 Excel 导出；提供 8–30 天显式历史回补 CLI。默认调度关闭。
-- **MCP：** 提供健康状态和已存储异常查询；尚未开放真实采集触发工具。
+- **MCP：** 提供只读店铺、活动、日指标、异常、coverage、同步任务查询；支持本地 stdio 与可选的 Streamable HTTP 远程服务。远程服务使用 Bearer Token，并默认只绑定宿主机回环地址；不开放领星采集或广告修改工具。
 
 ## 已核验的领星业务 API
 
@@ -101,6 +101,21 @@
 docker compose --profile scheduler up -d --build scheduler
 ```
 
+远程 MCP 服务使用独立的可选 profile。先在服务器 `.env` 中生成并设置至少 32 字符的 Bearer Token：
+```bash
+openssl rand -hex 32
+nano .env
+# 设置 MCP_BEARER_TOKEN=上一步生成的随机值
+```
+
+保持默认 `MCP_BIND_IP=127.0.0.1`，再启动：
+```bash
+docker compose --profile mcp up -d --build mcp
+docker compose logs -f mcp
+```
+
+本机 MCP 地址为 `http://127.0.0.1:8001/mcp`。如果要经公网域名提供给远程 MCP 客户端，先配置 TLS 反向代理，并把域名写入 `MCP_ALLOWED_HOSTS`（例如 `mcp.example.com,mcp.example.com:*`）；浏览器客户端还需配置准确的 `MCP_ALLOWED_ORIGINS`。不要将 MCP 容器端口直接暴露公网。客户端需要使用对应 Bearer Token。不要把 Token 写进仓库、聊天或 URL。
+
 默认 API 仅绑定 `127.0.0.1`，建议通过服务器 Nginx/Caddy 反向代理访问，不要直接暴露到公网。生产环境请另行配置 TLS、访问控制和防火墙。
 
 ## 测试
@@ -151,6 +166,6 @@ python scripts/test_feishu_webhook.py --send
 - 绩效通知接口尚未确认。
 - 店铺/站点时区、币种、负责人映射需由真实账号数据确认。
 - 数据库已加入兼容旧表的幂等增量升级；尚未迁移到完整 Alembic 版本化迁移框架。
-- 尚未在你的 Linux 服务器执行 Docker 部署，也未进行真实领星或飞书端到端测试。
+- 尚未在你的 Linux 服务器执行 Docker 部署，也未进行真实领星、飞书或远程 MCP 客户端端到端测试。
 
 第一阶段只读领星，不提供修改广告预算、竞价、关键词或活动状态的功能。
