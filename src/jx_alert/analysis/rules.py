@@ -64,7 +64,7 @@ def detect_order_anomaly(*, entity_key: str, current_orders: float,
     ]
 
 
-def detect_campaign_anomalies(*, entity_key: str, spend: float, orders: float,
+def detect_campaign_anomalies(*, entity_key: str, spend: float, orders: float | None,
                               clicks: int, prior_7_spend: list[float],
                               prior_7_orders: list[float], daily_budget: float | None,
                               config: RuleConfig, campaign_enabled: bool = True,
