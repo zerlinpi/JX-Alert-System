@@ -3,6 +3,7 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy import delete, select
 
+from jx_alert.storage.coverage import mark_coverage
 from jx_alert.storage.models import DailyMetric, Product, RawSnapshot, Store
 
 
@@ -222,6 +223,18 @@ def collect_sales_for_day(client, db, report_dates: str | dict[str, str], *,
                 currency=next(iter(currencies), None),
                 source="lingxing_sales_report",
             ))
+        for asin_type, dimension in ((1, "sku_asin"), (2, "sku_msku")):
+            entity_keys = set().union(*(
+                set(metric_values.keys()) for metric_values in collected[asin_type].values()
+            ))
+            mark_coverage(
+                db, store_id=store_id, metric_date=metric_date,
+                dimension=dimension, row_count=len(entity_keys),
+            )
+        mark_coverage(
+            db, store_id=store_id, metric_date=metric_date,
+            dimension="store", row_count=1,
+        )
         db.commit()
         report_count += sum(len(rows) for rows in collected[1].values()) + sum(
             len(rows) for rows in collected[2].values()
