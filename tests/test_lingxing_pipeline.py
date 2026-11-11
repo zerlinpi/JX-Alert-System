@@ -103,3 +103,27 @@ def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps():
             "store_status", "sales", "campaigns", "campaign_reports"
         ]
         assert db.scalar(select(func.count()).select_from(DailyMetric)) > 0
+
+
+
+def test_daily_pipeline_refreshes_configured_ad_attribution_window():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        result = collect_daily_snapshot(
+            FakeDailyClient(),
+            db,
+            {"101": "2026-11-10"},
+            ad_attribution_refresh_days=2,
+        )
+        assert result["status"] == "SUCCEEDED"
+        assert result["steps"]["ad_report_dates"] == {
+            "101": ["2026-11-09", "2026-11-10"]
+        }
+        assert result["steps"]["campaign_reports"]["rows"] == {
+            "sp": 2, "sb": 2, "sd": 2,
+        }
+        assert result["steps"]["product_ad_reports"]["rows"] == {
+            "sp": 2, "sd": 2,
+        }
