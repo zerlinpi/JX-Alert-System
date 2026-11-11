@@ -49,3 +49,24 @@ def test_upgrade_schema_adds_missing_anomaly_columns_and_index():
 def test_upgrade_schema_is_safe_when_anomaly_table_does_not_exist():
     engine = create_engine("sqlite:///:memory:")
     assert upgrade_schema(engine) == []
+
+
+
+def test_upgrade_schema_adds_timezone_and_currency_to_legacy_store_table():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE stores (
+                sid VARCHAR(100) PRIMARY KEY,
+                name VARCHAR(200) NOT NULL
+            )
+        """))
+        connection.execute(text(
+            "INSERT INTO stores (sid, name) VALUES ('101', 'Store A')"
+        ))
+
+    changes = upgrade_schema(engine)
+    columns = {column["name"] for column in inspect(engine).get_columns("stores")}
+    assert {"timezone", "currency_code"} <= columns
+    assert "stores.timezone" in changes
+    assert "stores.currency_code" in changes
