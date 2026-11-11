@@ -100,12 +100,13 @@ class LingxingTokenProvider:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def _call(self, *, path: str, template: str, method: str, refresh_token: str = "") -> dict:
+    def _call(self, *, path: str, template: str, method: str,
+              refresh_token: str = "", access_token: str = "") -> dict:
         s = self.settings
         values = {
             "LINGXING_APP_ID": s.lingxing_app_id,
             "LINGXING_APP_SECRET": s.lingxing_app_secret,
-            "LINGXING_ACCESS_TOKEN": "",
+            "LINGXING_ACCESS_TOKEN": access_token,
             "LINGXING_REFRESH_TOKEN": refresh_token,
         }
         payload = _json_payload(template, values)
@@ -137,11 +138,16 @@ class LingxingTokenProvider:
             return state["access_token"]
 
         if state.get("refresh_token") and s.lingxing_refresh_path:
+            if not s.lingxing_refresh_response_path:
+                raise LingxingError(
+                    "LINGXING_REFRESH_RESPONSE_PATH is required because Lingxing rotates refresh tokens."
+                )
             data = self._call(
                 path=s.lingxing_refresh_path,
                 template=s.lingxing_refresh_request_json,
                 method=s.lingxing_refresh_method,
                 refresh_token=state["refresh_token"],
+                access_token=state.get("access_token", ""),
             )
         else:
             if not s.lingxing_token_path:
