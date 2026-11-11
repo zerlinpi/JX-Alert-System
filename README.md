@@ -9,6 +9,7 @@
 - **领星：** AppID / AppSecret 用于按账户文档配置 Token 获取和续约；业务 API 使用 Bearer Token + URL Query 签名。Token 路径、请求体和响应字段路径必须从当前领星开放平台文档确认后填写。
 - **飞书：** 使用群自定义机器人 Webhook 单向推送到一个指定群，不使用飞书应用机器人或 tenant_access_token。
 - **数据库：** MariaDB 11；本地测试支持 SQLite。保留原始快照、日指标、异常事件、通知日志和 outbox。
+- **广告采集：** 已建立只读 SP/SB/SD 活动日报采集器；SP/SD 游标分页、SB 偏移分页，原始报表和 campaign 日指标入库。可按每个 sid 提供店铺本地报表日期。
 - **异常：** 订单量相对前七个完整自然日均值变化默认 ±15%；广告高花费、达到花费/点击门槛但无转化、低花费无转化和预算消耗提示。
 - **可靠通知：** 幂等 outbox、worker claim、失败退避重试和投递日志。Webhook 本身不支持外部幂等键，因此进程在“飞书已接收、数据库尚未标记成功”之间崩溃时，重试可能产生重复消息（at-least-once）。
 - **Excel：** 每日多工作表导出模块已建立。
@@ -98,9 +99,18 @@ ruff check .
 ```
 
 领星连接检查默认只检查本地配置，不获取 Token 或请求店铺数据。确认 Token 接口字段已核验后才加 `--request`：
+
 ```bash
 python scripts/test_lingxing_connection.py
 python scripts/test_lingxing_connection.py --request
+```
+
+广告日报采集也默认 dry-run。确认 Token 配置和店铺本地日期后，显式使用 `--collect`，并将服务器本地 `APP_DRY_RUN=false`：
+```bash
+python scripts/collect_lingxing_ads.py
+python scripts/collect_lingxing_ads.py --collect --date 2026-11-10
+# 多个站点日期不同：data/store-report-dates.json 内容为 {"sid1":"YYYY-MM-DD","sid2":"YYYY-MM-DD"}
+python scripts/collect_lingxing_ads.py --collect --date-map data/store-report-dates.json
 ```
 
 飞书连通性脚本默认只做本地配置检查，不发送消息。只有明确准备好向真实群发送测试时才加 `--send`：
@@ -112,7 +122,7 @@ python scripts/test_feishu_webhook.py --send
 ## 尚未达到生产完成的部分
 
 - 领星 Token 接口的准确路径、请求字段和响应字段路径尚需按你账号开放平台当前文档填写并验证。
-- 领星销量/广告响应 JSON 的标准化适配、游标分页采集、历史回补和每日完整数据流水线尚未完成。
+- 领星销量/MSKU 日报适配、历史回补、绩效通知和每日完整自动流水线尚未完成；当前已接入的是 SP/SB/SD 活动级日报，不是 SKU 级广告商品报告。
 - 绩效通知接口尚未确认。
 - 店铺/站点时区、币种、负责人映射需由真实账号数据确认。
 - 当前数据库初始化使用 SQLAlchemy `create_all`；尚未加入 Alembic 版本迁移。
