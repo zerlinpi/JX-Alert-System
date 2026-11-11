@@ -14,8 +14,8 @@ class FeishuWebhookError(RuntimeError):
 
 
 def build_feishu_signature(timestamp: str, secret: str) -> str:
-    """Feishu custom-bot signature: HMAC-SHA256(key=timestamp + '\\n' + secret, msg='')."""
-    key = f"{timestamp}\\n{secret}".encode("utf-8")
+    """Feishu custom-bot signature: HMAC-SHA256(key=timestamp + '\n' + secret, msg='')."""
+    key = f"{timestamp}\n{secret}".encode("utf-8")
     digest = hmac.new(key, b"", digestmod=hashlib.sha256).digest()
     return base64.b64encode(digest).decode("ascii")
 
@@ -42,7 +42,7 @@ class FeishuClient:
         )
         message = mentions + text
         if self.keyword and self.keyword not in message:
-            message = f"{self.keyword}\\n{message}"
+            message = f"{self.keyword}\n{message}"
         payload = {"msg_type": "text", "content": {"text": message}}
         if self.sign_secret:
             timestamp = str(int(time.time()))
