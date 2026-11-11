@@ -196,10 +196,9 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
     settings = get_settings()
     if settings.app_dry_run or not settings.feishu_enabled:
         return {"sent": 0, "skipped": True, "reason": "dry-run or Feishu disabled"}
-    if not settings.feishu_webhook_url:
-        raise RuntimeError("FEISHU_WEBHOOK_URL is required when FEISHU_ENABLED=true")
-
     routing = _load_routing(settings.feishu_routing_file)
+    if not routing.get("groups") and not settings.feishu_webhook_url:
+        raise RuntimeError("FEISHU_WEBHOOK_URL is required when FEISHU_ENABLED=true")
     default_ids = settings.feishu_at_ids()
     default_chat_id = routing.get("default_chat_id", "default")
     client_cache = {}
