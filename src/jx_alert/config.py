@@ -1,5 +1,6 @@
 from functools import lru_cache
 from sqlalchemy.engine import URL
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,6 +12,8 @@ class Settings(BaseSettings):
     app_timezone: str = "Asia/Shanghai"
     scheduler_enabled: bool = False
     daily_sync_cron: str = "0 8 * * *"
+    # Refresh report_date D and the previous seven marketplace-local days daily.
+    ad_attribution_refresh_days: int = Field(default=8, ge=1, le=31)
     store_timezones_file: str = "/app/data/store-timezones.json"
 
     # Remote MCP uses Streamable HTTP and is published on a loopback-only host port.
