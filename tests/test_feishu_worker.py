@@ -23,12 +23,18 @@ def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_pa
             asin="B000000001",
             owner_open_ids=["ou_product_owner"],
         ))
+        db.add(Product(
+            store_id="store-1",
+            seller_sku="SKU-2",
+            asin="B000000001",
+            owner_open_ids=["ou_brand_owner"],
+        ))
         db.add(NotificationOutbox(
             idempotency_key="stale-job",
             chat_id="default",
             payload={
                 "text": "test alert", "open_ids": [],
-                "store_id": "store-1", "entity_id": "SKU-1",
+                "store_id": "store-1", "entity_id": "B000000001",
             },
             status="SENDING",
             attempts=1,
@@ -65,7 +71,7 @@ def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_pa
 
     assert result["sent"] == 1
     assert result["claimed"] == 1
-    assert sent == [("test alert", ["ou_product_owner"])]
+    assert sent == [("test alert", ["ou_product_owner", "ou_brand_owner"])]
     with Session() as db:
         row = db.scalar(select(NotificationOutbox))
         assert row.status == "DELIVERED"
