@@ -42,6 +42,7 @@ def main():
         raise SystemExit("No active Lingxing stores were returned.")
 
     analysis_dates: set[str] = set()
+    analysis_maps: list[dict[str, str]] = []
     history_maps = []
     collected = []
     with SessionLocal() as db:
@@ -58,11 +59,14 @@ def main():
             sync_store_config(db, settings.store_timezones_file)
             db.commit()
             if offset <= args.days - 8:
+                analysis_maps.append(report_dates)
                 analysis_dates.update(report_dates.values())
 
+        # A backfill day is a per-store date map, not necessarily one global date.
+        # Keep each store aligned to its own marketplace calendar.
         analyses = [
-            evaluate_daily_anomalies(db, report_date)
-            for report_date in sorted(analysis_dates)
+            evaluate_daily_anomalies(db, date_map)
+            for date_map in analysis_maps
         ]
         report_files = []
         for date_map in history_maps:
@@ -76,6 +80,7 @@ def main():
         "days_requested": args.days,
         "daily_jobs": len(collected),
         "analysis_dates": sorted(analysis_dates),
+        "analysis_days": len(analysis_maps),
         "analyses": analyses,
         "report_files": report_files,
     }, ensure_ascii=False, default=str))
