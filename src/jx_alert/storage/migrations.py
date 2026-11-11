@@ -65,8 +65,6 @@ def upgrade_schema(engine) -> list[str]:
                 "has_ads_setting": "INTEGER NOT NULL DEFAULT 0",
                 "updated_at": "DATETIME NULL",
             }, changes)
-            if "stores.updated_at" in changes:
-                _backfill_updated_at(connection, "stores")
 
         if "products" in tables:
             _add_missing_columns(connection, inspector, "products", {
@@ -77,8 +75,6 @@ def upgrade_schema(engine) -> list[str]:
                 "owner_open_ids": "JSON NULL",
                 "updated_at": "DATETIME NULL",
             }, changes)
-            if "products.updated_at" in changes:
-                _backfill_updated_at(connection, "products")
 
         if "campaigns" in tables:
             _add_missing_columns(connection, inspector, "campaigns", {
@@ -93,8 +89,6 @@ def upgrade_schema(engine) -> list[str]:
                 "last_over_budget_at": "VARCHAR(40) NULL",
                 "updated_at": "DATETIME NULL",
             }, changes)
-            if "campaigns.updated_at" in changes:
-                _backfill_updated_at(connection, "campaigns")
 
         if "ad_products" in tables:
             _add_missing_columns(connection, inspector, "ad_products", {
@@ -105,7 +99,12 @@ def upgrade_schema(engine) -> list[str]:
                 "serving_status": "VARCHAR(80) NULL",
                 "updated_at": "DATETIME NULL",
             }, changes)
-            if "ad_products.updated_at" in changes:
-                _backfill_updated_at(connection, "ad_products")
+
+        # Backfill timestamp columns after all ALTER TABLE statements. SQLite can
+        # otherwise discard earlier UPDATEs when subsequent tables are altered in
+        # the same schema-upgrade transaction.
+        for table in ("stores", "products", "campaigns", "ad_products"):
+            if f"{table}.updated_at" in changes:
+                _backfill_updated_at(connection, table)
 
     return changes
