@@ -6,6 +6,7 @@ from jx_alert.storage.db import Base
 from jx_alert.storage import models  # noqa: F401
 from jx_alert.notifications.outbox import NotificationOutbox  # noqa: F401
 from jx_alert.storage.models import (
+    AdProduct,
     AnomalyEvent,
     NotificationLog,
     Campaign,
@@ -44,6 +45,11 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
             store_id="101", seller_sku="SKU-1", asin="B000000001",
             local_sku="LOCAL-1", product_name="Test product",
             currency_code="USD", owner_open_ids=["ou_product_owner"],
+        ))
+        db.add(AdProduct(
+            store_id="101", campaign_type="sp", ad_id="ad-1",
+            campaign_id="campaign-1", ad_group_id="group-1",
+            asin="B000000001", seller_sku="SKU-1",
         ))
         db.add(AnomalyEvent(
             dedupe_key="101:101:orders_decrease", store_id="101",
@@ -114,7 +120,7 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
             entity_id="ad-1", metric_name="spend", value=8,
             currency="USD", source="test",
         ))
-        for dimension in ("sku_msku", "sku_asin", "campaign_sp"):
+        for dimension in ("sku_msku", "sku_asin", "campaign_sp", "product_ad_sp"):
             for offset in range(1, 8):
                 day = target - timedelta(days=offset)
                 db.add(DataCoverage(
@@ -127,9 +133,12 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
                 elif dimension == "sku_asin":
                     entity_id = "B000000001"
                     metrics_for_day = {"orders": 8, "units": 9, "sales": 80}
-                else:
+                elif dimension == "campaign_sp":
                     entity_id = "campaign-1"
                     metrics_for_day = {"spend": 10, "orders": 1, "sales": 40, "clicks": 8, "impressions": 800}
+                else:
+                    entity_id = "ad-1"
+                    metrics_for_day = {"spend": 4, "orders": 1, "sales": 20, "units": 1, "clicks": 2, "impressions": 100}
                 for metric_name, metric_value in metrics_for_day.items():
                     db.add(DailyMetric(
                         store_id="101", metric_date=day, dimension=dimension,
@@ -200,6 +209,17 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
     campaign_rows = mcp_server.get_campaign_performance("101", "2026-11-10", "sp")
     assert campaign_rows[0]["metrics"]["spend"]["current"] == 12
     assert campaign_rows[0]["metrics"]["spend"]["average_7d"] == 10
+    assert campaign_rows[0]["metrics"]["spend"]["previous_day"] == 10
+    assert campaign_rows[0]["metrics"]["spend"]["change_vs_previous_day"] == 0.2
+
+    product_ad_rows = mcp_server.get_product_ad_performance(
+        "101", "2026-11-10", "sp"
+    )
+    product_ad_row = next(row for row in product_ad_rows if row["ad_id"] == "ad-1")
+    assert product_ad_row["metrics"]["spend"]["current"] == 8
+    assert product_ad_row["metrics"]["spend"]["previous_day"] == 4
+    assert product_ad_row["metrics"]["spend"]["average_7d"] == 4
+    assert product_ad_row["metrics"]["spend"]["change_vs_previous_day"] == 1.0
 
     history = mcp_server.get_anomaly_history(store_id="101", entity_id="101")
     assert history[0]["rule"] == "orders_decrease"
