@@ -13,7 +13,7 @@
 - **广告采集：** 已接入 SP/SB/SD 活动日报、SP/SB/SD 活动基础资料，以及 SP/SD 商品广告日报。SB 商品级报表接口尚未确认，不猜测接口路径。
 - **数据完整性：** 按店铺、日期、数据维度写入 coverage 标记；只有完整采集日才能把未返回的指标解释为零。
 - **时区：** 每个 sid 单独配置 IANA 时区和币种，日报按站点本地前一完整自然日计算。
-- **异常：** 店铺状态异常事件；店铺、ASIN、MSKU 订单/销量相对前七个完整自然日均值变化默认 ±15%；广告高花费、花费/点击达到门槛但无转化、低花费无转化、预算消耗和领星超预算事件。
+- **异常：** 店铺状态异常事件；店铺、ASIN、MSKU 订单量、销量和销售额相对前七个完整自然日均值变化默认 ±15%；广告高花费、花费/点击达到门槛但无转化、低花费无转化、预算消耗和领星超预算事件。
 - **可靠通知：** 幂等 outbox、worker claim、失败退避重试和投递日志。Webhook 本身不支持外部幂等键，因此进程在“飞书已接收、数据库尚未标记成功”之间崩溃时，重试可能产生重复消息（at-least-once）。
 - **Excel：** 已生成真实数据的七工作表日报，支持全店汇总和按店铺分别导出。
 - **调度/回补：** 每日调度已连接采集、异常分析和店铺 Excel 导出；提供 8–30 天显式历史回补 CLI。默认调度关闭。
@@ -81,9 +81,11 @@
    ```bash
    mkdir -p data
    cp config/feishu-routing.example.json data/feishu-routing.json
+   cp config/store-timezones.example.json data/store-timezones.json
    sudo chown -R 10001:10001 data
    chmod 700 data
-   chmod 600 data/feishu-routing.json
+   chmod 600 data/feishu-routing.json data/store-timezones.json
+   nano data/store-timezones.json
    ```
 5. 先保持 dry-run，验证 Compose 配置并启动 API 与数据库：
    ```bash
