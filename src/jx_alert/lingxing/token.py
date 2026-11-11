@@ -4,9 +4,11 @@ The exact token endpoint and field names vary by the account's current API docs.
 This module intentionally requires explicit paths and response-field mappings.
 """
 import json
+import fcntl
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -154,13 +156,34 @@ class LingxingTokenProvider:
             raise LingxingError(f"Lingxing token endpoint failed: code={code}")
         return data
 
+    @contextmanager
+    def _exclusive_lock(self):
+        token_path = Path(self.settings.lingxing_token_store_path)
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(token_path.parent, 0o700)
+        lock_path = token_path.with_suffix(token_path.suffix + ".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def get_access_token(self) -> str:
         s = self.settings
         if s.lingxing_access_token:
             return s.lingxing_access_token
         if not s.lingxing_app_id or not s.lingxing_app_secret:
             raise LingxingError("LINGXING_APP_ID and LINGXING_APP_SECRET are required")
+        # Multiple app/scheduler/MCP containers share the same token cache. The
+        # OS file lock prevents two processes consuming the same single-use refresh token.
+        with self._exclusive_lock():
+            return self._get_access_token_locked()
 
+    def _get_access_token_locked(self) -> str:
+        s = self.settings
         state = self._load()
         now = int(time.time())
         access_is_valid = (
