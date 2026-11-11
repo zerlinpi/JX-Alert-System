@@ -74,7 +74,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
                 row.severity = _ESCALATED_SEVERITY.get(incoming_severity, incoming_severity)
             else:
                 row.status = "ONGOING"
-                row.severity = event["severity"]
+                row.severity = incoming_severity
             row.last_seen = now
             row.entity_id = event.get("entity_key", "")
             row.metrics = event["metrics"]
