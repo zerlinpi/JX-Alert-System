@@ -67,6 +67,8 @@
    mkdir -p data
    sudo chown -R 10001:10001 data
    chmod 700 data
+   cp config/feishu-routing.example.json data/feishu-routing.json
+   chmod 600 data/feishu-routing.json
    ```
 5. 先保持 dry-run，验证 Compose 配置并启动 API 与数据库：
    ```bash
