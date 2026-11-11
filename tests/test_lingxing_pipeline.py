@@ -82,7 +82,7 @@ def test_daily_pipeline_records_successful_job_and_all_steps():
         job = db.get(SyncJob, result["job_id"])
         assert job.status == "SUCCEEDED"
         assert job.metadata_json["completed_steps"] == [
-            "sales", "campaigns", "campaign_reports", "product_ad_reports"
+            "store_status", "sales", "campaigns", "campaign_reports", "product_ad_reports"
         ]
         assert db.scalar(select(func.count()).select_from(DailyMetric)) > 0
         assert db.scalar(select(func.count()).select_from(DataCoverage)) == 8
@@ -100,6 +100,6 @@ def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps():
         job = db.scalar(select(SyncJob))
         assert job.status == "PARTIAL_FAILED"
         assert job.metadata_json["completed_steps"] == [
-            "sales", "campaigns", "campaign_reports"
+            "store_status", "sales", "campaigns", "campaign_reports"
         ]
         assert db.scalar(select(func.count()).select_from(DailyMetric)) > 0
