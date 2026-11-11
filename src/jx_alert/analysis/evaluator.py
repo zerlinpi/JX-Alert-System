@@ -355,6 +355,12 @@ def evaluate_store_status_events(db, stores_response: dict) -> dict:
         events = []
         if status_code != 1:
             non_normal += 1
+            status_labels = {
+                0: "停止同步",
+                2: "授权异常",
+                3: "欠费停服",
+            }
+            status_label = status_labels.get(status_code, "未知店铺状态")
             severity = "P1" if status_code in {2, 3} else "P2"
             events.append(_event(
                 "store_status_not_normal",
@@ -362,10 +368,13 @@ def evaluate_store_status_events(db, stores_response: dict) -> dict:
                 store_id,
                 f"{store_id}:store_status_not_normal",
                 {
+                    "store_name": record.get("name"),
                     "status_code": status_code,
+                    "status_label": status_label,
                     "has_ads_setting": record.get("has_ads_setting"),
                 },
-                f"领星店铺列表返回非正常状态码：{status_code}，请检查店铺同步/授权状态",
+                f"店铺「{record.get('name') or store_id}」状态为「{status_label}」"
+                f"（领星状态码 {status_code}），请检查领星店铺同步/授权状态",
             ))
         saved_events.extend(upsert_anomalies(
             db,
