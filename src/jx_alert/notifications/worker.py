@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from jx_alert.config import get_settings
 from jx_alert.notifications.feishu import FeishuClient
@@ -78,7 +78,10 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
             update(NotificationOutbox)
             .where(
                 NotificationOutbox.status == "SENDING",
-                NotificationOutbox.claimed_at < stale_before,
+                or_(
+                    NotificationOutbox.claimed_at.is_(None),
+                    NotificationOutbox.claimed_at < stale_before,
+                ),
             )
             .values(status="RETRY", claimed_at=None, next_attempt_at=now)
         )
@@ -105,16 +108,21 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
     sent = 0
     failed = 0
     for row_id, dedupe_key, payload, attempts in jobs:
-        open_ids = list(dict.fromkeys(
-            default_ids
-            + _routed_open_ids(routing, payload.get("store_id"), payload.get("entity_id"))
-            + list(payload.get("open_ids") or [])
-        ))
         try:
+            payload_ids = payload.get("open_ids") or []
+            if not isinstance(payload_ids, list) or not all(
+                isinstance(item, str) and item.startswith("ou_") for item in payload_ids
+            ):
+                raise ValueError("outbox open_ids must be a list of Feishu Open IDs")
+            open_ids = list(dict.fromkeys(
+                default_ids
+                + _routed_open_ids(routing, payload.get("store_id"), payload.get("entity_id"))
+                + payload_ids
+            ))
             client.send_text(str(payload.get("text") or ""), open_ids=open_ids)
             status = "DELIVERED"
             error = None
-            delivered_at = datetime.utcnow()
+            delivered_at = datetime.now(timezone.utc).replace(tzinfo=None)
             sent += 1
         except Exception as exc:  # sanitized client errors never include the webhook URL
             status = "DEAD" if attempts >= max_attempts else "RETRY"
@@ -132,7 +140,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
                 row.delivered_at = delivered_at
                 if status == "RETRY":
                     delay = min(30 * (2 ** max(attempts - 1, 0)), 3600)
-                    row.next_attempt_at = datetime.utcnow() + timedelta(seconds=delay)
+                    row.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=delay)
             db.add(NotificationLog(
                 dedupe_key=dedupe_key,
                 channel="feishu_webhook",
