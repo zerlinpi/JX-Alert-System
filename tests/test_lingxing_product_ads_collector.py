@@ -24,7 +24,10 @@ class FakeProductAdsClient:
             "report_date": payload["report_date"],
             "cost": 12.5,
             "orders": 2,
+            "orders_7d": 3,
+            "same_orders": 1,
             "sales": 50,
+            "sales_7d": 55,
             "units": 2,
             "clicks": 10,
             "impressions": 1000,
@@ -44,7 +47,7 @@ def test_product_ads_collector_saves_sp_sd_metrics_and_mappings():
             "active_ad_stores": 1,
             "rows": {"sp": 1, "sd": 1},
         }
-        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 12
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 18
         assert db.scalar(select(func.count()).select_from(AdProduct)) == 2
         assert db.scalar(select(func.count()).select_from(Product)) == 1
         sp_spend = db.scalar(select(DailyMetric).where(
@@ -53,6 +56,11 @@ def test_product_ads_collector_saves_sp_sd_metrics_and_mappings():
         ))
         assert sp_spend.value == 12.5
         assert sp_spend.metric_date == date(2026, 11, 10)
+        sp_orders_7d = db.scalar(select(DailyMetric).where(
+            DailyMetric.dimension == "product_ad_sp",
+            DailyMetric.metric_name == "orders_7d",
+        ))
+        assert sp_orders_7d.value == 3
         product = db.scalar(select(Product))
         assert product.seller_sku == "SKU-1"
         assert product.asin == "B000000001"
