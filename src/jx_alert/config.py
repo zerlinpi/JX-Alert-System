@@ -1,27 +1,46 @@
 from functools import lru_cache
+from sqlalchemy.engine import URL
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-    app_env: str = "development"
+
+    app_env: str = "production"
     app_dry_run: bool = True
     app_timezone: str = "Asia/Shanghai"
-    database_url: str = "sqlite:///./jxalert.db"
+    scheduler_enabled: bool = False
+    daily_sync_cron: str = "0 8 * * *"
+
+    # Prefer DATABASE_URL when explicitly supplied; otherwise compose a URL safely
+    # from DB_* fields so passwords containing URL-reserved characters are escaped.
+    database_url: str | None = None
+    db_host: str = "db"
+    db_port: int = 3306
+    db_name: str = "jxalert"
+    db_user: str = "jxalert"
+    db_password: str = ""
+
     lingxing_base_url: str = "https://openapi.lingxing.com"
     lingxing_app_id: str = ""
     lingxing_app_key: str = ""
     lingxing_app_secret: str = ""
     lingxing_access_token: str = ""
+    lingxing_refresh_token: str = ""
     lingxing_token_path: str = ""
     lingxing_refresh_path: str = ""
     lingxing_token_request_json: str = "{}"
     lingxing_refresh_request_json: str = "{}"
     lingxing_timeout: int = 30
+
+    # A Feishu custom bot is a one-way webhook bound to one group.
     feishu_enabled: bool = False
-    feishu_app_id: str = ""
-    feishu_app_secret: str = ""
-    feishu_base_url: str = "https://open.feishu.cn"
-    feishu_default_chat_id: str = ""
+    feishu_webhook_url: str = ""
+    feishu_sign_secret: str = ""
+    feishu_keyword: str = ""
+    feishu_default_at_open_ids: str = ""
+    feishu_timeout: int = 20
+
     alert_order_change_ratio: float = 0.15
     alert_high_spend_ratio: float = 1.30
     alert_low_spend_ratio: float = 0.50
@@ -31,6 +50,25 @@ class Settings(BaseSettings):
     alert_min_orders_baseline: float = 1.0
     report_dir: str = "./data/reports"
     raw_dir: str = "./data/raw"
+
+    def resolved_database_url(self) -> str:
+        if self.database_url:
+            return self.database_url
+        if self.db_password:
+            return URL.create(
+                "mysql+pymysql",
+                username=self.db_user,
+                password=self.db_password,
+                host=self.db_host,
+                port=self.db_port,
+                database=self.db_name,
+                query={"charset": "utf8mb4"},
+            ).render_as_string(hide_password=False)
+        return "sqlite:///./jxalert.db"
+
+    def feishu_at_ids(self) -> list[str]:
+        return [item.strip() for item in self.feishu_default_at_open_ids.split(",") if item.strip()]
+
 
 @lru_cache
 def get_settings() -> Settings:
