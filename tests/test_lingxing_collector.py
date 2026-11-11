@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from jx_alert.storage.db import Base
 from jx_alert.storage import models  # noqa: F401
-from jx_alert.storage.models import DailyMetric, RawSnapshot
+from jx_alert.storage.models import DataCoverage, DailyMetric, RawSnapshot
 from jx_alert.lingxing.collector import collect_ads_for_day
 
 
@@ -46,6 +46,7 @@ def test_collect_ads_persists_raw_and_normalized_rows():
         }
         assert db.scalar(select(func.count()).select_from(DailyMetric)) == 18
         assert db.scalar(select(func.count()).select_from(RawSnapshot)) == 4
+        assert db.scalar(select(func.count()).select_from(DataCoverage)) == 3
         spend = db.scalar(select(DailyMetric).where(DailyMetric.metric_name == "spend"))
         assert spend.value == 12.5
         assert spend.metric_date == date(2026, 11, 10)
