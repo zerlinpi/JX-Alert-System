@@ -3,6 +3,10 @@
 No tool in this module contacts Lingxing or sends Feishu messages.
 """
 from datetime import date
+import argparse
+import hmac
+
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp.server.fastmcp import FastMCP
 from sqlalchemy import select, text
@@ -19,6 +23,83 @@ from jx_alert.storage.models import (
 )
 
 mcp = FastMCP("JX Alert System")
+
+
+class BearerTokenMiddleware:
+    """Protect the remote MCP endpoint with a constant-time Bearer token check."""
+
+    def __init__(self, app: ASGIApp, token: str, path: str = "/mcp"):
+        if not token or len(token) < 32:
+            raise ValueError("MCP_BEARER_TOKEN must contain at least 32 characters")
+        if not path.startswith("/") or path == "/":
+            raise ValueError("MCP_PATH must be an absolute non-root path")
+        self.app = app
+        self.token = token
+        self.protected_paths = {path, path.rstrip("/") + "/"}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http" and scope.get("path") in self.protected_paths:
+            authorization = [
+                value for name, value in scope.get("headers", [])
+                if name.lower() == b"authorization"
+            ]
+            valid = False
+            if len(authorization) == 1:
+                value = authorization[0].decode("latin-1")
+                scheme, separator, supplied = value.partition(" ")
+                valid = (
+                    separator == " "
+                    and scheme.lower() == "bearer"
+                    and hmac.compare_digest(supplied, self.token)
+                )
+            if not valid:
+                body = b'{"error":"unauthorized"}'
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                        (b"www-authenticate", b"Bearer"),
+                        (b"cache-control", b"no-store"),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+def create_http_app(settings=None):
+    """Build the authenticated Streamable HTTP ASGI app for remote MCP clients."""
+    from mcp.server.transport_security import TransportSecuritySettings
+    from jx_alert.config import get_settings
+
+    settings = settings or get_settings()
+    if not settings.mcp_bearer_token:
+        raise RuntimeError(
+            "MCP_BEARER_TOKEN is required before starting the remote MCP service"
+        )
+
+    allowed_hosts = settings.mcp_allowed_host_list()
+    allowed_origins = settings.mcp_allowed_origin_list()
+    if not allowed_hosts:
+        # Secure local-only default. Add the exact public hostname before using
+        # a TLS reverse proxy or any non-local MCP client.
+        allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+        allowed_origins = [
+            "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"
+        ]
+
+    transport_security = TransportSecuritySettings(
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+    app = mcp.streamable_http_app(
+        streamable_http_path=settings.mcp_path,
+        host=settings.mcp_host,
+        transport_security=transport_security,
+    )
+    return BearerTokenMiddleware(app, settings.mcp_bearer_token, settings.mcp_path)
 
 
 def _limit(value: int, maximum: int = 500) -> int:
@@ -230,4 +311,24 @@ def get_sync_jobs(limit: int = 50) -> list[dict]:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    parser = argparse.ArgumentParser(description="JX Alert System MCP server")
+    parser.add_argument(
+        "--transport", choices=("stdio", "streamable-http"), default="stdio",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "stdio":
+        mcp.run()
+    else:
+        import uvicorn
+        from jx_alert.config import get_settings
+
+        settings = get_settings()
+        http_app = create_http_app(settings)
+        uvicorn.run(
+            http_app,
+            host=settings.mcp_host,
+            port=settings.mcp_port,
+            log_level="info",
+            proxy_headers=True,
+        )
