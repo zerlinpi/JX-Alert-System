@@ -42,9 +42,8 @@ def daily_job():
             )
             configured_stores = sync_store_config(db, settings.store_timezones_file)
             db.commit()
-            analyses = []
-            for report_date in sorted(set(report_dates.values())):
-                analyses.append(evaluate_daily_anomalies(db, report_date))
+            # Evaluate each store against its own marketplace-local report date.
+            analyses = [evaluate_daily_anomalies(db, report_dates)]
             report_files = []
             for sid, report_date in report_dates.items():
                 report_files.extend(str(path) for path in export_daily_reports(
