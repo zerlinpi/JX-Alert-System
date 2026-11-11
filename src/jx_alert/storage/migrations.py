@@ -37,6 +37,11 @@ def upgrade_schema(engine) -> list[str]:
                     "ALTER TABLE anomaly_events ADD COLUMN recovered_at DATETIME NULL"
                 ))
                 changes.append("anomaly_events.recovered_at")
+            if "escalated_at" not in columns:
+                connection.execute(text(
+                    "ALTER TABLE anomaly_events ADD COLUMN escalated_at DATETIME NULL"
+                ))
+                changes.append("anomaly_events.escalated_at")
             if "ix_anomaly_events_evaluation_scope" not in indexes:
                 connection.execute(text(
                     "CREATE INDEX ix_anomaly_events_evaluation_scope "
