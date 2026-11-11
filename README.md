@@ -43,6 +43,7 @@
 - 群自定义机器人无法通过手机号/邮箱查询用户 ID；请在路由配置中使用该群成员的真实 Open ID。
 - `FEISHU_KEYWORD` 用于满足机器人安全设置中的自定义关键词校验（若启用）。
 - `FEISHU_SIGN_SECRET` 用于签名校验（若启用）。
+- `config/feishu-routing.example.json` 可复制为服务器本地 `data/feishu-routing.json`，按店铺 ID 和 MSKU/ASIN 配置负责人 Open ID。
 - 一个 Webhook 对应一个群；当前配置面向一个主告警群。
 
 官方文档：[飞书自定义机器人使用指南](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)。
