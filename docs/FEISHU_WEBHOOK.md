@@ -20,17 +20,24 @@ FEISHU_SIGN_SECRET=你的签名密钥
 
 签名计算按飞书文档：以 `timestamp + "\\n" + secret` 作为 HMAC-SHA256 的 key，对空字符串签名，再 Base64 编码。请求体携带 `timestamp` 和 `sign`。服务器需保持时间同步。
 
-## 3. 指定人员 @
+## 3. 指定人员 @ 与路由
 
 自定义机器人文本消息支持：
 ```text
 <at user_id="ou_xxxxxxxxx">成员姓名</at>
 ```
 
-把成员真实 Open ID 填入 `FEISHU_DEFAULT_AT_OPEN_IDS`，多个 ID 用英文逗号分隔：
-```env
-FEISHU_DEFAULT_AT_OPEN_IDS=ou_xxxxx,ou_yyyyy
+把成员真实 Open ID 填入路由文件。先复制模板：
+```bash
+cp config/feishu-routing.example.json data/feishu-routing.json
+chmod 600 data/feishu-routing.json
+nano data/feishu-routing.json
 ```
+
+配置结构：
+- `stores`：领星店铺 ID → 店铺负责人 Open ID 列表。
+- `entities`：`店铺ID:MSKU/ASIN` 或全局 MSKU/ASIN → 产品负责人 Open ID 列表。
+- `FEISHU_DEFAULT_AT_OPEN_IDS`：所有告警都 @ 的管理员 Open ID，多个用英文逗号分隔。
 
 注意：
 - 必须是机器人所在群的成员 ID。
