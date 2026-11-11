@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from jx_alert.storage.db import Base
 from jx_alert.storage import models  # noqa: F401
-from jx_alert.storage.models import AdProduct, DailyMetric, Product, RawSnapshot
+from jx_alert.storage.models import AdProduct, DataCoverage, DailyMetric, Product, RawSnapshot
 from jx_alert.lingxing.product_ads_collector import collect_product_ads_for_day
 
 
@@ -57,6 +57,7 @@ def test_product_ads_collector_saves_sp_sd_metrics_and_mappings():
         assert product.seller_sku == "SKU-1"
         assert product.asin == "B000000001"
         assert db.scalar(select(func.count()).select_from(RawSnapshot)) == 2
+        assert db.scalar(select(func.count()).select_from(DataCoverage)) == 2
 
 
 def test_product_ads_collector_replaces_same_day_metrics_idempotently():
