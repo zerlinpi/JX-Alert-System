@@ -52,7 +52,7 @@ LINGXING_EXPIRES_IN_RESPONSE_PATH=
 
 ## 4. Token 缓存
 
-成功取得 Token 后，系统将 access_token、refresh_token 和 expires_at 写入 `LINGXING_TOKEN_STORE_PATH` 指定的本地 JSON 文件，默认位于 `/app/data/secrets/lingxing-token.json`，并设置文件权限 0600。该文件所在的 `data/` 目录必须持久化并限制主机访问权限。
+成功取得 Token 后，系统将 access_token、refresh_token 和 expires_at 写入 `LINGXING_TOKEN_STORE_PATH` 指定的本地 JSON 文件，默认位于 `/app/data/secrets/lingxing-token.json`，并设置文件权限 0600。该文件所在的 `data/` 目录必须持久化并限制主机访问权限。Token Provider 还会在同目录创建权限为 0600 的锁文件，通过 Linux 文件锁串行化 API、scheduler、MCP 多容器的刷新操作，避免两个进程同时消费同一个一次性 refresh_token。
 
 如果设置了 refresh_token 和续约路径，Token Provider 会在到期前尝试续约；续约返回的新 refresh_token 会替换旧值。refresh_token 若为一次性令牌，切勿手动重复使用旧值。
 
