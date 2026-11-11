@@ -17,7 +17,8 @@
 - **可靠通知：** 幂等 outbox、worker claim、失败退避重试和投递日志。Webhook 本身不支持外部幂等键，因此进程在“飞书已接收、数据库尚未标记成功”之间崩溃时，重试可能产生重复消息（at-least-once）。
 - **Excel：** 已生成真实数据的七工作表日报，支持全店汇总和按店铺分别导出。
 - **调度/回补：** 每日调度已连接采集、异常分析和店铺 Excel 导出；提供 8–30 天显式历史回补 CLI。默认调度关闭。
-- **MCP：** 提供只读店铺、产品/MSKU/ASIN负责人映射、SKU/ASIN与广告活动七日表现、日报汇总、异常历史、飞书投递日志、coverage 和同步任务查询；支持本地 stdio 与可选的 Streamable HTTP 远程服务。远程服务使用 Bearer Token，并默认只绑定宿主机回环地址；不开放领星采集或广告修改工具。
+- **MCP：** JX Alert 自身提供只读店铺、产品/MSKU/ASIN负责人映射、SKU/ASIN与广告活动七日表现、日报汇总、异常历史、飞书投递日志、coverage 和同步任务查询；支持本地 stdio 与可选的 Streamable HTTP 远程服务。远程服务使用 Bearer Token，并默认只绑定宿主机回环地址；不开放广告修改工具。
+- **店铺绩效：** 已确认领星官方 MCP 提供店铺绩效列表、绩效详情和业绩通知工具；当前已加入凭证配置与 Schema 探测脚本，尚未把这些工具接入定时采集。需要在领星后台开通 MCP 并提供服务器端 URL/X-Mcp-Key。
 
 ## 已核验的领星业务 API
 
@@ -94,7 +95,7 @@
    docker compose ps
    curl http://127.0.0.1:8000/health
    ```
-6. 阅读 [Linux 部署说明](docs/DEPLOY_LINUX.md)、[领星 Token 配置说明](docs/LINGXING_TOKEN_SETUP.md) 和 [飞书 Webhook 配置说明](docs/FEISHU_WEBHOOK.md)。
+6. 阅读 [Linux 部署说明](docs/DEPLOY_LINUX.md)、[领星 Token 配置说明](docs/LINGXING_TOKEN_SETUP.md)、[飞书 Webhook 配置说明](docs/FEISHU_WEBHOOK.md) 和 [领星店铺绩效 MCP 接入说明](docs/LINGXING_PERFORMANCE_MCP.md)。
 
 调度器是可选 profile。只有完成 API 契约、历史回补、飞书测试后才配置 `SCHEDULER_ENABLED=true`，再执行：
 ```bash
@@ -160,10 +161,10 @@ python scripts/test_feishu_webhook.py --send
 ## 尚未达到生产完成的部分
 
 - 领星 Token 接口的准确路径、请求字段和响应字段路径尚需按你账号开放平台当前文档填写并验证。
-- 领星账户健康/店铺绩效列表、绩效详情和业绩通知 API 尚未完成；需要核对这些接口的准确路径、请求参数和响应结构。
+- 领星店铺绩效列表、绩效详情和业绩通知尚未接入自动采集。官方 MCP 工具 ID 已确认，仍需你在领星后台启用 MCP、在服务器 .env 配置 URL/X-Mcp-Key，并运行 Schema 探测脚本核实真实参数。
 - SB 商品级广告日报的公开 API 契约尚未确认；当前不将 SB 活动数据分摊到商品。
 - 产品表现异步报告（reportType=2）需要嵌套 reportOptions 的签名 canonicalizer；当前客户端对此类嵌套参数 fail closed，未猜测签名格式。
-- 绩效通知接口尚未确认。
+- 业绩通知数据依赖领星插件同步状态；需在接入时增加数据新鲜度检查，不能将插件掉线误判为无异常。
 - 店铺/站点时区、币种、负责人映射需由真实账号数据确认。
 - 数据库已加入兼容旧表的幂等增量升级；尚未迁移到完整 Alembic 版本化迁移框架。
 - 尚未在你的 Linux 服务器执行 Docker 部署，也未进行真实领星、飞书或远程 MCP 客户端端到端测试。
