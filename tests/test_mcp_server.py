@@ -211,3 +211,39 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
 
     jobs = mcp_server.get_sync_jobs()
     assert jobs[0]["status"] == "SUCCEEDED"
+
+
+
+def test_daily_summary_aggregates_all_campaigns_when_detail_is_capped():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    target = date(2026, 11, 10)
+    with Session() as db:
+        db.add(Store(sid="large", name="Large Store", status=1, has_ads_setting=1))
+        for campaign_type in ("sp", "sb", "sd"):
+            db.add(DataCoverage(
+                store_id="large", metric_date=target,
+                dimension=f"campaign_{campaign_type}",
+                status="COMPLETE", row_count=201 if campaign_type == "sp" else 0,
+            ))
+        for index in range(201):
+            campaign_id = f"sp-{index:03d}"
+            db.add(Campaign(
+                store_id="large", campaign_type="sp", campaign_id=campaign_id,
+                name=f"Campaign {index:03d}", state="enabled",
+            ))
+            db.add(DailyMetric(
+                store_id="large", metric_date=target, dimension="campaign_sp",
+                entity_id=campaign_id, metric_name="spend", value=1,
+                currency="USD", source="test",
+            ))
+        db.commit()
+
+        summary = mcp_server._daily_summary(db, "large", target)
+        sp = summary["campaign_ads"]["by_type"]["sp"]
+        assert sp["complete"] is True
+        assert sp["totals"]["spend"] == 201
+        assert len(sp["campaigns"]) == 200
+        assert sp["campaign_count"] == 201
+        assert sp["campaigns_truncated"] is True
