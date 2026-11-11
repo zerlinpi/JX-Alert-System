@@ -60,8 +60,8 @@ def _numeric_map(rows: list[dict], *, key_field: str, expected_date: str,
         if key is None or str(key).strip() == "":
             raise RuntimeError(f"Lingxing sales row is missing {key_field}")
         row_date = row.get("r_date")
-        if row_date and row_date != expected_date:
-            raise RuntimeError("Lingxing sales report returned an unexpected r_date")
+        if row_date != expected_date:
+            raise RuntimeError("Lingxing sales report returned a missing or unexpected r_date")
         try:
             value = float(row["map_value"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -151,34 +151,19 @@ def collect_sales_for_day(client, db, report_dates: str | dict[str, str], *,
                     metric_name=metric_name,
                 )
 
-        # Validate the three complete responses before replacing existing metrics.
-        for asin_type, dimension, key_field in (
-            (1, "sku_asin", "asin"),
-            (2, "sku_msku", "seller_sku"),
-        ):
-            keys = set().union(*(
-                set(collected[asin_type][metric].keys()) for metric in SALES_TYPES.values()
-            ))
-            for key in keys:
-                for metric_name in SALES_TYPES.values():
-                    item = collected[asin_type][metric_name].get(key)
-                    if item is None:
-                        # An absent metric remains absent; do not invent a zero.
-                        continue
-                    _, _, source_row = item
-                    db.add(RawSnapshot(
-                        source=f"lingxing_sales_row_{dimension}",
-                        store_id=store_id,
-                        payload={"report_date": local_date, "row": source_row},
-                    ))
+        # Raw API pages are retained once per metric/dimension below. Missing
+        # metric rows are not synthesized as zero values.
 
         for source, payload in raw_payloads:
             db.add(RawSnapshot(source=source, store_id=store_id, payload=payload))
 
         # Upsert product identity from the MSKU response. Local SKU and owners are
         # intentionally preserved; they are operator-maintained mapping fields.
-        msku_rows = collected[2]["sales"]
-        for seller_sku, (_, currency, source_row) in msku_rows.items():
+        msku_product_rows = {}
+        for metric_values in collected[2].values():
+            for seller_sku, (_, currency, source_row) in metric_values.items():
+                msku_product_rows.setdefault(seller_sku, (currency, source_row))
+        for seller_sku, (currency, source_row) in msku_product_rows.items():
             product = db.scalar(select(Product).where(
                 Product.store_id == store_id,
                 Product.seller_sku == seller_sku,
