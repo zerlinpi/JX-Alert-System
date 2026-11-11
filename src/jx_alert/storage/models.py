@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from sqlalchemy import String, Integer, Float, Date, DateTime, Text, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from jx_alert.storage.db import Base
@@ -21,7 +21,7 @@ class RawSnapshot(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str] = mapped_column(String(80), index=True)
     store_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
-    captured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     payload: Mapped[dict] = mapped_column(JSON)
 
 class AnomalyEvent(Base):
