@@ -35,6 +35,7 @@ class AnomalyEvent(Base):
     status: Mapped[str] = mapped_column(String(20), default="NEW")
     evaluation_scope: Mapped[str] = mapped_column(String(200), default="", index=True)
     recovered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     first_seen: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     metrics: Mapped[dict] = mapped_column(JSON)
