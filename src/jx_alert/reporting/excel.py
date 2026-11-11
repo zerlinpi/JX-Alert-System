@@ -30,7 +30,8 @@ SHEETS = {
     ],
     "SKU销量": [
         "店铺ID", "店铺", "ASIN", "MSKU", "Local SKU", "日期", "订单",
-        "销量", "销售额", "前七日订单均值", "订单变化率", "数据完整性",
+        "销量", "销售额", "前七日订单均值", "订单变化率",
+        "前七日销售额均值", "销售额变化率", "数据完整性",
     ],
     "广告活动": [
         "店铺ID", "店铺", "广告类型", "活动ID", "活动名称", "活动状态",
@@ -182,18 +183,30 @@ def build_daily_report_rows(db, report_date: date | str, *,
                     value(sid, day, "sku_msku", product.seller_sku, "orders") or 0.0
                     for day in baseline_dates
                 ]
+                baseline_sales = [
+                    value(sid, day, "sku_msku", product.seller_sku, "sales") or 0.0
+                    for day in baseline_dates
+                ]
                 average_orders = sum(baseline_orders) / 7
+                average_sales = sum(baseline_sales) / 7
             else:
                 average_orders = None
-            change_ratio = (
+                average_sales = None
+            order_change_ratio = (
                 (current_orders - average_orders) / average_orders
                 if current_orders is not None and average_orders is not None and average_orders > 0
+                else None
+            )
+            sales_change_ratio = (
+                (current_sales - average_sales) / average_sales
+                if current_sales is not None and average_sales is not None and average_sales > 0
                 else None
             )
             rows["SKU销量"].append([
                 sid, store.name, product.asin, product.seller_sku, product.local_sku,
                 target.isoformat(), current_orders, current_units, current_sales,
-                average_orders, change_ratio, "完整" if msku_coverage else "样本不足",
+                average_orders, order_change_ratio, average_sales, sales_change_ratio,
+                "完整" if msku_coverage else "样本不足",
             ])
 
     for campaign in campaigns:
