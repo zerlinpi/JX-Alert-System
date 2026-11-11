@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
@@ -79,7 +80,7 @@ class FakeDailyClient:
         }])
 
 
-def test_daily_pipeline_records_successful_job_and_all_steps():
+def test_daily_pipeline_records_successful_job_and_all_steps(tmp_path):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -87,6 +88,8 @@ def test_daily_pipeline_records_successful_job_and_all_steps():
         result = collect_daily_snapshot(
             FakeDailyClient(), db, "2026-11-10",
             ad_attribution_refresh_days=1,
+            settings=SimpleNamespace(lingxing_performance_enabled=False, raw_dir=str(tmp_path / "raw")),
+            settings=SimpleNamespace(lingxing_performance_enabled=False, raw_dir=str(tmp_path / "raw")),
         )
         assert result["status"] == "SUCCEEDED"
         assert result["store_count"] == 1
@@ -94,13 +97,13 @@ def test_daily_pipeline_records_successful_job_and_all_steps():
         job = db.get(SyncJob, result["job_id"])
         assert job.status == "SUCCEEDED"
         assert job.metadata_json["completed_steps"] == [
-            "store_status", "sales", "campaigns", "campaign_reports", "product_ad_reports"
+            "store_status", "sales", "campaigns", "campaign_reports", "product_ad_reports", "raw_archive"
         ]
         assert db.scalar(select(func.count()).select_from(DailyMetric)) > 0
         assert db.scalar(select(func.count()).select_from(DataCoverage)) == 8
 
 
-def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps():
+def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps(tmp_path):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -119,7 +122,7 @@ def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps():
 
 
 
-def test_daily_pipeline_refreshes_configured_ad_attribution_window():
+def test_daily_pipeline_refreshes_configured_ad_attribution_window(tmp_path):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -129,6 +132,7 @@ def test_daily_pipeline_refreshes_configured_ad_attribution_window():
             db,
             {"101": "2026-11-10"},
             ad_attribution_refresh_days=2,
+            settings=SimpleNamespace(lingxing_performance_enabled=False, raw_dir=str(tmp_path / "raw")),
         )
         assert result["status"] == "SUCCEEDED"
         assert result["steps"]["ad_report_dates"] == {
