@@ -22,7 +22,7 @@ def test_only_complete_scope_can_recover_missing_anomalies():
             status="ONGOING",
             evaluation_scope="store-1:sku-orders",
             first_seen=datetime.now(),
-            last_seen=datetime.utcnow(),
+            last_seen=datetime.now(timezone.utc).replace(tzinfo=None),
             metrics={"orders": 0},
             reason="order decrease",
         )
