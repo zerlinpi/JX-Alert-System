@@ -55,6 +55,9 @@ def test_refresh_token_is_rotated_before_two_hour_expiry(tmp_path, monkeypatch):
     assert saved["refresh_token"] == "new-refresh"
     assert saved["refresh_expires_at"] >= now + 7000
     assert token_file.stat().st_mode & 0o777 == 0o600
+    lock_file = token_file.with_suffix(token_file.suffix + ".lock")
+    assert lock_file.exists()
+    assert lock_file.stat().st_mode & 0o777 == 0o600
 
 
 def test_expired_refresh_token_falls_back_to_app_credentials(tmp_path, monkeypatch):
