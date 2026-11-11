@@ -81,6 +81,7 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
             ):
                 _add_metric(db, store_id, dimension, entity, "orders", day, 10)
                 _add_metric(db, store_id, dimension, entity, "units", day, 10)
+                _add_metric(db, store_id, dimension, entity, "sales", day, 100)
             _add_metric(db, store_id, "campaign_sp", "campaign-1", "spend", day, 10)
             _add_metric(db, store_id, "campaign_sp", "campaign-1", "orders", day, 2)
             _add_metric(db, store_id, "campaign_sp", "campaign-1", "clicks", day, 20)
@@ -95,6 +96,7 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
         ):
             _add_metric(db, store_id, dimension, entity, "orders", target, 5)
             _add_metric(db, store_id, dimension, entity, "units", target, 15)
+            _add_metric(db, store_id, dimension, entity, "sales", target, 50)
         _add_metric(db, store_id, "campaign_sp", "campaign-1", "spend", target, 30)
         _add_metric(db, store_id, "campaign_sp", "campaign-1", "orders", target, 0)
         _add_metric(db, store_id, "campaign_sp", "campaign-1", "clicks", target, 15)
@@ -109,6 +111,7 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
         events = db.scalars(select(AnomalyEvent)).all()
         assert any(row.rule == "orders_decrease" and row.entity_id == "SKU-1" for row in events)
         assert any(row.rule == "units_increase" and row.entity_id == "B000000001" for row in events)
+        assert any(row.rule == "sales_decrease" and row.entity_id == "SKU-1" for row in events)
         assert any(row.rule == "high_ad_spend" and row.entity_id == "campaign-1" for row in events)
         assert any(row.rule == "campaign_over_budget" for row in events)
         assert any(row.rule == "spend_no_conversion" and row.entity_id == "SKU-1" for row in events)
