@@ -8,20 +8,13 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy import delete, select
 
+from jx_alert.lingxing.report_metrics import AD_REPORT_METRICS
 from jx_alert.lingxing.sales_collector import _upsert_store
 from jx_alert.storage.coverage import mark_coverage
 from jx_alert.storage.models import AdProduct, DailyMetric, Product, RawSnapshot
 
 
-AD_METRICS = {
-    "cost": "spend",
-    "orders": "orders",
-    "sales": "sales",
-    "units": "units",
-    "clicks": "clicks",
-    "impressions": "impressions",
-}
-
+AD_METRICS = AD_REPORT_METRICS
 
 def collect_product_ads_for_day(client, db, report_dates: str | dict[str, str], *,
                                 stores_response: dict | None = None,
