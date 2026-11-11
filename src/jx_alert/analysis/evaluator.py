@@ -188,7 +188,10 @@ def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
         prior_spend = [metrics["spend"].get((ad_id, day), 0.0) for day in baseline_dates]
         prior_orders = [metrics["orders"].get((ad_id, day), 0.0) for day in baseline_dates]
         campaign = campaigns.get(ad.campaign_id)
-        campaign_enabled = bool(campaign and (campaign.state or "").lower() == "enabled")
+        ad_enabled = (ad.state or "").lower() == "enabled"
+        campaign_enabled = bool(
+            ad_enabled and campaign and (campaign.state or "").lower() == "enabled"
+        )
         detected = []
         if campaign_enabled:
             detected.extend(detect_order_anomaly(
