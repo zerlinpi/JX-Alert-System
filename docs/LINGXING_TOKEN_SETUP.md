@@ -88,22 +88,21 @@ GET 请求始终通过 URL Query 发送参数。POST 请求支持 JSON、URL-enc
 
 ## 5. 真实 API 验证前的限制
 
-当前还没有对你的账号执行真实 Token 获取或数据接口请求。请先提供（可打码 AppID、AppSecret 和 Token）Token 获取/续约文档中的：
-- API Path 和请求方法；
-- 请求参数字段名称；
-- 成功响应 JSON 示例（凭据值全部打码）。
+当前只确认了 access-token 获取接口契约，尚未对任何真实账号执行 Token 获取或店铺列表请求。请先在服务器本地配置 AppID、AppSecret 和第 3.1 节的 multipart 参数；不要把凭据发送到聊天或提交到 Git。
 
-根据这三项信息核对本项目配置后，先在 Linux 服务器本地执行 dry-run 检查：
+先运行不访问领星的本地配置检查：
 ```bash
 python scripts/test_lingxing_connection.py
 ```
 
-确认 Token 路径、请求参数和响应字段路径已按官方文档填写后，才执行一次真实的只读店铺列表请求：
+确认 dry-run 通过后，更新应用镜像并只重建 app 服务，再执行一次真实的只读店铺列表请求。真实请求会访问领星、获取并在本地受保护的 Token 缓存文件中保存令牌：
 ```bash
-python scripts/test_lingxing_connection.py --request
+docker compose -p jx-alert build app
+docker compose -p jx-alert up -d --no-deps app
+docker compose -p jx-alert run --rm --no-deps app python scripts/test_lingxing_connection.py --request
 ```
 
-该脚本不会打印 Token 或 AppSecret。不要把 AppSecret 或真实 Token 发给 ChatGPT。
+测试脚本不会打印 Token 或 AppSecret。成功标准是输出 `Lingxing read-only store-list request succeeded.`。在续约接口的官方契约确认之前，系统只能在 access_token 失效后用 AppID/AppSecret 重新获取令牌；不要声称 refresh-token 自动续约已经验证。
 
 ## 6. 已接入的只读数据采集
 
