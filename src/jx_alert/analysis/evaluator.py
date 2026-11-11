@@ -106,14 +106,16 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
         prior_orders = [metrics["orders"].get((entity_id, day), 0.0) for day in baseline_dates]
         current_clicks = int(metrics["clicks"].get((entity_id, report_date), 0.0))
 
-        events.extend(detect_order_anomaly(
-            entity_key=entity_id,
-            current_orders=current_orders,
-            previous_orders=previous_orders,
-            prior_7_days=prior_orders,
-            config=config,
-            metric_name="orders",
-        ))
+        campaign_enabled = (campaign.state or "").lower() == "enabled"
+        if campaign_enabled:
+            events.extend(detect_order_anomaly(
+                entity_key=entity_id,
+                current_orders=current_orders,
+                previous_orders=previous_orders,
+                prior_7_days=prior_orders,
+                config=config,
+                metric_name="orders",
+            ))
         events.extend(detect_campaign_anomalies(
             entity_key=entity_id,
             spend=current_spend,
@@ -125,7 +127,7 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
                 campaign.budget if (campaign.budget_type or "").lower() == "daily" else None
             ),
             config=config,
-            campaign_enabled=(campaign.state or "").lower() == "enabled",
+            campaign_enabled=campaign_enabled,
         ))
         if campaign.last_over_budget_at and str(campaign.last_over_budget_at).startswith(
             report_date.isoformat()
@@ -184,16 +186,19 @@ def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
         prior_spend = [metrics["spend"].get((ad_id, day), 0.0) for day in baseline_dates]
         prior_orders = [metrics["orders"].get((ad_id, day), 0.0) for day in baseline_dates]
         campaign = campaigns.get(ad.campaign_id)
-        detected = detect_order_anomaly(
-            entity_key=ad_id,
-            current_orders=current_orders,
-            previous_orders=metrics["orders"].get(
-                (ad_id, report_date - timedelta(days=1)), 0.0
-            ),
-            prior_7_days=prior_orders,
-            config=config,
-            metric_name="orders",
-        )
+        campaign_enabled = bool(campaign and (campaign.state or "").lower() == "enabled")
+        detected = []
+        if campaign_enabled:
+            detected.extend(detect_order_anomaly(
+                entity_key=ad_id,
+                current_orders=current_orders,
+                previous_orders=metrics["orders"].get(
+                    (ad_id, report_date - timedelta(days=1)), 0.0
+                ),
+                prior_7_days=prior_orders,
+                config=config,
+                metric_name="orders",
+            ))
         detected.extend(detect_campaign_anomalies(
             entity_key=ad_id,
             spend=current_spend,
@@ -203,7 +208,7 @@ def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
             prior_7_orders=prior_orders,
             daily_budget=None,
             config=config,
-            campaign_enabled=bool(campaign and (campaign.state or "").lower() == "enabled"),
+            campaign_enabled=campaign_enabled,
         ))
         for event in detected:
             event["entity_key"] = ad.seller_sku or ad.asin or ad_id
