@@ -75,6 +75,40 @@ docker compose down
 docker compose up -d --build
 ```
 
+## 6. 启动远程 MCP 查询服务（可选）
+
+MCP 服务只开放只读查询工具，不会触发领星采集，也不能修改广告。先生成随机 Bearer Token：
+```bash
+openssl rand -hex 32
+nano .env
+```
+
+将生成值写入 `MCP_BEARER_TOKEN`。默认：
+- MCP 容器监听 `0.0.0.0:8001`；
+- Docker 只将端口发布到宿主机 `127.0.0.1:8001`；
+- MCP 路径为 `/mcp`；
+- 未设置域名白名单时，仅允许 localhost Host/Origin。
+
+启动服务：
+```bash
+docker compose --profile mcp up -d --build mcp
+docker compose logs -f mcp
+```
+
+本机 MCP URL：`http://127.0.0.1:8001/mcp`。客户端请求必须带：
+```http
+Authorization: Bearer <MCP_BEARER_TOKEN>
+```
+
+如果需要通过公网域名提供给远程 MCP 客户端：
+1. 配置 Nginx/Caddy TLS 反向代理到 `127.0.0.1:8001`，关闭响应缓冲并允许长连接。
+2. 将实际域名及带端口形式加入 `MCP_ALLOWED_HOSTS`，例如 `mcp.example.com,mcp.example.com:*`。
+3. 如果使用浏览器型客户端，再把其准确来源加入 `MCP_ALLOWED_ORIGINS`。
+4. 确认反向代理透传 `Authorization` 请求头。
+5. 保持 8001 端口只对本机开放，不要直接将容器端口映射到公网。
+
+`MCP_BEARER_TOKEN` 至少 32 字符，建议使用 `openssl rand -hex 32` 生成。不要把它放入 URL、Git、日志或聊天。若 Token 泄露，应立即替换并重启 MCP 服务。
+
 ## 7. 数据备份
 
 数据库备份示例：
