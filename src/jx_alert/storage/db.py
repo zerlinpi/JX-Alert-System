@@ -24,3 +24,5 @@ def init_db():
     from jx_alert.storage import models  # noqa: F401
     from jx_alert.notifications import outbox  # noqa: F401
     Base.metadata.create_all(bind=engine)
+    from jx_alert.storage.migrations import upgrade_schema
+    upgrade_schema(engine)
