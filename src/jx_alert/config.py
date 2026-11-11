@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     app_timezone: str = "Asia/Shanghai"
     scheduler_enabled: bool = False
     daily_sync_cron: str = "0 8 * * *"
-    # Refresh report_date D and the previous seven marketplace-local days daily.
+    # Refresh enough marketplace-local dates for the 14-day attribution window plus its 7-day baseline.
     ad_attribution_refresh_days: int = Field(default=22, ge=1, le=31)
     store_timezones_file: str = "/app/data/store-timezones.json"
 
