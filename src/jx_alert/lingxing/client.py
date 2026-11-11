@@ -7,6 +7,7 @@ Nested JSON values fail closed until an endpoint-specific canonicalizer is added
 import base64
 import hashlib
 import time
+from collections.abc import Iterator
 from urllib.parse import urljoin
 
 import httpx
@@ -146,6 +147,59 @@ class LingxingClient:
         if report_type not in paths:
             raise ValueError("report_type must be sp, sb or sd")
         return self._request("POST", paths[report_type], json_body=payload, advertising=True)
+
+    def iter_advertising_report(self, report_type: str, payload: dict, *,
+                                length: int = 100, max_pages: int = 1000
+                                ) -> Iterator[dict]:
+        """Yield all campaign-report rows; cursor for SP/SD, offset for SB.
+
+        SP/SD OpenAPI v2 return next_token. SB campaign report documentation
+        specifies offset/length pagination. Incomplete pagination raises instead
+        of silently presenting a partial report as complete.
+        """
+        report_type = report_type.lower()
+        if report_type not in {"sp", "sb", "sd"}:
+            raise ValueError("report_type must be sp, sb or sd")
+        if not payload.get("sid") and not payload.get("profile_id"):
+            raise ValueError("campaign report requires sid or profile_id")
+        if not payload.get("report_date"):
+            raise ValueError("campaign report requires report_date in YYYY-MM-DD format")
+        request = {**payload, "offset": 0, "length": length}
+        seen_tokens: set[str] = set()
+        offset = 0
+
+        for _ in range(max_pages):
+            result = self.advertising_report(report_type, request)
+            rows = result.get("data") if isinstance(result, dict) else None
+            if not isinstance(rows, list):
+                raise LingxingError("Campaign report response data must be an array")
+            try:
+                total = int(result.get("total", len(rows)))
+            except (TypeError, ValueError) as exc:
+                raise LingxingError("Campaign report response total is invalid") from exc
+
+            yield from rows
+            offset += len(rows)
+            if offset >= total or not rows:
+                return
+
+            if report_type == "sb":
+                request["offset"] = offset
+                continue
+
+            next_token = result.get("next_token")
+            if not isinstance(next_token, str) or not next_token:
+                raise LingxingError(
+                    f"{report_type.upper()} report pagination incomplete: "
+                    f"{offset} of {total} rows returned without next_token"
+                )
+            if next_token in seen_tokens:
+                raise LingxingError("Campaign report returned a repeated next_token")
+            seen_tokens.add(next_token)
+            request.pop("offset", None)
+            request["next_token"] = next_token
+
+        raise LingxingError(f"Campaign report exceeded max_pages={max_pages}")
 
     def performance(self, path: str, payload: dict):
         if not path.startswith("/") or path.startswith("//"):
