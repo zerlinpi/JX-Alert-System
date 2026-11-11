@@ -11,7 +11,7 @@
 每个 store/date/dimension 写入 `data_coverage` 完整性记录。店铺/ASIN/MSKU 需要 D-7 至 D 八天完整；SP 广告需要 D-14 至 D 共 15 天完整；SB/SD 广告需要 D-21 至 D 共 22 天完整，才能同时评估最新花费和成熟归因订单。只有所需日期全部 COMPLETE，才允许将该维度未返回的指标解释为 0。缺少 coverage、分页中断、响应结构异常时，不把缺失数据当成 0，也不恢复已有异常。
 
 ## 广告活动
-已接入 SP/SB/SD 活动级日报和活动基础资料。SP/SD 活动报表按 `next_token` 游标分页，SB 活动报表按 `offset/length` 分页。Campaign 级数据按 store + campaign type + campaign ID 保存。
+已接入 SP/SB/SD 活动级日报和活动基础资料。SP/SD 活动报表按 `next_token` 游标分页，SB 活动报表按 `offset/length` 分页。Campaign 级数据按 store + campaign type + campaign ID 保存。每次完整分页的活动主数据同步都会将本次列表中未再返回的旧活动标记为 `not_returned`，避免活动已删除/归档后仍以历史 `enabled` 状态参与无转化判断。
 - 高花费：最新报告日 D 的花费达到 D-1 至 D-7 均值的 `ALERT_HIGH_SPEND_RATIO` 倍，且达到最低花费门槛。
 - 无转化：归因成熟日 T 的花费、点击达到配置门槛，成熟订单为 0，且 T-1 至 T-7 的成熟订单均值大于 0。
 - 低花费无转化：启用中的活动在成熟日 T 的花费低于 T-1 至 T-7 均值的配置比例且成熟订单为 0，作为低优先级观察。
