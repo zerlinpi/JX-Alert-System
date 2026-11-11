@@ -12,7 +12,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from jx_alert.config import get_settings
 from jx_alert.storage.db import SessionLocal, engine, init_db
@@ -299,19 +299,36 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
         dimension = f"campaign_{campaign_type}"
         complete = is_complete(dimension, target_date)
         all_campaign_types_complete = all_campaign_types_complete and complete
-        campaigns = db.scalars(select(Campaign).where(
+        campaign_filter = (
             Campaign.store_id == str(store_id),
             Campaign.campaign_type == campaign_type,
+        )
+        campaign_count = db.scalar(
+            select(func.count()).select_from(Campaign).where(*campaign_filter)
+        ) or 0
+        campaigns = db.scalars(select(Campaign).where(
+            *campaign_filter
         ).order_by(Campaign.name).limit(200)).all()
         campaign_items = []
-        totals = {metric: 0.0 for metric in ("spend", "orders", "sales", "clicks", "impressions")}
+        metric_names = ("spend", "orders", "sales", "clicks", "impressions")
+        # Aggregate from the complete report grain, not the capped detail list.
+        # Otherwise stores with >200 campaigns silently receive understated totals.
+        totals = {
+            metric: (
+                sum(
+                    row.value for row in metric_rows
+                    if row.dimension == dimension
+                    and row.metric_date == target_date
+                    and row.metric_name == metric
+                ) if complete else None
+            )
+            for metric in metric_names
+        }
         for campaign in campaigns:
-            item_metrics = {}
-            for metric in totals:
-                metric_value = value(dimension, campaign.campaign_id, metric, target_date)
-                item_metrics[metric] = metric_value
-                if complete and metric_value is not None:
-                    totals[metric] += metric_value
+            item_metrics = {
+                metric: value(dimension, campaign.campaign_id, metric, target_date)
+                for metric in metric_names
+            }
             campaign_items.append({
                 "campaign_id": campaign.campaign_id,
                 "name": campaign.name,
@@ -325,8 +342,10 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
             })
         campaign_by_type[campaign_type] = {
             "complete": complete,
-            "totals": totals if complete else None,
+            "totals": totals,
             "campaigns": campaign_items if complete else None,
+            "campaign_count": campaign_count,
+            "campaigns_truncated": campaign_count > len(campaign_items),
         }
 
     campaign_total = None
