@@ -10,6 +10,7 @@ from jx_alert.lingxing.client import LingxingClient
 from jx_alert.lingxing.pipeline import collect_daily_snapshot
 from jx_alert.analysis.evaluator import evaluate_daily_anomalies
 from jx_alert.storage.store_config import build_store_report_dates, sync_store_config
+from jx_alert.reporting.excel import export_daily_reports
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,10 +45,17 @@ def daily_job():
             analyses = []
             for report_date in sorted(set(report_dates.values())):
                 analyses.append(evaluate_daily_anomalies(db, report_date))
+            report_files = []
+            for sid, report_date in report_dates.items():
+                report_files.extend(str(path) for path in export_daily_reports(
+                    db, report_date, settings.report_dir, store_id=sid
+                ))
 
         logger.info(
-            "Daily pipeline complete: job_id=%s stores=%s timezone_configs=%s analyses=%s",
-            collection["job_id"], collection["store_count"], configured_stores, analyses,
+            "Daily pipeline complete: job_id=%s stores=%s timezone_configs=%s "
+            "analyses=%s report_files=%s",
+            collection["job_id"], collection["store_count"], configured_stores,
+            analyses, report_files,
         )
     except Exception:
         logger.exception("Daily Lingxing collection/analysis failed; no partial data is treated as complete.")
