@@ -58,7 +58,7 @@ def detect_order_anomaly(*, entity_key: str, current_orders: float,
                 "baseline_7d": baseline,
                 "change_ratio": delta,
             },
-            f"{'订单量' if metric_name == 'orders' else '销量'}相对此前七个完整自然日均值变化 {delta:.1%}",
+            f"{ {'orders': '订单量', 'units': '销量', 'sales': '销售额'}.get(metric_name, metric_name) }相对此前七个完整自然日均值变化 {delta:.1%}",
         )
     ]
 
