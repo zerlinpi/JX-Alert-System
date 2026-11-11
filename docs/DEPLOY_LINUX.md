@@ -26,9 +26,11 @@ chmod 600 .env
 ```bash
 mkdir -p data
 cp config/feishu-routing.example.json data/feishu-routing.json
+cp config/store-timezones.example.json data/store-timezones.json
 sudo chown -R 10001:10001 data
 chmod 700 data
-chmod 600 data/feishu-routing.json
+chmod 600 data/feishu-routing.json data/store-timezones.json
+nano data/store-timezones.json
 ```
 
 ## 4. 首次启动
@@ -47,7 +49,7 @@ curl http://127.0.0.1:8000/health
 
 当前日采集任务仍是 fail-closed 占位，真实采集适配、历史回补和接口契约验证完成之前，不要将 `APP_DRY_RUN` 设为 false。
 
-只有确认飞书 Webhook 和 outbox worker 可用后，才设置：
+完成历史回补、检查异常规则和 Excel 结果，并确认飞书 Webhook 测试成功后，才设置：
 ```env
 SCHEDULER_ENABLED=true
 FEISHU_ENABLED=true
@@ -60,7 +62,7 @@ docker compose --profile scheduler up -d --build scheduler
 docker compose logs -f scheduler
 ```
 
-保持 scheduler 只运行一个实例。不要横向扩容 scheduler 服务，否则可能产生重复处理。当前采集流水线尚未接入，开启 scheduler 不会自动拉取领星数据；它只会按配置运行占位日志和通知 outbox worker。
+保持 scheduler 只运行一个实例。不要横向扩容 scheduler 服务，否则可能产生重复处理。启用后，调度器会按 DAILY_SYNC_CRON 执行只读采集、异常分析、每店 Excel 导出，并每 10 秒处理飞书 outbox。
 
 ## 6. 常用维护命令
 
