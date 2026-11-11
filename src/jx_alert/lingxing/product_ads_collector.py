@@ -17,6 +17,97 @@ from jx_alert.storage.models import AdProduct, DailyMetric, Product, RawSnapshot
 
 AD_METRICS = AD_REPORT_METRICS
 
+
+def _sync_product_ad_master_data(client, db, store_id: str, sid, report_type: str,
+                                 page_size: int) -> int:
+    """Synchronize current ad state before evaluating daily product-ad metrics."""
+    rows = list(client.iter_advertising_product_ads(
+        report_type, {"sid": sid}, length=page_size
+    ))
+    normalized = []
+    seen_ids: set[str] = set()
+    for record in rows:
+        ad_id = record.get("ad_id")
+        campaign_id = record.get("campaign_id")
+        seller_sku = record.get("sku")
+        asin = record.get("asin")
+        state = record.get("state")
+        if (
+            ad_id is None or campaign_id is None
+            or not isinstance(seller_sku, str) or not seller_sku.strip()
+            or not isinstance(asin, str) or not asin.strip()
+            or not isinstance(state, str) or not state.strip()
+        ):
+            raise RuntimeError(
+                f"{report_type.upper()} product-ad master row is missing "
+                "ad_id/campaign_id/sku/asin/state"
+            )
+        ad_id = str(ad_id)
+        if ad_id in seen_ids:
+            raise RuntimeError(
+                f"{report_type.upper()} product-ad master list contains duplicate ad_id"
+            )
+        seen_ids.add(ad_id)
+        normalized.append((
+            record, ad_id, str(campaign_id), str(seller_sku), str(asin), state.lower()
+        ))
+
+    db.add(RawSnapshot(
+        source=f"lingxing_{report_type}_product_ads",
+        store_id=store_id,
+        payload={"rows": rows},
+    ))
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for record, ad_id, campaign_id, seller_sku, asin, state in normalized:
+        ad_product = db.scalar(select(AdProduct).where(
+            AdProduct.store_id == store_id,
+            AdProduct.campaign_type == report_type,
+            AdProduct.ad_id == ad_id,
+        ))
+        if ad_product is None:
+            ad_product = AdProduct(
+                store_id=store_id,
+                campaign_type=report_type,
+                ad_id=ad_id,
+                campaign_id=campaign_id,
+            )
+            db.add(ad_product)
+        ad_product.campaign_id = campaign_id
+        ad_product.ad_group_id = (
+            str(record["ad_group_id"]) if record.get("ad_group_id") is not None else None
+        )
+        ad_product.asin = asin
+        ad_product.seller_sku = seller_sku
+        ad_product.state = state
+        ad_product.serving_status = record.get("serving_status")
+        ad_product.updated_at = now
+
+        product = db.scalar(select(Product).where(
+            Product.store_id == store_id,
+            Product.seller_sku == seller_sku,
+        ))
+        if product is None:
+            product = Product(store_id=store_id, seller_sku=seller_sku)
+            db.add(product)
+        product.asin = asin
+        product.updated_at = now
+
+    # A complete master-data response that no longer contains an ad must not
+    # leave its previous "enabled" state active indefinitely.
+    existing_ads = db.scalars(select(AdProduct).where(
+        AdProduct.store_id == store_id,
+        AdProduct.campaign_type == report_type,
+    )).all()
+    for ad_product in existing_ads:
+        if ad_product.ad_id not in seen_ids:
+            ad_product.state = "not_returned"
+            ad_product.serving_status = "not_returned"
+            ad_product.updated_at = now
+
+    db.commit()
+    return len(rows)
+
+
 def collect_product_ads_for_day(client, db,
                                 report_dates: str | dict[str, str | list[str]], *,
                                 stores_response: dict | None = None,
@@ -34,7 +125,12 @@ def collect_product_ads_for_day(client, db,
     db.flush()
 
     row_counts = {"sp": 0, "sd": 0}
+    master_counts = {"sp": 0, "sd": 0}
     for store_id, store in active_ad_stores:
+        for report_type in ("sp", "sd"):
+            master_counts[report_type] += _sync_product_ad_master_data(
+                client, db, store_id, store["sid"], report_type, page_size
+            )
         local_report_dates = normalize_store_report_dates(report_dates, store_id)
         for report_date in local_report_dates:
             metric_date = date.fromisoformat(report_date)
@@ -157,5 +253,6 @@ def collect_product_ads_for_day(client, db,
     return {
         "stores_seen": len(stores),
         "active_ad_stores": len(active_ad_stores),
+        "master_ads": master_counts,
         "rows": row_counts,
     }
