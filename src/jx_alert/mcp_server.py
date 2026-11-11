@@ -737,6 +737,7 @@ def get_anomaly_history(store_id: str | None = None,
             "first_seen": row.first_seen.isoformat() if row.first_seen else None,
             "last_seen": row.last_seen.isoformat() if row.last_seen else None,
             "recovered_at": row.recovered_at.isoformat() if row.recovered_at else None,
+            "escalated_at": row.escalated_at.isoformat() if row.escalated_at else None,
             "reason": row.reason,
             "metrics": row.metrics,
         } for row in rows]
