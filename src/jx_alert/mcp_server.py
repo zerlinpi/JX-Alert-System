@@ -168,6 +168,9 @@ def system_health() -> dict:
         "lingxing_credentials_configured": bool(
             settings.lingxing_app_id and settings.lingxing_app_secret
         ),
+        "lingxing_performance_mcp_configured": bool(
+            settings.lingxing_mcp_url and settings.lingxing_mcp_key.get_secret_value()
+        ),
         "lingxing_token_mode": token_mode,
         "feishu_enabled": settings.feishu_enabled,
         "feishu_webhook_configured": bool(settings.feishu_webhook_url),
