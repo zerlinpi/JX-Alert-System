@@ -11,6 +11,7 @@ class RuleConfig:
     min_spend: float = 20.0
     min_clicks: int = 10
     min_orders_baseline: float = 1.0
+    escalate_after_days: int = 2
 
 
 def _ratio_change(current: float, baseline: float) -> float | None:
