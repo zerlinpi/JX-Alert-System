@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -52,6 +52,39 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
             finished_at=datetime(2026, 11, 11, 8, 1),
             store_count=1, record_count=5, metadata_json={"ok": True},
         ))
+        target = date(2026, 11, 10)
+        for offset in range(1, 8):
+            day = target - timedelta(days=offset)
+            db.add(DataCoverage(
+                store_id="101", metric_date=day, dimension="store",
+                status="COMPLETE", row_count=1,
+            ))
+            db.add(DailyMetric(
+                store_id="101", metric_date=day, dimension="store",
+                entity_id="101", metric_name="orders", value=10,
+                currency="USD", source="test",
+            ))
+        for dimension in (
+            "sku_asin", "sku_msku", "campaign_sp", "campaign_sb",
+            "campaign_sd", "product_ad_sp", "product_ad_sd",
+        ):
+            db.add(DataCoverage(
+                store_id="101", metric_date=target, dimension=dimension,
+                status="COMPLETE", row_count=1,
+            ))
+        for metric_name, metric_value in {
+            "spend": 12, "orders": 2, "sales": 60, "clicks": 10, "impressions": 1000,
+        }.items():
+            db.add(DailyMetric(
+                store_id="101", metric_date=target, dimension="campaign_sp",
+                entity_id="campaign-1", metric_name=metric_name, value=metric_value,
+                currency="USD", source="test",
+            ))
+        db.add(DailyMetric(
+            store_id="101", metric_date=target, dimension="product_ad_sp",
+            entity_id="ad-1", metric_name="spend", value=8,
+            currency="USD", source="test",
+        ))
         db.commit()
 
     monkeypatch.setattr(mcp_server, "SessionLocal", Session)
@@ -64,6 +97,15 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
     metrics = mcp_server.get_daily_metrics("101", "2026-11-10")
     assert metrics[0]["metric_name"] == "orders"
     assert metrics[0]["value"] == 5
+
+    summary = mcp_server.get_daily_summary("101", "2026-11-10")
+    assert summary["data_complete"] is True
+    assert summary["sales"]["orders"]["current"] == 5
+    assert summary["sales"]["orders"]["previous_day"] == 10
+    assert summary["sales"]["orders"]["average_7d"] == 10
+    assert summary["sales"]["orders"]["change_vs_7d_average"] == -0.5
+    assert summary["campaign_ads"]["total"]["spend"] == 12
+    assert summary["product_ads"]["by_type"]["sp"]["totals"]["spend"] == 8
 
     campaigns = mcp_server.get_campaigns(store_id="101", campaign_type="SP")
     assert campaigns[0]["campaign_id"] == "campaign-1"
