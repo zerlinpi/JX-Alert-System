@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from jx_alert.storage.db import Base
 from jx_alert.storage import models  # noqa: F401
-from jx_alert.storage.models import DailyMetric, Product, RawSnapshot, Store
+from jx_alert.storage.models import DataCoverage, DailyMetric, Product, RawSnapshot, Store
 from jx_alert.lingxing.sales_collector import collect_sales_for_day, _fetch_sales_rows
 
 
@@ -73,6 +73,7 @@ def test_sales_collector_saves_store_asin_and_msku_metrics():
         assert msku_orders.value == 3
         assert store_sales.metric_date == date(2026, 11, 10)
         assert db.scalar(select(func.count()).select_from(RawSnapshot)) == 7
+        assert db.scalar(select(func.count()).select_from(DataCoverage)) == 3
 
 
 def test_sales_collector_does_not_synthesize_missing_metrics_as_zero():
