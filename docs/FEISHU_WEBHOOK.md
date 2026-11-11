@@ -54,6 +54,58 @@ python scripts/set_product_owners.py --store-id 你的店铺ID --asin B0XXXXXXXX
 - 手机号、邮箱、昵称不能直接代替 Open ID。
 - 自定义机器人没有查询用户资料或群成员的权限，因此需要从飞书管理界面/已有合法数据中取得 Open ID。
 
+## 3.1 多群路由（可选）
+
+如果不同店铺需要发送到不同运营群，在服务器 `.env` 中为每个群配置独立 Webhook 环境变量，例如：
+```env
+FEISHU_WEBHOOK_URL_STORE1=https://open.feishu.cn/open-apis/bot/v2/hook/真实token
+FEISHU_SIGN_SECRET_STORE1=该群机器人的签名密钥
+FEISHU_KEYWORD_STORE1=JX Alert
+FEISHU_WEBHOOK_URL_STORE2=https://open.feishu.cn/open-apis/bot/v2/hook/另一个真实token
+FEISHU_SIGN_SECRET_STORE2=另一个群的签名密钥
+FEISHU_KEYWORD_STORE2=JX Alert
+```
+
+在 `data/feishu-routing.json` 中配置群 ID、环境变量名称、群管理员 Open ID，再给店铺和 SKU/ASIN 指定群。示例：
+```json
+{
+  "default_chat_id": "main-ops",
+  "groups": {
+    "main-ops": {
+      "webhook_env": "FEISHU_WEBHOOK_URL",
+      "sign_secret_env": "FEISHU_SIGN_SECRET",
+      "admin_open_ids": ["ou_main_admin"]
+    },
+    "store-1-ops": {
+      "webhook_env": "FEISHU_WEBHOOK_URL_STORE1",
+      "sign_secret_env": "FEISHU_SIGN_SECRET_STORE1",
+      "keyword_env": "FEISHU_KEYWORD_STORE1",
+      "admin_open_ids": ["ou_store_1_admin"]
+    }
+  },
+  "stores": {
+    "领星店铺ID": {
+      "chat_id": "store-1-ops",
+      "open_ids": ["ou_store_1_owner"]
+    }
+  },
+  "entities": {
+    "领星店铺ID:MSKU或ASIN": {
+      "chat_id": "store-1-ops",
+      "open_ids": ["ou_product_owner"]
+    }
+  }
+}
+```
+
+- `default_chat_id` 是未匹配到专属群时使用的默认群。
+- `groups.<群ID>.admin_open_ids` 是该群需要被 @ 的群管理员。
+- `stores.<店铺ID>.open_ids` 是店铺负责人；`entities.<店铺ID:MSKU/ASIN>.open_ids` 是商品负责人。
+- `entities` 的群配置优先于 `stores`，店铺路由优先于默认群。
+- `FEISHU_DEFAULT_AT_OPEN_IDS` 中的管理员会在所有群收到 @；各群管理员和负责人会与之合并去重。
+- 旧格式的 `stores: {"店铺ID": ["ou_..."]}` 和 `entities: {"SKU": ["ou_..."]}` 仍兼容，未指定群时走默认群。
+- Webhook URL、签名密钥只放在服务器 `.env`，路由 JSON 仅保存环境变量名称，不保存密钥。
+
 ## 4. 本地配置检查与真实测试
 
 默认命令只检查本地配置，不发送消息：
