@@ -224,14 +224,18 @@ class LingxingClient:
             if not isinstance(rows, list):
                 raise LingxingError("Campaign report response data must be an array")
             try:
-                total = int(result.get("total", len(rows)))
-            except (TypeError, ValueError) as exc:
-                raise LingxingError("Campaign report response total is invalid") from exc
+                total = int(result["total"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise LingxingError("Campaign report response total is missing or invalid") from exc
 
             yield from rows
             offset += len(rows)
-            if offset >= total or not rows:
+            if offset > total:
+                raise LingxingError("Campaign report returned more rows than its reported total")
+            if offset == total:
                 return
+            if not rows:
+                raise LingxingError("Campaign report pagination stopped before the reported total")
 
             if report_type == "sb":
                 request["offset"] = offset
@@ -290,7 +294,9 @@ class LingxingClient:
                 raise LingxingError("Campaign list response total is missing or invalid") from exc
             yield from rows
             offset += len(rows)
-            if offset >= total:
+            if offset > total:
+                raise LingxingError("Campaign list returned more rows than its reported total")
+            if offset == total:
                 return
             if not rows:
                 raise LingxingError(
@@ -347,7 +353,9 @@ class LingxingClient:
                 raise LingxingError("Product ad report response total is missing or invalid") from exc
             yield from rows
             offset += len(rows)
-            if offset >= total:
+            if offset > total:
+                raise LingxingError("Product ad report returned more rows than its reported total")
+            if offset == total:
                 return
             if not rows:
                 raise LingxingError(
