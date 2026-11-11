@@ -11,6 +11,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy import select, text
 
 from jx_alert.config import get_settings
@@ -24,7 +25,33 @@ from jx_alert.storage.models import (
     SyncJob,
 )
 
-mcp = FastMCP("JX Alert System")
+_MCP_SETTINGS = get_settings()
+
+
+def _transport_security(settings):
+    allowed_hosts = settings.mcp_allowed_host_list()
+    allowed_origins = settings.mcp_allowed_origin_list()
+    if not allowed_hosts:
+        # Secure local-only default. Add the exact public hostname before using
+        # a TLS reverse proxy or any non-local MCP client.
+        allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+        allowed_origins = [
+            "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"
+        ]
+    return TransportSecuritySettings(
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    ), allowed_origins
+
+
+_MCP_TRANSPORT_SECURITY, _MCP_ALLOWED_ORIGINS = _transport_security(_MCP_SETTINGS)
+mcp = FastMCP(
+    "JX Alert System",
+    host=_MCP_SETTINGS.mcp_host,
+    port=_MCP_SETTINGS.mcp_port,
+    streamable_http_path=_MCP_SETTINGS.mcp_path,
+    transport_security=_MCP_TRANSPORT_SECURITY,
+)
 
 
 class BearerTokenMiddleware:
@@ -77,38 +104,22 @@ class BearerTokenMiddleware:
 
 def create_http_app(settings=None):
     """Build the authenticated Streamable HTTP ASGI app for remote MCP clients."""
-    from mcp.server.transport_security import TransportSecuritySettings
-    from jx_alert.config import get_settings
-
     settings = settings or get_settings()
     if not settings.mcp_bearer_token:
         raise RuntimeError(
             "MCP_BEARER_TOKEN is required before starting the remote MCP service"
         )
+    if settings.mcp_path != _MCP_SETTINGS.mcp_path:
+        raise RuntimeError(
+            "MCP_PATH is loaded when the MCP server module is imported; restart "
+            "the process after changing MCP_PATH."
+        )
 
-    allowed_hosts = settings.mcp_allowed_host_list()
-    allowed_origins = settings.mcp_allowed_origin_list()
-    if not allowed_hosts:
-        # Secure local-only default. Add the exact public hostname before using
-        # a TLS reverse proxy or any non-local MCP client.
-        allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-        allowed_origins = [
-            "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"
-        ]
-
-    transport_security = TransportSecuritySettings(
-        allowed_hosts=allowed_hosts,
-        allowed_origins=allowed_origins,
-    )
-    app = mcp.streamable_http_app(
-        streamable_http_path=settings.mcp_path,
-        host=settings.mcp_host,
-        transport_security=transport_security,
-    )
-    if allowed_origins:
+    app = mcp.streamable_http_app()
+    if _MCP_ALLOWED_ORIGINS:
         origin_pattern = "|".join(
             re.escape(origin).replace(r"\*", ".*").replace(r"\?", ".")
-            for origin in allowed_origins
+            for origin in _MCP_ALLOWED_ORIGINS
         )
         app = CORSMiddleware(
             app,
@@ -122,7 +133,6 @@ def create_http_app(settings=None):
             expose_headers=["Mcp-Session-Id", "Mcp-Protocol-Version"],
         )
     return BearerTokenMiddleware(app, settings.mcp_bearer_token, settings.mcp_path)
-
 
 def _limit(value: int, maximum: int = 500) -> int:
     return min(max(int(value), 1), maximum)
