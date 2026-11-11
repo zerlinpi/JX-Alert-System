@@ -66,6 +66,7 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
         db.add(AdProduct(
             store_id=store_id, campaign_type="sp", ad_id="ad-1",
             campaign_id="campaign-1", seller_sku="SKU-1", asin="B000000001",
+            state="enabled",
         ))
 
         dimensions = [
@@ -222,6 +223,7 @@ def test_product_ad_anomaly_uses_configured_escalation_window():
         db.add(AdProduct(
             store_id="store-1", campaign_type="sp", ad_id="ad-1",
             campaign_id="campaign-1", seller_sku="SKU-1", asin="B000000001",
+            state="enabled",
         ))
         _add_coverage(db, "store-1", "product_ad_sp", target)
         for offset in range(7, 0, -1):
