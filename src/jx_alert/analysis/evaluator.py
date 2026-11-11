@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import select
 
-from jx_alert.analysis.rules import RuleConfig, detect_campaign_anomalies, detect_order_anomaly
+from jx_alert.analysis.rules import RuleConfig, detect_campaign_anomalies, detect_order_anomaly, _event
 from jx_alert.analysis.service import enqueue_anomaly_notifications, upsert_anomalies
 from jx_alert.storage.models import (
     AdProduct,
@@ -287,6 +287,58 @@ def evaluate_daily_anomalies(db, report_date: date | str,
         "stores_seen": len(stores),
         "evaluated_scopes": evaluated_scopes,
         "skipped_incomplete_scopes": skipped_scopes,
+        "events_touched": len(saved_events),
+        "notifications_queued": queued,
+    }
+
+
+
+def evaluate_store_status_events(db, stores_response: dict) -> dict:
+    """Create/recover store-status events directly from the authoritative seller list."""
+    records = stores_response.get("data") if isinstance(stores_response, dict) else None
+    if not isinstance(records, list):
+        raise RuntimeError("Lingxing seller-list response data must be an array")
+
+    saved_events = []
+    non_normal = 0
+    for record in records:
+        sid = record.get("sid")
+        if sid is None or record.get("status") is None:
+            raise RuntimeError("Lingxing seller-list row must contain sid and status")
+        store_id = str(sid)
+        try:
+            status_code = int(record["status"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid Lingxing store status for sid={store_id}") from exc
+
+        events = []
+        if status_code != 1:
+            non_normal += 1
+            severity = "P1" if status_code in {2, 3} else "P2"
+            events.append(_event(
+                "store_status_not_normal",
+                severity,
+                store_id,
+                f"{store_id}:store_status_not_normal",
+                {
+                    "status_code": status_code,
+                    "has_ads_setting": record.get("has_ads_setting"),
+                },
+                f"领星店铺列表返回非正常状态码：{status_code}，请检查店铺同步/授权状态",
+            ))
+        saved_events.extend(upsert_anomalies(
+            db,
+            store_id,
+            events,
+            evaluation_scope=f"{store_id}:store_status",
+            scope_complete=True,
+        ))
+
+    queued = enqueue_anomaly_notifications(db, saved_events)
+    db.commit()
+    return {
+        "stores_checked": len(records),
+        "non_normal_stores": non_normal,
         "events_touched": len(saved_events),
         "notifications_queued": queued,
     }
