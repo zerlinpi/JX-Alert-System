@@ -61,4 +61,14 @@ LINGXING_EXPIRES_IN_RESPONSE_PATH=
 - 请求参数字段名称；
 - 成功响应 JSON 示例（凭据值全部打码）。
 
-根据这三项信息核对本项目配置，再进行单接口只读连通性测试。不要把 AppSecret 或真实 Token 发给 ChatGPT。
+根据这三项信息核对本项目配置后，先在 Linux 服务器本地执行 dry-run 检查：
+```bash
+python scripts/test_lingxing_connection.py
+```
+
+确认 Token 路径、请求参数和响应字段路径已按官方文档填写后，才执行一次真实的只读店铺列表请求：
+```bash
+python scripts/test_lingxing_connection.py --request
+```
+
+该脚本不会打印 Token 或 AppSecret。不要把 AppSecret 或真实 Token 发给 ChatGPT。
