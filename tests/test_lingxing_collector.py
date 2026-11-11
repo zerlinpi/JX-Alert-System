@@ -61,3 +61,17 @@ def test_collect_ads_replaces_same_day_metrics_idempotently():
         collect_ads_for_day(client, db, "2026-11-10")
         collect_ads_for_day(client, db, "2026-11-10")
         assert db.scalar(select(func.count()).select_from(DailyMetric)) == 18
+
+
+
+def test_collect_ads_accepts_store_local_date_map():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        result = collect_ads_for_day(
+            FakeLingxingClient(), db, {"101": "2026-11-09"}
+        )
+        assert result["report_date"] == "per-store mapping"
+        metric = db.scalar(select(DailyMetric))
+        assert metric.metric_date == date(2026, 11, 9)
