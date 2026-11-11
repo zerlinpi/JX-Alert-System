@@ -57,3 +57,25 @@ def test_campaign_collector_updates_existing_campaigns_without_duplicates():
         collect_campaigns(client, db)
         collect_campaigns(client, db)
         assert db.scalar(select(func.count()).select_from(Campaign)) == 3
+
+
+
+def test_campaign_collector_marks_campaigns_missing_from_complete_list_not_returned():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    class CampaignRemovedClient(FakeCampaignClient):
+        def iter_advertising_campaigns(self, campaign_type, payload, **kwargs):
+            if campaign_type == "sp":
+                return iter([])
+            return super().iter_advertising_campaigns(campaign_type, payload, **kwargs)
+
+    with Session() as db:
+        collect_campaigns(FakeCampaignClient(), db)
+        collect_campaigns(CampaignRemovedClient(), db)
+        sp = db.scalar(select(Campaign).where(Campaign.campaign_type == "sp"))
+        sb = db.scalar(select(Campaign).where(Campaign.campaign_type == "sb"))
+        assert sp.state == "not_returned"
+        assert sp.serving_status == "not_returned"
+        assert sb.state == "enabled"
