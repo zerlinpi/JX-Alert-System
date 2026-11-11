@@ -15,6 +15,7 @@ from jx_alert.storage.models import (
     Store,
 )
 from jx_alert.analysis.evaluator import (
+    _evaluate_campaign_dimension,
     _evaluate_product_ad_dimension,
     evaluate_daily_anomalies,
 )
@@ -284,3 +285,42 @@ def test_product_ad_anomaly_uses_configured_escalation_window():
         updated = next(row for row in saved if row.rule == "spend_no_conversion")
         assert updated.status == "ONGOING"
         assert updated.escalated_at is None
+
+
+
+def test_incomplete_mature_attribution_coverage_does_not_recover_campaign_alert():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    target = date(2026, 11, 10)
+
+    with Session() as db:
+        db.add(Campaign(
+            store_id="store-1", campaign_type="sp", campaign_id="campaign-1",
+            name="SP", state="enabled",
+        ))
+        existing = AnomalyEvent(
+            dedupe_key="store-1:campaign-1:orders_decrease",
+            store_id="store-1",
+            rule="orders_decrease",
+            entity_id="campaign-1",
+            severity="P1",
+            status="ONGOING",
+            evaluation_scope="store-1:campaign:sp",
+            first_seen=datetime.now(timezone.utc).replace(tzinfo=None),
+            last_seen=datetime.now(timezone.utc).replace(tzinfo=None),
+            metrics={"baseline_7d": 10},
+            reason="previous mature-attribution alert",
+        )
+        db.add(existing)
+        # Latest eight days are complete, but the mature conversion baseline
+        # (D-14 through D-8 for SP) is missing.
+        _add_coverage(db, "store-1", "campaign_sp", target, days=8)
+        db.commit()
+
+        saved, complete = _evaluate_campaign_dimension(
+            db, "store-1", "sp", target, RuleConfig()
+        )
+        assert complete is False
+        assert saved == []
+        assert existing.status == "ONGOING"
