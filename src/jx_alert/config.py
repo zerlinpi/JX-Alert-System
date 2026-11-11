@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     lingxing_refresh_path: str = ""
     lingxing_token_request_json: str = "{}"
     lingxing_refresh_request_json: str = "{}"
+    lingxing_token_response_path: str = ""
+    lingxing_refresh_response_path: str = ""
+    lingxing_expires_in_response_path: str = ""
+    lingxing_token_store_path: str = "./data/secrets/lingxing-token.json"
+    lingxing_token_method: str = "POST"
+    lingxing_refresh_method: str = "POST"
     lingxing_timeout: int = 30
 
     # A Feishu custom bot is a one-way webhook bound to one group.
