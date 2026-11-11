@@ -27,6 +27,8 @@ chmod 600 .env
 mkdir -p data
 sudo chown -R 10001:10001 data
 chmod 700 data
+cp config/feishu-routing.example.json data/feishu-routing.json
+chmod 600 data/feishu-routing.json
 ```
 
 ## 4. 首次启动
