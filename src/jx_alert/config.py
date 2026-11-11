@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     feishu_sign_secret: str = ""
     feishu_keyword: str = ""
     feishu_default_at_open_ids: str = ""
+    feishu_routing_file: str = "/app/data/feishu-routing.json"
     feishu_timeout: int = 20
 
     alert_order_change_ratio: float = 0.15
