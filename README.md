@@ -13,10 +13,10 @@
 - **广告采集：** 已接入 SP/SB/SD 活动日报、活动基础资料、SP/SD 商品广告日报，以及 SP/SD 商品广告基础状态（enabled/paused/archived）。SB 商品级报表接口尚未确认，不猜测接口路径。
 - **数据完整性：** 按店铺、日期、数据维度写入 coverage 标记；只有完整采集日才能把未返回的指标解释为零。
 - **时区：** 每个 sid 单独配置 IANA 时区和币种，日报按站点本地前一完整自然日计算。
-- **异常：** 店铺状态异常事件；店铺、ASIN、MSKU 订单量、销量和销售额相对前七个完整自然日均值变化默认 ±15%；广告高花费、花费/点击达到门槛但无转化、低花费无转化、预算消耗和领星超预算事件。
+- **异常：** 店铺状态异常事件；店铺、ASIN、MSKU 订单量、销量和销售额相对前七个完整自然日均值变化默认 ±15%。广告花费/预算按最新完整日和前七日计算；广告订单/无转化规则延后到对应归因窗成熟后，再与前七个成熟日比较（SP 7 天，SB/SD 14 天）。
 - **可靠通知：** 幂等 outbox、worker claim、失败退避重试和投递日志。Webhook 本身不支持外部幂等键，因此进程在“飞书已接收、数据库尚未标记成功”之间崩溃时，重试可能产生重复消息（at-least-once）。
 - **Excel：** 已生成真实数据的七工作表日报，支持全店汇总和按店铺分别导出。
-- **调度/回补：** 每日调度已连接采集、异常分析和店铺 Excel 导出；提供 8–30 天显式历史回补 CLI。默认调度关闭。
+- **调度/回补：** 每日调度已连接采集、异常分析和店铺 Excel 导出；广告归因成熟告警需要至少 22 天历史回补（覆盖 14 天归因窗口及其前七日基准）。提供 22–30 天显式历史回补 CLI。默认调度关闭。
 - **MCP：** JX Alert 自身提供只读店铺、产品/MSKU/ASIN负责人映射、SKU/ASIN、广告活动及 SP/SD 商品广告的前一日与七日表现、日报汇总、异常历史、飞书投递日志、coverage 和同步任务查询；支持本地 stdio 与可选的 Streamable HTTP 远程服务。远程服务使用 Bearer Token，并默认只绑定宿主机回环地址；不开放广告修改工具。
 - **店铺绩效：** 已确认领星官方 MCP 提供店铺绩效列表、绩效详情和业绩通知工具；当前已加入凭证配置与 Schema 探测脚本，尚未把这些工具接入定时采集。需要在领星后台开通 MCP 并提供服务器端 URL/X-Mcp-Key。
 
@@ -144,9 +144,9 @@ python scripts/collect_lingxing_daily.py --collect --date 2026-11-10
 # 每个店铺使用自己的站点日期：
 python scripts/collect_lingxing_daily.py --collect --date-map data/store-report-dates.json
 
-# 历史回补：首次上线建议至少回补 8 天；默认回补 14 天，最多 30 天
+# 历史回补：首次上线至少回补 22 天，覆盖 14 天归因窗口及其前七日基准；最多 30 天
 python scripts/backfill_lingxing.py
-python scripts/backfill_lingxing.py --collect --days 14
+python scripts/backfill_lingxing.py --collect --days 22
 
 # 手动导出已有数据
 python scripts/export_daily_report.py --date 2026-11-10
