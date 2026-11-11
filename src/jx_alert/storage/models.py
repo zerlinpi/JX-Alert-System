@@ -49,3 +49,41 @@ class NotificationLog(Base):
     message_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+
+class Store(Base):
+    __tablename__ = "stores"
+
+    sid: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    mid: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    seller_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    account_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    marketplace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    status: Mapped[int] = mapped_column(Integer, default=0)
+    has_ads_setting: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+
+
+class Product(Base):
+    __tablename__ = "products"
+    __table_args__ = (
+        UniqueConstraint("store_id", "seller_sku", name="uq_products_store_seller_sku"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(100), index=True)
+    seller_sku: Mapped[str] = mapped_column(String(200))
+    asin: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    local_sku: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    product_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    owner_open_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
