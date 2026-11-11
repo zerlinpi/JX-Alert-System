@@ -20,7 +20,7 @@ class FakeLingxingClient:
 
     def iter_advertising_report(self, report_type, payload):
         assert payload["sid"] == 101
-        return iter([{
+        row = {
             "campaign_id": 9001,
             "report_date": payload["report_date"],
             "cost": 12.5,
@@ -29,7 +29,12 @@ class FakeLingxingClient:
             "units": 2,
             "clicks": 10,
             "impressions": 1000,
-        }])
+            "same_orders": 1,
+        }
+        if report_type in {"sp", "sd"}:
+            assert payload["show_detail"] == 1
+            row["orders_7d"] = 3
+        return iter([row])
 
 
 def test_collect_ads_persists_raw_and_normalized_rows():
@@ -44,12 +49,17 @@ def test_collect_ads_persists_raw_and_normalized_rows():
             "active_ad_stores": 1,
             "rows": {"sp": 1, "sb": 1, "sd": 1},
         }
-        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 18
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 23
         assert db.scalar(select(func.count()).select_from(RawSnapshot)) == 4
         assert db.scalar(select(func.count()).select_from(DataCoverage)) == 3
         spend = db.scalar(select(DailyMetric).where(DailyMetric.metric_name == "spend"))
         assert spend.value == 12.5
         assert spend.metric_date == date(2026, 11, 10)
+        orders_7d = db.scalar(select(DailyMetric).where(
+            DailyMetric.dimension == "campaign_sp",
+            DailyMetric.metric_name == "orders_7d",
+        ))
+        assert orders_7d.value == 3
 
 
 def test_collect_ads_replaces_same_day_metrics_idempotently():
