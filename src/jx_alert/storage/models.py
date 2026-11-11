@@ -156,3 +156,24 @@ class SyncJob(Base):
     record_count: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+
+class DataCoverage(Base):
+    __tablename__ = "data_coverage"
+    __table_args__ = (
+        UniqueConstraint(
+            "store_id", "metric_date", "dimension",
+            name="uq_data_coverage_store_date_dimension",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(100), index=True)
+    metric_date: Mapped[date] = mapped_column(Date, index=True)
+    dimension: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20), default="COMPLETE")
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
