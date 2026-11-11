@@ -21,7 +21,7 @@ def test_only_complete_scope_can_recover_missing_anomalies():
             severity="P1",
             status="ONGOING",
             evaluation_scope="store-1:sku-orders",
-            first_seen=datetime.utcnow(),
+            first_seen=datetime.now(),
             last_seen=datetime.utcnow(),
             metrics={"orders": 0},
             reason="order decrease",
