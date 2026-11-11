@@ -30,6 +30,7 @@ class AnomalyEvent(Base):
     dedupe_key: Mapped[str] = mapped_column(String(512), unique=True, index=True)
     store_id: Mapped[str] = mapped_column(String(100), index=True)
     rule: Mapped[str] = mapped_column(String(80))
+    entity_id: Mapped[str] = mapped_column(String(200), default="")
     severity: Mapped[str] = mapped_column(String(8))
     status: Mapped[str] = mapped_column(String(20), default="NEW")
     evaluation_scope: Mapped[str] = mapped_column(String(200), default="", index=True)
