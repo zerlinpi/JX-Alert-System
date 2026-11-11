@@ -51,6 +51,21 @@ def test_excel_report_contains_store_sku_campaign_and_alert_rows(tmp_path):
             store_id="101", metric_date=target, dimension="store",
             status="COMPLETE", row_count=1,
         ))
+        for offset in range(1, 8):
+            day = target - timedelta(days=offset)
+            db.add(DataCoverage(
+                store_id="101", metric_date=day, dimension="store",
+                status="COMPLETE", row_count=1,
+            ))
+            for metric_name, metric_value in {
+                "orders": 10, "units": 10, "sales": 100,
+            }.items():
+                db.add(DailyMetric(
+                    store_id="101", metric_date=day, dimension="store",
+                    entity_id="101", metric_name=metric_name, value=metric_value,
+                    currency="USD", source="test",
+                ))
+
         for offset in range(7, -1, -1):
             db.add(DataCoverage(
                 store_id="101", metric_date=target - timedelta(days=offset),
@@ -67,6 +82,14 @@ def test_excel_report_contains_store_sku_campaign_and_alert_rows(tmp_path):
             entity_id="101", metric_name="orders", value=5, currency="USD", source="test",
         ))
         db.add(DailyMetric(
+            store_id="101", metric_date=target, dimension="store",
+            entity_id="101", metric_name="sales", value=50, currency="USD", source="test",
+        ))
+        db.add(DailyMetric(
+            store_id="101", metric_date=target, dimension="store",
+            entity_id="101", metric_name="units", value=15, currency="USD", source="test",
+        ))
+        db.add(DailyMetric(
             store_id="101", metric_date=target, dimension="sku_msku",
             entity_id="SKU-1", metric_name="orders", value=5, currency="USD", source="test",
         ))
@@ -74,6 +97,18 @@ def test_excel_report_contains_store_sku_campaign_and_alert_rows(tmp_path):
             store_id="101", metric_date=target, dimension="sku_msku",
             entity_id="SKU-1", metric_name="sales", value=100, currency="USD", source="test",
         ))
+        for offset in range(1, 8):
+            day = target - timedelta(days=offset)
+            db.add(DataCoverage(
+                store_id="101", metric_date=day, dimension="campaign_sp",
+                status="COMPLETE", row_count=1,
+            ))
+            for metric_name, metric_value in {"spend": 10, "orders": 1}.items():
+                db.add(DailyMetric(
+                    store_id="101", metric_date=day, dimension="campaign_sp",
+                    entity_id="campaign-1", metric_name=metric_name, value=metric_value,
+                    currency="USD", source="test",
+                ))
         db.add(DataCoverage(
             store_id="101", metric_date=target, dimension="campaign_sp",
             status="COMPLETE", row_count=1,
@@ -120,7 +155,19 @@ def test_excel_report_contains_store_sku_campaign_and_alert_rows(tmp_path):
         assert sku_row[3] == "SKU-1"
         assert sku_row[9] == 2
         assert sku_row[10] == 1.5
+        assert sku_row[13] == 2
+        assert sku_row[14] == 1.5
+        store_row = rows["店铺总览"][0]
+        assert store_row[10] == 10
+        assert store_row[11] == -0.5
+        assert store_row[12] == 10
+        assert store_row[13] == -0.5
         assert rows["广告活动"][0][3] == "campaign-1"
+        campaign_row = rows["广告活动"][0]
+        assert campaign_row[16] == 10
+        assert campaign_row[17] == 1.0
+        assert campaign_row[20] == 10
+        assert campaign_row[21] == 1.0
         assert rows["广告商品"][0][3] == "ad-1"
         assert rows["异常记录"][0][4] == "orders_decrease"
         assert rows["采集日志"][0][1] == "daily_collection"
