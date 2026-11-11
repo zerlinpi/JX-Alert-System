@@ -28,10 +28,10 @@ AppSecret 有权访问企业数据，不能发到聊天、工单或公开仓库�
 5. Token 续约是否使用 refresh_token，以及 refresh_token 是否轮换。
 
 将真实路径和请求模板填写到服务器本地 `.env`。请求模板支持以下字符串占位符：
-- `${"LINGXING_APP_ID"}`
-- `${"LINGXING_APP_SECRET"}`
-- `${"LINGXING_ACCESS_TOKEN"}`
-- `${"LINGXING_REFRESH_TOKEN"}`
+- `${LINGXING_APP_ID}`
+- `${LINGXING_APP_SECRET}`
+- `${LINGXING_ACCESS_TOKEN}`
+- `${LINGXING_REFRESH_TOKEN}`
 
 例如，下面只是说明占位符写法的结构示意，不是领星真实 API 请求字段：
 ```env
