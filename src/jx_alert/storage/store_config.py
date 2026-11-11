@@ -1,6 +1,6 @@
 """Operator-supplied marketplace timezone and currency configuration."""
 import json
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
