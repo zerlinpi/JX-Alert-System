@@ -4,9 +4,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import select
 
 from jx_alert.analysis.rules import RuleConfig, detect_campaign_anomalies, detect_order_anomaly
-
-# Amazon Ads default attribution windows: SP 7 days; SB/SD 14 days.
-AD_ATTRIBUTION_DAYS = {"sp": 7, "sb": 14, "sd": 14}, _event
+from jx_alert.lingxing.attribution import AD_ATTRIBUTION_DAYS, _event
 from jx_alert.analysis.service import enqueue_anomaly_notifications, upsert_anomalies
 from jx_alert.storage.models import (
     AdProduct,
