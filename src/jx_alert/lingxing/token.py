@@ -248,7 +248,7 @@ class LingxingTokenProvider:
                     method=s.lingxing_refresh_method,
                     refresh_token=cached_refresh_token,
                     access_token=state.get("access_token", ""),
-                    request_format=s.lingxing_refresh_request_format,
+                    request_format=getattr(s, "lingxing_refresh_request_format", "json"),
                 )
             except LingxingTransientError:
                 # Keep a still-valid access token during a short network/provider
@@ -273,7 +273,7 @@ class LingxingTokenProvider:
                 path=s.lingxing_token_path,
                 template=s.lingxing_token_request_json,
                 method=s.lingxing_token_method,
-                request_format=s.lingxing_token_request_format,
+                request_format=getattr(s, "lingxing_token_request_format", "json"),
             )
 
         access_token = _read_path(data, s.lingxing_token_response_path)
