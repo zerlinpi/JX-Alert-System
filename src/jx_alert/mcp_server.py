@@ -5,7 +5,9 @@ No tool in this module contacts Lingxing or sends Feishu messages.
 from datetime import date
 import argparse
 import hmac
+import re
 
+from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp.server.fastmcp import FastMCP
@@ -41,7 +43,8 @@ class BearerTokenMiddleware:
         self.protected_paths = {path, path.rstrip("/") + "/"}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] == "http" and scope.get("path") in self.protected_paths:
+        if (scope["type"] == "http" and scope.get("method") != "OPTIONS"
+                and scope.get("path") in self.protected_paths):
             authorization = [
                 value for name, value in scope.get("headers", [])
                 if name.lower() == b"authorization"
@@ -102,6 +105,22 @@ def create_http_app(settings=None):
         host=settings.mcp_host,
         transport_security=transport_security,
     )
+    if allowed_origins:
+        origin_pattern = "|".join(
+            re.escape(origin).replace(r"\\*", ".*").replace(r"\\?", ".")
+            for origin in allowed_origins
+        )
+        app = CORSMiddleware(
+            app,
+            allow_origins=[],
+            allow_origin_regex=f"^(?:{origin_pattern})$",
+            allow_methods=["GET", "POST", "DELETE"],
+            allow_headers=[
+                "Authorization", "Content-Type", "Mcp-Protocol-Version",
+                "Mcp-Session-Id", "Last-Event-ID",
+            ],
+            expose_headers=["Mcp-Session-Id", "Mcp-Protocol-Version"],
+        )
     return BearerTokenMiddleware(app, settings.mcp_bearer_token, settings.mcp_path)
 
 
