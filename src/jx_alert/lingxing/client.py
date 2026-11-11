@@ -6,7 +6,6 @@ Nested JSON values fail closed until an endpoint-specific canonicalizer is added
 """
 import base64
 import hashlib
-import json
 import time
 from urllib.parse import urljoin
 
