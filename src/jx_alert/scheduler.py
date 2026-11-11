@@ -38,7 +38,11 @@ def daily_job():
 
         with SessionLocal() as db:
             collection = collect_daily_snapshot(
-                client, db, report_dates, stores_response=stores_response
+                client,
+                db,
+                report_dates,
+                stores_response=stores_response,
+                ad_attribution_refresh_days=settings.ad_attribution_refresh_days,
             )
             configured_stores = sync_store_config(db, settings.store_timezones_file)
             db.commit()
