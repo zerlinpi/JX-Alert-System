@@ -1,6 +1,7 @@
 """Persistent notification outbox and idempotent enqueue helper."""
 from datetime import datetime, timezone
 from sqlalchemy import String, Integer, DateTime, Text, JSON, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
 from jx_alert.storage.db import Base
 
@@ -23,8 +24,9 @@ class NotificationOutbox(Base):
 
 def enqueue_notification(db, *, idempotency_key: str, text: str,
                          store_id: str | None = None, entity_id: str | None = None,
+                         chat_id: str = "default",
                          open_ids: list[str] | None = None) -> NotificationOutbox:
-    """Insert once per idempotency key; caller commits the surrounding transaction."""
+    """Insert once per idempotency key, safely handling concurrent producers."""
     existing = db.scalar(
         select(NotificationOutbox).where(
             NotificationOutbox.idempotency_key == idempotency_key
@@ -32,13 +34,26 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
     )
     if existing:
         return existing
+
     row = NotificationOutbox(
         idempotency_key=idempotency_key,
-        chat_id="default",
+        chat_id=chat_id,
         payload={"text": text, "store_id": store_id, "entity_id": entity_id,
                  "open_ids": open_ids or []},
         status="PENDING",
     )
-    db.add(row)
-    db.flush()
-    return row
+    try:
+        with db.begin_nested():
+            db.add(row)
+            db.flush()
+        return row
+    except IntegrityError:
+        # A concurrent producer may have inserted the unique key after our SELECT.
+        existing = db.scalar(
+            select(NotificationOutbox).where(
+                NotificationOutbox.idempotency_key == idempotency_key
+            )
+        )
+        if existing:
+            return existing
+        raise
