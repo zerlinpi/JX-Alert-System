@@ -37,7 +37,7 @@ class FeishuClient:
 
     def _payload(self, text: str, open_ids: list[str] | None = None) -> dict:
         mentions = "".join(
-            f'<at user_id="{html.escape(uid, quote=True)}"></at> '
+            f'<at user_id="{html.escape(uid, quote=True)}">提醒</at> '
             for uid in (open_ids or [])
         )
         message = mentions + text
