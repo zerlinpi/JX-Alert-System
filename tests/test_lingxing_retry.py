@@ -47,7 +47,7 @@ def test_rate_limit_response_retries_with_bounded_backoff(monkeypatch):
     calls = []
     sleeps = []
     responses = [
-        FakeResponse({"code": 10001, "message": "请求过于频繁"}),
+        FakeResponse({"code": 3001008, "message": "token bucket rate limit"}),
         FakeResponse({"code": 0, "data": []}),
     ]
     monkeypatch.setattr(
