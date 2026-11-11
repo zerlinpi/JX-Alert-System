@@ -61,6 +61,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
         raise RuntimeError("FEISHU_WEBHOOK_URL is required when FEISHU_ENABLED=true")
 
     routing = _load_routing(settings.feishu_routing_file)
+    default_ids = settings.feishu_at_ids()
     now = datetime.utcnow()
     stale_before = now - timedelta(minutes=5)
     client = FeishuClient(
@@ -103,7 +104,6 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
 
     sent = 0
     failed = 0
-    default_ids = settings.feishu_at_ids()
     for row_id, dedupe_key, payload, attempts in jobs:
         open_ids = list(dict.fromkeys(
             default_ids
