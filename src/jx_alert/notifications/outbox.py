@@ -1,5 +1,5 @@
 """Persistent notification outbox and idempotent enqueue helper."""
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import String, Integer, DateTime, Text, JSON, select
 from sqlalchemy.orm import Mapped, mapped_column
 from jx_alert.storage.db import Base
@@ -14,7 +14,7 @@ class NotificationOutbox(Base):
     payload: Mapped[dict] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
-    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
