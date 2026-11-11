@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     alert_min_spend: float = 20.0
     alert_min_clicks: int = 10
     alert_min_orders_baseline: float = 1.0
+    alert_escalate_after_days: int = Field(default=2, ge=1, le=30)
     report_dir: str = "./data/reports"
     raw_dir: str = "./data/raw"
 
