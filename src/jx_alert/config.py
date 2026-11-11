@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     lingxing_refresh_path: str = ""
     lingxing_token_request_json: str = "{}"
     lingxing_refresh_request_json: str = "{}"
+    lingxing_token_request_format: str = "json"
+    lingxing_refresh_request_format: str = "json"
     lingxing_token_response_path: str = ""
     lingxing_refresh_response_path: str = ""
     lingxing_expires_in_response_path: str = ""
