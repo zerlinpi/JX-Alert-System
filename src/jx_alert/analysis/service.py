@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select
 
@@ -7,7 +7,8 @@ from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.storage.models import AnomalyEvent, Campaign, Product, Store
 
 
-_SEVERITY_ORDER = {"P1": 1, "P2": 2, "P3": 3}
+_SEVERITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+_ESCALATED_SEVERITY = {"P3": "P2", "P2": "P1", "P1": "P1", "P0": "P0"}
 
 
 def _scoped_dedupe_key(store_id: str, event_key: str) -> str:
@@ -16,8 +17,8 @@ def _scoped_dedupe_key(store_id: str, event_key: str) -> str:
 
 
 def upsert_anomalies(db, store_id: str, events: list[dict], *,
-                     evaluation_scope: str, scope_complete: bool = False
-                     ) -> list[AnomalyEvent]:
+                     evaluation_scope: str, scope_complete: bool = False,
+                     escalation_after_days: int = 2) -> list[AnomalyEvent]:
     """Upsert one complete evaluation scope; only a complete scope can recover old events.
 
     evaluation_scope should identify the same store + metric family/date window each run.
@@ -25,6 +26,8 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
     """
     if not evaluation_scope:
         raise ValueError("evaluation_scope is required")
+    if escalation_after_days < 1:
+        raise ValueError("escalation_after_days must be at least 1")
     saved = []
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     active_keys = {
@@ -39,14 +42,32 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
         if row:
             previous_severity = row.severity
             was_recovered = row.status == "RECOVERED"
-            row.status = "NEW" if was_recovered else "ONGOING"
-            if (_SEVERITY_ORDER.get(event["severity"], 99)
-                    < _SEVERITY_ORDER.get(previous_severity, 99)):
-                row.status = "ESCALATED"
+            severity_increased = (
+                _SEVERITY_ORDER.get(event["severity"], 99)
+                < _SEVERITY_ORDER.get(previous_severity, 99)
+            )
+            persisted_long_enough = (
+                not was_recovered
+                and row.escalated_at is None
+                and now - row.first_seen >= timedelta(days=escalation_after_days)
+            )
             if was_recovered:
+                row.status = "NEW"
                 row.first_seen = now
+                row.escalated_at = None
+                row.severity = event["severity"]
+            elif severity_increased:
+                row.status = "ESCALATED"
+                row.escalated_at = now
+                row.severity = event["severity"]
+            elif persisted_long_enough:
+                row.status = "ESCALATED"
+                row.escalated_at = now
+                row.severity = _ESCALATED_SEVERITY.get(event["severity"], event["severity"])
+            else:
+                row.status = "ONGOING"
+                row.severity = event["severity"]
             row.last_seen = now
-            row.severity = event["severity"]
             row.entity_id = event.get("entity_key", "")
             row.metrics = event["metrics"]
             row.reason = event["reason"]
