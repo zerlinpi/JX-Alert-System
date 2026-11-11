@@ -89,7 +89,6 @@ def test_daily_pipeline_records_successful_job_and_all_steps(tmp_path):
             FakeDailyClient(), db, "2026-11-10",
             ad_attribution_refresh_days=1,
             settings=SimpleNamespace(lingxing_performance_enabled=False, raw_dir=str(tmp_path / "raw")),
-            settings=SimpleNamespace(lingxing_performance_enabled=False, raw_dir=str(tmp_path / "raw")),
         )
         assert result["status"] == "SUCCEEDED"
         assert result["store_count"] == 1
@@ -112,6 +111,7 @@ def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps(tmp_path
             collect_daily_snapshot(
                 FakeDailyClient(fail_product_sd=True), db, "2026-11-10",
                 ad_attribution_refresh_days=1,
+                settings=SimpleNamespace(lingxing_performance_enabled=False, raw_dir=str(tmp_path / "raw")),
             )
         job = db.scalar(select(SyncJob))
         assert job.status == "PARTIAL_FAILED"
