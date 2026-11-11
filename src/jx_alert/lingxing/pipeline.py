@@ -16,7 +16,7 @@ def _utcnow():
 
 def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
                            stores_response: dict | None = None,
-                           ad_attribution_refresh_days: int = 1) -> dict:
+                           ad_attribution_refresh_days: int = 22) -> dict:
     """Collect sales, campaign masters, campaign ads and SP/SD product ads.
 
     Each collector is idempotent for its store/date grain. A failed later step
