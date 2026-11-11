@@ -62,3 +62,21 @@ def test_create_http_app_builds_streamable_http_server():
     client = TestClient(app)
     response = client.get("/mcp")
     assert response.status_code == 401
+
+
+
+def test_remote_mcp_cors_preflight_allows_local_inspector_origin():
+    app = create_http_app(Settings(mcp_bearer_token="c" * 64))
+    client = TestClient(app)
+    response = client.options(
+        "/mcp",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": (
+                "authorization,content-type,mcp-protocol-version"
+            ),
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
