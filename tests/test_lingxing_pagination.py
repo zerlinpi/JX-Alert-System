@@ -122,3 +122,42 @@ def test_sp_product_report_uses_cursor_and_sd_uses_offset(monkeypatch):
     ))
     assert [row["ad_id"] for row in sd_rows] == [1, 2]
     assert sd_offsets == [0, 1]
+
+
+
+def test_sp_sd_product_ad_master_data_use_next_token_cursor(monkeypatch):
+    client = _client()
+    calls = []
+    pages = [
+        {"code": 0, "total": 2, "next_token": "ad-cursor", "data": [{"ad_id": 1}]},
+        {"code": 0, "total": 2, "next_token": "", "data": [{"ad_id": 2}]},
+    ]
+
+    def fake_ads(campaign_type, payload):
+        calls.append((campaign_type, dict(payload)))
+        return pages.pop(0)
+
+    monkeypatch.setattr(client, "advertising_product_ads", fake_ads)
+    for campaign_type in ("sp", "sd"):
+        pages[:] = [
+            {"code": 0, "total": 2, "next_token": "ad-cursor", "data": [{"ad_id": 1}]},
+            {"code": 0, "total": 2, "next_token": "", "data": [{"ad_id": 2}]},
+        ]
+        rows = list(client.iter_advertising_product_ads(
+            campaign_type, {"sid": 101}
+        ))
+        assert [row["ad_id"] for row in rows] == [1, 2]
+        assert calls[-2][1]["offset"] == 0
+        assert calls[-1][1]["next_token"] == "ad-cursor"
+        assert "offset" not in calls[-1][1]
+
+
+def test_product_ad_master_data_fails_closed_when_cursor_missing(monkeypatch):
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "advertising_product_ads",
+        lambda *_: {"code": 0, "total": 2, "data": [{"ad_id": 1}]},
+    )
+    with pytest.raises(LingxingError, match="missing next_token"):
+        list(client.iter_advertising_product_ads("sp", {"sid": 101}))
