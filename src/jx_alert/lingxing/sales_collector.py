@@ -37,7 +37,9 @@ def _fetch_sales_rows(client, payload: dict, *, page_size: int = 1000,
                 total = int(raw_total)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("Lingxing sales response total is invalid") from exc
-            if offset + len(page) >= total:
+            if offset + len(page) > total:
+                raise RuntimeError("Lingxing sales page exceeded the reported total")
+            if offset + len(page) == total:
                 return rows
             if not page:
                 raise RuntimeError(
