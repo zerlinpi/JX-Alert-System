@@ -67,7 +67,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
             elif severity_increased:
                 row.status = "ESCALATED"
                 row.escalated_at = now
-                row.severity = event["severity"]
+                row.severity = incoming_severity
             elif persisted_long_enough:
                 row.status = "ESCALATED"
                 row.escalated_at = now
