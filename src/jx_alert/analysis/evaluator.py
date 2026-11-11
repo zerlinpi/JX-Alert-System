@@ -149,7 +149,8 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
 
     scope = f"{store_id}:campaign:{campaign_type}"
     saved = upsert_anomalies(
-        db, store_id, events, evaluation_scope=scope, scope_complete=True
+        db, store_id, events, evaluation_scope=scope, scope_complete=True,
+        escalation_after_days=config.escalate_after_days,
     )
     return saved, True
 
