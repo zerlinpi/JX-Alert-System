@@ -1,4 +1,4 @@
-"""Explicit opt-in 8-30 day historical backfill for complete daily baselines."""
+"""Explicit opt-in 22-30 day historical backfill for mature ad attribution baselines."""
 import argparse
 import json
 from datetime import date, timedelta
@@ -16,8 +16,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--collect", action="store_true",
                         help="Fetch read-only historical sales and advertising reports.")
-    parser.add_argument("--days", type=int, default=14,
-                        help="Number of completed local report dates to backfill (8-30).")
+    parser.add_argument("--days", type=int, default=22,
+                        help="Number of completed local report dates to backfill (22-30).")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -25,12 +25,12 @@ def main():
         raise SystemExit("LINGXING_APP_ID and LINGXING_APP_SECRET must be configured locally.")
     if not args.collect:
         print("DRY RUN: no Lingxing token or business API request was made.")
-        print("Use --collect --days 14 after verifying token settings and store timezones.")
+        print("Use --collect --days 22 after verifying token settings and store timezones.")
         return
     if settings.app_dry_run:
         raise SystemExit("APP_DRY_RUN=true. Set APP_DRY_RUN=false locally before explicit --collect.")
-    if not 8 <= args.days <= 30:
-        raise SystemExit("--days must be between 8 and 30 to build a seven-day baseline.")
+    if not 22 <= args.days <= 30:
+        raise SystemExit("--days must be between 22 and 30 to mature 14-day attribution and build its seven-day baseline.")
 
     init_db()
     client = LingxingClient.from_settings()
@@ -50,15 +50,18 @@ def main():
                 for sid, base_date in base_dates.items()
             }
             result = collect_daily_snapshot(
-                client, db, report_dates, stores_response=stores_response
+                client,
+                db,
+                report_dates,
+                stores_response=stores_response,
+                ad_attribution_refresh_days=1,
             )
             collected.append(result)
             history_maps.append(report_dates)
             sync_store_config(db, settings.store_timezones_file)
             db.commit()
-        # Historical days populate the seven-day baseline. Evaluate only the
-        # latest completed report date per store so an initial backfill does not
-        # enqueue stale alerts for every historical date.
+        # Historical days populate the attribution-mature window and its
+        # seven-day baseline. Evaluate only each store's latest completed date.
         analyses = [evaluate_daily_anomalies(db, base_dates)]
         report_files = []
         for date_map in history_maps:
