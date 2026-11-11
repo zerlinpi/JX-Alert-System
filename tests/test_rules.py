@@ -22,3 +22,22 @@ def test_campaign_spend_and_zero_conversion_rules():
     rules = {e["rule"] for e in events}
     assert "high_ad_spend" in rules
     assert "spend_no_conversion" in rules
+
+
+
+def test_paused_campaign_does_not_trigger_zero_conversion_alert():
+    events = detect_campaign_anomalies(
+        entity_key="campaign-paused",
+        spend=50,
+        orders=0,
+        clicks=20,
+        prior_7_spend=[20] * 7,
+        prior_7_orders=[2] * 7,
+        daily_budget=60,
+        config=RuleConfig(min_spend=20, min_clicks=10),
+        campaign_enabled=False,
+    )
+    rules = {event["rule"] for event in events}
+    assert "high_ad_spend" in rules
+    assert "spend_no_conversion" not in rules
+    assert "low_spend_no_conversion" not in rules
