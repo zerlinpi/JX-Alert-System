@@ -132,25 +132,46 @@ class LingxingTokenProvider:
             return s.lingxing_access_token
         if not s.lingxing_app_id or not s.lingxing_app_secret:
             raise LingxingError("LINGXING_APP_ID and LINGXING_APP_SECRET are required")
+
         state = self._load()
         now = int(time.time())
-        if state.get("access_token") and int(state.get("expires_at", 0)) > now + 300:
+        access_is_valid = (
+            bool(state.get("access_token"))
+            and int(state.get("expires_at", 0)) > now + 300
+        )
+        cached_refresh_token = state.get("refresh_token") or s.lingxing_refresh_token
+        refresh_expires_at = int(state.get("refresh_expires_at", 0) or 0)
+        # Lingxing refresh tokens expire after two hours and are single-use.
+        # Renew before their own expiry, even if the access token remains valid.
+        refresh_is_due = bool(
+            cached_refresh_token
+            and s.lingxing_refresh_path
+            and refresh_expires_at <= now + 900
+        )
+
+        if access_is_valid and not refresh_is_due:
             return state["access_token"]
 
-        cached_refresh_token = state.get("refresh_token") or s.lingxing_refresh_token
+        data = None
         if cached_refresh_token and s.lingxing_refresh_path:
             if not s.lingxing_refresh_response_path:
                 raise LingxingError(
                     "LINGXING_REFRESH_RESPONSE_PATH is required because Lingxing rotates refresh tokens."
                 )
-            data = self._call(
-                path=s.lingxing_refresh_path,
-                template=s.lingxing_refresh_request_json,
-                method=s.lingxing_refresh_method,
-                refresh_token=cached_refresh_token,
-                access_token=state.get("access_token", ""),
-            )
-        else:
+            try:
+                data = self._call(
+                    path=s.lingxing_refresh_path,
+                    template=s.lingxing_refresh_request_json,
+                    method=s.lingxing_refresh_method,
+                    refresh_token=cached_refresh_token,
+                    access_token=state.get("access_token", ""),
+                )
+            except LingxingError:
+                # A refresh token may have expired while the service was offline.
+                # Fall back to a fresh AppID/AppSecret token instead of becoming stuck.
+                data = None
+
+        if data is None:
             if not s.lingxing_token_path:
                 raise LingxingError(
                     "LINGXING_TOKEN_PATH is not configured. Copy the exact token endpoint "
@@ -174,7 +195,11 @@ class LingxingTokenProvider:
             raise LingxingError("Configured token expiry field must contain TTL seconds") from exc
         if not isinstance(access_token, str) or not access_token:
             raise LingxingError("Configured access-token response field is empty or not a string")
-        new_state = {"access_token": access_token, "refresh_token": refresh_token,
-                     "expires_at": expires_at}
+        new_state = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
+            "refresh_expires_at": now + 7200 if refresh_token else 0,
+        }
         self._save(new_state)
         return access_token
