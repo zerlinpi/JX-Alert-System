@@ -3,7 +3,7 @@ import time
 from types import SimpleNamespace
 
 from jx_alert.lingxing.token import LingxingTokenProvider
-from jx_alert.lingxing.client import LingxingError
+from jx_alert.lingxing.client import LingxingError, LingxingTransientError
 
 
 def _settings(token_path):
@@ -82,3 +82,58 @@ def test_expired_refresh_token_falls_back_to_app_credentials(tmp_path, monkeypat
     monkeypatch.setattr(provider, "_call", fake_call)
     assert provider.get_access_token() == "fresh-access"
     assert calls == ["/refresh", "/token"]
+
+
+
+def test_transient_refresh_failure_keeps_valid_access_token_and_cools_down(
+    tmp_path, monkeypatch
+):
+    token_file = tmp_path / "token.json"
+    now = int(time.time())
+    token_file.write_text(json.dumps({
+        "access_token": "still-valid",
+        "refresh_token": "refresh-due",
+        "expires_at": now + 3600,
+        "refresh_expires_at": now + 60,
+    }), encoding="utf-8")
+    provider = LingxingTokenProvider(_settings(token_file))
+    calls = []
+
+    def fake_call(**kwargs):
+        calls.append(kwargs["path"])
+        raise LingxingTransientError("temporary timeout")
+
+    monkeypatch.setattr(provider, "_call", fake_call)
+    assert provider.get_access_token() == "still-valid"
+    saved = json.loads(token_file.read_text(encoding="utf-8"))
+    assert saved["refresh_retry_after"] >= now + 50
+    assert calls == ["/refresh"]
+
+    # Repeated requests inside the cooldown must not hammer the refresh endpoint.
+    assert provider.get_access_token() == "still-valid"
+    assert calls == ["/refresh"]
+
+
+def test_transient_refresh_failure_without_valid_access_token_is_not_hidden(
+    tmp_path, monkeypatch
+):
+    token_file = tmp_path / "token.json"
+    now = int(time.time())
+    token_file.write_text(json.dumps({
+        "access_token": "expired-access",
+        "refresh_token": "refresh-due",
+        "expires_at": now - 1,
+        "refresh_expires_at": now + 60,
+    }), encoding="utf-8")
+    provider = LingxingTokenProvider(_settings(token_file))
+
+    def fake_call(**kwargs):
+        raise LingxingTransientError("temporary timeout")
+
+    monkeypatch.setattr(provider, "_call", fake_call)
+    try:
+        provider.get_access_token()
+    except LingxingTransientError:
+        pass
+    else:
+        raise AssertionError("transient refresh failure must not be hidden")
