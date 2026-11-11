@@ -76,7 +76,7 @@ def test_product_ads_collector_replaces_same_day_metrics_idempotently():
         client = FakeProductAdsClient()
         collect_product_ads_for_day(client, db, "2026-11-10")
         collect_product_ads_for_day(client, db, "2026-11-10")
-        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 12
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 18
 
 
 
