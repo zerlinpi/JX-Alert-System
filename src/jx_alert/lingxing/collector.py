@@ -49,7 +49,8 @@ def collect_ads_for_day(client, db, report_date: str | dict[str, str], *,
 
     active_ad_stores = [
         store for store in stores
-        if store.get("status") == 1 and store.get("has_ads_setting") == 1
+        if int(store.get("status") or 0) == 1
+        and int(store.get("has_ads_setting") or 0) == 1
     ]
     report_counts = {"sp": 0, "sb": 0, "sd": 0}
     for store in active_ad_stores:
