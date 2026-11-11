@@ -34,7 +34,8 @@ def _event(kind: str, severity: str, entity_key: str, key: str,
 
 def detect_order_anomaly(*, entity_key: str, current_orders: float,
                          previous_orders: float, prior_7_days: list[float],
-                         config: RuleConfig) -> list[dict[str, Any]]:
+                         config: RuleConfig, metric_name: str = "orders"
+                         ) -> list[dict[str, Any]]:
     if len(prior_7_days) != 7:
         return []
     baseline = sum(prior_7_days) / 7
@@ -46,17 +47,18 @@ def detect_order_anomaly(*, entity_key: str, current_orders: float,
     direction = "increase" if delta > 0 else "decrease"
     return [
         _event(
-            f"orders_{direction}",
+            f"{metric_name}_{direction}",
             "P2" if delta > 0 else "P1",
             entity_key,
-            f"{entity_key}:orders_{direction}",
+            f"{entity_key}:{metric_name}_{direction}",
             {
+                "metric": metric_name,
                 "current": current_orders,
                 "previous": previous_orders,
                 "baseline_7d": baseline,
                 "change_ratio": delta,
             },
-            f"订单量相对此前七个完整自然日均值变化 {delta:.1%}",
+            f"{'订单量' if metric_name == 'orders' else '销量'}相对此前七个完整自然日均值变化 {delta:.1%}",
         )
     ]
 
