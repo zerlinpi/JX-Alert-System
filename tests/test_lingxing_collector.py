@@ -85,3 +85,23 @@ def test_collect_ads_accepts_store_local_date_map():
         assert result["report_date"] == "per-store mapping"
         metric = db.scalar(select(DailyMetric))
         assert metric.metric_date == date(2026, 11, 9)
+
+
+
+def test_collect_ads_refreshes_multiple_store_local_dates():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        result = collect_ads_for_day(
+            FakeLingxingClient(),
+            db,
+            {"101": ["2026-11-09", "2026-11-10"]},
+        )
+        assert result["report_days_per_store"] == "per-store date window"
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 46
+        assert db.scalar(select(func.count()).select_from(DataCoverage)) == 6
+        dates = db.scalars(select(DataCoverage.metric_date).where(
+            DataCoverage.dimension == "campaign_sp"
+        ).order_by(DataCoverage.metric_date)).all()
+        assert dates == [date(2026, 11, 9), date(2026, 11, 10)]
