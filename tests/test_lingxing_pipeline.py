@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from jx_alert.storage.db import Base
 from jx_alert.storage import models  # noqa: F401
-from jx_alert.storage.models import DailyMetric, SyncJob
+from jx_alert.storage.models import DataCoverage, DailyMetric, SyncJob
 from jx_alert.lingxing.pipeline import collect_daily_snapshot
 
 
@@ -85,6 +85,7 @@ def test_daily_pipeline_records_successful_job_and_all_steps():
             "sales", "campaigns", "campaign_reports", "product_ad_reports"
         ]
         assert db.scalar(select(func.count()).select_from(DailyMetric)) > 0
+        assert db.scalar(select(func.count()).select_from(DataCoverage)) == 8
 
 
 def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps():
