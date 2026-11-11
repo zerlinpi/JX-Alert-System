@@ -9,6 +9,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import delete, select
 
 from jx_alert.lingxing.sales_collector import _upsert_store
+from jx_alert.storage.coverage import mark_coverage
 from jx_alert.storage.models import AdProduct, DailyMetric, Product, RawSnapshot
 
 
@@ -148,6 +149,13 @@ def collect_product_ads_for_day(client, db, report_dates: str | dict[str, str], 
                         source=f"lingxing_{report_type}_product_ad_report",
                     ))
 
+            mark_coverage(
+                db,
+                store_id=store_id,
+                metric_date=metric_date,
+                dimension=dimension,
+                row_count=len(rows),
+            )
             db.commit()
             row_counts[report_type] += len(rows)
 
