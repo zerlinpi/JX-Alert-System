@@ -43,6 +43,7 @@ def test_campaign_collector_saves_all_types_and_daily_budget():
         assert db.scalar(select(func.count()).select_from(Campaign)) == 3
         sp = db.scalar(select(Campaign).where(Campaign.campaign_type == "sp"))
         assert sp.budget == 50.5
+        assert sp.budget_type == "daily"
         assert sp.state == "enabled"
         assert sp.last_over_budget_at == "2026-11-10 12:00:00"
 
