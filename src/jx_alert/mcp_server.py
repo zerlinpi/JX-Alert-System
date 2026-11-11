@@ -18,6 +18,7 @@ from jx_alert.config import get_settings
 from jx_alert.storage.db import SessionLocal, engine, init_db
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.models import (
+    AdProduct,
     AnomalyEvent,
     Campaign,
     DailyMetric,
@@ -676,10 +677,15 @@ def get_campaign_performance(store_id: str, report_date: str,
                 for row in metric_rows
             }
             metrics = {}
+            previous_date = target - timedelta(days=1)
             for metric in ("spend", "orders", "sales", "clicks", "impressions"):
                 current = (
                     values.get((metric, target), 0.0)
                     if target in complete_dates else None
+                )
+                previous = (
+                    values.get((metric, previous_date), 0.0)
+                    if previous_date in complete_dates else None
                 )
                 baseline_complete = all(day in complete_dates for day in baseline_dates)
                 average = (
@@ -688,6 +694,12 @@ def get_campaign_performance(store_id: str, report_date: str,
                 )
                 metrics[metric] = {
                     "current": current,
+                    "previous_day": previous,
+                    "change_vs_previous_day": (
+                        (current - previous) / previous
+                        if current is not None and previous is not None and previous > 0
+                        else None
+                    ),
                     "average_7d": average,
                     "change_vs_7d_average": (
                         (current - average) / average
@@ -712,6 +724,108 @@ def get_campaign_performance(store_id: str, report_date: str,
                 "acos": spend / sales if spend is not None and sales is not None and sales > 0 else None,
                 "roas": sales / spend if spend is not None and spend > 0 else None,
                 "current_day_complete": target in complete_dates,
+                "baseline_complete": all(day in complete_dates for day in baseline_dates),
+            })
+        return results
+
+
+@mcp.tool()
+def get_product_ad_performance(store_id: str, report_date: str,
+                               campaign_type: str = "sp",
+                               limit: int = 200) -> list[dict]:
+    """Return SP/SD advertised-product metrics with previous-day and 7-day comparisons.
+
+    SB product-ad reports are not exposed because their exact endpoint contract is
+    not confirmed. Missing coverage is returned as null, never interpreted as zero.
+    """
+    normalized_type = campaign_type.lower()
+    if normalized_type not in {"sp", "sd"}:
+        raise ValueError("campaign_type must be sp or sd")
+    try:
+        target = date.fromisoformat(report_date)
+    except ValueError as exc:
+        raise ValueError("report_date must be YYYY-MM-DD") from exc
+    dates = [target - timedelta(days=offset) for offset in range(8)]
+    baseline_dates = dates[1:]
+    previous_date = target - timedelta(days=1)
+    dimension = f"product_ad_{normalized_type}"
+    init_db()
+    with SessionLocal() as db:
+        store = db.get(Store, str(store_id))
+        ads = db.scalars(select(AdProduct).where(
+            AdProduct.store_id == str(store_id),
+            AdProduct.campaign_type == normalized_type,
+        ).order_by(AdProduct.seller_sku, AdProduct.asin, AdProduct.ad_id)
+         .limit(_limit(limit, 1000))).all()
+        coverage_rows = db.scalars(select(DataCoverage).where(
+            DataCoverage.store_id == str(store_id),
+            DataCoverage.dimension == dimension,
+            DataCoverage.metric_date.in_(dates),
+        )).all()
+        complete_dates = {
+            row.metric_date for row in coverage_rows if row.status == "COMPLETE"
+        }
+        metric_rows = db.scalars(select(DailyMetric).where(
+            DailyMetric.store_id == str(store_id),
+            DailyMetric.dimension == dimension,
+            DailyMetric.metric_date.in_(dates),
+        )).all()
+        values = {
+            (row.entity_id, row.metric_name, row.metric_date): float(row.value)
+            for row in metric_rows
+        }
+
+        results = []
+        for ad in ads:
+            metrics = {}
+            for metric in ("spend", "orders", "sales", "units", "clicks", "impressions"):
+                current = (
+                    values.get((ad.ad_id, metric, target), 0.0)
+                    if target in complete_dates else None
+                )
+                previous = (
+                    values.get((ad.ad_id, metric, previous_date), 0.0)
+                    if previous_date in complete_dates else None
+                )
+                baseline_complete = all(day in complete_dates for day in baseline_dates)
+                average = (
+                    sum(values.get((ad.ad_id, metric, day), 0.0)
+                        for day in baseline_dates) / 7
+                    if baseline_complete else None
+                )
+                metrics[metric] = {
+                    "current": current,
+                    "previous_day": previous,
+                    "change_vs_previous_day": (
+                        (current - previous) / previous
+                        if current is not None and previous is not None and previous > 0
+                        else None
+                    ),
+                    "average_7d": average,
+                    "change_vs_7d_average": (
+                        (current - average) / average
+                        if current is not None and average is not None and average > 0
+                        else None
+                    ),
+                }
+            spend = metrics["spend"]["current"]
+            sales = metrics["sales"]["current"]
+            results.append({
+                "store_id": str(store_id),
+                "campaign_type": normalized_type,
+                "ad_id": ad.ad_id,
+                "campaign_id": ad.campaign_id,
+                "ad_group_id": ad.ad_group_id,
+                "asin": ad.asin,
+                "seller_sku": ad.seller_sku,
+                "state": ad.state,
+                "serving_status": ad.serving_status,
+                "currency_code": store.currency_code if store else None,
+                "metrics": metrics,
+                "acos": spend / sales if spend is not None and sales is not None and sales > 0 else None,
+                "roas": sales / spend if spend is not None and spend > 0 else None,
+                "current_day_complete": target in complete_dates,
+                "previous_day_complete": previous_date in complete_dates,
                 "baseline_complete": all(day in complete_dates for day in baseline_dates),
             })
         return results
