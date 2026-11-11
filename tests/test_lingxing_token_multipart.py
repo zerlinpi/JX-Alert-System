@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -159,9 +160,9 @@ def test_provider_loads_nested_token_response_and_persists_ttl(
         lingxing_timeout=30,
     )
 
-    before = int(__import__("time").time())
+    before = int(time.time())
     access_token = LingxingTokenProvider(settings).get_access_token()
-    after = int(__import__("time").time())
+    after = int(time.time())
 
     assert access_token == "access-secret-value"
     kwargs = calls[0][1]
