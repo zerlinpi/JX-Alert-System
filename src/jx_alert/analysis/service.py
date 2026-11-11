@@ -96,12 +96,7 @@ def _notification_labels(db, anomaly: AnomalyEvent) -> tuple[str, str | None, st
     metrics = anomaly.metrics or {}
 
     campaign_id = metrics.get("campaign_id")
-    campaign_rules = {
-        "high_ad_spend", "spend_no_conversion", "low_spend_no_conversion",
-        "budget_consumption", "campaign_over_budget", "orders_increase",
-        "orders_decrease",
-    }
-    if not campaign_id and anomaly.rule in campaign_rules:
+    if not campaign_id and ":campaign:" in (anomaly.evaluation_scope or ""):
         campaign_id = anomaly.entity_id
     campaign_label = None
     if campaign_id is not None:
