@@ -44,7 +44,7 @@ SHEETS = {
     ],
     "异常记录": [
         "等级", "店铺ID", "店铺", "对象", "规则", "状态", "首次发现",
-        "最近发现", "恢复时间", "原因", "指标",
+        "最近发现", "升级时间", "恢复时间", "原因", "指标",
     ],
     "采集日志": [
         "任务ID", "任务", "开始时间", "结束时间", "状态", "店铺数",
@@ -250,7 +250,7 @@ def build_daily_report_rows(db, report_date: date | str, *,
             anomaly.severity, anomaly.store_id, store.name if store else "",
             anomaly.entity_id, anomaly.rule, anomaly.status,
             _iso(anomaly.first_seen), _iso(anomaly.last_seen),
-            _iso(anomaly.recovered_at), anomaly.reason,
+            _iso(anomaly.escalated_at), _iso(anomaly.recovered_at), anomaly.reason,
             json.dumps(anomaly.metrics or {}, ensure_ascii=False, default=str),
         ])
 
