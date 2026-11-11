@@ -1,10 +1,10 @@
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from jx_alert.notifications.outbox import enqueue_notification
-from jx_alert.storage.models import AnomalyEvent
+from jx_alert.storage.models import AnomalyEvent, Campaign, Product, Store
 
 
 _SEVERITY_ORDER = {"P1": 1, "P2": 2, "P3": 3}
@@ -88,6 +88,64 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
     return saved
 
 
+def _notification_labels(db, anomaly: AnomalyEvent) -> tuple[str, str | None, str | None]:
+    store = db.get(Store, anomaly.store_id)
+    store_label = (
+        f"{store.name}（{anomaly.store_id}）" if store else anomaly.store_id
+    )
+    metrics = anomaly.metrics or {}
+
+    campaign_id = metrics.get("campaign_id")
+    campaign_rules = {
+        "high_ad_spend", "spend_no_conversion", "low_spend_no_conversion",
+        "budget_consumption", "campaign_over_budget", "orders_increase",
+        "orders_decrease",
+    }
+    if not campaign_id and anomaly.rule in campaign_rules:
+        campaign_id = anomaly.entity_id
+    campaign_label = None
+    if campaign_id is not None:
+        campaign = db.scalar(select(Campaign).where(
+            Campaign.store_id == anomaly.store_id,
+            Campaign.campaign_id == str(campaign_id),
+        ).limit(1))
+        if campaign:
+            campaign_label = (
+                f"{campaign.name or campaign.campaign_id} "
+                f"（{campaign.campaign_type.upper()} / ID {campaign.campaign_id}）"
+            )
+        else:
+            campaign_label = f"活动 ID {campaign_id}"
+
+    product_label = None
+    product_key = (
+        metrics.get("seller_sku")
+        or metrics.get("asin")
+        or anomaly.entity_id
+    )
+    if product_key:
+        product = db.scalar(select(Product).where(
+            Product.store_id == anomaly.store_id,
+            or_(
+                Product.seller_sku == str(product_key),
+                Product.asin == str(product_key),
+            ),
+        ).limit(1))
+        if product:
+            product_label = (
+                f"MSKU {product.seller_sku}"
+                + (f" / ASIN {product.asin}" if product.asin else "")
+                + (f" / Local SKU {product.local_sku}" if product.local_sku else "")
+            )
+        elif metrics.get("asin") or metrics.get("seller_sku"):
+            product_label = (
+                f"MSKU {metrics.get('seller_sku') or '-'}"
+                f" / ASIN {metrics.get('asin') or '-'}"
+            )
+
+    return store_label, campaign_label, product_label
+
+
 def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
     """Queue first-seen, escalated and recovered events; ongoing events stay quiet."""
     queued = 0
@@ -100,14 +158,23 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
             "RECOVERED": "异常恢复",
         }[anomaly.status]
         metrics = json.dumps(anomaly.metrics or {}, ensure_ascii=False, default=str)
-        message = (
-            f"【JX Alert】{state_label} · {anomaly.severity}\n"
-            f"店铺 ID：{anomaly.store_id}\n"
-            f"对象：{anomaly.entity_id or '未指定'}\n"
-            f"规则：{anomaly.rule}\n"
-            f"说明：{anomaly.reason}\n"
-            f"指标：{metrics}"
-        )
+        store_label, campaign_label, product_label = _notification_labels(db, anomaly)
+        lines = [
+            f"【JX Alert】{state_label} · {anomaly.severity}",
+            f"店铺：{store_label}",
+        ]
+        if campaign_label:
+            lines.append(f"广告活动：{campaign_label}")
+        if product_label:
+            lines.append(f"商品：{product_label}")
+        elif not campaign_label and anomaly.entity_id:
+            lines.append(f"监控对象：{anomaly.entity_id}")
+        lines.extend([
+            f"规则：{anomaly.rule}",
+            f"说明：{anomaly.reason}",
+            f"指标：{metrics}",
+        ])
+        message = "\n".join(lines)
         first_seen = anomaly.first_seen.isoformat() if anomaly.first_seen else "unknown"
         enqueue_notification(
             db,
