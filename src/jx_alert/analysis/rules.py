@@ -80,7 +80,8 @@ def detect_campaign_anomalies(*, entity_key: str, spend: float, orders: float,
             {"spend": spend, "spend_avg_7d": spend_avg, "orders": orders},
             f"广告花费达到七日均值的 {spend / spend_avg:.2f} 倍",
         ))
-    if spend >= config.min_spend and clicks >= config.min_clicks and orders == 0 and orders_avg > 0:
+    if (campaign_enabled and spend >= config.min_spend
+            and clicks >= config.min_clicks and orders == 0 and orders_avg > 0):
         events.append(_event(
             "spend_no_conversion", "P1", entity_key, f"{entity_key}:spend_no_conversion",
             {"spend": spend, "clicks": clicks, "orders": orders, "orders_avg_7d": orders_avg},
