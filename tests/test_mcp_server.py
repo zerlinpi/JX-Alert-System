@@ -10,6 +10,7 @@ from jx_alert.storage.models import (
     Campaign,
     DailyMetric,
     DataCoverage,
+    Product,
     Store,
     SyncJob,
 )
@@ -37,6 +38,11 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
         db.add(Campaign(
             store_id="101", campaign_type="sp", campaign_id="campaign-1",
             name="SP Campaign", state="enabled", budget=50, budget_type="daily",
+        ))
+        db.add(Product(
+            store_id="101", seller_sku="SKU-1", asin="B000000001",
+            local_sku="LOCAL-1", product_name="Test product",
+            currency_code="USD", owner_open_ids=["ou_product_owner"],
         ))
         db.add(AnomalyEvent(
             dedupe_key="101:101:orders_decrease", store_id="101",
@@ -109,6 +115,10 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
 
     campaigns = mcp_server.get_campaigns(store_id="101", campaign_type="SP")
     assert campaigns[0]["campaign_id"] == "campaign-1"
+
+    products = mcp_server.get_products(store_id="101", seller_sku="SKU-1")
+    assert products[0]["asin"] == "B000000001"
+    assert products[0]["owner_open_ids"] == ["ou_product_owner"]
 
     coverage = mcp_server.get_data_coverage("101", "2026-11-10", "2026-11-10")
     assert coverage[0]["status"] == "COMPLETE"
