@@ -43,7 +43,12 @@ def main():
     init_db()
     client = LingxingClient.from_settings()
     with SessionLocal() as db:
-        summary = collect_daily_snapshot(client, db, report_dates)
+        summary = collect_daily_snapshot(
+            client,
+            db,
+            report_dates,
+            ad_attribution_refresh_days=settings.ad_attribution_refresh_days,
+        )
     print("Read-only Lingxing daily collection completed:")
     print(json.dumps(summary, ensure_ascii=False, default=str))
 
