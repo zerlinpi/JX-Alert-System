@@ -39,6 +39,15 @@ nano data/feishu-routing.json
 - `entities`：`店铺ID:MSKU/ASIN` 或全局 MSKU/ASIN → 产品负责人 Open ID 列表。
 - `FEISHU_DEFAULT_AT_OPEN_IDS`：所有告警都 @ 的管理员 Open ID，多个用英文逗号分隔。
 
+也可以将产品负责人写入数据库的 `products.owner_open_ids` 字段。先完成至少一次成功的销量采集，再执行：
+```bash
+python scripts/set_product_owners.py --store-id 你的店铺ID --seller-sku 你的MSKU --open-ids ou_负责人ID,ou_第二负责人ID
+# 也支持按 ASIN 更新该店铺下匹配的商品
+python scripts/set_product_owners.py --store-id 你的店铺ID --asin B0XXXXXXXX --open-ids ou_负责人ID
+```
+
+文件路由与数据库商品负责人会合并去重；所有告警默认 @ 人员来自 `FEISHU_DEFAULT_AT_OPEN_IDS`。MCP 的 `get_products` 工具可以检查 MSKU、ASIN 和数据库负责人映射。
+
 注意：
 - 必须是机器人所在群的成员 ID。
 - 外部群聊仅支持 Open ID。
