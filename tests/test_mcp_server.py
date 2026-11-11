@@ -101,8 +101,8 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
     assert stores[0]["timezone"] == "America/Los_Angeles"
 
     metrics = mcp_server.get_daily_metrics("101", "2026-11-10")
-    assert metrics[0]["metric_name"] == "orders"
-    assert metrics[0]["value"] == 5
+    orders_metric = next(row for row in metrics if row["metric_name"] == "orders")
+    assert orders_metric["value"] == 5
 
     summary = mcp_server.get_daily_summary("101", "2026-11-10")
     assert summary["data_complete"] is True
