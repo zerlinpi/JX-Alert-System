@@ -23,7 +23,7 @@ Only explicit 2 or 3 closes a pending notice. Status 0 is not handled. Provider 
 
 ## Standards and raw evidence
 
-Detail data.standard is persisted and used only when numeric actual values and provider standards are both present. Missing markers such as '-' are not zero. A performance scope only recovers old anomalies when source data is fresh, the health status is recognized, and standards cover every returned comparable indicator. Every list/detail/notice page is retained as a database JSON RawSnapshot. Independent filesystem JSON archival is not included in this restoration.
+Detail data.standard is persisted and used only when numeric actual values and provider standards are both present. Missing markers such as '-' are not zero. A performance scope only recovers old anomalies when source data is fresh, the health status is recognized, and standards cover every returned comparable indicator. Every list/detail/notice page is retained as a database JSON RawSnapshot and independently archived to the filesystem by the daily pipeline.
 
 Set LINGXING_PERFORMANCE_SOURCE_TIMEZONE after verifying the source timezone. Keep it blank until then.
 
