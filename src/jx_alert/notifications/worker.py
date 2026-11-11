@@ -10,7 +10,7 @@ from jx_alert.config import get_settings
 from jx_alert.notifications.feishu import FeishuClient
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import SessionLocal
-from jx_alert.storage.models import NotificationLog
+from jx_alert.storage.models import NotificationLog, Product
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,29 @@ def _routed_open_ids(routing: dict, store_id: str | None,
     if not all(isinstance(item, str) and item for item in ids):
         raise RuntimeError("Feishu routing entries must be non-empty Open ID strings")
     return list(dict.fromkeys(ids))
+
+
+def _database_entity_open_ids(store_id: str | None, entity_id: str | None) -> list[str]:
+    if not store_id or not entity_id:
+        return []
+    with SessionLocal() as db:
+        product = db.scalar(select(Product).where(
+            Product.store_id == str(store_id),
+            or_(
+                Product.seller_sku == str(entity_id),
+                Product.asin == str(entity_id),
+            ),
+        ).limit(1))
+        if product is None:
+            return []
+        ids = product.owner_open_ids or []
+        if not isinstance(ids, list) or not all(
+            isinstance(item, str) and item.startswith("ou_") for item in ids
+        ):
+            raise RuntimeError(
+                "Product owner_open_ids must be a list of Feishu Open IDs"
+            )
+        return list(dict.fromkeys(ids))
 
 
 def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
@@ -117,6 +140,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8) -> dict:
             open_ids = list(dict.fromkeys(
                 default_ids
                 + _routed_open_ids(routing, payload.get("store_id"), payload.get("entity_id"))
+                + _database_entity_open_ids(payload.get("store_id"), payload.get("entity_id"))
                 + payload_ids
             ))
             client.send_text(str(payload.get("text") or ""), open_ids=open_ids)
