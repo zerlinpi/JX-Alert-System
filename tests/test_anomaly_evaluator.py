@@ -21,8 +21,8 @@ from jx_alert.analysis.evaluator import (
 from jx_alert.analysis.rules import RuleConfig
 
 
-def _add_coverage(db, store_id, dimension, report_date):
-    for offset in range(7, -1, -1):
+def _add_coverage(db, store_id, dimension, report_date, days=8):
+    for offset in range(days - 1, -1, -1):
         db.add(DataCoverage(
             store_id=store_id,
             metric_date=report_date - timedelta(days=offset),
@@ -75,7 +75,14 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
             "product_ad_sp", "product_ad_sd",
         ]
         for dimension in dimensions:
-            _add_coverage(db, store_id, dimension, target)
+            days = (
+                22 if dimension in {
+                    "campaign_sb", "campaign_sd", "product_ad_sd"
+                } else 15 if dimension in {
+                    "campaign_sp", "product_ad_sp"
+                } else 8
+            )
+            _add_coverage(db, store_id, dimension, target, days=days)
 
         for offset in range(7, 0, -1):
             day = target - timedelta(days=offset)
@@ -87,12 +94,26 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
                 _add_metric(db, store_id, dimension, entity, "orders", day, 10)
                 _add_metric(db, store_id, dimension, entity, "units", day, 10)
                 _add_metric(db, store_id, dimension, entity, "sales", day, 100)
-            _add_metric(db, store_id, "campaign_sp", "campaign-1", "spend", day, 10)
-            _add_metric(db, store_id, "campaign_sp", "campaign-1", "orders", day, 2)
-            _add_metric(db, store_id, "campaign_sp", "campaign-1", "clicks", day, 20)
-            _add_metric(db, store_id, "product_ad_sp", "ad-1", "spend", day, 10)
-            _add_metric(db, store_id, "product_ad_sp", "ad-1", "orders", day, 2)
-            _add_metric(db, store_id, "product_ad_sp", "ad-1", "clicks", day, 20)
+            spend_value, order_value, click_value = (
+                (25, 0, 15) if offset == 7 else (10, 2, 20)
+            )
+            _add_metric(db, store_id, "campaign_sp", "campaign-1", "spend", day, spend_value)
+            _add_metric(db, store_id, "campaign_sp", "campaign-1", "orders", day, order_value)
+            _add_metric(db, store_id, "campaign_sp", "campaign-1", "clicks", day, click_value)
+            _add_metric(db, store_id, "product_ad_sp", "ad-1", "spend", day, spend_value)
+            _add_metric(db, store_id, "product_ad_sp", "ad-1", "orders", day, order_value)
+            _add_metric(db, store_id, "product_ad_sp", "ad-1", "clicks", day, click_value)
+
+        # Seven fully matured baseline dates before the attribution-complete day.
+        for offset in range(14, 7, -1):
+            day = target - timedelta(days=offset)
+            for dimension, entity in (
+                ("campaign_sp", "campaign-1"),
+                ("product_ad_sp", "ad-1"),
+            ):
+                _add_metric(db, store_id, dimension, entity, "spend", day, 10)
+                _add_metric(db, store_id, dimension, entity, "orders", day, 2)
+                _add_metric(db, store_id, dimension, entity, "clicks", day, 20)
 
         for dimension, entity in (
             ("store", store_id),
@@ -225,15 +246,16 @@ def test_product_ad_anomaly_uses_configured_escalation_window():
             campaign_id="campaign-1", seller_sku="SKU-1", asin="B000000001",
             state="enabled",
         ))
-        _add_coverage(db, "store-1", "product_ad_sp", target)
-        for offset in range(7, 0, -1):
+        _add_coverage(db, "store-1", "product_ad_sp", target, days=15)
+        for offset in range(14, 7, -1):
             day = target - timedelta(days=offset)
             _add_metric(db, "store-1", "product_ad_sp", "ad-1", "spend", day, 10)
             _add_metric(db, "store-1", "product_ad_sp", "ad-1", "orders", day, 2)
             _add_metric(db, "store-1", "product_ad_sp", "ad-1", "clicks", day, 20)
-        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "spend", target, 25)
-        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "orders", target, 0)
-        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "clicks", target, 15)
+        mature_day = target - timedelta(days=7)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "spend", mature_day, 25)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "orders", mature_day, 0)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "clicks", mature_day, 15)
         existing = AnomalyEvent(
             dedupe_key="store-1:ad-1:spend_no_conversion",
             store_id="store-1",
