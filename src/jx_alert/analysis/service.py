@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -21,7 +21,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
     if not evaluation_scope:
         raise ValueError("evaluation_scope is required")
     saved = []
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     active_keys = {event["dedupe_key"] for event in events}
 
     for event in events:
