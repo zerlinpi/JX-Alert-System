@@ -1,0 +1,1 @@
+"""JX Alert System."""
