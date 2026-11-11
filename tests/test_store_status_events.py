@@ -21,6 +21,8 @@ def test_store_status_event_is_queued_and_recovers_when_status_returns_to_normal
         assert row.rule == "store_status_not_normal"
         assert row.severity == "P1"
         assert row.status == "NEW"
+        assert row.metrics["status_label"] == "授权异常"
+        assert "授权异常" in row.reason
 
         second = evaluate_store_status_events(db, {
             "data": [{"sid": 101, "status": 1, "has_ads_setting": 1}]
