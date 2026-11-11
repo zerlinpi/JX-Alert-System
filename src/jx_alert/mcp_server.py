@@ -2,7 +2,7 @@
 
 No tool in this module contacts Lingxing or sends Feishu messages.
 """
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import argparse
 import hmac
 import re
@@ -16,11 +16,13 @@ from sqlalchemy import select, text
 
 from jx_alert.config import get_settings
 from jx_alert.storage.db import SessionLocal, engine, init_db
+from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.models import (
     AnomalyEvent,
     Campaign,
     DailyMetric,
     DataCoverage,
+    NotificationLog,
     Product,
     Store,
     SyncJob,
@@ -504,6 +506,299 @@ def get_campaigns(store_id: str | None = None,
             "budget_type": row.budget_type,
             "last_over_budget_at": row.last_over_budget_at,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        } for row in rows]
+
+
+
+@mcp.tool()
+def get_sku_performance(store_id: str, report_date: str,
+                        dimension: str = "sku_msku", limit: int = 200) -> list[dict]:
+    """Return SKU/ASIN daily metrics with previous-day and complete 7-day baselines.
+
+    Missing coverage is returned as null, never interpreted as zero. dimension
+    must be sku_msku or sku_asin.
+    """
+    if dimension not in {"sku_msku", "sku_asin"}:
+        raise ValueError("dimension must be sku_msku or sku_asin")
+    try:
+        target = date.fromisoformat(report_date)
+    except ValueError as exc:
+        raise ValueError("report_date must be YYYY-MM-DD") from exc
+    dates = [target - timedelta(days=offset) for offset in range(8)]
+    baseline_dates = dates[1:]
+    init_db()
+    with SessionLocal() as db:
+        products = db.scalars(select(Product).where(
+            Product.store_id == str(store_id)
+        ).order_by(Product.seller_sku)).all()
+        if dimension == "sku_msku":
+            entities = {row.seller_sku: [row] for row in products if row.seller_sku}
+        else:
+            entities = {}
+            for product in products:
+                if product.asin:
+                    entities.setdefault(product.asin, []).append(product)
+
+        coverage_rows = db.scalars(select(DataCoverage).where(
+            DataCoverage.store_id == str(store_id),
+            DataCoverage.dimension == dimension,
+            DataCoverage.metric_date.in_(dates),
+        )).all()
+        complete_dates = {
+            row.metric_date for row in coverage_rows if row.status == "COMPLETE"
+        }
+        metric_rows = db.scalars(select(DailyMetric).where(
+            DailyMetric.store_id == str(store_id),
+            DailyMetric.dimension == dimension,
+            DailyMetric.metric_date.in_(dates),
+        )).all()
+        values = {
+            (row.entity_id, row.metric_name, row.metric_date): float(row.value)
+            for row in metric_rows
+        }
+
+        results = []
+        for entity_id, mapped_products in entities.items():
+            metric_results = {}
+            for metric in ("orders", "units", "sales"):
+                current = (
+                    values.get((entity_id, metric, target), 0.0)
+                    if target in complete_dates else None
+                )
+                previous_date = target - timedelta(days=1)
+                previous = (
+                    values.get((entity_id, metric, previous_date), 0.0)
+                    if previous_date in complete_dates else None
+                )
+                baseline_complete = all(day in complete_dates for day in baseline_dates)
+                average = (
+                    sum(values.get((entity_id, metric, day), 0.0) for day in baseline_dates) / 7
+                    if baseline_complete else None
+                )
+                metric_results[metric] = {
+                    "current": current,
+                    "previous_day": previous,
+                    "change_vs_previous_day": (
+                        (current - previous) / previous
+                        if current is not None and previous is not None and previous > 0
+                        else None
+                    ),
+                    "average_7d": average,
+                    "change_vs_7d_average": (
+                        (current - average) / average
+                        if current is not None and average is not None and average > 0
+                        else None
+                    ),
+                    "baseline_complete": baseline_complete,
+                }
+            product = mapped_products[0]
+            results.append({
+                "store_id": str(store_id),
+                "dimension": dimension,
+                "entity_id": entity_id,
+                "seller_sku": product.seller_sku if dimension == "sku_msku" else None,
+                "asin": entity_id if dimension == "sku_asin" else product.asin,
+                "mapped_mskus": list(dict.fromkeys(
+                    item.seller_sku for item in mapped_products if item.seller_sku
+                )),
+                "local_sku": product.local_sku,
+                "product_name": product.product_name,
+                "metrics": metric_results,
+                "current_day_complete": target in complete_dates,
+                "baseline_complete": all(day in complete_dates for day in baseline_dates),
+            })
+        return results[:_limit(limit, 1000)]
+
+
+@mcp.tool()
+def get_campaign_performance(store_id: str, report_date: str,
+                             campaign_type: str | None = None,
+                             limit: int = 200) -> list[dict]:
+    """Return campaign daily spend/orders/sales/clicks and complete 7-day baselines."""
+    try:
+        target = date.fromisoformat(report_date)
+    except ValueError as exc:
+        raise ValueError("report_date must be YYYY-MM-DD") from exc
+    if campaign_type is not None and campaign_type.lower() not in {"sp", "sb", "sd"}:
+        raise ValueError("campaign_type must be sp, sb or sd")
+    types = [campaign_type.lower()] if campaign_type else ["sp", "sb", "sd"]
+    dates = [target - timedelta(days=offset) for offset in range(8)]
+    baseline_dates = dates[1:]
+    init_db()
+    with SessionLocal() as db:
+        campaigns = db.scalars(select(Campaign).where(
+            Campaign.store_id == str(store_id),
+            Campaign.campaign_type.in_(types),
+        ).order_by(Campaign.campaign_type, Campaign.name).limit(_limit(limit, 1000))).all()
+        store = db.get(Store, str(store_id))
+        results = []
+        for campaign in campaigns:
+            dimension = f"campaign_{campaign.campaign_type}"
+            coverage_rows = db.scalars(select(DataCoverage).where(
+                DataCoverage.store_id == str(store_id),
+                DataCoverage.dimension == dimension,
+                DataCoverage.metric_date.in_(dates),
+            )).all()
+            complete_dates = {
+                row.metric_date for row in coverage_rows if row.status == "COMPLETE"
+            }
+            metric_rows = db.scalars(select(DailyMetric).where(
+                DailyMetric.store_id == str(store_id),
+                DailyMetric.dimension == dimension,
+                DailyMetric.entity_id == campaign.campaign_id,
+                DailyMetric.metric_date.in_(dates),
+            )).all()
+            values = {
+                (row.metric_name, row.metric_date): float(row.value)
+                for row in metric_rows
+            }
+            metrics = {}
+            for metric in ("spend", "orders", "sales", "clicks", "impressions"):
+                current = (
+                    values.get((metric, target), 0.0)
+                    if target in complete_dates else None
+                )
+                baseline_complete = all(day in complete_dates for day in baseline_dates)
+                average = (
+                    sum(values.get((metric, day), 0.0) for day in baseline_dates) / 7
+                    if baseline_complete else None
+                )
+                metrics[metric] = {
+                    "current": current,
+                    "average_7d": average,
+                    "change_vs_7d_average": (
+                        (current - average) / average
+                        if current is not None and average is not None and average > 0
+                        else None
+                    ),
+                }
+            spend = metrics["spend"]["current"]
+            sales = metrics["sales"]["current"]
+            results.append({
+                "store_id": str(store_id),
+                "campaign_type": campaign.campaign_type,
+                "campaign_id": campaign.campaign_id,
+                "name": campaign.name,
+                "state": campaign.state,
+                "serving_status": campaign.serving_status,
+                "daily_budget": (
+                    campaign.budget if (campaign.budget_type or "").lower() == "daily" else None
+                ),
+                "currency_code": store.currency_code if store else None,
+                "metrics": metrics,
+                "acos": spend / sales if spend is not None and sales is not None and sales > 0 else None,
+                "roas": sales / spend if spend is not None and spend > 0 else None,
+                "current_day_complete": target in complete_dates,
+                "baseline_complete": all(day in complete_dates for day in baseline_dates),
+            })
+        return results
+
+
+@mcp.tool()
+def get_anomaly_history(store_id: str | None = None,
+                        entity_id: str | None = None,
+                        rule: str | None = None,
+                        start_date: str | None = None,
+                        end_date: str | None = None,
+                        limit: int = 200) -> list[dict]:
+    """Query historical anomaly lifecycle records by store, SKU/campaign entity or rule."""
+    start = date.fromisoformat(start_date) if start_date else None
+    end = date.fromisoformat(end_date) if end_date else None
+    if start and end and end < start:
+        raise ValueError("end_date must not be earlier than start_date")
+    init_db()
+    with SessionLocal() as db:
+        query = select(AnomalyEvent)
+        if store_id:
+            query = query.where(AnomalyEvent.store_id == str(store_id))
+        if entity_id:
+            query = query.where(AnomalyEvent.entity_id == str(entity_id))
+        if rule:
+            query = query.where(AnomalyEvent.rule == rule)
+        if start:
+            query = query.where(
+                AnomalyEvent.first_seen >= datetime.combine(start, datetime.min.time())
+            )
+        if end:
+            query = query.where(
+                AnomalyEvent.first_seen < datetime.combine(end + timedelta(days=1), datetime.min.time())
+            )
+        rows = db.scalars(
+            query.order_by(AnomalyEvent.first_seen.desc()).limit(_limit(limit, 1000))
+        ).all()
+        return [{
+            "id": row.id,
+            "store_id": row.store_id,
+            "entity_id": row.entity_id,
+            "rule": row.rule,
+            "severity": row.severity,
+            "status": row.status,
+            "first_seen": row.first_seen.isoformat() if row.first_seen else None,
+            "last_seen": row.last_seen.isoformat() if row.last_seen else None,
+            "recovered_at": row.recovered_at.isoformat() if row.recovered_at else None,
+            "reason": row.reason,
+            "metrics": row.metrics,
+        } for row in rows]
+
+
+@mcp.tool()
+def get_notification_logs(store_id: str | None = None,
+                          status: str | None = None,
+                          start_date: str | None = None,
+                          end_date: str | None = None,
+                          limit: int = 200) -> list[dict]:
+    """Inspect Feishu delivery attempts and persistent outbox state."""
+    start = date.fromisoformat(start_date) if start_date else None
+    end = date.fromisoformat(end_date) if end_date else None
+    if start and end and end < start:
+        raise ValueError("end_date must not be earlier than start_date")
+    init_db()
+    with SessionLocal() as db:
+        query = select(NotificationLog)
+        if status:
+            query = query.where(NotificationLog.status == status.upper())
+        if start:
+            query = query.where(
+                NotificationLog.created_at >= datetime.combine(start, datetime.min.time())
+            )
+        if end:
+            query = query.where(
+                NotificationLog.created_at < datetime.combine(end + timedelta(days=1), datetime.min.time())
+            )
+        if store_id:
+            query = query.join(
+                NotificationOutbox,
+                NotificationOutbox.idempotency_key == NotificationLog.dedupe_key,
+            ).where(NotificationOutbox.payload["store_id"].as_string() == str(store_id))
+        rows = db.scalars(
+            query.order_by(NotificationLog.created_at.desc()).limit(_limit(limit, 1000))
+        ).all()
+        keys = list(dict.fromkeys(row.dedupe_key for row in rows))
+        outbox_rows = db.scalars(select(NotificationOutbox).where(
+            NotificationOutbox.idempotency_key.in_(keys)
+        )).all() if keys else []
+        outbox_by_key = {row.idempotency_key: row for row in outbox_rows}
+        return [{
+            "dedupe_key": row.dedupe_key,
+            "channel": row.channel,
+            "attempt_status": row.status,
+            "message_id": row.message_id,
+            "error": row.error,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "outbox_status": (
+                outbox_by_key[row.dedupe_key].status if row.dedupe_key in outbox_by_key else None
+            ),
+            "attempts": (
+                outbox_by_key[row.dedupe_key].attempts if row.dedupe_key in outbox_by_key else None
+            ),
+            "next_attempt_at": (
+                outbox_by_key[row.dedupe_key].next_attempt_at.isoformat()
+                if row.dedupe_key in outbox_by_key and outbox_by_key[row.dedupe_key].next_attempt_at
+                else None
+            ),
+            "last_error": (
+                outbox_by_key[row.dedupe_key].last_error if row.dedupe_key in outbox_by_key else None
+            ),
         } for row in rows]
 
 
