@@ -137,7 +137,8 @@ class LingxingTokenProvider:
         if state.get("access_token") and int(state.get("expires_at", 0)) > now + 300:
             return state["access_token"]
 
-        if state.get("refresh_token") and s.lingxing_refresh_path:
+        cached_refresh_token = state.get("refresh_token") or s.lingxing_refresh_token
+        if cached_refresh_token and s.lingxing_refresh_path:
             if not s.lingxing_refresh_response_path:
                 raise LingxingError(
                     "LINGXING_REFRESH_RESPONSE_PATH is required because Lingxing rotates refresh tokens."
@@ -146,7 +147,7 @@ class LingxingTokenProvider:
                 path=s.lingxing_refresh_path,
                 template=s.lingxing_refresh_request_json,
                 method=s.lingxing_refresh_method,
-                refresh_token=state["refresh_token"],
+                refresh_token=cached_refresh_token,
                 access_token=state.get("access_token", ""),
             )
         else:
@@ -164,7 +165,7 @@ class LingxingTokenProvider:
         access_token = _read_path(data, s.lingxing_token_response_path)
         refresh_token = (
             _read_path(data, s.lingxing_refresh_response_path)
-            if s.lingxing_refresh_response_path else state.get("refresh_token", "")
+            if s.lingxing_refresh_response_path else cached_refresh_token
         )
         expires_in = _read_path(data, s.lingxing_expires_in_response_path)
         try:
