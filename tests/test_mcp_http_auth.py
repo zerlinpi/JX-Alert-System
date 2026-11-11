@@ -3,7 +3,10 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from jx_alert.mcp_server import BearerTokenMiddleware
+import pytest
+
+from jx_alert.config import Settings
+from jx_alert.mcp_server import BearerTokenMiddleware, create_http_app
 
 
 def _endpoint(request):
@@ -46,3 +49,16 @@ def test_remote_mcp_rejects_duplicate_authorization_headers():
 def test_remote_mcp_does_not_protect_unrelated_paths():
     response = _client().get("/not-mcp")
     assert response.status_code == 404
+
+
+
+def test_create_http_app_requires_bearer_token():
+    with pytest.raises(RuntimeError, match="MCP_BEARER_TOKEN"):
+        create_http_app(Settings(mcp_bearer_token=""))
+
+
+def test_create_http_app_builds_streamable_http_server():
+    app = create_http_app(Settings(mcp_bearer_token="b" * 64))
+    client = TestClient(app)
+    response = client.get("/mcp")
+    assert response.status_code == 401
