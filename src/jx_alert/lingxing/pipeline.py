@@ -1,6 +1,7 @@
 """Durable daily read-only collection orchestration."""
 from datetime import datetime, timezone
 
+from jx_alert.analysis.evaluator import evaluate_store_status_events
 from jx_alert.lingxing.campaign_collector import collect_campaigns
 from jx_alert.lingxing.collector import collect_ads_for_day
 from jx_alert.lingxing.product_ads_collector import collect_product_ads_for_day
@@ -40,6 +41,9 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             and isinstance(stores_response.get("data"), list)
             else None
         }
+
+        results["store_status"] = evaluate_store_status_events(db, stores_response)
+        completed_steps.append("store_status")
 
         results["sales"] = collect_sales_for_day(
             client, db, report_dates, stores_response=stores_response
