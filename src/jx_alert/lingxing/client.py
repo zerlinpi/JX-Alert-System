@@ -153,29 +153,32 @@ class LingxingClient:
             except ValueError as exc:
                 raise LingxingError("Lingxing API returned invalid JSON") from exc
 
-            if isinstance(data, dict):
-                code = data.get("code")
-                if code not in (None, 0, "0", 200, "200"):
-                    message = str(data.get("msg") or data.get("message") or "unknown")
-                    lowered = message.lower()
-                    rate_limited = (
-                        str(code) in {"429", "3001008"}
-                        or any(token in lowered for token in (
-                            "rate limit", "too many requests", "频率限制",
-                            "请求过于频繁", "限流", "令牌桶",
-                        ))
+            if not isinstance(data, dict):
+                raise LingxingError("Lingxing API response must be a JSON object")
+            if "code" not in data:
+                raise LingxingError("Lingxing API response is missing its required code field")
+            code = data["code"]
+            if code not in (0, "0", 200, "200"):
+                message = str(data.get("msg") or data.get("message") or "unknown")
+                lowered = message.lower()
+                rate_limited = (
+                    str(code) in {"429", "3001008"}
+                    or any(token in lowered for token in (
+                        "rate limit", "too many requests", "频率限制",
+                        "请求过于频繁", "限流", "令牌桶",
+                    ))
+                )
+                if rate_limited:
+                    error = LingxingTransientError(
+                        f"Lingxing rate limit response: code={code}"
                     )
-                    if rate_limited:
-                        error = LingxingTransientError(
-                            f"Lingxing rate limit response: code={code}"
-                        )
-                        if attempt == 4:
-                            raise error
-                        time.sleep(min(2 ** attempt, 16))
-                        continue
-                    raise LingxingError(
-                        f"Lingxing API error: code={code}, message={message}"
-                    )
+                    if attempt == 4:
+                        raise error
+                    time.sleep(min(2 ** attempt, 16))
+                    continue
+                raise LingxingError(
+                    f"Lingxing API error: code={code}, message={message}"
+                )
             return data
 
         raise LingxingTransientError("Lingxing request exhausted retry attempts")
