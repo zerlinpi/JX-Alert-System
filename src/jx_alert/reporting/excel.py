@@ -150,6 +150,24 @@ def build_daily_report_rows(db, report_date: date | str, *,
     for campaign in campaigns:
         campaign_by_store.setdefault(campaign.store_id, []).append(campaign)
 
+    previous_date = target - timedelta(days=1)
+    baseline_dates = history_dates[:-1]
+
+    def ad_totals_for_day(sid, day):
+        store = store_map[sid]
+        if not store.has_ads_setting:
+            return None, None, True
+        for campaign_type in ("sp", "sb", "sd"):
+            if not complete(sid, f"campaign_{campaign_type}", day):
+                return None, None, False
+        spend_total = 0.0
+        orders_total = 0.0
+        for campaign in campaign_by_store.get(sid, []):
+            dimension = f"campaign_{campaign.campaign_type}"
+            spend_total += value(sid, day, dimension, campaign.campaign_id, "spend") or 0.0
+            orders_total += value(sid, day, dimension, campaign.campaign_id, "orders") or 0.0
+        return spend_total, orders_total, True
+
     for store in stores:
         sid = store.sid
         sales_complete = complete(sid, "store", target)
@@ -157,29 +175,61 @@ def build_daily_report_rows(db, report_date: date | str, *,
         store_units = value(sid, target, "store", sid, "units")
         store_sales = value(sid, target, "store", sid, "sales")
 
-        ad_spend = 0.0
-        ad_orders = 0.0
-        ad_complete = bool(store.has_ads_setting)
-        if store.has_ads_setting:
-            for campaign_type in ("sp", "sb", "sd"):
-                dimension = f"campaign_{campaign_type}"
-                if not complete(sid, dimension, target):
-                    ad_complete = False
-                    continue
-                for campaign in campaign_by_store.get(sid, []):
-                    if campaign.campaign_type != campaign_type:
-                        continue
-                    ad_spend += value(sid, target, dimension, campaign.campaign_id, "spend") or 0.0
-                    ad_orders += value(sid, target, dimension, campaign.campaign_id, "orders") or 0.0
-        else:
-            ad_spend = None
-            ad_orders = None
+        previous_store_orders = value(sid, previous_date, "store", sid, "orders")
+        previous_store_sales = value(sid, previous_date, "store", sid, "sales")
+        store_previous_complete = complete(sid, "store", previous_date)
+        store_baseline_complete = all(
+            complete(sid, "store", day) for day in baseline_dates
+        )
+        average_store_orders = (
+            sum(value(sid, day, "store", sid, "orders") or 0.0 for day in baseline_dates) / 7
+            if store_baseline_complete else None
+        )
+        average_store_sales = (
+            sum(value(sid, day, "store", sid, "sales") or 0.0 for day in baseline_dates) / 7
+            if store_baseline_complete else None
+        )
+
+        ad_spend, ad_orders, ad_complete = ad_totals_for_day(sid, target)
+        previous_ad_spend, previous_ad_orders, ad_previous_complete = ad_totals_for_day(
+            sid, previous_date
+        )
+        ad_baseline_days = [ad_totals_for_day(sid, day) for day in baseline_dates]
+        ad_baseline_complete = all(item[2] for item in ad_baseline_days)
+        average_ad_spend = (
+            sum(item[0] or 0.0 for item in ad_baseline_days) / 7
+            if ad_baseline_complete and store.has_ads_setting else None
+        )
+        average_ad_orders = (
+            sum(item[1] or 0.0 for item in ad_baseline_days) / 7
+            if ad_baseline_complete and store.has_ads_setting else None
+        )
 
         rows["店铺总览"].append([
             sid, store.name, store.country or store.region, target.isoformat(),
             store_orders, store_units, store_sales, store.currency_code,
             ad_spend if ad_complete else None,
             ad_orders if ad_complete else None,
+            previous_store_orders if store_previous_complete else None,
+            _change_ratio(store_orders, previous_store_orders)
+            if store_previous_complete else None,
+            average_store_orders,
+            _change_ratio(store_orders, average_store_orders),
+            previous_store_sales if store_previous_complete else None,
+            _change_ratio(store_sales, previous_store_sales)
+            if store_previous_complete else None,
+            average_store_sales,
+            _change_ratio(store_sales, average_store_sales),
+            previous_ad_spend if ad_previous_complete else None,
+            _change_ratio(ad_spend, previous_ad_spend)
+            if ad_previous_complete else None,
+            average_ad_spend,
+            _change_ratio(ad_spend, average_ad_spend),
+            previous_ad_orders if ad_previous_complete else None,
+            _change_ratio(ad_orders, previous_ad_orders)
+            if ad_previous_complete else None,
+            average_ad_orders,
+            _change_ratio(ad_orders, average_ad_orders),
             "完整" if sales_complete and (ad_complete or not store.has_ads_setting) else "部分/缺失",
         ])
         rows["店铺绩效"].append([
@@ -189,15 +239,22 @@ def build_daily_report_rows(db, report_date: date | str, *,
         ])
 
         store_products = [product for product in products if product.store_id == sid]
-        msku_coverage = all(
-            complete(sid, "sku_msku", day) for day in history_dates
+        msku_current_complete = complete(sid, "sku_msku", target)
+        msku_previous_complete = complete(sid, "sku_msku", previous_date)
+        msku_baseline_complete = all(
+            complete(sid, "sku_msku", day) for day in baseline_dates
         )
-        baseline_dates = history_dates[:-1]
         for product in store_products:
             current_orders = value(sid, target, "sku_msku", product.seller_sku, "orders")
             current_units = value(sid, target, "sku_msku", product.seller_sku, "units")
             current_sales = value(sid, target, "sku_msku", product.seller_sku, "sales")
-            if msku_coverage:
+            previous_orders = value(
+                sid, previous_date, "sku_msku", product.seller_sku, "orders"
+            )
+            previous_sales = value(
+                sid, previous_date, "sku_msku", product.seller_sku, "sales"
+            )
+            if msku_baseline_complete:
                 baseline_orders = [
                     value(sid, day, "sku_msku", product.seller_sku, "orders") or 0.0
                     for day in baseline_dates
@@ -211,21 +268,18 @@ def build_daily_report_rows(db, report_date: date | str, *,
             else:
                 average_orders = None
                 average_sales = None
-            order_change_ratio = (
-                (current_orders - average_orders) / average_orders
-                if current_orders is not None and average_orders is not None and average_orders > 0
-                else None
-            )
-            sales_change_ratio = (
-                (current_sales - average_sales) / average_sales
-                if current_sales is not None and average_sales is not None and average_sales > 0
-                else None
-            )
             rows["SKU销量"].append([
                 sid, store.name, product.asin, product.seller_sku, product.local_sku,
                 target.isoformat(), current_orders, current_units, current_sales,
-                average_orders, order_change_ratio, average_sales, sales_change_ratio,
-                "完整" if msku_coverage else "样本不足",
+                previous_orders if msku_previous_complete else None,
+                _change_ratio(current_orders, previous_orders)
+                if msku_previous_complete else None,
+                previous_sales if msku_previous_complete else None,
+                _change_ratio(current_sales, previous_sales)
+                if msku_previous_complete else None,
+                average_orders, _change_ratio(current_orders, average_orders),
+                average_sales, _change_ratio(current_sales, average_sales),
+                "完整" if msku_current_complete else "样本不足",
             ])
 
     for campaign in campaigns:
