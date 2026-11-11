@@ -73,7 +73,8 @@ def _evaluate_sales_dimension(db, store_id: str, dimension: str,
 
     scope = f"{store_id}:sales:{dimension}"
     saved = upsert_anomalies(
-        db, store_id, events, evaluation_scope=scope, scope_complete=True
+        db, store_id, events, evaluation_scope=scope, scope_complete=True,
+        escalation_after_days=config.escalate_after_days,
     )
     return saved, True
 
@@ -264,6 +265,7 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
         from jx_alert.config import get_settings
         settings = get_settings()
         config = RuleConfig(
+            escalate_after_days=settings.alert_escalate_after_days,
             order_change_ratio=settings.alert_order_change_ratio,
             high_spend_ratio=settings.alert_high_spend_ratio,
             low_spend_ratio=settings.alert_low_spend_ratio,
