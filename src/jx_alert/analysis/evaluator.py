@@ -221,15 +221,40 @@ def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
     return saved, True
 
 
-def evaluate_daily_anomalies(db, report_date: date | str,
+def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
                              config: RuleConfig | None = None) -> dict:
-    """Evaluate only dimensions with complete coverage for D-7 through D.
+    """Evaluate only dimensions with complete coverage for each store's D-7 through D.
 
-    A missing metric row is interpreted as zero only after a COMPLETE coverage
-    marker exists for that store/date/dimension. Missing/incomplete days never
-    enter the baseline and never recover an existing anomaly.
+    report_date may be a single date for legacy/single-timezone use, or a mapping
+    of Lingxing sid to its own marketplace-local report date. A mapping restricts
+    evaluation to the listed stores; dates are never inferred from another store.
     """
-    target_date = _parse_date(report_date)
+    if isinstance(report_date, dict):
+        if not report_date:
+            raise ValueError("report_dates mapping must not be empty")
+        target_dates = {
+            str(store_id): _parse_date(value)
+            for store_id, value in report_date.items()
+        }
+        stores = db.scalars(
+            select(Store).where(Store.sid.in_(list(target_dates)))
+        ).all()
+        found_ids = {store.sid for store in stores}
+        missing_ids = set(target_dates) - found_ids
+        if missing_ids:
+            raise ValueError(
+                "Report-date mapping contains unsynchronized store IDs: "
+                + ", ".join(sorted(missing_ids))
+            )
+        normalized_dates = {
+            store_id: target.isoformat() for store_id, target in target_dates.items()
+        }
+    else:
+        target_date = _parse_date(report_date)
+        stores = db.scalars(select(Store)).all()
+        target_dates = {store.sid: target_date for store in stores}
+        normalized_dates = target_date.isoformat()
+
     if config is None:
         from jx_alert.config import get_settings
         settings = get_settings()
@@ -242,13 +267,13 @@ def evaluate_daily_anomalies(db, report_date: date | str,
             min_clicks=settings.alert_min_clicks,
             min_orders_baseline=settings.alert_min_orders_baseline,
         )
-    stores = db.scalars(select(Store)).all()
     evaluated_scopes = 0
     skipped_scopes = 0
     saved_events: list[AnomalyEvent] = []
 
     for store in stores:
         store_id = store.sid
+        target_date = target_dates[store_id]
         sku_msku = db.scalars(select(Product.seller_sku).where(
             Product.store_id == store_id
         )).all()
@@ -294,14 +319,14 @@ def evaluate_daily_anomalies(db, report_date: date | str,
     queued = enqueue_anomaly_notifications(db, saved_events)
     db.commit()
     return {
-        "report_date": target_date.isoformat(),
+        "report_date": normalized_dates if isinstance(normalized_dates, str) else None,
+        "report_dates": normalized_dates if isinstance(normalized_dates, dict) else None,
         "stores_seen": len(stores),
         "evaluated_scopes": evaluated_scopes,
         "skipped_incomplete_scopes": skipped_scopes,
         "events_touched": len(saved_events),
         "notifications_queued": queued,
     }
-
 
 
 def evaluate_store_status_events(db, stores_response: dict) -> dict:
