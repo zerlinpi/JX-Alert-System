@@ -87,6 +87,7 @@ class LingxingTokenProvider:
     def _save(self, state: dict) -> None:
         path = Path(self.settings.lingxing_token_store_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
         fd, temporary = tempfile.mkstemp(prefix="lingxing-token-", dir=str(path.parent))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
