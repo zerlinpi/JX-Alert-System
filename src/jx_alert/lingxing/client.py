@@ -70,6 +70,20 @@ class LingxingClient:
         self.access_token = access_token
         self.timeout = timeout
 
+    @classmethod
+    def from_settings(cls):
+        from jx_alert.config import get_settings
+        from jx_alert.lingxing.token import LingxingTokenProvider
+        settings = get_settings()
+        token = LingxingTokenProvider(settings).get_access_token()
+        return cls(
+            base_url=settings.lingxing_base_url,
+            app_id=settings.lingxing_app_id,
+            app_key=settings.lingxing_app_key,
+            access_token=token,
+            timeout=settings.lingxing_timeout,
+        )
+
     def _request(self, method: str, path: str, params: dict | None = None,
                  json_body: dict | None = None, *, advertising: bool = False):
         if not self.access_token:
