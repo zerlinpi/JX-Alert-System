@@ -16,16 +16,27 @@ AD_METRICS = {
 }
 
 
-def collect_ads_for_day(client, db, report_date: str) -> dict:
+def collect_ads_for_day(client, db, report_date: str | dict[str, str]) -> dict:
     """Fetch store list and SP/SB/SD campaign reports, storing raw + normalized data.
 
     The caller must supply the store-local report date. This function deliberately
     does not guess marketplace time zones or trigger itself on a schedule.
     """
-    try:
-        date.fromisoformat(report_date)
-    except ValueError as exc:
-        raise ValueError("report_date must be YYYY-MM-DD") from exc
+    if isinstance(report_date, str):
+        try:
+            date.fromisoformat(report_date)
+        except ValueError as exc:
+            raise ValueError("report_date must be YYYY-MM-DD") from exc
+
+    def store_report_date(sid) -> str:
+        value = report_date if isinstance(report_date, str) else report_date.get(str(sid))
+        if not value:
+            raise ValueError(f"Missing store-local report date for sid={sid}")
+        try:
+            date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid store-local report date for sid={sid}") from exc
+        return value
 
     stores_response = client.get_stores()
     stores = stores_response.get("data") if isinstance(stores_response, dict) else None
@@ -44,9 +55,11 @@ def collect_ads_for_day(client, db, report_date: str) -> dict:
         if sid is None:
             raise RuntimeError("Active seller-list record is missing sid")
         store_id = str(sid)
+        local_report_date = store_report_date(sid)
+        metric_date = date.fromisoformat(local_report_date)
 
         for report_type in ("sp", "sb", "sd"):
-            payload = {"sid": sid, "report_date": report_date, "length": 100}
+            payload = {"sid": sid, "report_date": local_report_date, "length": 100}
             if report_type in {"sp", "sd"}:
                 payload["show_detail"] = 1
             rows = list(client.iter_advertising_report(report_type, payload))
@@ -55,7 +68,7 @@ def collect_ads_for_day(client, db, report_date: str) -> dict:
             db.execute(
                 delete(DailyMetric).where(
                     DailyMetric.store_id == store_id,
-                    DailyMetric.metric_date == date.fromisoformat(report_date),
+                    DailyMetric.metric_date == metric_date,
                     DailyMetric.dimension == dimension,
                 )
             )
@@ -64,7 +77,7 @@ def collect_ads_for_day(client, db, report_date: str) -> dict:
                 store_id=store_id,
                 payload={
                     "report_type": report_type,
-                    "report_date": report_date,
+                    "report_date": local_report_date,
                     "rows": rows,
                 },
             ))
@@ -76,7 +89,7 @@ def collect_ads_for_day(client, db, report_date: str) -> dict:
                         f"{report_type.upper()} report row is missing campaign_id"
                     )
                 row_date = row.get("report_date")
-                if row_date and row_date != report_date:
+                if row_date and row_date != local_report_date:
                     raise RuntimeError(
                         f"{report_type.upper()} report returned unexpected report_date"
                     )
@@ -92,7 +105,7 @@ def collect_ads_for_day(client, db, report_date: str) -> dict:
                         ) from exc
                     db.add(DailyMetric(
                         store_id=store_id,
-                        metric_date=date.fromisoformat(report_date),
+                        metric_date=metric_date,
                         dimension=dimension,
                         entity_id=str(campaign_id),
                         metric_name=metric_name,
@@ -104,7 +117,7 @@ def collect_ads_for_day(client, db, report_date: str) -> dict:
             report_counts[report_type] += len(rows)
 
     return {
-        "report_date": report_date,
+        "report_date": report_date if isinstance(report_date, str) else "per-store mapping",
         "stores_seen": len(stores),
         "active_ad_stores": len(active_ad_stores),
         "rows": report_counts,
