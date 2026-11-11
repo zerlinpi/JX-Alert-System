@@ -97,6 +97,12 @@ pytest -q
 ruff check .
 ```
 
+领星连接检查默认只检查本地配置，不获取 Token 或请求店铺数据。确认 Token 接口字段已核验后才加 `--request`：
+```bash
+python scripts/test_lingxing_connection.py
+python scripts/test_lingxing_connection.py --request
+```
+
 飞书连通性脚本默认只做本地配置检查，不发送消息。只有明确准备好向真实群发送测试时才加 `--send`：
 ```bash
 python scripts/test_feishu_webhook.py
