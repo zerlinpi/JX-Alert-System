@@ -34,6 +34,21 @@ services:
       retries: 3
       start_period: 20s
 
+
+  mcp:
+    build: .
+    command: ["python", "-m", "jx_alert.mcp_server", "--transport", "streamable-http"]
+    env_file: .env
+    restart: unless-stopped
+    profiles: ["mcp"]
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${MCP_BIND_IP:-127.0.0.1}:${MCP_BIND_PORT:-8001}:8001"
+    volumes:
+      - ./data:/app/data
+
   scheduler:
     build: .
     command: ["python", "-m", "jx_alert.scheduler"]
