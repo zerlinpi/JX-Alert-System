@@ -67,7 +67,10 @@ def detect_order_anomaly(*, entity_key: str, current_orders: float,
 def detect_campaign_anomalies(*, entity_key: str, spend: float, orders: float,
                               clicks: int, prior_7_spend: list[float],
                               prior_7_orders: list[float], daily_budget: float | None,
-                              config: RuleConfig, campaign_enabled: bool = True
+                              config: RuleConfig, campaign_enabled: bool = True,
+                              high_spend_enabled: bool = True,
+                              conversion_enabled: bool = True,
+                              budget_enabled: bool = True
                               ) -> list[dict[str, Any]]:
     if len(prior_7_spend) != 7 or len(prior_7_orders) != 7:
         return []
@@ -75,26 +78,29 @@ def detect_campaign_anomalies(*, entity_key: str, spend: float, orders: float,
     spend_avg = sum(prior_7_spend) / 7
     orders_avg = sum(prior_7_orders) / 7
 
-    if spend_avg > 0 and spend >= config.min_spend and spend / spend_avg >= config.high_spend_ratio:
+    if (high_spend_enabled and spend_avg > 0 and spend >= config.min_spend
+            and spend / spend_avg >= config.high_spend_ratio):
         events.append(_event(
             "high_ad_spend", "P1", entity_key, f"{entity_key}:high_ad_spend",
             {"spend": spend, "spend_avg_7d": spend_avg, "orders": orders},
             f"广告花费达到七日均值的 {spend / spend_avg:.2f} 倍",
         ))
-    if (campaign_enabled and spend >= config.min_spend
+    if (conversion_enabled and campaign_enabled and spend >= config.min_spend
             and clicks >= config.min_clicks and orders == 0 and orders_avg > 0):
         events.append(_event(
             "spend_no_conversion", "P1", entity_key, f"{entity_key}:spend_no_conversion",
             {"spend": spend, "clicks": clicks, "orders": orders, "orders_avg_7d": orders_avg},
             "广告花费和点击达到观察门槛，但广告订单为 0",
         ))
-    if campaign_enabled and spend_avg > 0 and spend < spend_avg * config.low_spend_ratio and orders == 0:
+    if (conversion_enabled and campaign_enabled and spend_avg > 0
+            and spend < spend_avg * config.low_spend_ratio and orders == 0):
         events.append(_event(
             "low_spend_no_conversion", "P3", entity_key, f"{entity_key}:low_spend_no_conversion",
             {"spend": spend, "spend_avg_7d": spend_avg, "orders": orders},
             "启用中的广告活动花费低于七日均值且没有转化，需结合投放量检查",
         ))
-    if daily_budget and daily_budget > 0 and spend / daily_budget >= config.budget_ratio:
+    if (budget_enabled and daily_budget and daily_budget > 0
+            and spend / daily_budget >= config.budget_ratio):
         events.append(_event(
             "budget_consumption", "P2", entity_key, f"{entity_key}:budget_consumption",
             {"spend": spend, "daily_budget": daily_budget, "budget_ratio": spend / daily_budget},
