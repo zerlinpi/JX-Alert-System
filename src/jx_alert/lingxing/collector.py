@@ -3,6 +3,7 @@ from datetime import date
 
 from sqlalchemy import delete
 
+from jx_alert.storage.coverage import mark_coverage
 from jx_alert.storage.models import DailyMetric, RawSnapshot
 
 
@@ -113,6 +114,13 @@ def collect_ads_for_day(client, db, report_date: str | dict[str, str]) -> dict:
                         currency=None,
                         source=f"lingxing_ads_{report_type}",
                     ))
+            mark_coverage(
+                db,
+                store_id=store_id,
+                metric_date=date.fromisoformat(local_report_date),
+                dimension=f"campaign_{report_type}",
+                row_count=len(rows),
+            )
             db.commit()
             report_counts[report_type] += len(rows)
 
