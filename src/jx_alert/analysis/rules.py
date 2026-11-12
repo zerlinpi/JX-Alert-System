@@ -86,18 +86,19 @@ def detect_campaign_anomalies(*, entity_key: str, spend: float, orders: float | 
             f"广告花费达到七日均值的 {spend / spend_avg:.2f} 倍",
         ))
     if (conversion_enabled and campaign_enabled and spend >= config.min_spend
-            and clicks >= config.min_clicks and orders == 0 and orders_avg > 0):
+            and clicks >= config.min_clicks and orders == 0):
         events.append(_event(
             "spend_no_conversion", "P1", entity_key, f"{entity_key}:spend_no_conversion",
             {"spend": spend, "clicks": clicks, "orders": orders, "orders_avg_7d": orders_avg},
             "广告花费和点击达到观察门槛，但广告订单为 0",
         ))
     if (conversion_enabled and campaign_enabled and spend_avg > 0
-            and spend < spend_avg * config.low_spend_ratio and orders == 0):
+            and config.min_spend <= spend < spend_avg * config.low_spend_ratio
+            and clicks >= config.min_clicks and orders == 0):
         events.append(_event(
             "low_spend_no_conversion", "P3", entity_key, f"{entity_key}:low_spend_no_conversion",
-            {"spend": spend, "spend_avg_7d": spend_avg, "orders": orders},
-            "启用中的广告活动花费低于七日均值且没有转化，需结合投放量检查",
+            {"spend": spend, "spend_avg_7d": spend_avg, "clicks": clicks, "orders": orders},
+            "启用中的广告活动花费显著低于七日均值，花费与点击达到观察门槛但没有转化",
         ))
     if (budget_enabled and daily_budget and daily_budget > 0
             and spend / daily_budget >= config.budget_ratio):

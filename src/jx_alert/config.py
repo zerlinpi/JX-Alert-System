@@ -1,4 +1,7 @@
 from functools import lru_cache
+import json
+from pathlib import Path
+from typing import Literal
 from sqlalchemy.engine import URL
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,6 +18,13 @@ class Settings(BaseSettings):
     # Refresh enough marketplace-local dates for the 14-day attribution window plus its 7-day baseline.
     ad_attribution_refresh_days: int = Field(default=22, ge=1, le=31)
     store_timezones_file: str = "/app/data/store-timezones.json"
+    runtime_settings_file: str = "/app/data/runtime-settings.json"
+    collection_scope_file: str = "/app/data/collection-scope.json"
+    sp_collection_enabled: bool = False
+    sp_validation_targets_file: str = "/app/data/sp-validation-targets.json"
+    sp_refresh_days: int = Field(default=7, ge=1, le=30)
+    mcp_operations_enabled: bool = False
+    mcp_auth_file: str = "/app/data/secrets/mcp-auth.json"
 
     # Remote MCP uses Streamable HTTP and is published on a loopback-only host port.
     mcp_host: str = "0.0.0.0"
@@ -78,6 +88,13 @@ class Settings(BaseSettings):
     feishu_default_at_open_ids: str = ""
     feishu_routing_file: str = "/app/data/feishu-routing.json"
     feishu_timeout: int = 20
+    feishu_transport: Literal["webhook", "app"] = "webhook"
+    feishu_app_id: str = ""
+    feishu_app_secret: SecretStr = SecretStr("")
+    feishu_app_credentials_file: str = "/app/data/secrets/feishu-app.json"
+    feishu_manager_open_ids: str = ""
+    feishu_daily_report_enabled: bool = False
+    feishu_daily_report_chat_id: str = ""
 
     alert_order_change_ratio: float = 0.15
     alert_high_spend_ratio: float = 1.30
@@ -114,4 +131,26 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    path = Path(settings.runtime_settings_file)
+    if path.is_file():
+        runtime = json.loads(path.read_text(encoding="utf-8"))
+        allowed = {
+            "app_dry_run", "scheduler_enabled", "daily_sync_cron",
+            "collection_scope_file", "sp_collection_enabled", "sp_validation_targets_file",
+            "store_timezones_file", "feishu_routing_file",
+            "sp_refresh_days", "mcp_operations_enabled", "feishu_enabled", "feishu_transport",
+            "feishu_manager_open_ids", "feishu_daily_report_enabled", "feishu_daily_report_chat_id",
+            "lingxing_performance_enabled", "lingxing_performance_source_timezone",
+            "mcp_allowed_hosts", "mcp_allowed_origins",
+        }
+        if not isinstance(runtime, dict) or set(runtime) - allowed:
+            raise ValueError("Runtime settings contain unsupported fields")
+        settings = Settings(_env_file=None, **{**settings.model_dump(), **runtime})
+    if not settings.mcp_bearer_token and Path(settings.mcp_auth_file).is_file():
+        auth = json.loads(Path(settings.mcp_auth_file).read_text(encoding="utf-8"))
+        token = auth.get("bearer_token") if isinstance(auth, dict) else None
+        if not isinstance(token, str) or len(token) < 32:
+            raise ValueError("MCP authentication file is invalid")
+        settings = settings.model_copy(update={"mcp_bearer_token": token})
+    return settings

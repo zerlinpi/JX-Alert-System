@@ -1,6 +1,6 @@
-"""Read-only MCP tools for persisted JX Alert data.
+"""Persisted-data MCP queries and explicitly enabled bounded job requests.
 
-No tool in this module contacts Lingxing or sends Feishu messages.
+Collection requests only enqueue work; the scheduler performs the read-only APIs.
 """
 from datetime import date, datetime, timedelta
 import argparse
@@ -990,6 +990,67 @@ def get_sync_jobs(limit: int = 50) -> list[dict]:
             "error_message": row.error_message,
             "metadata": row.metadata_json,
         } for row in rows]
+
+
+@mcp.tool()
+def get_sp_report(store_id: str, campaign_id: str, report_date: str,
+                  scope: str = "daily") -> dict:
+    """Read one complete SP version. Daily and hour scopes are never added."""
+    from jx_alert.lingxing.sp_persistence import latest_sp_partition
+    init_db()
+    with SessionLocal() as db:
+        result = latest_sp_partition(db, sid=store_id, campaign_id=campaign_id,
+                                     report_date=report_date, scope=scope)
+        rows = result.pop("rows")
+        result["row_count"] = len(rows)
+        result["rows"] = [{
+            "campaign_id": r.campaign_id, "date": r.report_date.isoformat(),
+            "hour": getattr(r, "hour", None), "ad_id": getattr(r, "ad_id", None),
+            "targeting_id": getattr(r, "targeting_id", None),
+            "asin": getattr(r, "asin", None), "seller_sku": getattr(r, "seller_sku", None),
+            **{key: str(getattr(r, key)) for key in ("cost", "clicks", "impressions", "orders", "sales")},
+        } for r in rows[:500]]
+        if result["metrics"] is not None:
+            result["metrics"] = {k: str(v) for k, v in result["metrics"].items()}
+        return result
+
+
+@mcp.tool()
+def get_sp_reconciliations(store_id: str, campaign_id: str, limit: int = 100) -> list[dict]:
+    """Inspect observed differences and failed/empty SP collection attempts."""
+    from jx_alert.storage.sp import ReconciliationLog
+    init_db()
+    with SessionLocal() as db:
+        rows = db.scalars(select(ReconciliationLog).where(
+            ReconciliationLog.store_id == store_id,
+            ReconciliationLog.campaign_id == campaign_id,
+        ).order_by(ReconciliationLog.id.desc()).limit(_limit(limit))).all()
+        return [{"run_id": r.run_id, "date": r.report_date.isoformat(), "scope": r.scope,
+                 "collection_status": r.collection_status,
+                 "comparison_status": r.comparison_status,
+                 "daily_metrics": r.daily_metrics, "hourly_metrics": r.hourly_metrics,
+                 "delta_hour_minus_daily": r.delta_hour_minus_daily,
+                 "captured_at": r.captured_at.isoformat()} for r in rows]
+
+
+@mcp.tool()
+def request_collection(report_date: str | None = None, backfill_days: int = 1,
+                       idempotency_key: str | None = None) -> dict:
+    """Explicitly request collection/analysis of the configured store scope.
+
+    Requires enabled operations and a running scheduler. Returns a persisted job ID.
+    Never changes advertisements, budgets, bids, listings, or shop settings.
+    """
+    settings = get_settings()
+    if not settings.mcp_operations_enabled or settings.app_dry_run:
+        return {"status": "DISABLED"}
+    from jx_alert.operations import enqueue_collection
+    init_db()
+    with SessionLocal() as db:
+        result = enqueue_collection(db, report_date=report_date, backfill_days=backfill_days,
+                                    idempotency_key=idempotency_key)
+        db.commit()
+        return result
 
 
 if __name__ == "__main__":

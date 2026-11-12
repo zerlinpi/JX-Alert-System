@@ -25,7 +25,9 @@ class NotificationOutbox(Base):
 def enqueue_notification(db, *, idempotency_key: str, text: str,
                          store_id: str | None = None, entity_id: str | None = None,
                          chat_id: str = "default",
-                         open_ids: list[str] | None = None) -> NotificationOutbox:
+                         open_ids: list[str] | None = None,
+                         delivery: dict | None = None,
+                         fixed_route: bool = False) -> NotificationOutbox:
     """Insert once per idempotency key, safely handling concurrent producers."""
     existing = db.scalar(
         select(NotificationOutbox).where(
@@ -42,6 +44,10 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
                  "open_ids": open_ids or []},
         status="PENDING",
     )
+    if fixed_route:
+        row.payload = {**row.payload, "fixed_route": True}
+    if delivery is not None:
+        row.payload = {**row.payload, "transport": "app", "delivery": delivery}
     try:
         with db.begin_nested():
             db.add(row)

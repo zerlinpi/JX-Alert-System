@@ -23,6 +23,7 @@ def init_db():
     # Import every model module before create_all so all tables are registered.
     from jx_alert.storage import models  # noqa: F401
     from jx_alert.notifications import outbox  # noqa: F401
+    from jx_alert.storage import sp  # noqa: F401
     Base.metadata.create_all(bind=engine)
     from jx_alert.storage.migrations import upgrade_schema
     upgrade_schema(engine)
