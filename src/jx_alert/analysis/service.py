@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select
 
+from jx_alert.config import get_settings
 from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.storage.models import AnomalyEvent, Campaign, Product, Store
 
@@ -207,15 +208,31 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         ])
         message = "\n".join(lines)
         first_seen = anomaly.first_seen.isoformat() if anomaly.first_seen else "unknown"
-        enqueue_notification(
-            db,
-            idempotency_key=(
-                f"anomaly:{anomaly.dedupe_key}:{anomaly.status}:"
-                f"{anomaly.severity}:{first_seen}"
-            ),
-            text=message,
-            store_id=anomaly.store_id,
-            entity_id=anomaly.entity_id or None,
+        event_key = (
+            f"anomaly:{anomaly.dedupe_key}:{anomaly.status}:"
+            f"{anomaly.severity}:{first_seen}"
         )
-        queued += 1
+        settings = get_settings()
+        if getattr(settings, "feishu_transport", "webhook") == "app":
+            from jx_alert.notifications.routing import enqueue_application_deliveries
+            from jx_alert.notifications.cards import anomaly_card
+            result = enqueue_application_deliveries(
+                db, settings, event_key=event_key, text=message,
+                card=anomaly_card(state=state_label, severity=anomaly.severity,
+                                  store=store_label, campaign=campaign_label,
+                                  product=product_label, rule=anomaly.rule,
+                                  reason=anomaly.reason, metrics=anomaly.metrics or {}),
+                context={
+                    "store_id": anomaly.store_id, "entity_id": anomaly.entity_id,
+                    "metrics": anomaly.metrics or {}, "scope": anomaly.evaluation_scope,
+                    "severity": anomaly.severity, "status": anomaly.status,
+                },
+            )
+            queued += result["planned"]
+        else:
+            enqueue_notification(
+                db, idempotency_key=event_key, text=message,
+                store_id=anomaly.store_id, entity_id=anomaly.entity_id or None,
+            )
+            queued += 1
     return queued

@@ -1,0 +1,70 @@
+{
+  "_usage": "仅供人工汇总，不能直接作为 runtime-settings.json 或任何单项运行配置加载；空值表示待确认，不应覆盖已有有效值。",
+  "server_locations": {
+    "project_directory": "/opt/jx-alert-system",
+    "runtime_settings_file": "/opt/jx-alert-system/data/runtime-settings.json",
+    "mapping_directory": "/opt/jx-alert-system/data/sp-runtime",
+    "private_directory": "/opt/jx-alert-system/data/secrets"
+  },
+  "collection_scope": {
+    "store_ids": [5174]
+  },
+  "store_timezones": {
+    "stores": {
+      "5174": {
+        "timezone": "America/Los_Angeles",
+        "currency_code": ""
+      }
+    }
+  },
+  "feishu_routing": {
+    "default_chat_id": "test",
+    "groups": {
+      "test": {
+        "chat_id": "",
+        "admin_open_ids": []
+      }
+    },
+    "stores": {
+      "5174": {
+        "chat_id": "test",
+        "open_ids": []
+      }
+    },
+    "entities": {
+      "5174:待替换为真实MSKU或ASIN": {
+        "open_ids": []
+      }
+    },
+    "management": {
+      "open_ids": []
+    }
+  },
+  "sp_validation_targets": {
+    "targets": [
+      {
+        "sid": 5174,
+        "campaign_id": 141469378857743
+      }
+    ]
+  },
+  "performance_source": {
+    "lingxing_performance_source_timezone": ""
+  },
+  "mcp_deployment": {
+    "mcp_public_url": "",
+    "dns_confirmed": false,
+    "tls_confirmed": false,
+    "intended_auth_mode": "oauth",
+    "mcp_path": "/mcp",
+    "mcp_owner_credentials_file": "/app/data/secrets/mcp-owner.json",
+    "mcp_oauth_database_path": "/app/data/secrets/mcp-oauth.sqlite3",
+    "owner_setup": "私有交互输入口令，仅在服务器私有文件保存口令哈希；本示例不含口令、哈希、令牌或客户端密钥。"
+  },
+  "runtime_file_references": {
+    "collection_scope": "使用 collection_scope_file 当前指向的单项文件",
+    "store_timezones": "使用 store_timezones_file 当前指向的单项文件",
+    "sp_validation_targets": "使用 sp_validation_targets_file 当前指向的单项文件",
+    "feishu_routing": "/opt/jx-alert-system/data/sp-runtime/feishu-routing.json"
+  }
+}

@@ -1,0 +1,24 @@
+# Replace the domain and certificate paths, then nginx -t before reloading.
+# This is a dedicated JX-MCP virtual host; do not overwrite another site's vhost.
+server {
+    listen 443 ssl;
+    server_name mcp.example.com;
+    ssl_certificate /etc/letsencrypt/live/mcp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/mcp.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 64k;
+    # OAuth authorization codes/state occur in URLs. Do not log query strings.
+    access_log off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+    }
+}

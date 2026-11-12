@@ -80,6 +80,41 @@ def test_product_ads_collector_saves_sp_sd_metrics_and_mappings():
         assert db.scalar(select(func.count()).select_from(DataCoverage)) == 2
 
 
+def test_multiple_ads_share_one_product_with_production_autoflush_disabled():
+    class Client(FakeProductAdsClient):
+        def iter_advertising_product_ads(self, report_type, payload, **kwargs):
+            row = list(super().iter_advertising_product_ads(report_type, payload))[0]
+            return iter([row, {**row, "ad_id": row["ad_id"] + 100}])
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False)
+    with Session() as db:
+        collect_product_ads_for_day(Client(), db, "2026-11-10")
+        assert db.scalar(select(func.count()).select_from(Product)) == 1
+        assert db.scalar(select(func.count()).select_from(AdProduct)) == 4
+
+
+def test_duplicate_product_report_rows_preserve_prior_partition():
+    import pytest
+
+    class Duplicate(FakeProductAdsClient):
+        def iter_advertising_product_report(self, report_type, payload, **kwargs):
+            rows = list(super().iter_advertising_product_report(report_type, payload))
+            return iter(rows + rows)
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False)
+    with Session() as db:
+        collect_product_ads_for_day(FakeProductAdsClient(), db, "2026-11-10")
+        before = db.scalar(select(func.count()).select_from(DailyMetric))
+        with pytest.raises(RuntimeError, match="duplicate ad_id"):
+            collect_product_ads_for_day(Duplicate(), db, "2026-11-10")
+        db.rollback()
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) == before
+
+
 def test_product_ads_collector_replaces_same_day_metrics_idempotently():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)

@@ -89,6 +89,9 @@ def _sync_product_ad_master_data(client, db, store_id: str, sid, report_type: st
         if product is None:
             product = Product(store_id=store_id, seller_sku=seller_sku)
             db.add(product)
+            # Production sessions disable autoflush. Several ads can share one
+            # SKU, so make its identity visible before the next lookup.
+            db.flush()
         product.asin = asin
         product.updated_at = now
 
@@ -149,6 +152,7 @@ def collect_product_ads_for_day(client, db,
 
                 # Validate the entire report before replacing prior rows for this date.
                 normalized = []
+                report_ad_ids = set()
                 for record in rows:
                     if record.get("report_date") != report_date:
                         raise RuntimeError(
@@ -162,6 +166,9 @@ def collect_product_ads_for_day(client, db,
                         raise RuntimeError(
                             f"{report_type.upper()} product report row is missing ad_id/campaign_id/sku/asin"
                         )
+                    if str(ad_id) in report_ad_ids:
+                        raise RuntimeError("Product report contains duplicate ad_id for one date")
+                    report_ad_ids.add(str(ad_id))
                     values = {}
                     for source_field, metric_name in AD_METRICS.items():
                         value = record.get(source_field)
@@ -203,6 +210,7 @@ def collect_product_ads_for_day(client, db,
                     if product is None:
                         product = Product(store_id=store_id, seller_sku=seller_sku)
                         db.add(product)
+                        db.flush()
                     product.asin = asin
                     product.product_name = product.product_name or record.get("product_name")
                     product.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)

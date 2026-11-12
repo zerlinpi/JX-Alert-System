@@ -1,8 +1,10 @@
 import base64
 import hashlib
 import hmac
+import httpx
+import pytest
 
-from jx_alert.notifications.feishu import FeishuClient, build_feishu_signature
+from jx_alert.notifications.feishu import FeishuClient, FeishuWebhookError, build_feishu_signature
 
 
 def test_feishu_signature_is_hmac_sha256_base64():
@@ -42,3 +44,27 @@ def test_feishu_signature_matches_official_newline_formula():
         hmac.new(string_to_sign, b"", digestmod=hashlib.sha256).digest()
     ).decode("ascii")
     assert build_feishu_signature(timestamp, secret) == expected
+
+
+def test_webhook_message_data_cannot_inject_mentions():
+    client = FeishuClient("https://open.feishu.cn/open-apis/bot/v2/hook/test")
+    payload = client._payload('<at user_id="all">unexpected</at>', ["ou_owner"])
+    assert '<at user_id="all">' not in payload["content"]["text"]
+    assert '<at user_id="ou_owner">' in payload["content"]["text"]
+    with pytest.raises(ValueError, match="valid Open IDs"):
+        client._payload("test", ['ou_owner\"><at user_id="all'])
+
+
+@pytest.mark.parametrize("body", [
+    {"code": 19021, "msg": "provider echoed a private-webhook-token"},
+    {"code": "private-webhook-token"},
+    {"code": False},
+])
+def test_webhook_provider_errors_do_not_reveal_response_contents(monkeypatch, body):
+    original = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body)), **kwargs,
+    ))
+    with pytest.raises(FeishuWebhookError) as error:
+        FeishuClient("https://open.feishu.cn/open-apis/bot/v2/hook/test").send_text("test")
+    assert "private-webhook-token" not in str(error.value)

@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import html
+import re
 import time
 from urllib.parse import urlparse
 
@@ -28,7 +29,9 @@ class FeishuClient:
         parsed = urlparse(webhook_url)
         if parsed.scheme != "https" or parsed.hostname not in {
             "open.feishu.cn", "open.larksuite.com"
-        } or not parsed.path.startswith("/open-apis/bot/v2/hook/"):
+        } or not re.fullmatch(r"/open-apis/bot/v2/hook/[A-Za-z0-9_-]+", parsed.path) or (
+            parsed.username or parsed.password or parsed.port or parsed.query or parsed.fragment
+        ):
             raise ValueError("FEISHU_WEBHOOK_URL must be a Feishu/Lark custom-bot HTTPS webhook")
         self.webhook_url = webhook_url
         self.sign_secret = sign_secret
@@ -36,11 +39,18 @@ class FeishuClient:
         self.timeout = timeout
 
     def _payload(self, text: str, open_ids: list[str] | None = None) -> dict:
+        if open_ids is not None and (
+            not isinstance(open_ids, list) or not all(
+                isinstance(uid, str) and re.fullmatch(r"ou_[A-Za-z0-9_-]+", uid)
+                for uid in open_ids
+            )
+        ):
+            raise ValueError("Feishu mentions must contain valid Open IDs")
         mentions = "".join(
             f'<at user_id="{html.escape(uid, quote=True)}">提醒</at> '
             for uid in (open_ids or [])
         )
-        message = mentions + text
+        message = mentions + html.escape(text, quote=False)
         if self.keyword and self.keyword not in message:
             message = f"{self.keyword}\n{message}"
         payload = {"msg_type": "text", "content": {"text": message}}
@@ -70,9 +80,9 @@ class FeishuClient:
                 data = response.json()
         except httpx.HTTPError as exc:
             # Do not include the URL: it contains the secret webhook token.
-            raise FeishuWebhookError(f"Feishu webhook HTTP request failed: {type(exc).__name__}") from exc
-        except ValueError as exc:
-            raise FeishuWebhookError("Feishu webhook returned invalid JSON") from exc
+            raise FeishuWebhookError(f"Feishu webhook HTTP request failed: {type(exc).__name__}") from None
+        except ValueError:
+            raise FeishuWebhookError("Feishu webhook returned invalid JSON") from None
         if not isinstance(data, dict):
             raise FeishuWebhookError("Feishu webhook returned an unexpected response")
         if "code" in data:
@@ -81,9 +91,12 @@ class FeishuClient:
             code = data["StatusCode"]
         else:
             raise FeishuWebhookError("Feishu webhook response did not contain a status code")
+        if isinstance(code, bool) or not isinstance(code, (int, str)) or (
+            isinstance(code, str) and not re.fullmatch(r"-?\d+", code)
+        ):
+            raise FeishuWebhookError("Feishu webhook returned an invalid status code")
         if code not in (0, "0"):
             raise FeishuWebhookError(
-                f"Feishu webhook rejected message: code={code}, "
-                f"message={data.get('msg') or data.get('StatusMessage') or 'unknown'}"
+                f"Feishu webhook rejected message: code={code}"
             )
         return data

@@ -269,6 +269,10 @@ def _queue_freshness_event(db, store_id, dataset, status, source_timestamp):
 
 
 def _build_performance_events(store_id, store_name, row, standards, freshness):
+    # Keep the raw observation, but unknown/old/future source data cannot
+    # establish a new health risk or close an existing one.
+    if freshness != "FRESH":
+        return [], []
     events = []
     status = row.get("ahr_status")
     status_text = str(status or "").strip()
@@ -342,7 +346,7 @@ def _notice_status(value):
     return code, _STATUS_LABELS.get(code, "UNKNOWN")
 
 
-def _save_notice(db, store_id, row, source_updated_at):
+def _save_notice(db, store_id, row, source_updated_at, *, evaluate: bool):
     external_id = _notice_identity(row)
     notice_key = sha256(f"{store_id}:{external_id}".encode("utf-8")).hexdigest()
     status_code, status_label = _notice_status(row.get("status"))
@@ -377,6 +381,11 @@ def _save_notice(db, store_id, row, source_updated_at):
     saved.source_updated_at = _timestamp_text(source_updated_at)
     saved.payload = row
     saved.last_seen = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    if not evaluate:
+        # Observation/persistence is independent of evaluating its risk state.
+        # An old handled status must not recover a previously active alert.
+        return
 
     scope = f"{store_id}:performance_notice:{notice_key}"
     if status_code == 1:
@@ -526,25 +535,33 @@ def _store_performance_for_sid(client, db, sid, store_name, settings):
         lambda offset, length: client.performance_notice_list({
             "sid": _sid_value(sid), "offset": offset, "length": length,
         }),
-        page_size=page_size,
+        # The notice endpoint rejects length=200 in live responses although the
+        # separate storeTarget list accepts it. Keep its verified smaller page
+        # size and continue pagination using the actual returned row count.
+        page_size=min(page_size, 100),
         max_pages=max_pages,
         label="Performance notice list",
     )
-    source_updated_at = None
+    page_sources = []
     for offset, response in notice_pages:
-        if source_updated_at is None:
-            source_updated_at = _notice_last_update(response)
+        page_sources.append(_notice_last_update(response))
         db.add(RawSnapshot(
             source="lingxing_performance_notice_list",
             store_id=store_id,
             payload={"offset": offset, "response": response},
         ))
+    # Fetch and check every page before evaluating any notice. A fresh first
+    # page cannot make missing/old timestamps on later pages authoritative.
+    page_freshness = [_freshness_status(value, settings) for value in page_sources]
+    notice_freshness = next((state for state in page_freshness if state != "FRESH"),
+                            "FRESH" if page_freshness else "MISSING")
+    source_updated_at = next((value for value, state in zip(page_sources, page_freshness)
+                              if state == notice_freshness), None)
     for row in notice_rows:
         if not isinstance(row, dict):
             raise RuntimeError("Performance notice list contains a non-object row")
-        _save_notice(db, store_id, row, source_updated_at)
-
-    notice_freshness = _freshness_status(source_updated_at, settings)
+        _save_notice(db, store_id, row, source_updated_at,
+                     evaluate=notice_freshness == "FRESH")
     _upsert_sync_state(
         db, store_id=store_id, dataset="performance_notices",
         status=notice_freshness, source_updated_at=source_updated_at,

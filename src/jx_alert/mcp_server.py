@@ -1,6 +1,6 @@
-"""Read-only MCP tools for persisted JX Alert data.
+"""Persisted-data MCP queries and explicitly enabled bounded job requests.
 
-No tool in this module contacts Lingxing or sends Feishu messages.
+Collection requests only enqueue work; the scheduler performs the read-only APIs.
 """
 from datetime import date, datetime, timedelta
 import argparse
@@ -12,6 +12,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from sqlalchemy import func, select, text
 
 from jx_alert.config import get_settings
@@ -49,13 +50,38 @@ def _transport_security(settings):
 
 
 _MCP_TRANSPORT_SECURITY, _MCP_ALLOWED_ORIGINS = _transport_security(_MCP_SETTINGS)
+_OAUTH_PROVIDER = None
+_AUTH_OPTIONS = {}
+if _MCP_SETTINGS.mcp_auth_mode == "oauth":
+    from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+    from jx_alert.mcp_oauth import SqliteOAuthProvider, SCOPES
+    issuer = _MCP_SETTINGS.mcp_public_url.rstrip("/")
+    _OAUTH_PROVIDER = SqliteOAuthProvider(
+        database_path=_MCP_SETTINGS.mcp_oauth_database_path,
+        credentials_path=_MCP_SETTINGS.mcp_owner_credentials_file,
+        issuer_url=issuer, resource_url=issuer + _MCP_SETTINGS.mcp_path,
+    )
+    _AUTH_OPTIONS = {
+        "auth_server_provider": _OAUTH_PROVIDER,
+        "auth": AuthSettings(
+            issuer_url=issuer, resource_server_url=issuer + _MCP_SETTINGS.mcp_path,
+            validate_token_resource=True, required_scopes=["jx:read"],
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True, valid_scopes=list(SCOPES), default_scopes=["jx:read"],
+            ), revocation_options=RevocationOptions(enabled=True),
+        ),
+    }
 mcp = FastMCP(
     "JX Alert System",
     host=_MCP_SETTINGS.mcp_host,
     port=_MCP_SETTINGS.mcp_port,
     streamable_http_path=_MCP_SETTINGS.mcp_path,
     transport_security=_MCP_TRANSPORT_SECURITY,
+    **_AUTH_OPTIONS,
 )
+if _OAUTH_PROVIDER is not None:
+    for route in _OAUTH_PROVIDER.owner_routes():
+        mcp.custom_route(route.path, methods=sorted(route.methods))(route.endpoint)
 
 
 class BearerTokenMiddleware:
@@ -109,7 +135,9 @@ class BearerTokenMiddleware:
 def create_http_app(settings=None):
     """Build the authenticated Streamable HTTP ASGI app for remote MCP clients."""
     settings = settings or get_settings()
-    if not settings.mcp_bearer_token:
+    if settings.mcp_auth_mode != _MCP_SETTINGS.mcp_auth_mode:
+        raise RuntimeError("MCP authentication mode changed; restart the process")
+    if settings.mcp_auth_mode == "bearer" and not settings.mcp_bearer_token:
         raise RuntimeError(
             "MCP_BEARER_TOKEN is required before starting the remote MCP service"
         )
@@ -136,13 +164,15 @@ def create_http_app(settings=None):
             ],
             expose_headers=["Mcp-Session-Id", "Mcp-Protocol-Version"],
         )
+    if _OAUTH_PROVIDER is not None:
+        return _OAUTH_PROVIDER.auth_guard(app)
     return BearerTokenMiddleware(app, settings.mcp_bearer_token, settings.mcp_path)
 
 def _limit(value: int, maximum: int = 500) -> int:
     return min(max(int(value), 1), maximum)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def system_health() -> dict:
     """Return application/database configuration status without exposing secrets."""
     settings = get_settings()
@@ -181,7 +211,7 @@ def system_health() -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_stores() -> list[dict]:
     """List synchronized Lingxing stores and their configured marketplace timezone."""
     init_db()
@@ -201,7 +231,7 @@ def get_stores() -> list[dict]:
         } for row in rows]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_all_anomalies(limit: int = 100, status: str | None = None,
                       severity: str | None = None,
                       store_id: str | None = None) -> list[dict]:
@@ -417,7 +447,7 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_daily_metrics(store_id: str, report_date: str,
                       dimension: str | None = None,
                       entity_id: str | None = None,
@@ -454,7 +484,7 @@ def get_daily_metrics(store_id: str, report_date: str,
 
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_daily_summary(store_id: str, report_date: str) -> dict:
     """Return one store's daily sales comparison, ad totals, campaign detail and coverage.
 
@@ -472,7 +502,7 @@ def get_daily_summary(store_id: str, report_date: str) -> dict:
 
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_products(store_id: str | None = None, seller_sku: str | None = None,
                  asin: str | None = None, limit: int = 200) -> list[dict]:
     """Query synchronized MSKU/ASIN mappings and configured product-owner Open IDs."""
@@ -500,7 +530,7 @@ def get_products(store_id: str | None = None, seller_sku: str | None = None,
         } for row in rows]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_campaigns(store_id: str | None = None,
                   campaign_type: str | None = None,
                   limit: int = 300) -> list[dict]:
@@ -534,7 +564,7 @@ def get_campaigns(store_id: str | None = None,
 
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_sku_performance(store_id: str, report_date: str,
                         dimension: str = "sku_msku", limit: int = 200) -> list[dict]:
     """Return SKU/ASIN daily metrics with previous-day and complete 7-day baselines.
@@ -634,7 +664,7 @@ def get_sku_performance(store_id: str, report_date: str,
         return results[:_limit(limit, 1000)]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_campaign_performance(store_id: str, report_date: str,
                              campaign_type: str | None = None,
                              limit: int = 200) -> list[dict]:
@@ -729,7 +759,7 @@ def get_campaign_performance(store_id: str, report_date: str,
         return results
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_product_ad_performance(store_id: str, report_date: str,
                                campaign_type: str = "sp",
                                limit: int = 200) -> list[dict]:
@@ -831,7 +861,7 @@ def get_product_ad_performance(store_id: str, report_date: str,
         return results
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_anomaly_history(store_id: str | None = None,
                         entity_id: str | None = None,
                         rule: str | None = None,
@@ -879,7 +909,7 @@ def get_anomaly_history(store_id: str | None = None,
         } for row in rows]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_notification_logs(store_id: str | None = None,
                           status: str | None = None,
                           start_date: str | None = None,
@@ -943,7 +973,7 @@ def get_notification_logs(store_id: str | None = None,
         } for row in rows]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_data_coverage(store_id: str, start_date: str, end_date: str,
                       limit: int = 500) -> list[dict]:
     """Inspect which store/date/dimension partitions were completely collected."""
@@ -971,7 +1001,7 @@ def get_data_coverage(store_id: str, start_date: str, end_date: str,
         } for row in rows]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_sync_jobs(limit: int = 50) -> list[dict]:
     """Inspect recent daily collection jobs, including partial failures."""
     init_db()
@@ -990,6 +1020,81 @@ def get_sync_jobs(limit: int = 50) -> list[dict]:
             "error_message": row.error_message,
             "metadata": row.metadata_json,
         } for row in rows]
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_sp_report(store_id: str, campaign_id: str, report_date: str,
+                  scope: str = "daily") -> dict:
+    """Read one complete SP version. Daily and hour scopes are never added."""
+    from jx_alert.lingxing.sp_persistence import latest_sp_partition
+    init_db()
+    with SessionLocal() as db:
+        result = latest_sp_partition(db, sid=store_id, campaign_id=campaign_id,
+                                     report_date=report_date, scope=scope)
+        rows = result.pop("rows")
+        result["row_count"] = len(rows)
+        result["rows"] = [{
+            "campaign_id": r.campaign_id, "date": r.report_date.isoformat(),
+            "hour": getattr(r, "hour", None), "ad_id": getattr(r, "ad_id", None),
+            "targeting_id": getattr(r, "targeting_id", None),
+            "asin": getattr(r, "asin", None), "seller_sku": getattr(r, "seller_sku", None),
+            **{key: str(getattr(r, key)) for key in ("cost", "clicks", "impressions", "orders", "sales")},
+        } for r in rows[:500]]
+        if result["metrics"] is not None:
+            result["metrics"] = {k: str(v) for k, v in result["metrics"].items()}
+        return result
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_sp_reconciliations(store_id: str, campaign_id: str, limit: int = 100) -> list[dict]:
+    """Inspect observed differences and failed/empty SP collection attempts."""
+    from jx_alert.storage.sp import ReconciliationLog
+    init_db()
+    with SessionLocal() as db:
+        rows = db.scalars(select(ReconciliationLog).where(
+            ReconciliationLog.store_id == store_id,
+            ReconciliationLog.campaign_id == campaign_id,
+        ).order_by(ReconciliationLog.id.desc()).limit(_limit(limit))).all()
+        return [{"run_id": r.run_id, "date": r.report_date.isoformat(), "scope": r.scope,
+                 "collection_status": r.collection_status,
+                 "comparison_status": r.comparison_status,
+                 "daily_metrics": r.daily_metrics, "hourly_metrics": r.hourly_metrics,
+                 "delta_hour_minus_daily": r.delta_hour_minus_daily,
+                 "captured_at": r.captured_at.isoformat()} for r in rows]
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_configuration_status() -> dict:
+    """List missing owner/store/timezone/domain mappings without exposing credentials or IDs."""
+    from jx_alert.readiness import configuration_status
+    init_db()
+    with SessionLocal() as db:
+        return configuration_status(db, get_settings())
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
+def request_collection(report_date: str | None = None, backfill_days: int = 1,
+                       idempotency_key: str | None = None) -> dict:
+    """Explicitly request collection/analysis of the configured store scope.
+
+    Requires enabled operations and a running scheduler. Returns a persisted job ID.
+    Never changes advertisements, budgets, bids, listings, or shop settings.
+    """
+    settings = get_settings()
+    if getattr(settings, "mcp_auth_mode", "bearer") == "oauth":
+        from mcp.server.auth.middleware.auth_context import get_access_token
+        token = get_access_token()
+        if token is None or "jx:collect" not in token.scopes:
+            raise PermissionError("The jx:collect scope is required to request collection")
+    if not settings.mcp_operations_enabled or settings.app_dry_run:
+        return {"status": "DISABLED"}
+    from jx_alert.operations import enqueue_collection
+    init_db()
+    with SessionLocal() as db:
+        result = enqueue_collection(db, report_date=report_date, backfill_days=backfill_days,
+                                    idempotency_key=idempotency_key)
+        db.commit()
+        return result
 
 
 if __name__ == "__main__":
@@ -1012,5 +1117,7 @@ if __name__ == "__main__":
             host=settings.mcp_host,
             port=settings.mcp_port,
             log_level="info",
+            access_log=False,  # OAuth query strings contain authorization codes/state.
             proxy_headers=True,
+            forwarded_allow_ips=settings.mcp_forwarded_allow_ips,
         )

@@ -1,0 +1,19 @@
+{
+  "default_chat_id": "test",
+  "groups": {
+    "test": {
+      "chat_id": "oc_REPLACE_WITH_GROUP_ID",
+      "admin_open_ids": []
+    }
+  },
+  "stores": {
+    "5174": {
+      "chat_id": "test",
+      "open_ids": []
+    }
+  },
+  "entities": {},
+  "management": {
+    "open_ids": []
+  }
+}

@@ -124,9 +124,9 @@ def test_explicit_zero_metrics_remain_valid_and_can_recover_prior_alert(db):
     zero_alert = db.scalar(select(AnomalyEvent).where(
         AnomalyEvent.rule == "low_spend_no_conversion",
     ))
-    assert zero_alert is not None
-    assert zero_alert.metrics["spend"] == 0
-    assert zero_alert.metrics["orders"] == 0
+    # Explicit zeros are valid data, but zero spend/clicks do not meet the
+    # minimum sample needed for a conversion warning.
+    assert zero_alert is None
 
 
 def test_missing_campaign_preserves_scope_but_other_complete_campaign_still_alerts(db):
