@@ -8,7 +8,7 @@ from sqlalchemy import select
 from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.notifications.routing import _load_routing
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerformance
-from jx_alert.notifications.cards import card, number, change
+from jx_alert.notifications.cards import card, number, change, status_label
 
 
 def build_daily_card(db, store, day):
@@ -40,20 +40,26 @@ def build_daily_card(db, store, day):
         complete = all(coverage.get((d, dimension)) == "COMPLETE" for d in [day, previous])
         metrics.append((label, number(current, money=money, currency=currency),
                         number(prior, money=money, currency=currency), change(current, prior, complete=complete)))
-    quality = [(label, coverage.get((day, dimension), "未知")) for label, dimension in [
+    quality = [(label, status_label(coverage.get((day, dimension), "未知"))) for label, dimension in [
         ("店铺销量", "store"), ("SP日报", "campaign_sp"), ("SB日报", "campaign_sb"), ("SD日报", "campaign_sd")]]
     performance = db.scalar(select(StorePerformance).where(StorePerformance.store_id == store.sid)
                             .order_by(StorePerformance.pull_date.desc()).limit(1))
     notes = [f"报表时区：{store.timezone or '待确认'} · 前一日：{previous.isoformat()}",
              "空记录不代表真实零值；完整采集也不代表每个活动均返回记录。",
              "广告花费取日报；小时数据单独对账。转化告警按成熟归因日判断。"]
-    notes.append(f"绩效：{performance.pull_date} / {performance.freshness_status}" if performance
+    notes.append(f"绩效：{performance.pull_date} / {status_label(performance.freshness_status)}；仅展示原始观测。" if performance
                  else "绩效：未知（尚无记录）")
+    sections = [("经营与广告", ["指标", "当日", "前一日", "环比"], metrics),
+                ("采集状态", ["数据集", "状态"], quality)]
+    if performance:
+        sections.append(("绩效原始观测", ["指标", "观测值", "源状态"], [
+            ("AHR评分", number(performance.ahr_score), status_label(performance.freshness_status)),
+            ("账户健康状态", performance.ahr_status or "未知", status_label(performance.freshness_status)),
+        ]))
     return card(
         f"每日经营快照 · {day.isoformat()}",
         subtitle=f"{store.name}（{store.sid}） · {currency}",
-        sections=[("经营与广告", ["指标", "当日", "前一日", "环比"], metrics),
-                  ("采集状态", ["数据集", "状态"], quality)], notes=notes,
+        sections=sections, notes=notes,
     )
 
 
