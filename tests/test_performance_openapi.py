@@ -141,3 +141,34 @@ def test_client_uses_confirmed_read_only_performance_paths(monkeypatch):
         "/basicOpen/customerService/storeTarget/detail",
         "/basicOpen/customerService/performanceNotice/list",
     ]
+
+
+@pytest.mark.parametrize("configured_page_size", [50, 200])
+def test_notice_endpoint_uses_verified_page_size_without_truncating(configured_page_size):
+    class PagedNoticeClient(FakePerformanceClient):
+        def performance_notice_list(self, payload):
+            self.calls.append(("notices", payload))
+            assert payload["length"] <= 100
+            start = payload["offset"]
+            rows = [{"notice_id": f"notice-{i}", "subject": "Historical notice",
+                     "status": 3, "date": "2026-11-10 10:00:00"}
+                    for i in range(start, min(start + payload["length"], 102))]
+            return {"code": 0, "data": {"list": rows, "total": 102,
+                    "lastUpdateDate": "2026-11-10 10:00:00"}}
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    client = PagedNoticeClient()
+    settings = _settings("")
+    settings.lingxing_performance_page_size = configured_page_size
+    with sessionmaker(bind=engine)() as db:
+        result = collect_store_performance(
+            client, db, stores_response={"data": [{"sid": 101}]}, settings=settings,
+        )
+        assert result["status"] == "SUCCEEDED_WITH_WARNINGS"
+        assert result["notice_rows"] == 102
+        assert len(db.scalars(select(PerformanceNotice)).all()) == 102
+        notices = [payload for kind, payload in client.calls if kind == "notices"]
+        step = min(configured_page_size, 100)
+        assert [payload["offset"] for payload in notices] == list(range(0, 102, step))
+        assert next(payload for kind, payload in client.calls if kind == "list")["length"] == configured_page_size

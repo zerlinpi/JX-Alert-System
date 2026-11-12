@@ -526,7 +526,10 @@ def _store_performance_for_sid(client, db, sid, store_name, settings):
         lambda offset, length: client.performance_notice_list({
             "sid": _sid_value(sid), "offset": offset, "length": length,
         }),
-        page_size=page_size,
+        # The notice endpoint rejects length=200 in live responses although the
+        # separate storeTarget list accepts it. Keep its verified smaller page
+        # size and continue pagination using the actual returned row count.
+        page_size=min(page_size, 100),
         max_pages=max_pages,
         label="Performance notice list",
     )

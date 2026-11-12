@@ -76,6 +76,16 @@ Each is an array of real `ou_...` identifiers. Leave unknown recipients empty.
 The group destination is already configured; credentials are stored separately.
 See `config/feishu-app-routing.example.json` for the non-sensitive structure.
 
+## Store health source validation
+
+Live read-only checks accepted a store-health list page of 200, but the separate
+performance-notice endpoint rejected 200 with provider code 400 and accepted 100.
+The collector caps only notice pages at the verified size of 100 and still reads
+every page. This is an observed compatibility limit, not a documented maximum.
+Automatic health collection remains disabled until the source timestamps'
+timezone is confirmed. A successful sample is stored as `NOT_CONFIGURED` when
+that timezone is unknown; it must not recover freshness alerts.
+
 ## Historical rule replay
 
 `analysis.backtest.backtest_history()` copies the selected store's historical
