@@ -18,11 +18,14 @@ def _scoped_dedupe_key(store_id: str, event_key: str) -> str:
 
 def upsert_anomalies(db, store_id: str, events: list[dict], *,
                      evaluation_scope: str, scope_complete: bool = False,
+                     recovery_entity_ids: set[str] | None = None,
                      escalation_after_days: int = 2) -> list[AnomalyEvent]:
     """Upsert one complete evaluation scope; only a complete scope can recover old events.
 
     evaluation_scope should identify the same store + metric family/date window each run.
     If collection failed or pagination was incomplete, pass scope_complete=False.
+    When recovery_entity_ids is provided, only those fully evaluated entities may recover;
+    an empty set intentionally recovers none. None preserves scope_complete behavior.
     """
     if not evaluation_scope:
         raise ValueError("evaluation_scope is required")
@@ -98,12 +101,15 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
             db.add(row)
         saved.append(row)
 
-    if scope_complete:
+    if scope_complete or recovery_entity_ids is not None:
         conditions = [
             AnomalyEvent.store_id == store_id,
             AnomalyEvent.evaluation_scope == evaluation_scope,
             AnomalyEvent.status.in_(["NEW", "ONGOING", "ESCALATED"]),
         ]
+        if recovery_entity_ids is not None:
+            eligible_ids = {str(entity_id) for entity_id in recovery_entity_ids}
+            conditions.append(AnomalyEvent.entity_id.in_(eligible_ids))
         if active_keys:
             conditions.append(AnomalyEvent.dedupe_key.not_in(active_keys))
         recovered_rows = db.scalars(select(AnomalyEvent).where(*conditions)).all()

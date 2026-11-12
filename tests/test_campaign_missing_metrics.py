@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
 
 from jx_alert.analysis.evaluator import evaluate_daily_anomalies
+from jx_alert.analysis.service import upsert_anomalies
 from jx_alert.analysis.rules import RuleConfig
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
@@ -146,3 +147,34 @@ def test_missing_campaign_preserves_scope_but_other_complete_campaign_still_aler
     other_alert = db.scalar(select(AnomalyEvent).where(AnomalyEvent.entity_id == other))
     assert other_alert.rule == "high_ad_spend"
     assert other_alert.metrics["spend"] == 30
+
+
+@pytest.mark.parametrize("missing_state", ["enabled", "archived", "not_returned"])
+def test_complete_campaign_recovers_without_recovering_campaign_missing_history(db, missing_state):
+    complete_alert = _existing_alert(db, CAMPAIGN)
+    missing_campaign = "141469378857744"
+    db.add(Campaign(
+        store_id=STORE, campaign_type="sp", campaign_id=missing_campaign,
+        name=missing_campaign, state=missing_state,
+    ))
+    missing_alert = _existing_alert(db, missing_campaign)
+
+    result = evaluate_daily_anomalies(db, TARGET, RuleConfig())
+
+    assert complete_alert.status == "RECOVERED"
+    assert missing_alert.status == "ONGOING"
+    assert result["skipped_scope_details"][0]["campaign_id"] == missing_campaign
+    assert result["notifications_queued"] == 1
+
+
+@pytest.mark.parametrize("scope_complete", [False, True])
+def test_empty_recovery_entity_ids_never_recover_anomalies(db, scope_complete):
+    existing = _existing_alert(db)
+    upsert_anomalies(
+        db, STORE, [], evaluation_scope=f"{STORE}:campaign:sp",
+        scope_complete=scope_complete, recovery_entity_ids=set(),
+    )
+    db.commit()
+
+    assert existing.status == "ONGOING"
+    assert existing.recovered_at is None

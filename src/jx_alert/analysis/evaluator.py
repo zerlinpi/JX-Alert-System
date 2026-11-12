@@ -115,6 +115,7 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
     }
     events = []
     scope_complete = True
+    recovery_entity_ids: set[str] = set()
     for campaign in campaigns:
         entity_id = campaign.campaign_id
         if campaign_type == "sp":
@@ -141,6 +142,8 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
                         "missing": missing,
                     })
                 continue
+        if campaign_type == "sp":
+            recovery_entity_ids.add(str(entity_id))
         current_spend = metrics["spend"].get((entity_id, report_date), 0.0)
         prior_spend = [
             metrics["spend"].get((entity_id, day), 0.0)
@@ -236,6 +239,7 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
     scope = f"{store_id}:campaign:{campaign_type}"
     saved = upsert_anomalies(
         db, store_id, events, evaluation_scope=scope, scope_complete=scope_complete,
+        recovery_entity_ids=recovery_entity_ids if campaign_type == "sp" else None,
         escalation_after_days=config.escalate_after_days,
     )
     return saved, scope_complete
@@ -452,8 +456,8 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
                 db, store_id, campaign_type, target_date, config,
                 skip_details=skipped_scope_details,
             )
-            # A partly known SP scope may still produce valid alerts for other
-            # campaigns, while recovery remains disabled for the entire scope.
+            # A partly known SP scope may still produce valid alerts for complete
+            # campaigns; missing campaigns are excluded from recovery.
             saved_events.extend(saved)
             if complete:
                 evaluated_scopes += 1
