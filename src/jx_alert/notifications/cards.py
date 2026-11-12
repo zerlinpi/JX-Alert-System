@@ -97,16 +97,30 @@ _METRIC_NAMES = {
     "ad_id": "广告商品 ID", "campaign_id": "活动 ID", "seller_sku": "MSKU", "asin": "ASIN",
     "freshness_status": "源数据状态", "source_updated_at": "源更新时间",
     "comparison_date": "比较日期", "metric_name": "指标", "ahr_score": "AHR评分",
+    "attribution_complete_report_date": "归因成熟日", "currency_code": "币种",
 }
+_RULE_NAMES = {
+    "orders_increase": "订单增长", "orders_decrease": "订单下降", "sales_increase": "销售额增长",
+    "sales_decrease": "销售额下降", "units_increase": "销量增长", "units_decrease": "销量下降",
+    "high_ad_spend": "广告花费增长", "spend_no_conversion": "高花费无转化",
+    "low_spend_no_conversion": "低花费无转化", "budget_consumption": "预算消耗",
+}
+_STATUS_NAMES = {"COMPLETE": "采集完成", "NOT_CONFIGURED": "源时区待确认", "STALE": "数据过期",
+                 "FUTURE": "源时间异常", "MISSING": "缺少源时间", "FRESH": "新鲜度已验证", "FAILED": "采集失败"}
 
 
-def anomaly_card(*, state, severity, store, campaign, product, rule, reason, metrics):
+def status_label(value):
+    return _STATUS_NAMES.get(value, value or "未知")
+
+
+def anomaly_card(*, state, severity, store, campaign, product, rule, reason, metrics, currency=None):
     identity = [("店铺", store)]
     if campaign:
         identity.append(("广告活动", campaign))
     if product:
         identity.append(("商品", product))
-    identity.append(("规则", rule))
+    identity.append(("规则", _RULE_NAMES.get(rule, rule)))
+    identity.append(("币种", currency or "待确认"))
     values = []
     for key, value in metrics.items():
         if isinstance(value, (dict, list)):
@@ -114,7 +128,8 @@ def anomaly_card(*, state, severity, store, campaign, product, rule, reason, met
         if value is None:
             value = "未知"
         elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
-            value = (f"{value:.1%}" if key.endswith("ratio") else number(value))
+            value = (f"{value:.1%}" if key.endswith("ratio") else number(
+                value, money=key in {"spend", "spend_avg_7d", "daily_budget"}, currency=currency or "币种待确认"))
         values.append((_METRIC_NAMES.get(key, key), value))
     return card(
         f"{state} · {severity}", subtitle=reason,

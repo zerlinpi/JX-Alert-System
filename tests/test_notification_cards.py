@@ -13,7 +13,7 @@ from jx_alert.notifications.feishu_app import FeishuAppClient
 from jx_alert.notifications import worker
 from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
 from jx_alert.storage.db import Base
-from jx_alert.storage.models import DailyMetric, DataCoverage, Store
+from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerformance
 
 
 def test_card_preserves_explicit_zero_missing_and_incomplete_comparison():
@@ -22,6 +22,8 @@ def test_card_preserves_explicit_zero_missing_and_incomplete_comparison():
     with Session(engine) as db:
         store = Store(sid="5174", name="Geteen-US", timezone="America/Los_Angeles", currency_code="USD")
         db.add(store)
+        db.add(StorePerformance(store_id=store.sid, pull_date=date(2026, 11, 11), ahr_score=248,
+                                ahr_status="Healthy", freshness_status="NOT_CONFIGURED"))
         for day, value in [(date(2026, 11, 10), 10), (date(2026, 11, 11), 0)]:
             db.add(DailyMetric(store_id=store.sid, entity_id=store.sid, metric_date=day,
                                dimension="store", metric_name="orders", value=value))
@@ -34,6 +36,8 @@ def test_card_preserves_explicit_zero_missing_and_incomplete_comparison():
         assert table["rows"][3]["c1"] == "未知（无记录）"
         assert table["rows"][3]["c3"] == "待完整采集"
         assert "America/Los_Angeles" in json.dumps(result, ensure_ascii=False)
+        tables = [e for e in result["body"]["elements"] if e["tag"] == "table"]
+        assert tables[2]["rows"][0] == {"c0": "AHR评分", "c1": "248", "c2": "源时区待确认"}
 
 
 def sample_card():
