@@ -86,7 +86,8 @@ def _evaluate_sales_dimension(db, store_id: str, dimension: str,
 
 
 def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
-                                 report_date: date, config: RuleConfig
+                                 report_date: date, config: RuleConfig, *,
+                                 skip_details: list[dict] | None = None
                                  ) -> tuple[list[AnomalyEvent], bool]:
     dimension = f"campaign_{campaign_type}"
     attribution_days = AD_ATTRIBUTION_DAYS[campaign_type]
@@ -113,8 +114,33 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
         for name in ("spend", "orders", "clicks")
     }
     events = []
+    scope_complete = True
     for campaign in campaigns:
         entity_id = campaign.campaign_id
+        if campaign_type == "sp":
+            # Store/date coverage proves the response was complete, not that
+            # this campaign had a row. Missing entities or metrics are unknown;
+            # only an explicitly stored zero is evidence of zero activity.
+            required_metrics = {
+                "spend": required_dates,
+                "orders": attribution_baseline_dates + [attribution_date],
+                "clicks": [report_date, attribution_date],
+            }
+            missing = [
+                {"metric_name": name, "metric_date": day.isoformat()}
+                for name, dates in required_metrics.items()
+                for day in dates
+                if (entity_id, day) not in metrics[name]
+            ]
+            if missing:
+                scope_complete = False
+                if skip_details is not None:
+                    skip_details.append({
+                        "store_id": store_id, "dimension": dimension,
+                        "campaign_id": entity_id, "reason": "MISSING_CAMPAIGN_METRICS",
+                        "missing": missing,
+                    })
+                continue
         current_spend = metrics["spend"].get((entity_id, report_date), 0.0)
         prior_spend = [
             metrics["spend"].get((entity_id, day), 0.0)
@@ -209,10 +235,10 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
 
     scope = f"{store_id}:campaign:{campaign_type}"
     saved = upsert_anomalies(
-        db, store_id, events, evaluation_scope=scope, scope_complete=True,
+        db, store_id, events, evaluation_scope=scope, scope_complete=scope_complete,
         escalation_after_days=config.escalate_after_days,
     )
-    return saved, True
+    return saved, scope_complete
 
 
 def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
@@ -393,6 +419,7 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
         )
     evaluated_scopes = 0
     skipped_scopes = 0
+    skipped_scope_details: list[dict] = []
     saved_events: list[AnomalyEvent] = []
 
     for store in stores:
@@ -422,11 +449,14 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
 
         for campaign_type in ("sp", "sb", "sd"):
             saved, complete = _evaluate_campaign_dimension(
-                db, store_id, campaign_type, target_date, config
+                db, store_id, campaign_type, target_date, config,
+                skip_details=skipped_scope_details,
             )
+            # A partly known SP scope may still produce valid alerts for other
+            # campaigns, while recovery remains disabled for the entire scope.
+            saved_events.extend(saved)
             if complete:
                 evaluated_scopes += 1
-                saved_events.extend(saved)
             else:
                 skipped_scopes += 1
 
@@ -448,6 +478,7 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
         "stores_seen": len(stores),
         "evaluated_scopes": evaluated_scopes,
         "skipped_incomplete_scopes": skipped_scopes,
+        "skipped_scope_details": skipped_scope_details,
         "events_touched": len(saved_events),
         "notifications_queued": queued,
     }
