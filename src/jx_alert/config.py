@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     sp_refresh_days: int = Field(default=7, ge=1, le=30)
     mcp_operations_enabled: bool = False
     mcp_auth_file: str = "/app/data/secrets/mcp-auth.json"
+    mcp_auth_mode: Literal["bearer", "oauth"] = "bearer"
+    mcp_public_url: str = ""
+    mcp_oauth_database_path: str = "/app/data/secrets/mcp-oauth.sqlite3"
+    mcp_owner_credentials_file: str = "/app/data/secrets/mcp-owner.json"
+    mcp_forwarded_allow_ips: str = "127.0.0.1"
 
     # Remote MCP uses Streamable HTTP and is published on a loopback-only host port.
     mcp_host: str = "0.0.0.0"
@@ -143,6 +148,8 @@ def get_settings() -> Settings:
             "feishu_manager_open_ids", "feishu_daily_report_enabled", "feishu_daily_report_chat_id",
             "lingxing_performance_enabled", "lingxing_performance_source_timezone",
             "mcp_allowed_hosts", "mcp_allowed_origins",
+            "mcp_auth_mode", "mcp_public_url", "mcp_oauth_database_path", "mcp_owner_credentials_file",
+            "mcp_forwarded_allow_ips",
         }
         if not isinstance(runtime, dict) or set(runtime) - allowed:
             raise ValueError("Runtime settings contain unsupported fields")

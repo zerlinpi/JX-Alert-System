@@ -82,9 +82,13 @@ Live read-only checks accepted a store-health list page of 200, but the separate
 performance-notice endpoint rejected 200 with provider code 400 and accepted 100.
 The collector caps only notice pages at the verified size of 100 and still reads
 every page. This is an observed compatibility limit, not a documented maximum.
-Automatic health collection remains disabled until the source timestamps'
-timezone is confirmed. A successful sample is stored as `NOT_CONFIGURED` when
-that timezone is unknown; it must not recover freshness alerts.
+Health collection can run in observation mode before the source timestamps'
+timezone is confirmed. Unknown, missing, old or future source times block both
+new health-risk alerts and recovery of old ones while retaining observations.
+Only data-quality messages may change then. Complete requests with quality
+warnings return `SUCCEEDED_WITH_WARNINGS`; the manual dispatcher records that
+state without repeating a successful full collection. Request failures retain
+failure/retry behavior. Freshness must be verified before health-risk evaluation.
 
 ## Historical rule replay
 

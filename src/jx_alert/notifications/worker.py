@@ -107,8 +107,10 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     client_cache["app"] = FeishuAppClient.from_settings(settings)
                 destination = payload["delivery"]
                 chat_id = destination["receive_id"]
-                response = client_cache["app"].send_text(
-                    str(payload.get("text") or ""),
+                card = payload.get("card")
+                send_message = client_cache["app"].send_card if card is not None else client_cache["app"].send_text
+                response = send_message(
+                    card if card is not None else str(payload.get("text") or ""),
                     receive_id=chat_id,
                     receive_id_type=destination["receive_id_type"],
                     open_ids=destination.get("open_ids", []),

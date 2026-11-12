@@ -1,13 +1,60 @@
 """Queue read-only daily snapshots to an explicitly selected test/report group."""
 import hashlib
 import re
-from datetime import date
+from datetime import date, timedelta
 
 from sqlalchemy import select
 
 from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.notifications.routing import _load_routing
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerformance
+from jx_alert.notifications.cards import card, number, change
+
+
+def build_daily_card(db, store, day):
+    """Read two authoritative daily partitions; never fill missing facts with zero."""
+    previous = day - timedelta(days=1)
+    dimensions = ["store", "campaign_sp", "campaign_sb", "campaign_sd"]
+    facts = db.scalars(select(DailyMetric).where(
+        DailyMetric.store_id == store.sid, DailyMetric.metric_date.in_([day, previous]),
+        DailyMetric.dimension.in_(dimensions),
+    )).all()
+    coverage = {(r.metric_date, r.dimension): r.status for r in db.scalars(select(DataCoverage).where(
+        DataCoverage.store_id == store.sid, DataCoverage.metric_date.in_([day, previous]),
+        DataCoverage.dimension.in_(dimensions),
+    ))}
+    currency = store.currency_code or "币种未知"
+
+    def total(on, dimension, metric):
+        values = [r.value for r in facts if r.metric_date == on and r.dimension == dimension
+                  and r.metric_name == metric and (dimension != "store" or r.entity_id == store.sid)]
+        return sum(values) if values else None
+
+    metrics = []
+    for label, dimension, metric, money in [
+        ("订单", "store", "orders", False), ("销量", "store", "units", False),
+        ("销售额", "store", "sales", True), ("SP活动花费", "campaign_sp", "spend", True),
+        ("SB活动花费", "campaign_sb", "spend", True), ("SD活动花费", "campaign_sd", "spend", True),
+    ]:
+        current, prior = total(day, dimension, metric), total(previous, dimension, metric)
+        complete = all(coverage.get((d, dimension)) == "COMPLETE" for d in [day, previous])
+        metrics.append((label, number(current, money=money, currency=currency),
+                        number(prior, money=money, currency=currency), change(current, prior, complete=complete)))
+    quality = [(label, coverage.get((day, dimension), "未知")) for label, dimension in [
+        ("店铺销量", "store"), ("SP日报", "campaign_sp"), ("SB日报", "campaign_sb"), ("SD日报", "campaign_sd")]]
+    performance = db.scalar(select(StorePerformance).where(StorePerformance.store_id == store.sid)
+                            .order_by(StorePerformance.pull_date.desc()).limit(1))
+    notes = [f"报表时区：{store.timezone or '待确认'} · 前一日：{previous.isoformat()}",
+             "空记录不代表真实零值；完整采集也不代表每个活动均返回记录。",
+             "广告花费取日报；小时数据单独对账。转化告警按成熟归因日判断。"]
+    notes.append(f"绩效：{performance.pull_date} / {performance.freshness_status}" if performance
+                 else "绩效：未知（尚无记录）")
+    return card(
+        f"每日经营快照 · {day.isoformat()}",
+        subtitle=f"{store.name}（{store.sid}） · {currency}",
+        sections=[("经营与广告", ["指标", "当日", "前一日", "环比"], metrics),
+                  ("采集状态", ["数据集", "状态"], quality)], notes=notes,
+    )
 
 
 def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = None,
@@ -94,6 +141,7 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
         enqueue_notification(
             db, idempotency_key=key, text="\n".join(lines), store_id=store.sid,
             chat_id=chat_id, delivery=delivery, fixed_route=True,
+            card=build_daily_card(db, store, day) if app_transport else None,
         )
         queued += 1
     return {"queued": queued, "skipped": False}

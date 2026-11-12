@@ -139,7 +139,8 @@ def run_collection(*, report_date=None, backfill_days=1):
             db.commit()
             archive = archive_raw_snapshots(db, settings.raw_dir)
             return {"status": "PARTIAL" if sp["status"] == "PARTIAL" or
-                    collected["status"] != "SUCCEEDED" else "COMPLETE",
+                    collected["status"] not in {"SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"} else
+                    "COMPLETE_WITH_WARNINGS" if collected["status"] == "SUCCEEDED_WITH_WARNINGS" else "COMPLETE",
                     "report_dates": latest, "collection": collected, "sp": sp,
                     "analysis": analysis, "reports": reports,
                     "daily_notifications": notifications, "raw_archive": archive}
@@ -232,8 +233,8 @@ def process_pending_collection():
         try:
             result = run_collection(report_date=args.get("report_date"),
                                     backfill_days=args.get("backfill_days", 1))
-            if result["status"] == "COMPLETE":
-                status = "SUCCEEDED"
+            if result["status"] in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}:
+                status = "SUCCEEDED_WITH_WARNINGS" if result["status"] == "COMPLETE_WITH_WARNINGS" else "SUCCEEDED"
                 args.pop("retry_at", None)
                 args.pop("error_type", None)
             elif result["status"] == "DRY_RUN":

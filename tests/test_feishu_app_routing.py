@@ -134,6 +134,8 @@ def test_one_bot_separate_group_mentions_and_manager_delivery_with_independent_r
                 raise RuntimeError("provider accidentally echoed test-secret")
             return {"message_id": "om_confirmed"}
 
+        send_card = send_text
+
     monkeypatch.setattr(app_module, "FeishuAppClient", FakeApp)
     first = worker.process_outbox_batch()
     assert (first["sent"], first["failed"], first["claimed"]) == (1, 1, 2)

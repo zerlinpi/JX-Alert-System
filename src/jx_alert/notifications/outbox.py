@@ -27,6 +27,7 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
                          chat_id: str = "default",
                          open_ids: list[str] | None = None,
                          delivery: dict | None = None,
+                         card: dict | None = None,
                          fixed_route: bool = False) -> NotificationOutbox:
     """Insert once per idempotency key, safely handling concurrent producers."""
     existing = db.scalar(
@@ -46,6 +47,8 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
     )
     if fixed_route:
         row.payload = {**row.payload, "fixed_route": True}
+    if card is not None:
+        row.payload = {**row.payload, "card": card}
     if delivery is not None:
         row.payload = {**row.payload, "transport": "app", "delivery": delivery}
     try:

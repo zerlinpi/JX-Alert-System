@@ -33,6 +33,20 @@ def test_enqueue_reuses_pending_and_explicit_success_key(warehouse):
             operations.enqueue_collection(db, backfill_days=22, idempotency_key="report-1")
 
 
+def test_quality_warning_is_explicit_and_does_not_retry_successful_collection(warehouse, monkeypatch):
+    monkeypatch.setattr(operations, "run_collection", lambda **kwargs: {"status": "COMPLETE_WITH_WARNINGS"})
+    with warehouse() as db:
+        job_id = operations.enqueue_collection(db, idempotency_key="quality-warning")["job_id"]
+        db.commit()
+    result = operations.process_pending_collection()
+    assert result == {"job_id": job_id, "status": "SUCCEEDED_WITH_WARNINGS"}
+    with warehouse() as db:
+        job = db.get(SyncJob, job_id)
+        assert job.metadata_json["attempts"] == 0
+        assert "retry_at" not in job.metadata_json
+    assert operations.process_pending_collection()["status"] == "IDLE"
+
+
 @pytest.mark.parametrize("bad", [0, True, 31, -1])
 def test_invalid_backfill_never_enqueues(warehouse, bad):
     with warehouse() as db, pytest.raises(ValueError):

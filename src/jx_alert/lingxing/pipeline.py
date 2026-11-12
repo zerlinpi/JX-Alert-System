@@ -114,7 +114,8 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         )
         job = db.get(SyncJob, job_id)
         performance_status = results.get("performance", {}).get("status", "DISABLED")
-        job.status = "PARTIAL_FAILED" if performance_status in {"PARTIAL_FAILED", "SUCCEEDED_WITH_WARNINGS"} else "SUCCEEDED"
+        job.status = ("PARTIAL_FAILED" if performance_status == "PARTIAL_FAILED" else
+                      "SUCCEEDED_WITH_WARNINGS" if performance_status == "SUCCEEDED_WITH_WARNINGS" else "SUCCEEDED")
         job.finished_at = _utcnow()
         job.store_count = int(results["sales"].get("stores_seen", 0))
         job.record_count = record_count

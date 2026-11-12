@@ -215,8 +215,13 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         settings = get_settings()
         if getattr(settings, "feishu_transport", "webhook") == "app":
             from jx_alert.notifications.routing import enqueue_application_deliveries
+            from jx_alert.notifications.cards import anomaly_card
             result = enqueue_application_deliveries(
                 db, settings, event_key=event_key, text=message,
+                card=anomaly_card(state=state_label, severity=anomaly.severity,
+                                  store=store_label, campaign=campaign_label,
+                                  product=product_label, rule=anomaly.rule,
+                                  reason=anomaly.reason, metrics=anomaly.metrics or {}),
                 context={
                     "store_id": anomaly.store_id, "entity_id": anomaly.entity_id,
                     "metrics": anomaly.metrics or {}, "scope": anomaly.evaluation_scope,

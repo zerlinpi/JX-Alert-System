@@ -175,6 +175,27 @@ class FeishuAppClient:
             "content": json.dumps(content, ensure_ascii=False),
             "uuid": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:40],
         }
+        return self._send_message_payload(payload, receive_id_type)
+
+    def send_card(self, card: dict, *, receive_id: str, receive_id_type: str = "chat_id",
+                  open_ids: list[str] | None = None, idempotency_key: str) -> dict:
+        """Deliver a native table card with only explicitly mapped mentions."""
+        from jx_alert.notifications.cards import with_mentions
+        if receive_id_type not in {"chat_id", "open_id"}:
+            raise ValueError("Feishu message receive_id_type is invalid")
+        prefix = "oc_" if receive_id_type == "chat_id" else "ou_"
+        if not isinstance(receive_id, str) or not re.fullmatch(prefix + r"[A-Za-z0-9_-]+", receive_id):
+            raise ValueError("Feishu message recipient has an invalid ID")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("Feishu message idempotency_key is required")
+        payload = {
+            "receive_id": receive_id, "msg_type": "interactive",
+            "content": json.dumps(with_mentions(card, open_ids or []), ensure_ascii=False),
+            "uuid": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:40],
+        }
+        return self._send_message_payload(payload, receive_id_type)
+
+    def _send_message_payload(self, payload, receive_id_type):
         # Bound operational alerts conservatively, including JSON escaping.
         if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 20 * 1024:
             raise ValueError("Feishu app text message exceeds the 20 KB application limit")

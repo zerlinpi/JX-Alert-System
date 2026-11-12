@@ -171,6 +171,8 @@ python scripts/test_feishu_webhook.py --send
 - 业绩通知数据依赖领星插件同步状态；已加入 lastUpdateDate 新鲜度检查，未配置源时区或数据过期时保持未知/异常状态。
 - 店铺/站点时区、币种、负责人映射需由真实账号数据确认。
 - 数据库已加入兼容旧表的幂等增量升级；尚未迁移到完整 Alembic 版本化迁移框架。
-- 尚未在你的 Linux 服务器执行 Docker 部署，也未进行真实领星、飞书或远程 MCP 客户端端到端测试。
+- 已在用户 Linux/MariaDB 上验证只读采集、历史回补、版本去重、容器重启持久化和测试群投递；当前实际店铺范围为5174。公网 ChatGPT OAuth 连接及人员映射后的正式通知仍须验收，不能以本地测试替代。
+
+运行、回滚和后续手填配置见 [OPERATIONS_AND_ROLLBACK](docs/OPERATIONS_AND_ROLLBACK.md)、[手工映射清单](docs/MANUAL_MAPPING.md) 和 [ChatGPT MCP 接入](docs/CHATGPT_MCP.md)。飞书应用机器人使用原生表格卡片展示关键数据，旧文本队列保持兼容；缺数据不补零。健康源时区未知时可以保存观测，但不会新增或恢复健康风险业务告警。
 
 第一阶段只读领星，不提供修改广告预算、竞价、关键词或活动状态的功能。

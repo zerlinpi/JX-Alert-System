@@ -14,7 +14,9 @@ def backtest_history(db, *, store_id: str, start_date: str, end_date: str,
                      labels: dict | None = None) -> dict:
     """Use the production evaluator on copied facts, with separate anomaly/outbox tables.
 
-    labels maps date|store|rule|entity to true_positive/false_positive. No false
+    labels maps each returned candidate key to true_positive/false_positive.
+    Keys combine report date with the persisted anomaly dedupe key, retaining
+    ad identity when several ads share the same displayed SKU. No false
     positive rate is inferred without those human-reviewed labels. Current stored
     historical revisions are replayed; this is not an event-time simulation.
     """
@@ -55,7 +57,7 @@ def backtest_history(db, *, store_id: str, start_date: str, end_date: str,
                 AnomalyEvent.last_seen >= started,
                 AnomalyEvent.status.in_(["NEW", "ONGOING", "ESCALATED"]),
             )):
-                key = f"{day}:{store_id}:{event.rule}:{event.entity_id}"
+                key = f"{day}:{event.dedupe_key}"
                 candidates.append({
                     "key": key, "report_date": day.isoformat(), "store_id": str(store_id),
                     "entity_id": event.entity_id, "rule": event.rule,
