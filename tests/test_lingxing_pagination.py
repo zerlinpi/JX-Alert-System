@@ -67,6 +67,28 @@ def test_sp_report_fails_closed_when_cursor_missing(monkeypatch):
         ))
 
 
+@pytest.mark.parametrize("report_type", ["sp", "sb", "sd"])
+@pytest.mark.parametrize("changed_total", [2, 4])
+def test_campaign_report_rejects_changed_total_before_yielding_that_page(
+    monkeypatch, report_type, changed_total,
+):
+    client = _client()
+    pages = [
+        {"code": 0, "total": 3, "next_token": "page-2", "data": [{"id": 1}]},
+        {"code": 0, "total": changed_total, "next_token": "", "data": [{"id": 2}]},
+    ]
+    monkeypatch.setattr(client, "advertising_report", lambda *_: pages.pop(0))
+    rows = client.iter_advertising_report(
+        report_type, {"sid": 100, "report_date": "2026-11-10"}
+    )
+
+    assert next(rows) == {"id": 1}
+    # A total shrinking from 3 to 2 used to return two rows as a complete report.
+    with pytest.raises(LingxingError, match="total changed during pagination"):
+        next(rows)
+    assert pages == []
+
+
 
 def test_campaign_master_uses_next_token_cursor(monkeypatch):
     client = _client()

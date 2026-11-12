@@ -2,10 +2,12 @@
 
 Signature rules follow the current official integration guide. Scalar POST JSON
 fields are included in the signature even though they are sent in the request body.
-Nested JSON values fail closed until an endpoint-specific canonicalizer is added.
+Only campaign_ids arrays on spAdvertiseHourData and spTargetHourData have a
+verified canonicalizer; all other nested JSON values continue to fail closed.
 """
 import base64
 import hashlib
+import json
 import time
 from collections.abc import Iterator
 from urllib.parse import urljoin
@@ -21,6 +23,46 @@ class LingxingError(RuntimeError):
 
 class LingxingTransientError(LingxingError):
     """A network or provider rate-limit condition safe to retry."""
+
+
+_SP_HOUR_ARRAY_PATHS = frozenset({
+    "/pb/openapi/newad/spAdvertiseHourData",
+    "/pb/openapi/newad/spTargetHourData",
+})
+
+
+def _endpoint_signature_params(path: str, params: dict) -> dict:
+    """Copy signature parameters, canonicalizing only verified SP campaign arrays."""
+    values = dict(params)
+    if path not in _SP_HOUR_ARRAY_PATHS:
+        return values
+
+    campaign_ids = values.get("campaign_ids", [])
+    if not isinstance(campaign_ids, list) or any(
+        type(value) is not int or value <= 0 for value in campaign_ids
+    ):
+        raise LingxingError("campaign_ids must be an array of positive integers")
+    campaign_id = values.get("campaign_id")
+    if "campaign_id" in values and (type(campaign_id) is not int or campaign_id <= 0):
+        raise LingxingError("campaign_id must be a positive integer")
+    combined_ids = set(campaign_ids)
+    if campaign_id is not None:
+        combined_ids.add(campaign_id)
+    if not combined_ids:
+        raise LingxingError("SP hour report requires campaign_id or nonempty campaign_ids")
+    if len(combined_ids) > 50 or (
+        path.endswith("/spAdvertiseHourData") and len(campaign_ids) > 50
+    ):
+        raise LingxingError("SP hour report accepts at most 50 campaign IDs")
+
+    if "campaign_ids" in values:
+        # Official Python SDK sign.py uses compact JSON for list values; the
+        # official Java OrderListDemo restores the original List in the body.
+        # https://apidoc.lingxing.com/new/guides/new-instructions/
+        # https://apidoc.lingxing.com/file/openapi-python3-sdk-20230419.zip
+        # https://apidoc.lingxing.com/new/api-docs/newAd/report/spTargetHourData/
+        values["campaign_ids"] = json.dumps(campaign_ids, separators=(",", ":"))
+    return values
 
 
 def _signature_scalar(value):
@@ -97,9 +139,12 @@ class LingxingClient:
 
         query_business = dict(params or {})
         body_business = dict(json_body or {})
+        business_sign_params = _endpoint_signature_params(
+            path, {**query_business, **body_business}
+        )
         for attempt in range(5):
             timestamp = int(time.time())
-            sign_params = {**query_business, **body_business, "timestamp": timestamp}
+            sign_params = {**business_sign_params, "timestamp": timestamp}
             signature = build_signature(
                 sign_params, access_token=self.access_token,
                 app_key=self.app_key, app_id=self.app_id,
@@ -235,6 +280,7 @@ class LingxingClient:
         request = {**payload, "offset": 0, "length": length}
         seen_tokens: set[str] = set()
         offset = 0
+        expected_total: int | None = None
 
         for _ in range(max_pages):
             result = self.advertising_report(report_type, request)
@@ -245,6 +291,13 @@ class LingxingClient:
                 total = int(result["total"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise LingxingError("Campaign report response total is missing or invalid") from exc
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise LingxingError(
+                    "Campaign report total changed during pagination: "
+                    f"expected {expected_total}, received {total}"
+                )
 
             yield from rows
             offset += len(rows)
