@@ -4,6 +4,7 @@ services:
   app:
     volumes:
       - ./src:/app/src:ro
+      - ./scripts:/app/scripts:ro
     environment:
       PYTHONPATH: /app/src
   scheduler:

@@ -13,8 +13,14 @@ def main():
         print('{"status":"DRY_RUN"}')
         return
     from jx_alert.operations import run_collection
-    result = run_collection(report_date=args.report_date, backfill_days=args.backfill_days)
+    try:
+        result = run_collection(report_date=args.report_date, backfill_days=args.backfill_days)
+    except Exception as exc:
+        print(json.dumps({"status": "FAILED", "error_type": type(exc).__name__}))
+        raise SystemExit(1) from None
     print(json.dumps(result, ensure_ascii=False, default=str))
+    if result["status"] not in {"COMPLETE", "DRY_RUN"}:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

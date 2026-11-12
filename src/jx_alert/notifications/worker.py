@@ -36,7 +36,10 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
     default_ids = [] if transport == "app" else settings.feishu_at_ids()
     default_chat_id = routing.get("default_chat_id", "default")
     client_cache = {}
+    # Existing MariaDB DATETIME columns have second precision. Use the same
+    # precision for the claim and its CAS predicate; attempts fence same-second claims.
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    claim_time = now.replace(microsecond=0)
     # Cover the complete claimed batch, including token acquisition/refresh.
     lease_seconds = max(300, settings.feishu_timeout * 20 * 5 + 60)
     stale_before = now - timedelta(seconds=lease_seconds)
@@ -75,7 +78,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                 NotificationOutbox.id == row.id,
                 NotificationOutbox.status.in_(["PENDING", "RETRY"]),
                 NotificationOutbox.next_attempt_at <= now,
-            ).values(status="SENDING", claimed_at=now,
+            ).values(status="SENDING", claimed_at=claim_time,
                      attempts=attempts))
             if not claimed.rowcount:
                 continue
@@ -141,7 +144,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             result = db.execute(update(NotificationOutbox).where(
                 NotificationOutbox.id == row_id,
                 NotificationOutbox.status == "SENDING",
-                NotificationOutbox.claimed_at == now,
+                NotificationOutbox.claimed_at == claim_time,
                 NotificationOutbox.attempts == attempts,
             ).values(**values))
             # An obsolete attempt must never overwrite a newer worker's result.

@@ -86,6 +86,36 @@ def test_targeted_worker_does_not_send_other_pending_messages(setup, monkeypatch
         assert db.get(NotificationOutbox, other_id).status == "PENDING"
 
 
+def test_delivery_cas_survives_second_precision_database_timestamp(setup, monkeypatch):
+    from sqlalchemy import event
+    from jx_alert.notifications.outbox import enqueue_notification
+    Session, settings, config, path = setup
+    engine = Session.kw["bind"]
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def coarsen_stored_claim(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE notification_outbox"):
+            # Simulate MariaDB DATETIME(0) storage while leaving comparison bind
+            # parameters untouched. SQLite otherwise preserves microseconds.
+            cursor.execute("UPDATE notification_outbox SET claimed_at = "
+                           "strftime('%Y-%m-%d %H:%M:%S', claimed_at) || '.000000' "
+                           "WHERE status = 'SENDING' AND claimed_at IS NOT NULL")
+
+    class Client:
+        def send_text(self, text, **kwargs):
+            return {"message_id": "confirmed-message"}
+
+    monkeypatch.setattr(app_module.FeishuAppClient, "from_settings", lambda _: Client())
+    with Session() as db:
+        row = enqueue_notification(db, idempotency_key="precision", text="test", delivery={
+            "receive_id": "oc_test", "receive_id_type": "chat_id", "open_ids": []})
+        db.commit()
+        row_id = row.id
+    worker.process_outbox_batch(outbox_ids=[row_id])
+    with Session() as db:
+        assert db.get(NotificationOutbox, row_id).status == "DELIVERED"
+
+
 def test_one_bot_separate_group_mentions_and_manager_delivery_with_independent_retry(
     setup, monkeypatch,
 ):
