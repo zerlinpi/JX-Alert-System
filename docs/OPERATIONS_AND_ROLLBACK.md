@@ -65,6 +65,27 @@ acceptance but before the database commit; exact-once delivery is not claimed.
 `process_outbox_batch(outbox_ids=[...])` can isolate a test delivery from other
 pending messages. Repairing a failed route does not resend successful recipients.
 
+On the current server, edit
+`/opt/jx-alert-system/data/sp-runtime/feishu-routing.json`:
+
+- `groups.test.admin_open_ids`: administrator Open IDs.
+- `stores.5174.open_ids`: the store's operator Open IDs.
+- `management.open_ids`: recipients of independent management DMs.
+
+Each is an array of real `ou_...` identifiers. Leave unknown recipients empty.
+The group destination is already configured; credentials are stored separately.
+See `config/feishu-app-routing.example.json` for the non-sensitive structure.
+
+## Historical rule replay
+
+`analysis.backtest.backtest_history()` copies the selected store's historical
+facts into an isolated in-memory database and calls the same production
+evaluator. Its anomaly and outbox rows never enter the source warehouse, and
+no worker sends them. Export returned candidates with review labels for manual
+assessment. Without human true/false-positive labels the false-positive rate
+is `null`, not zero. Current revised historical data is replayed; this is not
+a reconstruction of what was known at every past collection time.
+
 ## Rollback
 
 1. Stop the scheduler/MCP processes to stop new jobs; retain outbox and job data.
