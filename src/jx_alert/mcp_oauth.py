@@ -372,16 +372,16 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         if not row:
             return None
         client = OAuthClientInformationFull.model_validate_json(row[0])
-        # ChatGPT initially registers this connection for read access. Permit
-        # a subsequent authorization request for notifications on the same
-        # client. This is client eligibility, not a grant: the owner must
-        # approve the new scope and refresh still uses the original token scopes.
+        # Allow ChatGPT to request the workflow scopes after its initial
+        # read-only registration. Each grant still needs explicit owner consent.
+        # The token exchange and refresh checks use the approved grant scopes.
         redirects = [str(uri) for uri in client.redirect_uris or []]
-        if client.scope == "jx:read" and redirects and all(
+        registered = set((client.scope or "jx:read").split())
+        if "jx:read" in registered and registered <= set(SCOPES) and redirects and all(
             re.fullmatch(r"https://chatgpt\.com/(?:connector_platform_oauth_redirect|connector/oauth/[A-Za-z0-9_-]+)", uri)
             for uri in redirects
         ):
-            client = client.model_copy(update={"scope": "jx:read jx:notify"})
+            client = client.model_copy(update={"scope": " ".join(SCOPES)})
         return client
 
     def _scopes(self, scopes, client):
@@ -420,14 +420,15 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             return None
         return AuthorizationCode(code=authorization_code, expires_at=row["expires"], **data)
 
-    def _issue(self, db, *, client_id, scopes, family=None):
+    def _issue(self, db, *, client_id, scopes, family=None, refresh_scopes=None):
         access, refresh = secrets.token_urlsafe(48), secrets.token_urlsafe(48)
         family = family or secrets.token_hex(24)
         now = int(time.time())
-        data = json.dumps({"client_id": client_id, "scopes": scopes,
-                           "resource": self.resource_url, "subject": "owner"})
+        grant = {"client_id": client_id, "resource": self.resource_url, "subject": "owner"}
         for token, kind, ttl in ((access, "access", self.access_token_ttl),
                                  (refresh, "refresh", self.refresh_token_ttl)):
+            token_scopes = refresh_scopes if kind == "refresh" and refresh_scopes is not None else scopes
+            data = json.dumps({**grant, "scopes": token_scopes})
             db.execute("INSERT INTO tokens VALUES(?,?,?,?,?)", (_digest(token), kind, family, data, now + ttl))
         return OAuthToken(access_token=access, refresh_token=refresh, expires_in=self.access_token_ttl,
                           scope=" ".join(scopes))
@@ -497,7 +498,10 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 db.execute("INSERT INTO used_refresh VALUES(?,?,?,?)",
                            (_digest(refresh_token.token), row["family"], client.client_id, row["expires"]))
                 db.execute("DELETE FROM tokens WHERE family=?", (row["family"],))
-                return self._issue(db, client_id=client.client_id, scopes=scopes, family=row["family"])
+                # RFC 6749 section 6 keeps the refresh grant scope unchanged
+                # when the client requests a narrower access token.
+                return self._issue(db, client_id=client.client_id, scopes=scopes, family=row["family"],
+                                   refresh_scopes=data["scopes"])
         # Commit replay-family revocation before returning the protocol error.
         raise TokenError("invalid_grant", "Refresh token is unavailable")
 
