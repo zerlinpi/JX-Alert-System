@@ -50,6 +50,16 @@ OAuth采用SDK协议处理，授权码和refresh单次消费，refresh重放撤�
 关闭旧页，从插件设置发起新的连接，在10分钟内使用私下初始化的所有者口令登录并同意。
 这里不填写飞书 App Secret、服务器密码或固定 Bearer token。服务端测试通过后仍需用户真实重连验收。
 
+如果口令已通过、点击“同意”后仍出现同样错误，另有浏览器回调问题：
+Chromium会把`form-action 'self'`应用到表单提交后的跨站302跳转。
+首次同意可能已经签发授权码却被浏览器阻止回到ChatGPT；重复点击同一表单则因请求已消费而403。
+修复只在**已登录的同意页及批准/拒绝重定向**允许该次注册回调的规范来源，
+登录口令页仍限制同源提交。来源由严格校验的scheme/hostname/port构造，不拼接路径、查询或原始netloc，
+防止回调URI注入CSP。精确redirect_uri、CSRF、单次消费、PKCE和resource校验继续保留。
+必须从插件设置发起全新连接，不重试已经消费的旧“同意”按钮，也不重置所有者口令。
+
+浏览器行为依据：[MDN form-action](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/form-action)。
+
 授权页将明确显示权限：`jx:read` 查询已存数据；`jx:collect` 请求已配置范围的采集任务；`jx:notify` 将有证据的中文分析发送至已配置飞书群。仅查询的连接无需授予采集或通知权限。采集与通知还需相应服务器开关；所有领星业务操作只读，没有广告修改工具。
 
 首先发送：
@@ -67,3 +77,15 @@ OAuth采用SDK协议处理，授权码和refresh单次消费，refresh重放撤�
 可用工具包括 `system_health`、`get_configuration_status`、`get_analysis_plan`、`get_stores`、`get_campaigns`、`get_products`、日报/商品表现/异常/覆盖/任务/通知查询、`get_sp_report`、`get_sp_reconciliations`、受权限保护的 `request_collection`，以及证据分析与异常提交工具 `prepare_chat_analysis`、`submit_chat_analysis`。分析通知需要 `jx:notify`；空结论不会发送群消息。以连接实际列出的工具为准。全店铺模式详见[全店铺说明](ALL_STORE_ANALYSIS.md)。
 
 域名、TLS与所有者口令填好后，仍必须在ChatGPT实际完成授权并成功调用一次；单元测试或服务器本机初始化不能替代该项外部验收。
+
+## 本地原生浏览器回归
+
+`scripts/verify_oauth_browser.py` 使用全新隔离的Chrome／Chromium profile，在loopback临时TLS服务中验证原生登录、同意、跨源回调与PKCE换令牌；不连接生产、不读取用户浏览器或生产凭据。
+先运行负例，再运行正例：
+
+```bash
+python scripts/verify_oauth_browser.py --expect-blocked --output work/oauth-browser-verification.json
+python scripts/verify_oauth_browser.py --output work/oauth-browser-verification.json
+```
+
+自动发现不到浏览器时传 `--browser /path/to/chrome`。脚本仅对临时公钥使用SPKI信任，不关闭CSP或浏览器安全；有32秒超时保护，并关闭自己创建的隐藏浏览器。产物只含阶段和验证状态，不包含口令、授权码、令牌或完整授权URL。

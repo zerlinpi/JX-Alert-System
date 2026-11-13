@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import hmac
 import html
+from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,40 @@ _OWNER_PAGE_HEADERS = {**_SECURE_HEADERS, "Referrer-Policy": "same-origin"}
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _callback_origin(value: str) -> str:
+    """Build a CSP source from a registered URI without copying path/query/header syntax."""
+    parts = urlsplit(str(AnyHttpUrl(value)))
+    host = parts.hostname or ""
+    if parts.username or parts.password or parts.fragment:
+        raise ValueError("Invalid callback URI")
+    if parts.scheme != "https" and not (
+        parts.scheme == "http" and host in {"127.0.0.1", "localhost", "::1"}
+    ):
+        raise ValueError("Invalid callback scheme")
+    try:
+        address = ip_address(host)
+    except ValueError:
+        if not host or any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                           for label in host.rstrip(".").split(".")):
+            raise ValueError("Invalid callback hostname") from None
+        authority = host.lower()
+    else:
+        authority = f"[{address.compressed}]" if address.version == 6 else str(address)
+    port = parts.port
+    if port is not None:
+        authority += f":{port}"
+    return f"{parts.scheme}://{authority}"
+
+
+def _consent_headers(redirect_uri: str) -> dict[str, str]:
+    # Chromium also applies form-action to the POST's redirect destination.
+    # Only the authenticated consent page permits this registered callback origin;
+    # owner passwords are still submitted under the self-only login policy.
+    origin = _callback_origin(redirect_uri)
+    return {**_SECURE_HEADERS, "Content-Security-Policy": _SECURE_HEADERS["Content-Security-Policy"].replace(
+        "form-action 'self';", f"form-action 'self' {origin};", 1)}
 
 
 def _https_url(value: str) -> str:
@@ -318,6 +353,7 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 loopback = parts.scheme == "http" and parts.hostname in {"127.0.0.1", "localhost", "::1"}
                 if not (parts.scheme == "https" or loopback) or parts.username or parts.password or parts.fragment:
                     raise ValueError
+                _callback_origin(str(uri))
             if not client_info.redirect_uris or len(client_info.redirect_uris) > 10:
                 raise ValueError
             if client_info.token_endpoint_auth_method != "none" and not client_info.client_secret:
@@ -482,7 +518,9 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         # no-referrer makes a native form POST send Origin: null in browsers,
         # which our strict same-origin CSRF check must reject. same-origin keeps
         # the legitimate Origin and still suppresses referrers to other sites.
-        return HTMLResponse('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>JX Alert 授权</title><h1>JX Alert 授权</h1>' + message + '<form method="post" action="/oauth/owner">' + fields + content + '</form></html>', headers=_OWNER_PAGE_HEADERS)
+        headers = ({**_consent_headers(data["redirect_uri"]), "Referrer-Policy": "same-origin"}
+                   if authenticated else _OWNER_PAGE_HEADERS)
+        return HTMLResponse('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>JX Alert 授权</title><h1>JX Alert 授权</h1>' + message + '<form method="post" action="/oauth/owner">' + fields + content + '</form></html>', headers=headers)
 
     async def _owner(self, request: Request):
         def failure():
@@ -562,7 +600,7 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                     target = construct_redirect_uri(data["redirect_uri"], code=code, state=data.get("state"), iss=self.issuer_url)
                 else:
                     target = construct_redirect_uri(data["redirect_uri"], error="access_denied", state=data.get("state"), iss=self.issuer_url)
-            response = RedirectResponse(target, 302, headers=_SECURE_HEADERS)
+            response = RedirectResponse(target, 302, headers=_consent_headers(data["redirect_uri"]))
         else:
             csrf = secrets.token_urlsafe(32)
             with self._db() as db:
