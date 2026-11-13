@@ -154,7 +154,11 @@ def test_resource_redirect_and_client_binding_are_not_bypassed_at_exchange(setup
     provider, client, options = setup
     account, other = register(client), register(client)
     code = code_for(client, account)
-    assert exchange(client, account, code, resource="https://wrong.example/mcp").status_code == 400
+    wrong_target = exchange(client, account, code, resource=ISSUER + ".well-known/oauth-authorization-server")
+    assert wrong_target.status_code == 400
+    assert wrong_target.json()["error"] == "invalid_target"
+    assert wrong_target.json()["expected_resource"] == RESOURCE
+    assert code not in wrong_target.text
     assert exchange(client, account, code, redirect_uri="https://evil.example/callback").status_code == 400
     assert exchange(client, other, code).status_code == 400
     assert exchange(client, account, code).status_code == 200
@@ -259,6 +263,19 @@ def test_expired_code_access_refresh_and_owner_session_are_rejected(setup):
     assert owner_post(client, request_id, csrf, action="approve").status_code == 403
 
 
+def test_login_form_preserves_browser_origin_without_accepting_opaque_origin(setup):
+    _, client, _ = setup
+    account = register(client)
+    request_id, csrf, page = begin(client, account)
+    assert page.headers["referrer-policy"] == "same-origin"
+    rejected = client.post("/oauth/owner", data={"request": request_id, "csrf": csrf,
+        "action": "login", "password": PASSWORD}, headers={"Origin": "null"})
+    assert rejected.status_code == 403
+    accepted = owner_post(client, request_id, csrf, action="login", password=PASSWORD)
+    assert accepted.status_code == 200 and "同意" in accepted.text
+    assert accepted.headers["referrer-policy"] == "same-origin"
+
+
 def test_transactionally_consumes_code_under_two_independent_connections(setup):
     provider, client, options = setup
     account = register(client)
@@ -311,6 +328,37 @@ def test_authorization_requires_explicit_s256_and_correct_resource(setup):
         assert response.status_code == 400
     with provider._db() as db:
         assert db.execute("SELECT COUNT(*) FROM pending").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("wrong_resource", [
+    ISSUER + ".well-known/oauth-authorization-server", ISSUER,
+    "https://wrong.example/mcp?token=private-resource-marker",
+])
+def test_wrong_authorization_target_explains_actual_mcp_url_without_reflecting_request(setup, wrong_resource):
+    provider, client, options = setup
+    account = register(client)
+    response = client.get("/authorize", params={
+        "client_id": account["client_id"], "redirect_uri": REDIRECT,
+        "response_type": "code", "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": wrong_resource,
+        "state": "private-state-marker",
+    })
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_target"
+    assert response.json()["expected_resource"] == RESOURCE
+    assert RESOURCE in response.json()["error_description"]
+    assert "重新发起授权" in response.json()["error_description"]
+    assert "private-state-marker" not in response.text
+    assert "private-resource-marker" not in response.text
+    assert "location" not in response.headers
+    assert response.headers["cache-control"] == "no-store"
+    with provider._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM pending").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM tokens").fetchone()[0] == 0
+    # The strict rejection does not change the valid /mcp authorization path.
+    _, _, page = begin(client, account)
+    assert page.status_code == 200
 
 
 def test_sdk_metadata_and_cors_preflight_match_supported_auth_methods(setup):

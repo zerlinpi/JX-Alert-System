@@ -45,6 +45,7 @@ _SECURE_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
 }
+_OWNER_PAGE_HEADERS = {**_SECURE_HEADERS, "Referrer-Policy": "same-origin"}
 
 
 def _digest(value: str) -> str:
@@ -264,7 +265,15 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 if request.method != "OPTIONS" and path == "/authorize" and params.get("code_challenge_method") != "S256":
                     raise ValueError
                 if request.method != "OPTIONS" and path in {"/authorize", "/token"} and params.get("resource") != provider.resource_url:
-                    raise ValueError
+                    return await JSONResponse({
+                        "error": "invalid_target",
+                        "error_description": (
+                            "连接地址应填写 MCP 接口 " + provider.resource_url
+                            + "。授权信息页不是 MCP 接口；请在连接设置中更正地址后重新发起授权，"
+                            "不要修改或复用旧授权链接。"
+                        ),
+                        "expected_resource": provider.resource_url,
+                    }, 400, headers=_SECURE_HEADERS)(scope, receive, send)
             except (ValueError, UnicodeError):
                 return await JSONResponse({"error": "invalid_request"}, 400, headers=_SECURE_HEADERS)(scope, receive, send)
             consumed = False
@@ -470,7 +479,10 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         else:
             content = '<label>所有者口令 <input type="password" name="password" autocomplete="current-password" required maxlength="1024"></label><button name="action" value="login">登录</button>'
         message = "<p>登录未成功，请重试。</p>" if error else ""
-        return HTMLResponse('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>JX Alert 授权</title><h1>JX Alert 授权</h1>' + message + '<form method="post" action="/oauth/owner">' + fields + content + '</form></html>', headers=_SECURE_HEADERS)
+        # no-referrer makes a native form POST send Origin: null in browsers,
+        # which our strict same-origin CSRF check must reject. same-origin keeps
+        # the legitimate Origin and still suppresses referrers to other sites.
+        return HTMLResponse('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>JX Alert 授权</title><h1>JX Alert 授权</h1>' + message + '<form method="post" action="/oauth/owner">' + fields + content + '</form></html>', headers=_OWNER_PAGE_HEADERS)
 
     async def _owner(self, request: Request):
         def failure():
