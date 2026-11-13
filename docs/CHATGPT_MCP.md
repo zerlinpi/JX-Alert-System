@@ -38,9 +38,13 @@ OAuth采用SDK协议处理，授权码和refresh单次消费，refresh重放撤�
 
 ## ChatGPT 中添加
 
-按官方当前入口：打开 **Plugins → ＋ → Add custom MCP server**，选择 **Server URL**，地址填写 `https://你的域名/mcp`，认证选择 **OAuth**。使用动态客户端注册（DCR），不要把应用密钥当成OAuth客户端信息填写。创建并安装私有插件后，在对话中输入 `@` 选择它。实际界面名称可能随账户/工作区变化；能否创建还受工作区权限限制。
+按官方当前入口：打开 **Plugins → ＋ → Add custom MCP server**，选择 **Server URL**，本项目地址只填写 `https://jxmcp.pacefitday.com/mcp`，认证选择 **OAuth**。Codex中相应的远程MCP连接也使用这个接口地址。使用动态客户端注册（DCR），不要把应用密钥当成OAuth客户端信息填写。创建并安装私有插件后，在对话中输入 `@` 选择它。实际界面名称可能随账户/工作区变化；能否创建还受工作区权限限制。
 
-授权页将明确显示权限：`jx:read` 查询已存数据；`jx:collect` 请求已配置范围的采集任务。仅查询的连接不要授予采集权限。采集仍须服务器启用操作开关；所有领星业务操作只读，没有广告修改工具。
+`/.well-known/oauth-authorization-server` 是授权信息页，`/.well-known/oauth-protected-resource/mcp` 是资源信息页；两者供客户端自动发现，**不能填入 Server URL 或 OAuth resource**。本项目的受保护资源固定为 `https://jxmcp.pacefitday.com/mcp`。错误地址会被拒绝并返回 `invalid_target`、正确的 `expected_resource`，不会为了连接成功放宽资源校验。
+
+如果已创建连接后出现这个错误，请在该连接设置中更正 Server URL；若入口不能修改地址，则重新创建使用正确地址的连接，再从连接界面发起新的OAuth流程。不要手工修改浏览器中旧 `/authorize?...` 链接后继续使用；其中的 `state`、PKCE及回调信息属于那一次客户端发起的流程。服务端修正文档和错误提示不代表已经代用户修改了客户端连接设置。
+
+授权页将明确显示权限：`jx:read` 查询已存数据；`jx:collect` 请求已配置范围的采集任务；`jx:notify` 将有证据的中文分析发送至已配置飞书群。仅查询的连接无需授予采集或通知权限。采集与通知还需相应服务器开关；所有领星业务操作只读，没有广告修改工具。
 
 首先发送：
 
@@ -54,6 +58,6 @@ OAuth采用SDK协议处理，授权码和refresh单次消费，refresh重放撤�
 - “仅检查数据覆盖和配置，不触发采集。”
 - 获准 `jx:collect` 后：“为已配置店铺请求最近7天回补，幂等键 chat-backfill-20261113；返回任务号，再查询执行结果。”
 
-可用工具包括 `system_health`、`get_configuration_status`、`get_stores`、`get_campaigns`、`get_products`、日报/商品表现/异常/覆盖/任务/通知查询、`get_sp_report`、`get_sp_reconciliations` 和受权限保护的 `request_collection`。以连接实际列出的工具为准。
+可用工具包括 `system_health`、`get_configuration_status`、`get_stores`、`get_campaigns`、`get_products`、日报/商品表现/异常/覆盖/任务/通知查询、`get_sp_report`、`get_sp_reconciliations`、受权限保护的 `request_collection`，以及证据分析与异常提交工具 `prepare_chat_analysis`、`submit_chat_analysis`。分析通知需要 `jx:notify`；空结论不会发送群消息。以连接实际列出的工具为准。
 
 域名、TLS与所有者口令填好后，仍必须在ChatGPT实际完成授权并成功调用一次；单元测试或服务器本机初始化不能替代该项外部验收。
