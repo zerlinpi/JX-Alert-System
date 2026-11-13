@@ -237,6 +237,19 @@ def collect_sales_for_day(client, db, report_dates: str | dict[str, str], *,
             db, store_id=store_id, metric_date=metric_date,
             dimension="store", row_count=1,
         )
+        # Only complete, explicit sales observations establish sales currency;
+        # advertising-profile currency and country labels are not substitutes.
+        sales_values = collected[1]["sales"].values()
+        currencies = {currency for _, currency, _ in sales_values if currency}
+        if len(currencies) > 1:
+            raise RuntimeError("One store/date sales report contains multiple currencies")
+        if len(currencies) == 1:
+            observed = next(iter(currencies))
+            store_row = db.get(Store, store_id)
+            if store_row.currency_code and store_row.currency_code != observed:
+                raise RuntimeError("Sales currency conflicts with confirmed store currency")
+            if isinstance(observed, str) and len(observed) == 3 and observed.isalpha() and all(currency == observed for _, currency, _ in sales_values):
+                store_row.currency_code = observed.upper()
         db.commit()
         report_count += sum(len(rows) for rows in collected[1].values()) + sum(
             len(rows) for rows in collected[2].values()

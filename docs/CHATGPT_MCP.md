@@ -44,6 +44,12 @@ OAuth采用SDK协议处理，授权码和refresh单次消费，refresh重放撤�
 
 如果已创建连接后出现这个错误，请在该连接设置中更正 Server URL；若入口不能修改地址，则重新创建使用正确地址的连接，再从连接界面发起新的OAuth流程。不要手工修改浏览器中旧 `/authorize?...` 链接后继续使用；其中的 `state`、PKCE及回调信息属于那一次客户端发起的流程。服务端修正文档和错误提示不代表已经代用户修改了客户端连接设置。
 
+若已经进入所有者口令页，提交后显示“授权请求无效或已过期”，2026-11-13 已修复一处浏览器表单来源问题：
+原 `no-referrer` 策略会使原生表单发送 `Origin:null`，正常请求被同源校验拒绝。
+登录与同意页改用 `same-origin`，并继续拒绝空来源、错误CSRF、过期请求和错误浏览器绑定。
+关闭旧页，从插件设置发起新的连接，在10分钟内使用私下初始化的所有者口令登录并同意。
+这里不填写飞书 App Secret、服务器密码或固定 Bearer token。服务端测试通过后仍需用户真实重连验收。
+
 授权页将明确显示权限：`jx:read` 查询已存数据；`jx:collect` 请求已配置范围的采集任务；`jx:notify` 将有证据的中文分析发送至已配置飞书群。仅查询的连接无需授予采集或通知权限。采集与通知还需相应服务器开关；所有领星业务操作只读，没有广告修改工具。
 
 首先发送：
@@ -58,6 +64,6 @@ OAuth采用SDK协议处理，授权码和refresh单次消费，refresh重放撤�
 - “仅检查数据覆盖和配置，不触发采集。”
 - 获准 `jx:collect` 后：“为已配置店铺请求最近7天回补，幂等键 chat-backfill-20261113；返回任务号，再查询执行结果。”
 
-可用工具包括 `system_health`、`get_configuration_status`、`get_stores`、`get_campaigns`、`get_products`、日报/商品表现/异常/覆盖/任务/通知查询、`get_sp_report`、`get_sp_reconciliations`、受权限保护的 `request_collection`，以及证据分析与异常提交工具 `prepare_chat_analysis`、`submit_chat_analysis`。分析通知需要 `jx:notify`；空结论不会发送群消息。以连接实际列出的工具为准。
+可用工具包括 `system_health`、`get_configuration_status`、`get_analysis_plan`、`get_stores`、`get_campaigns`、`get_products`、日报/商品表现/异常/覆盖/任务/通知查询、`get_sp_report`、`get_sp_reconciliations`、受权限保护的 `request_collection`，以及证据分析与异常提交工具 `prepare_chat_analysis`、`submit_chat_analysis`。分析通知需要 `jx:notify`；空结论不会发送群消息。以连接实际列出的工具为准。全店铺模式详见[全店铺说明](ALL_STORE_ANALYSIS.md)。
 
 域名、TLS与所有者口令填好后，仍必须在ChatGPT实际完成授权并成功调用一次；单元测试或服务器本机初始化不能替代该项外部验收。

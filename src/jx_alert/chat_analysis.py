@@ -17,7 +17,6 @@ from jx_alert.notifications.cards import card, number
 from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.notifications.routing import _load_routing
 from jx_alert.storage.models import Campaign, DailyMetric, DataCoverage, Store, SyncJob
-from jx_alert.storage.store_config import load_store_config
 
 
 TOPICS = {"订单异常", "销量异常", "销售额异常", "花费异常", "转化异常"}
@@ -34,15 +33,17 @@ def _now(now):
     return value.astimezone(timezone.utc)
 
 
-def _scope(settings, store_id):
+def _scope(settings, store_id, *, now=None):
     config = json.loads(Path(settings.collection_scope_file).read_text(encoding="utf-8"))
     scope = config.get("store_ids", [])
     if str(store_id) not in {str(sid) for sid in scope}:
         raise ValueError("Store is outside the configured collection scope")
-    zones = load_store_config(settings.store_timezones_file)
-    if str(store_id) not in zones:
+    from jx_alert.operations import store_report_plan
+    plan = store_report_plan([{"sid": str(store_id), "status": 1}], settings.store_timezones_file,
+        now=now, allow_unknown_timezone_history=getattr(settings, "allow_unconfigured_timezone_history", False))[0]
+    if plan["state"] != "READY":
         raise ValueError("Confirmed marketplace timezone is required")
-    return zones[str(store_id)]
+    return plan
 
 
 def prepare_review(db, settings, store_id, *, dimension="store", entity_id=None, now=None):
@@ -50,11 +51,11 @@ def prepare_review(db, settings, store_id, *, dimension="store", entity_id=None,
     clock = _now(now)
     if dimension not in DIMENSIONS:
         raise ValueError("Unsupported analysis dimension")
-    zone = _scope(settings, store_id)
+    zone = _scope(settings, store_id, now=clock)
     store = db.get(Store, str(store_id))
     if store is None or store.timezone != zone["timezone"] or store.status != 1:
         raise ValueError("Store must be synchronized with its confirmed timezone")
-    last = clock.astimezone(ZoneInfo(zone["timezone"])).date() - timedelta(days=1)
+    last = date.fromisoformat(zone["report_date"])
     first = last - timedelta(days=21)
     rows = db.scalars(select(DailyMetric).where(
         DailyMetric.store_id == str(store_id), DailyMetric.metric_date.between(first, last),
@@ -69,9 +70,16 @@ def prepare_review(db, settings, store_id, *, dimension="store", entity_id=None,
     complete = {(r.metric_date, r.dimension): r.status == "COMPLETE" for r in coverage}
     facts = [{"id": r.id, "date": r.metric_date.isoformat(), "dimension": r.dimension,
               "entity_id": r.entity_id, "metric": r.metric_name, "value": r.value,
+              "currency": r.currency,
               "complete": complete.get((r.metric_date, r.dimension), False)} for r in rows]
+    baseline_dates = [last - timedelta(days=i) for i in range(8)]
+    missing_dates = [day.isoformat() for day in baseline_dates if not complete.get((day, dimension), False)]
+    sufficient = not missing_dates and any(r["date"] == last.isoformat() for r in facts) and len({r["date"] for r in facts}) > 1
     context = {"store_id": store.sid, "store_name": store.name, "timezone": store.timezone,
                "currency": store.currency_code, "dimension": dimension, "last_complete_date": last.isoformat(),
+               "timezone_confirmed": zone["timezone_confirmed"], "date_basis": zone["date_basis"],
+               "intraday_enabled": zone["intraday_enabled"], "data_sufficient": sufficient,
+               "missing_baseline_dates": missing_dates,
                "facts": facts, "coverage": [{"date": r.metric_date.isoformat(),
                    "dimension": r.dimension, "status": r.status} for r in coverage],
                "campaigns": [{"id": c.campaign_id, "name": c.name, "type": c.campaign_type}
@@ -103,14 +111,17 @@ def submit_review(db, settings, review_id, findings, *, now=None):
     if job is None:
         raise ValueError("Unknown analysis review")
     meta = job.metadata_json
-    if job.status == "REVIEWED":
+    if job.status in {"REVIEWED", "INSUFFICIENT_DATA"}:
         if findings != meta["findings"]:
             raise ValueError("A completed review cannot be changed")
         return meta["result"]
     if clock > datetime.fromisoformat(meta["expires_at"]):
         raise ValueError("Analysis review expired; fetch a fresh snapshot")
     context = meta["context"]
-    zone = _scope(settings, context["store_id"])
+    zone = _scope(settings, context["store_id"], now=clock)
+    store = db.get(Store, context["store_id"])
+    if store is None or store.status != 1:
+        raise ValueError("Store authorization or synchronization is no longer ready")
     if zone["timezone"] != context["timezone"]:
         raise ValueError("Store timezone changed; fetch a fresh snapshot")
     if not isinstance(findings, list) or len(findings) > 10:
@@ -140,9 +151,14 @@ def submit_review(db, settings, review_id, findings, *, now=None):
                     (r["date"], r["dimension"], r["entity_id"], r["metric"]) or
                     coverage is None or coverage.status != "COMPLETE"):
                 raise ValueError("Incomplete or revised evidence requires a fresh analysis")
+            if r["metric"] in {"sales", "spend"} and (
+                not context["currency"] or r.get("currency") != context["currency"] or live.currency != r.get("currency")
+            ):
+                raise ValueError("Monetary analysis requires one confirmed currency and matching evidence")
             if r["metric"] in {"orders", "sales"} and "_" in r["dimension"] and r["dimension"] not in {"sku_msku", "sku_asin"}:
                 lag = 7 if r["dimension"].endswith("_sp") else 14
-                local = clock.astimezone(ZoneInfo(context["timezone"])).date()
+                local = (clock.astimezone(ZoneInfo(context["timezone"])).date() if context["timezone"]
+                         else date.fromisoformat(zone["report_date"]) + timedelta(days=1))
                 if date.fromisoformat(r["date"]) > local - timedelta(days=lag + 1):
                     raise ValueError("Advertising attribution is not mature")
         validated.append((topic, summary, action, evidence))
@@ -165,15 +181,18 @@ def submit_review(db, settings, review_id, findings, *, now=None):
         value = card(topic, subtitle=context["store_name"] + "（" + context["store_id"] + "）",
             sections=[("异常", ["结论", "建议"], [(summary, action)]),
                       ("数据", ["日期", "对象", "指标", "数值"], [(r["date"], r["entity_id"],
-                          METRICS[r["metric"]], number(r["value"])) for r in evidence])])
+                          METRICS[r["metric"]], number(r["value"], money=r["metric"] in {"sales", "spend"},
+                              currency=context["currency"] or "币种待确认")) for r in evidence])])
         row = enqueue_notification(db, idempotency_key=key, text=topic + "：" + summary + "；" + action,
             store_id=context["store_id"], entity_id=evidence[0]["entity_id"], chat_id=chat_id, card=value,
             fixed_route=True, delivery={"role": "chat_analysis", "receive_id": chat_id,
                 "receive_id_type": "chat_id", "open_ids": owners})
         ids.append(row.id)
-    result = {"status": "QUEUED" if ids else "NO_ANOMALY", "outbox_ids": ids,
-              "review_id": review_id, "finding_count": len(validated)}
-    job.status, job.finished_at = "REVIEWED", clock.replace(tzinfo=None)
+    result = {"status": "QUEUED" if ids else "NO_ANOMALY" if context.get("data_sufficient") else "INSUFFICIENT_DATA",
+              "outbox_ids": ids, "review_id": review_id, "finding_count": len(validated),
+              "data_sufficient": bool(context.get("data_sufficient"))}
+    job.status = "INSUFFICIENT_DATA" if result["status"] == "INSUFFICIENT_DATA" else "REVIEWED"
+    job.finished_at = clock.replace(tzinfo=None)
     job.metadata_json = {**meta, "findings": findings, "result": result}
     db.flush()
     return result
