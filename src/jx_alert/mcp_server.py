@@ -17,6 +17,7 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from sqlalchemy import func, or_, select, text
 
 from jx_alert.config import get_settings
+from jx_alert.analysis.comparison import metric_comparison
 from jx_alert.storage.db import SessionLocal, engine, init_db
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.models import (
@@ -182,8 +183,9 @@ def _tool_security(*scopes):
 def _scope_challenge(required_scope, settings):
     """Signal incremental consent to ChatGPT without executing the action."""
     metadata = settings.mcp_public_url.rstrip("/") + "/.well-known/oauth-protected-resource" + settings.mcp_path
+    label = {"jx:notify": "发送飞书异常通知", "jx:collect": "请求数据采集"}.get(required_scope, required_scope)
     return CallToolResult(
-        content=[TextContent(type="text", text="需要重新授权：" + required_scope)],
+        content=[TextContent(type="text", text=f"当前连接缺少「{label}」权限。请确认新增权限后重试本操作。")],
         structuredContent={"status": "AUTHORIZATION_REQUIRED", "required_scope": required_scope},
         isError=True,
         _meta={"mcp/www_authenticate": [
@@ -218,6 +220,14 @@ def system_health() -> dict:
     else:
         token_mode = "not_configured"
 
+    oauth_permissions = None
+    if getattr(settings, "mcp_auth_mode", "bearer") == "oauth":
+        from mcp.server.auth.middleware.auth_context import get_access_token
+        token = get_access_token()
+        if token is not None:
+            oauth_permissions = {"read": "jx:read" in token.scopes, "notify": "jx:notify" in token.scopes,
+                                 "collect": "jx:collect" in token.scopes}
+
     return {
         "service": "JX Alert System",
         "database": database_status,
@@ -233,6 +243,7 @@ def system_health() -> dict:
         "feishu_enabled": settings.feishu_enabled,
         "feishu_webhook_configured": bool(settings.feishu_webhook_url),
         **feishu_channel_status(settings),
+        "current_connection_permissions": oauth_permissions,
         "remote_mcp_bearer_configured": bool(settings.mcp_bearer_token),
         "remote_mcp_path": settings.mcp_path,
         "remote_mcp_port": settings.mcp_port,
@@ -294,6 +305,21 @@ def get_all_anomalies(limit: int = 100, status: str | None = None,
 
 
 
+def _compare_metric(values, currencies, metric, target, complete_dates, *, entity_id=None):
+    days = [target - timedelta(days=i) for i in range(8)]
+    def key(day):
+        return (entity_id, metric, day) if entity_id is not None else (metric, day)
+    return metric_comparison({day: values[key(day)] for day in days if key(day) in values},
+        target, complete_dates,
+        currencies={day: currencies.get(key(day)) for day in days} if metric in {"spend", "sales"} else None)
+
+
+def _observed_currency(rows):
+    values = [row.currency for row in rows if row.metric_name in {"spend", "sales"}]
+    return (values[0] if values and all(isinstance(v, str) and re.fullmatch(r"[A-Z]{3}", v)
+                                      for v in values) and len(set(values)) == 1 else None)
+
+
 def _daily_summary(db, store_id: str, target_date: date) -> dict:
     store = db.get(Store, str(store_id))
     if store is None:
@@ -323,34 +349,15 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
     def value(dimension: str, entity_id: str, metric: str, day: date):
         if not is_complete(dimension, day):
             return None
-        return metric_values.get((dimension, entity_id, metric, day), 0.0)
+        return metric_values.get((dimension, entity_id, metric, day))
 
     sales = {}
     for metric in ("orders", "units", "sales"):
-        current = value("store", str(store_id), metric, target_date)
-        previous_date = target_date - timedelta(days=1)
-        previous = value("store", str(store_id), metric, previous_date)
-        baseline_dates = [target_date - timedelta(days=offset) for offset in range(1, 8)]
-        baseline_complete = all(is_complete("store", day) for day in baseline_dates)
-        baseline_values = [
-            metric_values.get(("store", str(store_id), metric, day), 0.0)
-            for day in baseline_dates
-        ] if baseline_complete else []
-        average = sum(baseline_values) / 7 if baseline_complete else None
-        sales[metric] = {
-            "current": current,
-            "previous_day": previous,
-            "change_vs_previous_day": (
-                (current - previous) / previous
-                if current is not None and previous is not None and previous > 0 else None
-            ),
-            "average_7d": average,
-            "change_vs_7d_average": (
-                (current - average) / average
-                if current is not None and average is not None and average > 0 else None
-            ),
-            "baseline_complete": baseline_complete,
-        }
+        rows = [r for r in metric_rows if r.dimension == "store" and r.entity_id == str(store_id)
+                and r.metric_name == metric]
+        sales[metric] = metric_comparison({r.metric_date: r.value for r in rows}, target_date,
+            {day for day in dates if is_complete("store", day)},
+            currencies={r.metric_date: r.currency for r in rows} if metric == "sales" else None)
 
     campaign_by_type = {}
     all_campaign_types_complete = True
@@ -372,17 +379,11 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
         metric_names = ("spend", "orders", "sales", "clicks", "impressions")
         # Aggregate from the complete report grain, not the capped detail list.
         # Otherwise stores with >200 campaigns silently receive understated totals.
-        totals = {
-            metric: (
-                sum(
-                    row.value for row in metric_rows
-                    if row.dimension == dimension
-                    and row.metric_date == target_date
-                    and row.metric_name == metric
-                ) if complete else None
-            )
-            for metric in metric_names
-        }
+        totals = {}
+        for metric in metric_names:
+            observed = [row.value for row in metric_rows if row.dimension == dimension
+                        and row.metric_date == target_date and row.metric_name == metric]
+            totals[metric] = sum(observed) if complete and observed else None
         for campaign in campaigns:
             item_metrics = {
                 metric: value(dimension, campaign.campaign_id, metric, target_date)
@@ -410,10 +411,9 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
     campaign_total = None
     if all_campaign_types_complete:
         campaign_total = {
-            metric: sum(
-                campaign_by_type[kind]["totals"][metric]
-                for kind in ("sp", "sb", "sd")
-            )
+            metric: (sum(campaign_by_type[kind]["totals"][metric] for kind in ("sp", "sb", "sd"))
+                     if all(campaign_by_type[kind]["totals"][metric] is not None for kind in ("sp", "sb", "sd"))
+                     else None)
             for metric in ("spend", "orders", "sales", "clicks", "impressions")
         }
 
@@ -425,14 +425,9 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
         all_product_types_complete = all_product_types_complete and complete
         totals = {}
         for metric in ("spend", "orders", "sales", "units", "clicks", "impressions"):
-            totals[metric] = (
-                sum(
-                    row.value for row in metric_rows
-                    if row.dimension == dimension
-                    and row.metric_date == target_date
-                    and row.metric_name == metric
-                ) if complete else None
-            )
+            observed = [row.value for row in metric_rows if row.dimension == dimension
+                        and row.metric_date == target_date and row.metric_name == metric]
+            totals[metric] = sum(observed) if complete and observed else None
         product_ads[campaign_type] = {"complete": complete, "totals": totals}
 
     required_dimensions = ["store", "sku_asin", "sku_msku"]
@@ -462,12 +457,14 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
             "complete": all_campaign_types_complete,
             "by_type": campaign_by_type,
             "total": campaign_total,
-            "currency_code": store.currency_code,
+            "currency_code": _observed_currency([r for r in metric_rows if r.metric_date == target_date
+                                                  and r.dimension.startswith("campaign_")]),
         },
         "product_ads": {
             "complete": all_product_types_complete,
             "by_type": product_ads,
-            "currency_code": store.currency_code,
+            "currency_code": _observed_currency([r for r in metric_rows if r.metric_date == target_date
+                                                  and r.dimension.startswith("product_ad_")]),
             "note": "Product-ad metrics are a separate grain; do not add them to campaign totals.",
         },
         "coverage": target_coverage,
@@ -517,8 +514,8 @@ def get_daily_summary(store_id: str, report_date: str) -> dict:
     """Return one store's daily sales comparison, ad totals, campaign detail and coverage.
 
     report_date must be the marketplace-local date for this store. Missing data is
-    returned as null when coverage is incomplete; complete but absent metric rows
-    are treated as zero.
+    returned as null when coverage is incomplete or facts are absent. Prefer a
+    complete seven-day baseline; otherwise use exact previous-day facts, never invented zeros.
     """
     try:
         target_date = date.fromisoformat(report_date)
@@ -597,7 +594,8 @@ def get_sku_performance(store_id: str, report_date: str,
                         dimension: str = "sku_msku", limit: int = 200) -> list[dict]:
     """Return SKU/ASIN daily metrics with previous-day and complete 7-day baselines.
 
-    Missing coverage is returned as null, never interpreted as zero. dimension
+    Prefer seven days, falling back to explicit adjacent dates. Missing facts
+    remain null. dimension
     must be sku_msku or sku_asin.
     """
     if dimension not in {"sku_msku", "sku_asin"}:
@@ -639,40 +637,13 @@ def get_sku_performance(store_id: str, report_date: str,
             for row in metric_rows
         }
 
+        currencies = {(r.entity_id, r.metric_name, r.metric_date): r.currency for r in metric_rows}
+
         results = []
         for entity_id, mapped_products in entities.items():
             metric_results = {}
             for metric in ("orders", "units", "sales"):
-                current = (
-                    values.get((entity_id, metric, target), 0.0)
-                    if target in complete_dates else None
-                )
-                previous_date = target - timedelta(days=1)
-                previous = (
-                    values.get((entity_id, metric, previous_date), 0.0)
-                    if previous_date in complete_dates else None
-                )
-                baseline_complete = all(day in complete_dates for day in baseline_dates)
-                average = (
-                    sum(values.get((entity_id, metric, day), 0.0) for day in baseline_dates) / 7
-                    if baseline_complete else None
-                )
-                metric_results[metric] = {
-                    "current": current,
-                    "previous_day": previous,
-                    "change_vs_previous_day": (
-                        (current - previous) / previous
-                        if current is not None and previous is not None and previous > 0
-                        else None
-                    ),
-                    "average_7d": average,
-                    "change_vs_7d_average": (
-                        (current - average) / average
-                        if current is not None and average is not None and average > 0
-                        else None
-                    ),
-                    "baseline_complete": baseline_complete,
-                }
+                metric_results[metric] = _compare_metric(values, currencies, metric, target, complete_dates, entity_id=entity_id)
             product = mapped_products[0]
             results.append({
                 "store_id": str(store_id),
@@ -712,7 +683,6 @@ def get_campaign_performance(store_id: str, report_date: str,
             Campaign.store_id == str(store_id),
             Campaign.campaign_type.in_(types),
         ).order_by(Campaign.campaign_type, Campaign.name).limit(_limit(limit, 1000))).all()
-        store = db.get(Store, str(store_id))
         results = []
         for campaign in campaigns:
             dimension = f"campaign_{campaign.campaign_type}"
@@ -734,39 +704,14 @@ def get_campaign_performance(store_id: str, report_date: str,
                 (row.metric_name, row.metric_date): float(row.value)
                 for row in metric_rows
             }
+            currencies = {(r.metric_name, r.metric_date): r.currency for r in metric_rows}
             metrics = {}
-            previous_date = target - timedelta(days=1)
             for metric in ("spend", "orders", "sales", "clicks", "impressions"):
-                current = (
-                    values.get((metric, target), 0.0)
-                    if target in complete_dates else None
-                )
-                previous = (
-                    values.get((metric, previous_date), 0.0)
-                    if previous_date in complete_dates else None
-                )
-                baseline_complete = all(day in complete_dates for day in baseline_dates)
-                average = (
-                    sum(values.get((metric, day), 0.0) for day in baseline_dates) / 7
-                    if baseline_complete else None
-                )
-                metrics[metric] = {
-                    "current": current,
-                    "previous_day": previous,
-                    "change_vs_previous_day": (
-                        (current - previous) / previous
-                        if current is not None and previous is not None and previous > 0
-                        else None
-                    ),
-                    "average_7d": average,
-                    "change_vs_7d_average": (
-                        (current - average) / average
-                        if current is not None and average is not None and average > 0
-                        else None
-                    ),
-                }
+                metrics[metric] = _compare_metric(values, currencies, metric, target, complete_dates)
             spend = metrics["spend"]["current"]
             sales = metrics["sales"]["current"]
+            currency = _observed_currency([r for r in metric_rows if r.metric_date == target
+                                           ])
             results.append({
                 "store_id": str(store_id),
                 "campaign_type": campaign.campaign_type,
@@ -777,10 +722,10 @@ def get_campaign_performance(store_id: str, report_date: str,
                 "daily_budget": (
                     campaign.budget if (campaign.budget_type or "").lower() == "daily" else None
                 ),
-                "currency_code": store.currency_code if store else None,
+                "currency_code": currency,
                 "metrics": metrics,
-                "acos": spend / sales if spend is not None and sales is not None and sales > 0 else None,
-                "roas": sales / spend if spend is not None and spend > 0 else None,
+                "acos": spend / sales if currency and spend is not None and sales is not None and sales > 0 else None,
+                "roas": sales / spend if currency and sales is not None and spend is not None and spend > 0 else None,
                 "current_day_complete": target in complete_dates,
                 "baseline_complete": all(day in complete_dates for day in baseline_dates),
             })
@@ -809,7 +754,6 @@ def get_product_ad_performance(store_id: str, report_date: str,
     dimension = f"product_ad_{normalized_type}"
     init_db()
     with SessionLocal() as db:
-        store = db.get(Store, str(store_id))
         ads = db.scalars(select(AdProduct).where(
             AdProduct.store_id == str(store_id),
             AdProduct.campaign_type == normalized_type,
@@ -833,41 +777,17 @@ def get_product_ad_performance(store_id: str, report_date: str,
             for row in metric_rows
         }
 
+        currencies = {(r.entity_id, r.metric_name, r.metric_date): r.currency for r in metric_rows}
+
         results = []
         for ad in ads:
             metrics = {}
             for metric in ("spend", "orders", "sales", "units", "clicks", "impressions"):
-                current = (
-                    values.get((ad.ad_id, metric, target), 0.0)
-                    if target in complete_dates else None
-                )
-                previous = (
-                    values.get((ad.ad_id, metric, previous_date), 0.0)
-                    if previous_date in complete_dates else None
-                )
-                baseline_complete = all(day in complete_dates for day in baseline_dates)
-                average = (
-                    sum(values.get((ad.ad_id, metric, day), 0.0)
-                        for day in baseline_dates) / 7
-                    if baseline_complete else None
-                )
-                metrics[metric] = {
-                    "current": current,
-                    "previous_day": previous,
-                    "change_vs_previous_day": (
-                        (current - previous) / previous
-                        if current is not None and previous is not None and previous > 0
-                        else None
-                    ),
-                    "average_7d": average,
-                    "change_vs_7d_average": (
-                        (current - average) / average
-                        if current is not None and average is not None and average > 0
-                        else None
-                    ),
-                }
+                metrics[metric] = _compare_metric(values, currencies, metric, target, complete_dates, entity_id=ad.ad_id)
             spend = metrics["spend"]["current"]
             sales = metrics["sales"]["current"]
+            currency = _observed_currency([r for r in metric_rows if r.metric_date == target
+                                           and r.entity_id == ad.ad_id])
             results.append({
                 "store_id": str(store_id),
                 "campaign_type": normalized_type,
@@ -878,10 +798,10 @@ def get_product_ad_performance(store_id: str, report_date: str,
                 "seller_sku": ad.seller_sku,
                 "state": ad.state,
                 "serving_status": ad.serving_status,
-                "currency_code": store.currency_code if store else None,
+                "currency_code": currency,
                 "metrics": metrics,
-                "acos": spend / sales if spend is not None and sales is not None and sales > 0 else None,
-                "roas": sales / spend if spend is not None and spend > 0 else None,
+                "acos": spend / sales if currency and spend is not None and sales is not None and sales > 0 else None,
+                "roas": sales / spend if currency and sales is not None and spend is not None and spend > 0 else None,
                 "current_day_complete": target in complete_dates,
                 "previous_day_complete": previous_date in complete_dates,
                 "baseline_complete": all(day in complete_dates for day in baseline_dates),
@@ -1154,7 +1074,8 @@ def prepare_chat_analysis(store_id: str, dimension: str = "store", entity_id: st
 def get_analysis_plan() -> dict:
     """查询全部已启用店铺的分析计划、真实时区核实状态、保守历史日期和数据缺口。
 
-    不采集、不发送通知。未采集、授权异常、未确认时区或缺基线不能解释为经营正常。
+    优先七日均值，七日不足且两日完整时使用前一日对比。
+    未采集、授权异常或无可比证据单独标记。未确认时区只使用保守历史日期。
     小时任务先读此计划，逐店处理可用证据，分别记录未完整分析的店铺。
     """
     from jx_alert.readiness import analysis_plan
@@ -1169,7 +1090,9 @@ def submit_chat_analysis(review_id: int, findings: list[dict]) -> dict:
 
     每项仅含topic（订单异常/销量异常/销售额异常/花费异常/转化异常）、summary（中文≤160字）、
     action（中文建议≤100字）、evidence_ids（2至24条快照证据ID，跨日同对象）。
-    需jx:notify授权和服务开关；只返回入队结果，实际送达由通知日志确认。不得虚构原因。
+    证据需覆盖同对象同指标的七日均值或前一日比较。权限可先用system_health核对。
+    需jx:notify授权和服务开关。人员未映射时按群兜底设置发已配置日报群。
+    返回入队结果，实际送达由通知日志确认。不得虚构原因。
     """
     settings = get_settings()
     if getattr(settings, "mcp_auth_mode", "bearer") == "oauth":

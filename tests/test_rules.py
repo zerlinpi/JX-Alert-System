@@ -12,9 +12,13 @@ def test_order_small_change_does_not_alert():
     assert detect_order_anomaly(entity_key="x", current_orders=11,
         previous_orders=10, prior_7_days=[10]*7, config=RuleConfig()) == []
 
-def test_insufficient_history_does_not_alert():
+def test_insufficient_seven_days_can_use_observed_previous_day():
+    result = detect_order_anomaly(entity_key="x", current_orders=20,
+        previous_orders=10, prior_7_days=[10]*6, config=RuleConfig())
+    assert result[0]["metrics"]["comparison_basis"] == "PREVIOUS_DAY"
+    assert "baseline_7d" not in result[0]["metrics"]
     assert detect_order_anomaly(entity_key="x", current_orders=20,
-        previous_orders=10, prior_7_days=[10]*6, config=RuleConfig()) == []
+        previous_orders=None, prior_7_days=[10]*6, config=RuleConfig()) == []
 
 def test_campaign_spend_and_zero_conversion_rules():
     events = detect_campaign_anomalies(entity_key="store:campaign", spend=50, orders=0,

@@ -369,7 +369,20 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
     async def get_client(self, client_id):
         with self._db() as db:
             row = db.execute("SELECT data FROM clients WHERE id=?", (client_id,)).fetchone()
-        return OAuthClientInformationFull.model_validate_json(row[0]) if row else None
+        if not row:
+            return None
+        client = OAuthClientInformationFull.model_validate_json(row[0])
+        # ChatGPT initially registers this connection for read access. Permit
+        # a subsequent authorization request for notifications on the same
+        # client. This is client eligibility, not a grant: the owner must
+        # approve the new scope and refresh still uses the original token scopes.
+        redirects = [str(uri) for uri in client.redirect_uris or []]
+        if client.scope == "jx:read" and redirects and all(
+            re.fullmatch(r"https://chatgpt\.com/(?:connector_platform_oauth_redirect|connector/oauth/[A-Za-z0-9_-]+)", uri)
+            for uri in redirects
+        ):
+            client = client.model_copy(update={"scope": "jx:read jx:notify"})
+        return client
 
     def _scopes(self, scopes, client):
         wanted = list(dict.fromkeys(scopes or ["jx:read"]))

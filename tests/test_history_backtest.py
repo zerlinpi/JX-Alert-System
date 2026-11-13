@@ -74,7 +74,7 @@ def test_same_sku_ads_keep_independent_candidate_labels_and_notification_keys(mo
                 }.items():
                     db.add(DailyMetric(store_id="1", metric_date=day,
                                        dimension="product_ad_sp", entity_id=ad_id,
-                                       metric_name=metric_name, value=value))
+                                       metric_name=metric_name, value=value, currency="USD"))
         for offset in range(15):
             db.add(DataCoverage(store_id="1", metric_date=target - timedelta(days=offset),
                                 dimension="product_ad_sp", status="COMPLETE", row_count=2))

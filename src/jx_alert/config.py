@@ -103,6 +103,8 @@ class Settings(BaseSettings):
     feishu_routing_file: str = "/app/data/feishu-routing.json"
     feishu_timeout: int = 20
     feishu_transport: Literal["webhook", "app"] = "webhook"
+    # Explicit policy: missing role mappings use the verified report group without mentions.
+    feishu_group_fallback_enabled: bool = False
     feishu_app_id: str = ""
     feishu_app_secret: SecretStr = SecretStr("")
     feishu_app_credentials_file: str = "/app/data/secrets/feishu-app.json"
@@ -158,6 +160,7 @@ def get_settings() -> Settings:
             "collection_scope_file", "sp_collection_enabled", "sp_validation_targets_file",
             "store_timezones_file", "feishu_routing_file",
             "sp_refresh_days", "mcp_operations_enabled", "mcp_notifications_enabled", "feishu_enabled", "feishu_transport",
+            "feishu_group_fallback_enabled",
             "feishu_manager_open_ids", "feishu_daily_report_enabled", "feishu_daily_report_chat_id",
             "lingxing_performance_enabled", "lingxing_performance_source_timezone",
             "lingxing_performance_observation_only",

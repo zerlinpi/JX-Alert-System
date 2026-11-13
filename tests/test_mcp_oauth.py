@@ -231,6 +231,28 @@ def test_revoke_either_token_revokes_its_associated_pair(setup):
     assert refresh(client, account, first["refresh_token"]).status_code == 400
 
 
+def test_read_only_chatgpt_client_can_request_notify_with_fresh_owner_consent(setup):
+    provider, client, _ = setup
+    account = register(client, scope="jx:read")
+    request_id, csrf, _ = begin(client, account, scope="jx:read")
+    login = owner_post(client, request_id, csrf, action="login", password=PASSWORD)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', login.text)[1]
+    callback = owner_post(client, request_id, csrf, action="approve")
+    code = parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
+    original = exchange(client, account, code).json()
+    assert original["scope"] == "jx:read"
+    assert refresh(client, account, original["refresh_token"], scope="jx:read jx:notify").json()["error"] == "invalid_scope"
+    assert refresh(client, account, original["refresh_token"]).json()["scope"] == "jx:read"
+
+    request_id, csrf, consent = begin(client, account, scope="jx:read jx:notify")
+    assert "发送至已配置飞书群" in consent.text
+    callback = owner_post(client, request_id, csrf, action="approve")
+    code = parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
+    upgraded = exchange(client, account, code).json()
+    assert upgraded["scope"] == "jx:read jx:notify"
+    assert run(provider.load_access_token(upgraded["access_token"])).scopes == ["jx:read", "jx:notify"]
+
+
 def test_restart_preserves_client_and_authorization_code_then_access_tokens(setup):
     provider, client, options = setup
     account = register(client)

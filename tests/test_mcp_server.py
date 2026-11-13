@@ -184,7 +184,9 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
     assert summary["sales"]["orders"]["previous_day"] == 10
     assert summary["sales"]["orders"]["average_7d"] == 10
     assert summary["sales"]["orders"]["change_vs_7d_average"] == -0.5
-    assert summary["campaign_ads"]["total"]["spend"] == 12
+    assert summary["campaign_ads"]["by_type"]["sp"]["totals"]["spend"] == 12
+    assert summary["campaign_ads"]["total"]["spend"] is None
+    assert summary["sales"]["units"]["comparison_basis"] == "INSUFFICIENT_DATA"
     assert summary["product_ads"]["by_type"]["sp"]["totals"]["spend"] == 8
 
     campaigns = mcp_server.get_campaigns(store_id="101", campaign_type="SP")

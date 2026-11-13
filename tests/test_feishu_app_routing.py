@@ -295,3 +295,132 @@ def test_chat_delivery_mode_keeps_rule_candidates_out_of_group_notifications(set
     with Session() as db:
         assert db.scalar(select(AnomalyEvent)) is not None
         assert db.scalars(select(NotificationOutbox)).all() == []
+
+
+@pytest.mark.parametrize("missing", ["owner", "admin", "both"])
+def test_approved_fallback_sends_missing_roles_to_report_group_without_mentions(setup, monkeypatch, missing):
+    Session, settings, config, path = setup
+    settings.feishu_group_fallback_enabled = True
+    settings.feishu_daily_report_chat_id = "test"
+    if missing in {"owner", "both"}:
+        config["stores"] = {}
+    if missing in {"admin", "both"}:
+        config["groups"]["operations"]["admin_open_ids"] = []
+    if missing == "both":
+        config["management"] = {}
+    path.write_text(json.dumps(config), encoding="utf-8")
+    original = path.read_bytes()
+    enqueue(Session)
+    sent = []
+
+    class Client:
+        def send_card(self, card, **kwargs):
+            sent.append(kwargs)
+            return {"message_id": "synthetic-message"}
+
+    monkeypatch.setattr(app_module.FeishuAppClient, "from_settings", lambda *_: Client())
+    with Session() as db:
+        jobs = db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)).all()
+        group = next(job for job in jobs if job.chat_id == "oc_test")
+        delivery = group.payload["delivery"]
+        assert delivery["open_ids"] == [] and delivery["group_fallback"]
+        assert len(jobs) == (1 if missing == "both" else 2)
+        assert all(job.status == "PENDING" for job in jobs)
+        if missing == "both":
+            assert set(delivery["covered_roles"]) == {"group", "management"}
+            assert len(delivery["fallback_reasons"]) == 2
+        else:
+            assert jobs[-1].payload["delivery"]["receive_id"] == "ou_manager"
+    assert worker.process_outbox_batch()["sent"] == (1 if missing == "both" else 2)
+    assert sum(item["receive_id"] == "oc_test" for item in sent) == 1
+    assert next(item for item in sent if item["receive_id"] == "oc_test")["open_ids"] == []
+    assert path.read_bytes() == original, "Fallback must not invent or rewrite owner mappings"
+
+
+def test_missing_management_uses_same_group_once_and_preserves_verified_mentions(setup):
+    Session, settings, config, path = setup
+    settings.feishu_group_fallback_enabled = True
+    settings.feishu_daily_report_chat_id = "operations"
+    config["management"] = {}
+    path.write_text(json.dumps(config), encoding="utf-8")
+    enqueue(Session)
+    with Session() as db:
+        jobs = db.scalars(select(NotificationOutbox)).all()
+        assert len(jobs) == 1
+        delivery = jobs[0].payload["delivery"]
+        assert delivery["receive_id"] == "oc_operations"
+        assert delivery["open_ids"] == ["ou_admin", "ou_operator"]
+        assert delivery["group_fallback"]
+        assert set(delivery["covered_roles"]) == {"group", "management"}
+
+
+@pytest.mark.parametrize("broken", ["missing_alias", "unknown_alias", "missing_chat", "unknown_route",
+                                  "invalid_owner", "malformed_owner", "invalid_report_admin",
+                                  "invalid_routed_admin", "invalid_defaults", "malformed_file"])
+def test_fallback_never_bypasses_a_missing_group_or_malformed_mapping(setup, broken):
+    Session, settings, config, path = setup
+    settings.feishu_group_fallback_enabled = True
+    settings.feishu_daily_report_chat_id = "test"
+    config["stores"] = {}
+    config["management"] = {}
+    if broken == "missing_alias":
+        settings.feishu_daily_report_chat_id = ""
+    elif broken == "unknown_alias":
+        settings.feishu_daily_report_chat_id = "unknown"
+    elif broken == "missing_chat":
+        config["groups"]["test"]["chat_id"] = ""
+    elif broken == "unknown_route":
+        config["stores"] = {"s": {"chat_id": "unknown", "open_ids": []}}
+    elif broken == "invalid_owner":
+        config["stores"] = {"s": {"open_ids": ["unverified-id"]}}
+    elif broken == "malformed_owner":
+        config["stores"] = {"s": "not-a-route"}
+    elif broken == "invalid_report_admin":
+        config["groups"]["test"]["admin_open_ids"] = ["unverified-id"]
+    elif broken == "invalid_routed_admin":
+        config["groups"]["operations"]["admin_open_ids"] = ["unverified-id"]
+    elif broken == "invalid_defaults":
+        settings.feishu_default_at_open_ids = "unverified-id"
+    path.write_text("not-json" if broken == "malformed_file" else json.dumps(config), encoding="utf-8")
+    enqueue(Session)
+    with Session() as db:
+        jobs = db.scalars(select(NotificationOutbox)).all()
+        assert jobs and all(job.status == "ROUTING_FAILED" for job in jobs)
+        assert all(not job.payload["delivery"].get("receive_id") for job in jobs)
+
+
+def test_invalid_management_mapping_is_not_treated_as_an_absent_role(setup):
+    Session, settings, config, path = setup
+    settings.feishu_group_fallback_enabled = True
+    settings.feishu_daily_report_chat_id = "operations"
+    config["management"] = {"open_ids": ["invalid-user-id"]}
+    path.write_text(json.dumps(config), encoding="utf-8")
+    enqueue(Session)
+    with Session() as db:
+        jobs = db.scalars(select(NotificationOutbox)).all()
+        assert len(jobs) == 2
+        assert sum(job.status == "PENDING" for job in jobs) == 1
+        assert sum(job.status == "ROUTING_FAILED" for job in jobs) == 1
+
+
+def test_enabling_fallback_does_not_replay_history_and_explicit_repair_reuses_delivered_group(setup):
+    Session, settings, config, path = setup
+    config["management"] = {}
+    path.write_text(json.dumps(config), encoding="utf-8")
+    enqueue(Session)
+    with Session() as db:
+        jobs = db.scalars(select(NotificationOutbox)).all()
+        group = next(job for job in jobs if job.status == "PENDING")
+        failure = next(job for job in jobs if job.status == "ROUTING_FAILED")
+        group.status, group.attempts = "DELIVERED", 1
+        db.commit()
+        settings.feishu_group_fallback_enabled = True
+        settings.feishu_daily_report_chat_id = "operations"
+        planned = application_deliveries(db, settings, store_id="s", entity_id="SKU-1", metrics={},
+            scope="s:sales:sku_msku", severity="P1", status="NEW")
+        assert len(planned) == 1
+        assert failure.status == "ROUTING_FAILED" and group.status == "DELIVERED"
+        result = repair_application_notification(db, settings, failure.id)
+        assert result["status"] == "SUPERSEDED" and result["outbox_ids"] == [group.id]
+        assert len(db.scalars(select(NotificationOutbox)).all()) == 2
+        assert (group.status, group.attempts) == ("DELIVERED", 1)

@@ -44,7 +44,7 @@ def _seed_campaign(db, campaign_id):
             db.add(DailyMetric(
                 store_id=STORE, metric_date=TARGET - timedelta(days=offset),
                 dimension="campaign_sp", entity_id=campaign_id,
-                metric_name=name, value=value,
+                metric_name=name, value=value, currency="USD" if name == "spend" else None,
             ))
 
 
@@ -69,8 +69,12 @@ def _metric(db, campaign_id, field, offset=0):
     ))
 
 
+def _campaign_gaps(result):
+    return [item for item in result["skipped_scope_details"] if item["dimension"] == "campaign_sp"]
+
+
 @pytest.mark.parametrize("field,offset", [
-    ("spend", 0), ("spend", 8), ("orders", 7), ("orders", 9), ("clicks", 0),
+    ("spend", 0), ("spend", 8), ("orders", 7), ("orders", 8), ("clicks", 0),
 ])
 def test_missing_sp_campaign_metric_cannot_create_zero_alert_or_recover_active(db, field, offset):
     existing = _existing_alert(db)
@@ -86,7 +90,7 @@ def test_missing_sp_campaign_metric_cannot_create_zero_alert_or_recover_active(d
     assert db.scalars(select(AnomalyEvent)).all() == [existing]
     assert db.scalars(select(NotificationOutbox)).all() == []
     assert result["events_touched"] == 0
-    assert result["skipped_scope_details"] == [{
+    assert _campaign_gaps(result) == [{
         "store_id": STORE, "dimension": "campaign_sp", "campaign_id": CAMPAIGN,
         "reason": "MISSING_CAMPAIGN_METRICS", "missing": [{
             "metric_name": field,
@@ -107,7 +111,7 @@ def test_complete_report_without_target_campaign_row_is_unknown(db):
     assert existing.status == "ONGOING"
     assert result["events_touched"] == 0
     assert result["notifications_queued"] == 0
-    assert result["skipped_scope_details"][0]["reason"] == "MISSING_CAMPAIGN_METRICS"
+    assert _campaign_gaps(result)[0]["reason"] == "MISSING_CAMPAIGN_METRICS"
 
 
 def test_explicit_zero_metrics_remain_valid_and_can_recover_prior_alert(db):
@@ -119,7 +123,7 @@ def test_explicit_zero_metrics_remain_valid_and_can_recover_prior_alert(db):
 
     result = evaluate_daily_anomalies(db, TARGET, RuleConfig())
 
-    assert result["skipped_scope_details"] == []
+    assert _campaign_gaps(result) == []
     assert existing.status == "RECOVERED"
     zero_alert = db.scalar(select(AnomalyEvent).where(
         AnomalyEvent.rule == "low_spend_no_conversion",
@@ -141,7 +145,7 @@ def test_missing_campaign_preserves_scope_but_other_complete_campaign_still_aler
     result = evaluate_daily_anomalies(db, TARGET, RuleConfig())
 
     assert existing.status == "ONGOING"
-    assert result["skipped_scope_details"][0]["campaign_id"] == CAMPAIGN
+    assert _campaign_gaps(result)[0]["campaign_id"] == CAMPAIGN
     assert result["events_touched"] == 1
     assert result["notifications_queued"] == 1
     other_alert = db.scalar(select(AnomalyEvent).where(AnomalyEvent.entity_id == other))
@@ -163,7 +167,7 @@ def test_complete_campaign_recovers_without_recovering_campaign_missing_history(
 
     assert complete_alert.status == "RECOVERED"
     assert missing_alert.status == "ONGOING"
-    assert result["skipped_scope_details"][0]["campaign_id"] == missing_campaign
+    assert _campaign_gaps(result)[0]["campaign_id"] == missing_campaign
     assert result["notifications_queued"] == 1
 
 
@@ -178,3 +182,15 @@ def test_empty_recovery_entity_ids_never_recover_anomalies(db, scope_complete):
 
     assert existing.status == "ONGOING"
     assert existing.recovered_at is None
+
+
+def test_campaign_uses_exact_previous_day_when_older_baseline_fact_is_missing(db):
+    db.delete(_metric(db, CAMPAIGN, "spend", 4))
+    _metric(db, CAMPAIGN, "spend").value = 30
+    db.commit()
+    evaluate_daily_anomalies(db, TARGET, RuleConfig())
+    event = db.scalar(select(AnomalyEvent).where(AnomalyEvent.rule == "high_ad_spend"))
+    assert event.metrics["comparison_basis"] == "PREVIOUS_DAY"
+    assert event.metrics["spend_previous"] == 10
+    assert event.metrics["comparison_dates"] == ["2026-11-11", "2026-11-10"]
+    assert "spend_avg_7d" not in event.metrics

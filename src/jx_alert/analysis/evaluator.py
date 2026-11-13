@@ -30,59 +30,148 @@ def _parse_date(value: date | str) -> date:
     return date.fromisoformat(value)
 
 
-def _has_complete_coverage(db, store_id: str, dimension: str,
-                           dates: list[date]) -> bool:
-    rows = db.scalars(select(DataCoverage).where(
-        DataCoverage.store_id == store_id,
-        DataCoverage.dimension == dimension,
-        DataCoverage.metric_date.in_(dates),
-        DataCoverage.status == "COMPLETE",
-    )).all()
-    return {row.metric_date for row in rows} >= set(dates)
-
-
-def _metric_values(db, store_id: str, dimension: str, metric_name: str,
-                   dates: list[date]) -> dict[tuple[str, date], float]:
+def _comparison_evidence(db, store_id, dimension, dates):
     rows = db.scalars(select(DailyMetric).where(
-        DailyMetric.store_id == store_id,
-        DailyMetric.dimension == dimension,
-        DailyMetric.metric_name == metric_name,
+        DailyMetric.store_id == store_id, DailyMetric.dimension == dimension,
         DailyMetric.metric_date.in_(dates),
     )).all()
-    return {(row.entity_id, row.metric_date): float(row.value) for row in rows}
+    covered = {r.metric_date for r in db.scalars(select(DataCoverage).where(
+        DataCoverage.store_id == store_id, DataCoverage.dimension == dimension,
+        DataCoverage.metric_date.in_(dates), DataCoverage.status == "COMPLETE"))}
+    values, currencies = {}, {}
+    for row in rows:
+        values.setdefault(row.metric_name, {})[(row.entity_id, row.metric_date)] = row.value
+        currencies.setdefault(row.metric_name, {})[(row.entity_id, row.metric_date)] = row.currency
+    return values, currencies, covered
+
+
+def _comparison(values, currencies, covered, entity_id, metric, target):
+    from jx_alert.analysis.comparison import metric_comparison
+    observations = {day: value for (entity, day), value in values.get(metric, {}).items()
+                    if entity == entity_id}
+    money = metric in {"sales", "spend"}
+    units = ({day: code for (entity, day), code in currencies.get(metric, {}).items()
+              if entity == entity_id} if money else None)
+    return metric_comparison(observations, target, covered, currencies=units)
+
+
+def _ready(plan):
+    return plan["comparison_basis"] in {"SEVEN_DAY", "PREVIOUS_DAY"}
+
+
+def _prior(values, entity, metric, target, plan):
+    return ([values[metric][(entity, target - timedelta(days=i))] for i in range(1, 8)]
+            if plan["comparison_basis"] == "SEVEN_DAY" else [])
+
+
+def _observed(values, covered, entity, metric, day):
+    import math
+    value = values.get(metric, {}).get((entity, day))
+    if day not in covered or value is None or isinstance(value, bool):
+        return None
+    return float(value) if math.isfinite(float(value)) and value >= 0 else None
 
 
 def _evaluate_sales_dimension(db, store_id: str, dimension: str,
                               entities: list[str], report_date: date,
-                              config: RuleConfig) -> tuple[list[AnomalyEvent], bool]:
-    baseline_dates = [report_date - timedelta(days=offset) for offset in range(7, 0, -1)]
-    previous_date = report_date - timedelta(days=1)
-    required_dates = baseline_dates + [report_date]
-    if not _has_complete_coverage(db, store_id, dimension, required_dates):
-        return [], False
+                              config: RuleConfig, *, skip_details=None) -> tuple[list[AnomalyEvent], bool]:
+    dates = [report_date - timedelta(days=i) for i in range(8)]
+    values, currencies, covered = _comparison_evidence(db, store_id, dimension, dates)
+    events, recovery_entities = [], set()
+    complete = bool(entities)
+    for entity in entities:
+        entity_complete = True
+        for metric in ("orders", "units", "sales"):
+            plan = _comparison(values, currencies, covered, entity, metric, report_date)
+            if not _ready(plan):
+                entity_complete = complete = False
+                if skip_details is not None:
+                    skip_details.append({"store_id": store_id, "dimension": dimension,
+                        "entity_id": entity, "metric_name": metric,
+                        "reason": plan["comparison_basis"], "metric_date": report_date.isoformat()})
+                continue
+            detected = detect_order_anomaly(entity_key=entity, current_orders=plan["current"],
+                previous_orders=plan["previous_day"], prior_7_days=_prior(values, entity, metric, report_date, plan),
+                config=config, metric_name=metric, comparison_basis=plan["comparison_basis"])
+            for event in detected:
+                event["metrics"].update(comparison_dates=plan["comparison_dates"],
+                                         report_date=report_date.isoformat())
+                if metric == "sales":
+                    event["metrics"]["currency_code"] = currencies[metric][(entity, report_date)]
+            events.extend(detected)
+        if entity_complete:
+            recovery_entities.add(entity)
+    saved = upsert_anomalies(db, store_id, events,
+        evaluation_scope=f"{store_id}:sales:{dimension}", scope_complete=complete,
+        recovery_entity_ids=recovery_entities, escalation_after_days=config.escalate_after_days)
+    return saved, complete
 
+
+def _ad_entity_events(*, values, currencies, covered, entity_id, report_date, attribution_days,
+                      campaign_enabled, daily_budget, config):
+    mature_day = report_date - timedelta(days=attribution_days)
+    spend = _comparison(values, currencies, covered, entity_id, "spend", report_date)
+    mature_spend = _comparison(values, currencies, covered, entity_id, "spend", mature_day)
+    mature_orders = _comparison(values, currencies, covered, entity_id, "orders", mature_day)
+    clicks = _observed(values, covered, entity_id, "clicks", report_date)
+    mature_clicks = _observed(values, covered, entity_id, "clicks", mature_day)
     events = []
-    for metric_name in ("orders", "units", "sales"):
-        values = _metric_values(db, store_id, dimension, metric_name, required_dates)
-        for entity_id in entities:
-            current = values.get((entity_id, report_date), 0.0)
-            previous = values.get((entity_id, previous_date), 0.0)
-            baseline = [values.get((entity_id, day), 0.0) for day in baseline_dates]
-            events.extend(detect_order_anomaly(
-                entity_key=entity_id,
-                current_orders=current,
-                previous_orders=previous,
-                prior_7_days=baseline,
-                config=config,
-                metric_name=metric_name,
-            ))
+    if campaign_enabled and _ready(mature_orders):
+        detected = detect_order_anomaly(entity_key=entity_id,
+            current_orders=mature_orders["current"], previous_orders=mature_orders["previous_day"],
+            prior_7_days=_prior(values, entity_id, "orders", mature_day, mature_orders),
+            config=config, comparison_basis=mature_orders["comparison_basis"])
+        for event in detected:
+            event["metrics"].update(attribution_window_days=attribution_days,
+                attribution_complete_report_date=mature_day.isoformat(),
+                comparison_dates=mature_orders["comparison_dates"])
+        events.extend(detected)
+    if _ready(spend):
+        detected = detect_campaign_anomalies(entity_key=entity_id, spend=spend["current"], orders=None,
+            clicks=clicks, prior_7_spend=_prior(values, entity_id, "spend", report_date, spend),
+            prior_7_orders=[], daily_budget=daily_budget, config=config,
+            campaign_enabled=campaign_enabled, conversion_enabled=False,
+            previous_spend=spend["previous_day"], comparison_basis=spend["comparison_basis"])
+        for event in detected:
+            event["metrics"].update(report_date=report_date.isoformat(),
+                comparison_dates=spend["comparison_dates"], currency_code=currencies["spend"][(entity_id, report_date)])
+        events.extend(detected)
+    if _ready(mature_spend) and _ready(mature_orders) and mature_clicks is not None:
+        basis = ("SEVEN_DAY" if mature_spend["comparison_basis"] == mature_orders["comparison_basis"] == "SEVEN_DAY"
+                 else "PREVIOUS_DAY")
+        detected = detect_campaign_anomalies(entity_key=entity_id, spend=mature_spend["current"],
+            orders=mature_orders["current"], clicks=int(mature_clicks),
+            prior_7_spend=_prior(values, entity_id, "spend", mature_day, mature_spend),
+            prior_7_orders=_prior(values, entity_id, "orders", mature_day, mature_orders),
+            daily_budget=None, config=config, campaign_enabled=campaign_enabled,
+            high_spend_enabled=False, budget_enabled=False,
+            previous_spend=mature_spend["previous_day"], previous_orders=mature_orders["previous_day"],
+            comparison_basis=basis)
+        dates = ([mature_day.isoformat(), *[(mature_day - timedelta(days=i)).isoformat() for i in range(1, 8)]]
+                 if basis == "SEVEN_DAY" else [mature_day.isoformat(), (mature_day - timedelta(days=1)).isoformat()])
+        for event in detected:
+            event["metrics"].update(attribution_window_days=attribution_days,
+                attribution_complete_report_date=mature_day.isoformat(), comparison_dates=dates,
+                currency_code=currencies["spend"][(entity_id, mature_day)])
+        events.extend(detected)
+    complete = (_ready(spend) and _ready(mature_spend) and _ready(mature_orders)
+                and clicks is not None and mature_clicks is not None)
+    return events, complete, spend, mature_spend, mature_orders
 
-    scope = f"{store_id}:sales:{dimension}"
-    saved = upsert_anomalies(
-        db, store_id, events, evaluation_scope=scope, scope_complete=True,
-        escalation_after_days=config.escalate_after_days,
-    )
-    return saved, True
+
+def _ad_skipped_detail(values, entity, store_id, dimension, report_date, attribution_days):
+    mature_day = report_date - timedelta(days=attribution_days)
+    dates = sorted({report_date - timedelta(days=i) for i in range(8)} |
+                   {mature_day - timedelta(days=i) for i in range(8)})
+    required = {"spend": dates, "orders": [mature_day - timedelta(days=i) for i in range(8)],
+                "clicks": [report_date, mature_day]}
+    missing = [{"metric_name": metric, "metric_date": day.isoformat()} for metric, days in required.items()
+               for day in days if (entity, day) not in values.get(metric, {})]
+    return {"store_id": store_id, "dimension": dimension,
+        "campaign_id" if dimension.startswith("campaign_") else "ad_id": entity,
+        "reason": ("MISSING_CAMPAIGN_METRICS" if dimension.startswith("campaign_") else "MISSING_PRODUCT_AD_METRICS")
+                  if missing else "CURRENCY_OR_OBSERVATION_UNCONFIRMED",
+        "missing": missing}
 
 
 def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
@@ -91,292 +180,81 @@ def _evaluate_campaign_dimension(db, store_id: str, campaign_type: str,
                                  ) -> tuple[list[AnomalyEvent], bool]:
     dimension = f"campaign_{campaign_type}"
     attribution_days = AD_ATTRIBUTION_DAYS[campaign_type]
-    spend_baseline_dates = [
-        report_date - timedelta(days=offset) for offset in range(7, 0, -1)
-    ]
-    attribution_date = report_date - timedelta(days=attribution_days)
-    attribution_baseline_dates = [
-        attribution_date - timedelta(days=offset) for offset in range(7, 0, -1)
-    ]
-    required_dates = sorted(set(
-        spend_baseline_dates + [report_date]
-        + attribution_baseline_dates + [attribution_date]
-    ))
-    if not _has_complete_coverage(db, store_id, dimension, required_dates):
-        return [], False
-
-    campaigns = db.scalars(select(Campaign).where(
-        Campaign.store_id == store_id,
-        Campaign.campaign_type == campaign_type,
-    )).all()
-    metrics = {
-        name: _metric_values(db, store_id, dimension, name, required_dates)
-        for name in ("spend", "orders", "clicks")
-    }
-    events = []
-    scope_complete = True
-    recovery_entity_ids: set[str] = set()
+    dates = [report_date - timedelta(days=i) for i in range(attribution_days + 8)]
+    values, currencies, covered = _comparison_evidence(db, store_id, dimension, dates)
+    campaigns = db.scalars(select(Campaign).where(Campaign.store_id == store_id,
+        Campaign.campaign_type == campaign_type)).all()
+    events, recovery_entities = [], set()
+    complete = bool(campaigns)
     for campaign in campaigns:
-        entity_id = campaign.campaign_id
-        if campaign_type == "sp":
-            # Store/date coverage proves the response was complete, not that
-            # this campaign had a row. Missing entities or metrics are unknown;
-            # only an explicitly stored zero is evidence of zero activity.
-            required_metrics = {
-                "spend": required_dates,
-                "orders": attribution_baseline_dates + [attribution_date],
-                "clicks": [report_date, attribution_date],
-            }
-            missing = [
-                {"metric_name": name, "metric_date": day.isoformat()}
-                for name, dates in required_metrics.items()
-                for day in dates
-                if (entity_id, day) not in metrics[name]
-            ]
-            if missing:
-                scope_complete = False
-                if skip_details is not None:
-                    skip_details.append({
-                        "store_id": store_id, "dimension": dimension,
-                        "campaign_id": entity_id, "reason": "MISSING_CAMPAIGN_METRICS",
-                        "missing": missing,
-                    })
-                continue
-        if campaign_type == "sp":
-            recovery_entity_ids.add(str(entity_id))
-        current_spend = metrics["spend"].get((entity_id, report_date), 0.0)
-        prior_spend = [
-            metrics["spend"].get((entity_id, day), 0.0)
-            for day in spend_baseline_dates
-        ]
-        current_clicks = int(metrics["clicks"].get((entity_id, report_date), 0.0))
-        mature_spend = metrics["spend"].get((entity_id, attribution_date), 0.0)
-        mature_orders = metrics["orders"].get((entity_id, attribution_date), 0.0)
-        mature_clicks = int(metrics["clicks"].get((entity_id, attribution_date), 0.0))
-        mature_prior_spend = [
-            metrics["spend"].get((entity_id, day), 0.0)
-            for day in attribution_baseline_dates
-        ]
-        mature_prior_orders = [
-            metrics["orders"].get((entity_id, day), 0.0)
-            for day in attribution_baseline_dates
-        ]
-        mature_previous_orders = metrics["orders"].get(
-            (entity_id, attribution_date - timedelta(days=1)), 0.0
-        )
-
-        campaign_enabled = (campaign.state or "").lower() == "enabled"
-        if campaign_enabled:
-            order_events = detect_order_anomaly(
-                entity_key=entity_id,
-                current_orders=mature_orders,
-                previous_orders=mature_previous_orders,
-                prior_7_days=mature_prior_orders,
-                config=config,
-                metric_name="orders",
-            )
-            for event in order_events:
-                event["metrics"]["attribution_window_days"] = attribution_days
-                event["metrics"]["attribution_complete_report_date"] = attribution_date.isoformat()
-            events.extend(order_events)
-
-        # Spend/budget alerts use the latest report date; conversion-dependent
-        # alerts use a report date old enough for the campaign type's attribution.
-        spend_events = detect_campaign_anomalies(
-            entity_key=entity_id,
-            spend=current_spend,
-            orders=None,
-            clicks=current_clicks,
-            prior_7_spend=prior_spend,
-            prior_7_orders=mature_prior_orders,
-            daily_budget=(
-                campaign.budget if (campaign.budget_type or "").lower() == "daily" else None
-            ),
-            config=config,
-            campaign_enabled=campaign_enabled,
-            conversion_enabled=False,
-        )
-        for event in spend_events:
-            event["metrics"]["report_date"] = report_date.isoformat()
-        events.extend(spend_events)
-
-        conversion_events = detect_campaign_anomalies(
-            entity_key=entity_id,
-            spend=mature_spend,
-            orders=mature_orders,
-            clicks=mature_clicks,
-            prior_7_spend=mature_prior_spend,
-            prior_7_orders=mature_prior_orders,
-            daily_budget=None,
-            config=config,
-            campaign_enabled=campaign_enabled,
-            high_spend_enabled=False,
-            budget_enabled=False,
-        )
-        for event in conversion_events:
-            event["metrics"]["attribution_window_days"] = attribution_days
-            event["metrics"]["attribution_complete_report_date"] = attribution_date.isoformat()
-        events.extend(conversion_events)
-
-        if campaign.last_over_budget_at and str(campaign.last_over_budget_at).startswith(
-            report_date.isoformat()
-        ):
-            from jx_alert.analysis.rules import _event
-            events.append(_event(
-                "campaign_over_budget",
-                "P1",
-                entity_id,
-                f"{entity_id}:campaign_over_budget",
-                {
-                    "last_over_budget_at": campaign.last_over_budget_at,
-                    "daily_budget": campaign.budget,
-                    "budget_type": campaign.budget_type,
-                    "report_date": report_date.isoformat(),
-                },
-                "领星广告活动资料记录该活动在报告日发生过超预算事件",
-            ))
-
-    scope = f"{store_id}:campaign:{campaign_type}"
-    saved = upsert_anomalies(
-        db, store_id, events, evaluation_scope=scope, scope_complete=scope_complete,
-        recovery_entity_ids=recovery_entity_ids if campaign_type == "sp" else None,
-        escalation_after_days=config.escalate_after_days,
-    )
-    return saved, scope_complete
+        entity = campaign.campaign_id
+        detected, known, spend, mature_spend, mature_orders = _ad_entity_events(
+            values=values, currencies=currencies, covered=covered, entity_id=entity,
+            report_date=report_date, attribution_days=attribution_days,
+            campaign_enabled=(campaign.state or "").lower() == "enabled",
+            daily_budget=campaign.budget if (campaign.budget_type or "").lower() == "daily" else None,
+            config=config)
+        if known:
+            recovery_entities.add(str(entity))
+        else:
+            complete = False
+            if skip_details is not None:
+                skip_details.append(_ad_skipped_detail(values, entity, store_id, dimension,
+                    report_date, attribution_days))
+        if _ready(spend) and campaign.last_over_budget_at and str(campaign.last_over_budget_at).startswith(report_date.isoformat()):
+            detected.append(_event("campaign_over_budget", "P1", entity, f"{entity}:campaign_over_budget",
+                {"last_over_budget_at": campaign.last_over_budget_at, "daily_budget": campaign.budget,
+                 "budget_type": campaign.budget_type, "report_date": report_date.isoformat()},
+                "领星广告活动资料记录该活动在报告日发生过超预算事件"))
+        events.extend(detected)
+    saved = upsert_anomalies(db, store_id, events, evaluation_scope=f"{store_id}:campaign:{campaign_type}",
+        scope_complete=complete, recovery_entity_ids=recovery_entities,
+        escalation_after_days=config.escalate_after_days)
+    return saved, complete
 
 
 def _evaluate_product_ad_dimension(db, store_id: str, campaign_type: str,
-                                   report_date: date, config: RuleConfig
+                                   report_date: date, config: RuleConfig, *, skip_details=None
                                    ) -> tuple[list[AnomalyEvent], bool]:
     dimension = f"product_ad_{campaign_type}"
     attribution_days = AD_ATTRIBUTION_DAYS[campaign_type]
-    spend_baseline_dates = [
-        report_date - timedelta(days=offset) for offset in range(7, 0, -1)
-    ]
-    attribution_date = report_date - timedelta(days=attribution_days)
-    attribution_baseline_dates = [
-        attribution_date - timedelta(days=offset) for offset in range(7, 0, -1)
-    ]
-    required_dates = sorted(set(
-        spend_baseline_dates + [report_date]
-        + attribution_baseline_dates + [attribution_date]
-    ))
-    if not _has_complete_coverage(db, store_id, dimension, required_dates):
-        return [], False
-
-    ads = db.scalars(select(AdProduct).where(
-        AdProduct.store_id == store_id,
-        AdProduct.campaign_type == campaign_type,
-    )).all()
-    metrics = {
-        name: _metric_values(db, store_id, dimension, name, required_dates)
-        for name in ("spend", "orders", "clicks")
-    }
-    campaigns = {
-        row.campaign_id: row
-        for row in db.scalars(select(Campaign).where(
-            Campaign.store_id == store_id,
-            Campaign.campaign_type == campaign_type,
-        )).all()
-    }
-    events = []
+    dates = [report_date - timedelta(days=i) for i in range(attribution_days + 8)]
+    values, currencies, covered = _comparison_evidence(db, store_id, dimension, dates)
+    ads = db.scalars(select(AdProduct).where(AdProduct.store_id == store_id,
+        AdProduct.campaign_type == campaign_type)).all()
+    campaigns = {c.campaign_id: c for c in db.scalars(select(Campaign).where(
+        Campaign.store_id == store_id, Campaign.campaign_type == campaign_type))}
+    events, complete = [], bool(ads)
     for ad in ads:
-        ad_id = ad.ad_id
-        current_spend = metrics["spend"].get((ad_id, report_date), 0.0)
-        current_clicks = int(metrics["clicks"].get((ad_id, report_date), 0.0))
-        prior_spend = [
-            metrics["spend"].get((ad_id, day), 0.0)
-            for day in spend_baseline_dates
-        ]
-        mature_spend = metrics["spend"].get((ad_id, attribution_date), 0.0)
-        mature_orders = metrics["orders"].get((ad_id, attribution_date), 0.0)
-        mature_clicks = int(metrics["clicks"].get((ad_id, attribution_date), 0.0))
-        mature_prior_spend = [
-            metrics["spend"].get((ad_id, day), 0.0)
-            for day in attribution_baseline_dates
-        ]
-        mature_prior_orders = [
-            metrics["orders"].get((ad_id, day), 0.0)
-            for day in attribution_baseline_dates
-        ]
-        mature_previous_orders = metrics["orders"].get(
-            (ad_id, attribution_date - timedelta(days=1)), 0.0
-        )
         campaign = campaigns.get(ad.campaign_id)
-        ad_enabled = (ad.state or "").lower() == "enabled"
-        campaign_enabled = bool(
-            ad_enabled and campaign and (campaign.state or "").lower() == "enabled"
-        )
-
-        detected = []
-        if campaign_enabled:
-            order_events = detect_order_anomaly(
-                entity_key=ad_id,
-                current_orders=mature_orders,
-                previous_orders=mature_previous_orders,
-                prior_7_days=mature_prior_orders,
-                config=config,
-                metric_name="orders",
-            )
-            for event in order_events:
-                event["metrics"]["attribution_window_days"] = attribution_days
-                event["metrics"]["attribution_complete_report_date"] = attribution_date.isoformat()
-            detected.extend(order_events)
-
-        spend_events = detect_campaign_anomalies(
-            entity_key=ad_id,
-            spend=current_spend,
-            orders=None,
-            clicks=current_clicks,
-            prior_7_spend=prior_spend,
-            prior_7_orders=mature_prior_orders,
-            daily_budget=None,
-            config=config,
-            campaign_enabled=campaign_enabled,
-            conversion_enabled=False,
-        )
-        for event in spend_events:
-            event["metrics"]["report_date"] = report_date.isoformat()
-        detected.extend(spend_events)
-
-        conversion_events = detect_campaign_anomalies(
-            entity_key=ad_id,
-            spend=mature_spend,
-            orders=mature_orders,
-            clicks=mature_clicks,
-            prior_7_spend=mature_prior_spend,
-            prior_7_orders=mature_prior_orders,
-            daily_budget=None,
-            config=config,
-            campaign_enabled=campaign_enabled,
-            high_spend_enabled=False,
-            budget_enabled=False,
-        )
-        for event in conversion_events:
-            event["metrics"]["attribution_window_days"] = attribution_days
-            event["metrics"]["attribution_complete_report_date"] = attribution_date.isoformat()
-        detected.extend(conversion_events)
-
+        enabled = bool((ad.state or "").lower() == "enabled" and campaign
+                       and (campaign.state or "").lower() == "enabled")
+        detected, known, spend, mature_spend, mature_orders = _ad_entity_events(
+            values=values, currencies=currencies, covered=covered, entity_id=ad.ad_id,
+            report_date=report_date, attribution_days=attribution_days,
+            campaign_enabled=enabled, daily_budget=None, config=config)
+        if not known:
+            complete = False
+            if skip_details is not None:
+                skip_details.append(_ad_skipped_detail(values, ad.ad_id, store_id, dimension,
+                    report_date, attribution_days))
         for event in detected:
-            event["entity_key"] = ad.seller_sku or ad.asin or ad_id
-            event["dedupe_key"] = f"{ad_id}:{event['rule']}"
-            event["metrics"]["ad_id"] = ad_id
-            event["metrics"]["campaign_id"] = ad.campaign_id
-            event["metrics"]["seller_sku"] = ad.seller_sku
-            event["metrics"]["asin"] = ad.asin
+            event["entity_key"] = ad.seller_sku or ad.asin or ad.ad_id
+            event["dedupe_key"] = f"{ad.ad_id}:{event['rule']}"
+            event["metrics"].update(ad_id=ad.ad_id, campaign_id=ad.campaign_id,
+                                     seller_sku=ad.seller_sku, asin=ad.asin)
         events.extend(detected)
-
-    scope = f"{store_id}:product_ad:{campaign_type}"
-    saved = upsert_anomalies(
-        db, store_id, events, evaluation_scope=scope, scope_complete=True,
-        escalation_after_days=config.escalate_after_days,
-    )
-    return saved, True
+    # Product display keys may be shared by multiple ads. Partial evidence must
+    # never recover a sibling ad merely because its SKU matches a known one.
+    saved = upsert_anomalies(db, store_id, events,
+        evaluation_scope=f"{store_id}:product_ad:{campaign_type}", scope_complete=complete,
+        escalation_after_days=config.escalate_after_days)
+    return saved, complete
 
 
 def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
                              config: RuleConfig | None = None) -> dict:
-    """Evaluate only dimensions with complete coverage for each store's D-7 through D.
+    """Evaluate complete seven-day comparisons, falling back to an observed previous day.
 
     report_date may be a single date for legacy/single-timezone use, or a mapping
     of Lingxing sid to its own marketplace-local report date. A mapping restricts
@@ -428,6 +306,11 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
 
     for store in stores:
         store_id = store.sid
+        if store.status != 1:
+            skipped_scopes += 8
+            skipped_scope_details.append({"store_id": store_id,
+                "reason": "AUTHORIZATION_FAILED" if store.status == 2 else "STORE_NOT_ACTIVE"})
+            continue
         target_date = target_dates[store_id]
         sku_msku = db.scalars(select(Product.seller_sku).where(
             Product.store_id == store_id
@@ -443,11 +326,12 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
             ("sku_asin", sorted(set(sku_asin))),
         ):
             saved, complete = _evaluate_sales_dimension(
-                db, store_id, dimension, entities, target_date, config
+                db, store_id, dimension, entities, target_date, config,
+                skip_details=skipped_scope_details,
             )
+            saved_events.extend(saved)
             if complete:
                 evaluated_scopes += 1
-                saved_events.extend(saved)
             else:
                 skipped_scopes += 1
 
@@ -466,11 +350,12 @@ def evaluate_daily_anomalies(db, report_date: date | str | dict[str, str],
 
         for campaign_type in ("sp", "sd"):
             saved, complete = _evaluate_product_ad_dimension(
-                db, store_id, campaign_type, target_date, config
+                db, store_id, campaign_type, target_date, config,
+                skip_details=skipped_scope_details,
             )
+            saved_events.extend(saved)
             if complete:
                 evaluated_scopes += 1
-                saved_events.extend(saved)
             else:
                 skipped_scopes += 1
 

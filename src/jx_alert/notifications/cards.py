@@ -92,6 +92,7 @@ def with_mentions(value, open_ids):
 
 _METRIC_NAMES = {
     "current": "当前值", "previous": "前一日", "baseline_7d": "过去7日均值",
+    "spend_previous": "前一日花费", "orders_previous": "前一日订单", "comparison_basis": "比较依据",
     "spend": "花费", "spend_avg_7d": "过去7日平均花费", "orders": "归因订单",
     "orders_avg_7d": "过去7日平均订单", "clicks": "点击", "daily_budget": "日预算",
     "budget_ratio": "预算消耗比例", "change_ratio": "变化比例", "ratio": "变化比例",
@@ -134,7 +135,9 @@ def anomaly_card(*, state, severity, store, campaign, product, rule, reason, met
             value = "未知"
         elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
             value = (f"{value:.1%}" if key.endswith("ratio") else number(
-                value, money=key in {"spend", "spend_avg_7d", "daily_budget"}, currency=currency or "币种待确认"))
+                value, money=key in {"spend", "spend_avg_7d", "spend_previous", "daily_budget"}, currency=currency or "币种待确认"))
+        elif key == "comparison_basis":
+            value = {"SEVEN_DAY": "较过去7日均值", "PREVIOUS_DAY": "较前一日"}.get(value, "待确认")
         elif isinstance(value, str) and key in {"freshness_status", "ahr_status"}:
             value = status_label(value)
         elif isinstance(value, str) and key == "metric_name":

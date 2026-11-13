@@ -46,9 +46,34 @@ def test_no_anomaly_is_audited_without_any_notification(setup):
     db, s = setup
     review = prepare_review(db, s, "5174", now=CLOCK)
     result = submit_review(db, s, review["review_id"], [], now=CLOCK)
-    assert result["status"] == "INSUFFICIENT_DATA" and result["outbox_ids"] == []
+    assert result["status"] == "PARTIAL_REVIEW" and result["outbox_ids"] == []
+    assert result["comparison_basis"] == "PREVIOUS_DAY"
+    assert {item["metric"] for item in result["comparison_gaps"]} == {"sales", "units"}
     assert db.scalars(select(NotificationOutbox)).all() == []
-    assert db.get(SyncJob, review["review_id"]).status == "INSUFFICIENT_DATA"
+    assert db.get(SyncJob, review["review_id"]).status == "PARTIAL_REVIEW"
+
+
+def test_previous_day_alert_uses_configured_group_when_roles_missing(setup):
+    db, settings = setup
+    settings.feishu_group_fallback_enabled = True
+    review = prepare_review(db, settings, "5174", now=CLOCK)
+    result = submit_review(db, settings, review["review_id"], finding(review), now=CLOCK)
+    row = db.get(NotificationOutbox, result["outbox_ids"][0])
+    assert row.payload["delivery"]["receive_id"] == "oc_test"
+    assert row.payload["delivery"]["open_ids"] == []
+    assert "较前一日" in json.dumps(row.payload["card"], ensure_ascii=False)
+
+
+def test_nonadjacent_previous_fact_does_not_make_a_comparison(setup):
+    db, settings = setup
+    previous = db.scalar(select(DailyMetric).where(DailyMetric.metric_date == date(2026, 11, 10)))
+    previous.metric_date = date(2026, 11, 9)
+    db.add(DataCoverage(store_id="5174", dimension="store", metric_date=previous.metric_date, status="COMPLETE"))
+    db.flush()
+    review = prepare_review(db, settings, "5174", now=CLOCK)
+    assert review["comparison_basis"] == "INSUFFICIENT_DATA"
+    with pytest.raises(ValueError, match="comparison"):
+        submit_review(db, settings, review["review_id"], finding(review), now=CLOCK)
 
 
 def test_same_incident_deduplicates_across_hourly_reviews_and_keeps_chinese_tables(setup):

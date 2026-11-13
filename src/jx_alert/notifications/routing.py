@@ -199,6 +199,45 @@ def _app_open_ids(value) -> list[str]:
     return list(dict.fromkeys(value))
 
 
+def report_group_delivery(settings, routing, *, role="group", reason=None):
+    """Resolve only the explicitly configured report group; never invent recipients."""
+    if getattr(settings, "feishu_transport", "webhook") != "app":
+        raise ApplicationRoutingError("report_group_requires_application_transport")
+    alias = getattr(settings, "feishu_daily_report_chat_id", "")
+    groups = routing.get("groups", {}) if isinstance(routing, dict) else None
+    if not isinstance(alias, str) or not alias or not isinstance(groups, dict):
+        raise ApplicationRoutingError("missing_report_group_mapping")
+    group = groups.get(alias)
+    if not isinstance(group, dict):
+        raise ApplicationRoutingError("missing_report_group_mapping")
+    chat_id = group.get("chat_id")
+    if not isinstance(chat_id, str) or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat_id):
+        raise ApplicationRoutingError("missing_report_group_chat_id")
+    # An absent role can use the approved group; a malformed mapping must still
+    # be repaired. Validating this field does not create any mention.
+    _app_open_ids(group.get("admin_open_ids", []))
+    delivery = {"role": role, "receive_id": chat_id, "receive_id_type": "chat_id", "open_ids": []}
+    if reason is not None:
+        delivery.update(group_fallback=True, fallback_reasons=[reason])
+    return delivery
+
+
+def _application_route_entry(mapping, key, groups):
+    """Distinguish an absent owner from a malformed responsible route."""
+    if key not in mapping:
+        return {}
+    raw = mapping[key]
+    if isinstance(raw, list):
+        return {"open_ids": _app_open_ids(raw)}
+    if not isinstance(raw, dict):
+        raise ApplicationRoutingError("invalid_owner_mapping")
+    _app_open_ids(raw.get("open_ids", []))
+    alias = raw.get("chat_id")
+    if alias is not None and (not isinstance(alias, str) or not alias or alias not in groups):
+        raise ApplicationRoutingError("invalid_group_mapping")
+    return raw
+
+
 def _application_group_delivery(db, settings, routing, *, store_id, entity_id, metrics, scope):
     groups = routing.get("groups", {})
     if not isinstance(groups, dict) or any(
@@ -206,6 +245,9 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
     ):
         raise ApplicationRoutingError("invalid_group_mapping")
     entity_key = str(metrics.get("seller_sku") or metrics.get("asin") or entity_id)
+    for section, key in (("stores", store_id), ("entities", f"{store_id}:{entity_key}"),
+                         ("entities", entity_key)):
+        _application_route_entry(routing.get(section, {}), key, groups)
     chat_alias = _route_chat_id(routing, store_id, entity_key)
     if not isinstance(chat_alias, str):
         raise ApplicationRoutingError("invalid_group_mapping")
@@ -215,6 +257,11 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
     chat_id = group.get("chat_id")
     if not isinstance(chat_id, str) or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat_id):
         raise ApplicationRoutingError("missing_group_chat_id")
+    try:
+        default_ids = _app_open_ids(settings.feishu_at_ids())
+    except ValueError:
+        raise ApplicationRoutingError("invalid_default_mentions") from None
+    admin_ids = default_ids + _app_open_ids(group.get("admin_open_ids", []))
     owner_ids = []
     keys = {str(value) for value in (entity_key, metrics.get("seller_sku"), metrics.get("asin")) if value}
     # Each advertised MSKU resolves independently. A shared ASIN must not pull in
@@ -243,7 +290,7 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
         for section, route_key in (
             ("stores", store_id), ("entities", f"{store_id}:{key}"), ("entities", key),
         ):
-            entry = _route_entry(routing.get(section, {}), route_key)
+            entry = _application_route_entry(routing.get(section, {}), route_key, groups)
             owner_ids.extend(_app_open_ids(entry.get("open_ids", [])))
     if keys:
         products = db.scalars(select(Product).where(
@@ -263,11 +310,6 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
     owner_ids = list(dict.fromkeys(owner_ids))
     if not owner_ids:
         raise ApplicationRoutingError("missing_operations_owner")
-    try:
-        default_ids = _app_open_ids(settings.feishu_at_ids())
-    except ValueError:
-        raise ApplicationRoutingError("invalid_default_mentions") from None
-    admin_ids = default_ids + _app_open_ids(group.get("admin_open_ids", []))
     if not admin_ids:
         raise ApplicationRoutingError("missing_group_administrator")
     mentions = list(dict.fromkeys(admin_ids + owner_ids))
@@ -315,17 +357,42 @@ def _application_management_deliveries(settings, routing, *, store_id, severity,
         for uid in dict.fromkeys(manager_ids)
     ]
     if failed or not manager_ids:
-        deliveries.append({"role": "management", "routing_failure": "missing_or_invalid_manager_mapping"})
+        deliveries.append({"role": "management", "routing_failure": "missing_or_invalid_manager_mapping",
+                           "mapping_invalid": failed})
     return deliveries
+
+
+def _merge_same_destinations(deliveries):
+    """One event has one group delivery even when several missing roles use it."""
+    merged, by_recipient = [], {}
+    for item in deliveries:
+        if item.get("routing_failure"):
+            merged.append(item)
+            continue
+        identity = (item["receive_id_type"], item["receive_id"])
+        if identity not in by_recipient:
+            item = dict(item)
+            by_recipient[identity] = item
+            merged.append(item)
+            continue
+        existing = by_recipient[identity]
+        existing["covered_roles"] = list(dict.fromkeys(
+            existing.get("covered_roles", [existing["role"]]) + item.get("covered_roles", [item["role"]])))
+        existing["open_ids"] = list(dict.fromkeys(existing.get("open_ids", []) + item.get("open_ids", [])))
+        if existing.get("group_fallback") or item.get("group_fallback"):
+            existing["group_fallback"] = True
+            existing["fallback_reasons"] = list(dict.fromkeys(
+                existing.get("fallback_reasons", []) + item.get("fallback_reasons", [])))
+    return merged
 
 
 def application_deliveries(db, settings, *, store_id: str, entity_id: str,
                            metrics: dict, scope: str, severity: str, status: str) -> list[dict]:
     """Plan valid destinations and independent, durable routing-failure roles.
 
-    A group/owner mistake must not suppress manager messages, and a manager
-    mistake must not suppress the group mention. Malformed input is represented
-    by a failure placeholder, never by an invented or unmentioned destination.
+    Missing roles may use the explicitly approved report group when enabled.
+    Malformed configuration stays a failure, and valid manager messages remain
+    independent. This planner never rearms persisted notifications.
     """
     routing_failed = False
     try:
@@ -343,7 +410,15 @@ def application_deliveries(db, settings, *, store_id: str, entity_id: str,
             db, settings, routing, store_id=store_id, entity_id=entity_id, metrics=metrics, scope=scope,
         )
     except ApplicationRoutingError as exc:
-        group = {"role": "group", "routing_failure": str(exc)}
+        reason = str(exc)
+        if (getattr(settings, "feishu_group_fallback_enabled", False) and not routing_failed
+                and reason in {"missing_operations_owner", "missing_group_administrator"}):
+            try:
+                group = report_group_delivery(settings, routing, reason=reason)
+            except ApplicationRoutingError as fallback_exc:
+                group = {"role": "group", "routing_failure": str(fallback_exc)}
+        else:
+            group = {"role": "group", "routing_failure": reason}
     deliveries = [group]
     managers = _application_management_deliveries(
         settings, routing, store_id=store_id, severity=severity, status=status,
@@ -352,8 +427,18 @@ def application_deliveries(db, settings, *, store_id: str, entity_id: str,
         # Environment recipients can still receive the message, but the unread
         # file may contain more managers. Keep an explicit repairable failure.
         managers.append({"role": "management", "routing_failure": "routing_file_unavailable"})
+    if (getattr(settings, "feishu_group_fallback_enabled", False) and not routing_failed
+            and not group.get("routing_failure")):
+        for index, item in enumerate(managers):
+            if (item.get("routing_failure") == "missing_or_invalid_manager_mapping"
+                    and not item.get("mapping_invalid")):
+                try:
+                    managers[index] = report_group_delivery(
+                        settings, routing, role="management", reason=item["routing_failure"])
+                except ApplicationRoutingError as exc:
+                    managers[index] = {"role": "management", "routing_failure": str(exc)}
     deliveries.extend(managers)
-    return deliveries
+    return _merge_same_destinations(deliveries)
 
 
 def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
@@ -365,7 +450,7 @@ def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
 
     planned = application_deliveries(db, settings, **context)
     if roles is not None:
-        planned = [item for item in planned if item["role"] in roles]
+        planned = [item for item in planned if roles.intersection(item.get("covered_roles", [item["role"]]))]
     outbox_ids = []
     unresolved = False
     for delivery in planned:
