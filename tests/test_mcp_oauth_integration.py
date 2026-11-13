@@ -117,17 +117,18 @@ def call(client, headers, name, arguments=None):
     assert "error" not in result, result
     return result["result"]
 
-def owner_token(client, scopes):
+def owner_token(client, scopes, account=None):
     callback = "https://chatgpt.com/connector/oauth/synthetic-integration"
     verifier = "v" * 64
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-    registration = client.post("/register", json={
-        "redirect_uris": [callback], "token_endpoint_auth_method": "none",
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"], "scope": " ".join(scopes),
-    })
-    assert registration.status_code == 201, registration.text
-    account = registration.json()
+    if account is None:
+        registration = client.post("/register", json={
+            "redirect_uris": [callback], "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"], "scope": " ".join(scopes),
+        })
+        assert registration.status_code == 201, registration.text
+        account = registration.json()
     authorization = client.get("/authorize", params={
         "client_id": account["client_id"], "redirect_uri": callback,
         "response_type": "code", "code_challenge": challenge,
@@ -156,7 +157,7 @@ def owner_token(client, scopes):
         "code_verifier": verifier, "resource": resource,
     })
     assert token.status_code == 200, token.text
-    return token.json()["access_token"]
+    return token.json()["access_token"], account
 
 with TestClient(app, base_url=origin, follow_redirects=False) as client:
     anonymous = client.get("/mcp", headers={"Accept": "application/json, text/event-stream"})
@@ -173,7 +174,7 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
         assert protected.json()["resource"] == resource
         assert client.get("/mcp", headers=protocol_headers(static_token)).status_code == 401
 
-        read_token = owner_token(client, ["jx:read"])
+        read_token, account = owner_token(client, ["jx:read"])
         read_headers = initialize(client, read_token)
         listing = rpc(client, read_headers, "tools/list", {})["result"]["tools"]
         by_name = {tool["name"]: tool for tool in listing}
@@ -182,6 +183,13 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
         assert by_name["request_collection"]["annotations"]["readOnlyHint"] is False
         assert by_name["request_collection"]["_meta"]["securitySchemes"][0]["scopes"] == ["jx:read", "jx:collect"]
         assert by_name["submit_chat_analysis"]["_meta"]["securitySchemes"][0]["scopes"] == ["jx:read", "jx:notify"]
+        workflow_scopes = ["jx:read", "jx:collect", "jx:notify"]
+        permission_tool = by_name["check_workflow_permissions"]
+        assert permission_tool["annotations"]["readOnlyHint"] is True
+        assert permission_tool["_meta"]["securitySchemes"][0]["scopes"] == workflow_scopes
+        preflight = call(client, read_headers, "check_workflow_permissions")
+        assert preflight["isError"] is True
+        assert 'scope="jx:read jx:collect jx:notify"' in preflight["_meta"]["mcp/www_authenticate"][0]
         stores = call(client, read_headers, "get_stores")
         assert not stores.get("isError") and "Synthetic integration store" in json.dumps(stores)
         configuration = call(client, read_headers, "get_configuration_status")
@@ -196,8 +204,17 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
         assert 'scope="jx:read jx:notify"' in denied_notification["_meta"]["mcp/www_authenticate"][0]
         assert job_count() == 0, "Read-only scope must never enqueue a job"
 
-        collect_token = owner_token(client, ["jx:read", "jx:collect"])
+        notify_token, _ = owner_token(client, ["jx:read", "jx:notify"], account)
+        notify_headers = initialize(client, notify_token)
+        missing_collect = call(client, notify_headers, "request_collection")
+        assert 'scope="jx:read jx:collect jx:notify"' in missing_collect["_meta"]["mcp/www_authenticate"][0]
+        assert job_count() == 0
+
+        collect_token, _ = owner_token(client, workflow_scopes, account)
         collect_headers = initialize(client, collect_token)
+        ready = call(client, collect_headers, "check_workflow_permissions")
+        assert not ready.get("isError") and "AUTHORIZED" in json.dumps(ready)
+        assert job_count() == 0
         queued = call(client, collect_headers, "request_collection", {
             "backfill_days": 1, "idempotency_key": "permitted-collection",
         })

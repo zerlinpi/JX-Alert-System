@@ -180,19 +180,48 @@ def _tool_security(*scopes):
     return {"securitySchemes": [{"type": "oauth2", "scopes": list(scopes)}]}
 
 
-def _scope_challenge(required_scope, settings):
+def _scope_challenge(required_scope, settings, *, current_scopes=()):
     """Signal incremental consent to ChatGPT without executing the action."""
+    from jx_alert.mcp_oauth import SCOPES
+
+    requested = (required_scope,) if isinstance(required_scope, str) else required_scope
+    missing = [scope for scope in requested if scope not in current_scopes]
+    combined = " ".join(scope for scope in SCOPES if scope in {*current_scopes, *requested, "jx:read"})
     metadata = settings.mcp_public_url.rstrip("/") + "/.well-known/oauth-protected-resource" + settings.mcp_path
-    label = {"jx:notify": "发送飞书异常通知", "jx:collect": "请求数据采集"}.get(required_scope, required_scope)
+    labels = {"jx:notify": "发送飞书异常通知", "jx:collect": "请求数据采集"}
+    label = "、".join(labels[scope] for scope in missing)
+    details = {"status": "AUTHORIZATION_REQUIRED", "required_scopes": missing}
+    if len(missing) == 1:
+        details["required_scope"] = missing[0]
     return CallToolResult(
         content=[TextContent(type="text", text=f"当前连接缺少「{label}」权限。请确认新增权限后重试本操作。")],
-        structuredContent={"status": "AUTHORIZATION_REQUIRED", "required_scope": required_scope},
+        structuredContent=details,
         isError=True,
         _meta={"mcp/www_authenticate": [
             f'Bearer resource_metadata="{metadata}", error="insufficient_scope", '
-            f'error_description="Additional permission required", scope="jx:read {required_scope}"',
+            f'error_description="Additional permission required", scope="{combined}"',
         ]},
     )
+
+
+@mcp.tool(title="检查采集与飞书通知授权", annotations=ToolAnnotations(readOnlyHint=True),
+          meta=_tool_security("jx:read", "jx:collect", "jx:notify"))
+def check_workflow_permissions() -> dict:
+    """在开始广告分析前核对主动采集和发送飞书通知的权限。
+
+    缺权限时一次请求补齐两项。检查本身只读取权限状态。
+    """
+    settings = get_settings()
+    if settings.mcp_auth_mode != "oauth":
+        return {"status": "NOT_APPLICABLE", "auth_mode": settings.mcp_auth_mode}
+    from mcp.server.auth.middleware.auth_context import get_access_token
+
+    token = get_access_token()
+    scopes = token.scopes if token is not None else []
+    required = ("jx:collect", "jx:notify")
+    if any(scope not in scopes for scope in required):
+        return _scope_challenge(required, settings, current_scopes=scopes)
+    return {"status": "AUTHORIZED", "collect": True, "notify": True}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -200,6 +229,7 @@ def system_health() -> dict:
     """查询服务、数据库及实际飞书通道的本机配置状态，不发送消息或暴露凭据。
 
     判断飞书通道使用feishu_transport及feishu_transport_configured。
+    准备主动采集和发送通知时，先用check_workflow_permissions补齐两项授权。
     自建应用app模式无需Webhook，不能因feishu_webhook_configured=false判断未连接。
     配置就绪不等于消息已送达；实际送达查get_notification_logs。
     """
@@ -244,6 +274,7 @@ def system_health() -> dict:
         "feishu_webhook_configured": bool(settings.feishu_webhook_url),
         **feishu_channel_status(settings),
         "current_connection_permissions": oauth_permissions,
+        "workflow_permission_check": "check_workflow_permissions" if oauth_permissions is not None else None,
         "remote_mcp_bearer_configured": bool(settings.mcp_bearer_token),
         "remote_mcp_path": settings.mcp_path,
         "remote_mcp_port": settings.mcp_port,
@@ -1042,7 +1073,7 @@ def request_collection(report_date: str | None = None, backfill_days: int = 1,
         from mcp.server.auth.middleware.auth_context import get_access_token
         token = get_access_token()
         if token is None or "jx:collect" not in token.scopes:
-            return _scope_challenge("jx:collect", settings)
+            return _scope_challenge("jx:collect", settings, current_scopes=token.scopes if token else ())
     if not settings.mcp_operations_enabled or settings.app_dry_run:
         return {"status": "DISABLED"}
     from jx_alert.operations import enqueue_collection
@@ -1099,7 +1130,7 @@ def submit_chat_analysis(review_id: int, findings: list[dict]) -> dict:
         from mcp.server.auth.middleware.auth_context import get_access_token
         token = get_access_token()
         if token is None or "jx:notify" not in token.scopes:
-            return _scope_challenge("jx:notify", settings)
+            return _scope_challenge("jx:notify", settings, current_scopes=token.scopes if token else ())
     if not settings.mcp_notifications_enabled or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
     from jx_alert.chat_analysis import submit_review

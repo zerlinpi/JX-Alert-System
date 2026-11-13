@@ -62,12 +62,13 @@ def register(client, method="none", scope="jx:read jx:collect"):
 
 
 def begin(client, account, **overrides):
-    response = client.get("/authorize", params={
+    params = {
         "client_id": account["client_id"], "redirect_uri": REDIRECT,
         "response_type": "code", "code_challenge": CHALLENGE,
         "code_challenge_method": "S256", "resource": RESOURCE,
         "scope": "jx:read jx:collect", "state": "opaque-state", **overrides,
-    })
+    }
+    response = client.get("/authorize", params={key: value for key, value in params.items() if value is not None})
     assert response.status_code == 302, response.text
     location = response.headers["location"]
     assert "/oauth/owner?request=" in location, location
@@ -231,26 +232,32 @@ def test_revoke_either_token_revokes_its_associated_pair(setup):
     assert refresh(client, account, first["refresh_token"]).status_code == 400
 
 
-def test_read_only_chatgpt_client_can_request_notify_with_fresh_owner_consent(setup):
+def test_read_only_chatgpt_client_can_request_workflow_scopes_with_fresh_owner_consent(setup):
     provider, client, _ = setup
     account = register(client, scope="jx:read")
-    request_id, csrf, _ = begin(client, account, scope="jx:read")
+    request_id, csrf, _ = begin(client, account, scope=None)
     login = owner_post(client, request_id, csrf, action="login", password=PASSWORD)
     csrf = re.search(r'name="csrf" value="([^"]+)"', login.text)[1]
     callback = owner_post(client, request_id, csrf, action="approve")
     code = parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
     original = exchange(client, account, code).json()
     assert original["scope"] == "jx:read"
-    assert refresh(client, account, original["refresh_token"], scope="jx:read jx:notify").json()["error"] == "invalid_scope"
+    workflow = "jx:read jx:collect jx:notify"
+    assert refresh(client, account, original["refresh_token"], scope=workflow).json()["error"] == "invalid_scope"
     assert refresh(client, account, original["refresh_token"]).json()["scope"] == "jx:read"
 
-    request_id, csrf, consent = begin(client, account, scope="jx:read jx:notify")
+    request_id, csrf, consent = begin(client, account, scope=workflow)
+    assert "请求采集与分析任务" in consent.text
     assert "发送至已配置飞书群" in consent.text
     callback = owner_post(client, request_id, csrf, action="approve")
     code = parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
     upgraded = exchange(client, account, code).json()
-    assert upgraded["scope"] == "jx:read jx:notify"
-    assert run(provider.load_access_token(upgraded["access_token"])).scopes == ["jx:read", "jx:notify"]
+    assert upgraded["scope"] == workflow
+    assert run(provider.load_access_token(upgraded["access_token"])).scopes == list(SCOPES)
+    narrowed = refresh(client, account, upgraded["refresh_token"], scope="jx:read").json()
+    assert narrowed["scope"] == "jx:read"
+    assert run(provider.load_access_token(narrowed["access_token"])).scopes == ["jx:read"]
+    assert refresh(client, account, narrowed["refresh_token"]).json()["scope"] == workflow
 
 
 def test_restart_preserves_client_and_authorization_code_then_access_tokens(setup):
