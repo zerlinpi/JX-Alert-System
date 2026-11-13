@@ -12,7 +12,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from sqlalchemy import func, select, text
 
 from jx_alert.config import get_settings
@@ -170,6 +170,26 @@ def create_http_app(settings=None):
 
 def _limit(value: int, maximum: int = 500) -> int:
     return min(max(int(value), 1), maximum)
+
+
+def _tool_security(*scopes):
+    if _MCP_SETTINGS.mcp_auth_mode != "oauth":
+        return None
+    return {"securitySchemes": [{"type": "oauth2", "scopes": list(scopes)}]}
+
+
+def _scope_challenge(required_scope, settings):
+    """Signal incremental consent to ChatGPT without executing the action."""
+    metadata = settings.mcp_public_url.rstrip("/") + "/.well-known/oauth-protected-resource" + settings.mcp_path
+    return CallToolResult(
+        content=[TextContent(type="text", text="需要重新授权：" + required_scope)],
+        structuredContent={"status": "AUTHORIZATION_REQUIRED", "required_scope": required_scope},
+        isError=True,
+        _meta={"mcp/www_authenticate": [
+            f'Bearer resource_metadata="{metadata}", error="insufficient_scope", '
+            f'error_description="Additional permission required", scope="jx:read {required_scope}"',
+        ]},
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -1072,7 +1092,8 @@ def get_configuration_status() -> dict:
         return configuration_status(db, get_settings())
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
+          meta=_tool_security("jx:read", "jx:collect"))
 def request_collection(report_date: str | None = None, backfill_days: int = 1,
                        idempotency_key: str | None = None) -> dict:
     """Explicitly request collection/analysis of the configured store scope.
@@ -1085,7 +1106,7 @@ def request_collection(report_date: str | None = None, backfill_days: int = 1,
         from mcp.server.auth.middleware.auth_context import get_access_token
         token = get_access_token()
         if token is None or "jx:collect" not in token.scopes:
-            raise PermissionError("The jx:collect scope is required to request collection")
+            return _scope_challenge("jx:collect", settings)
     if not settings.mcp_operations_enabled or settings.app_dry_run:
         return {"status": "DISABLED"}
     from jx_alert.operations import enqueue_collection
@@ -1097,7 +1118,8 @@ def request_collection(report_date: str | None = None, backfill_days: int = 1,
         return result
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
+          meta=_tool_security("jx:read"))
 def prepare_chat_analysis(store_id: str, dimension: str = "store", entity_id: str | None = None) -> dict:
     """为ChatGPT分析生成22个完整当地日的证据快照。返回证据ID、覆盖和成熟度要求。
 
@@ -1112,7 +1134,8 @@ def prepare_chat_analysis(store_id: str, dimension: str = "store", entity_id: st
         return result
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+          meta=_tool_security("jx:read", "jx:notify"))
 def submit_chat_analysis(review_id: int, findings: list[dict]) -> dict:
     """保存ChatGPT分析，仅向已配置群发送有证据的中文异常。无异常传[]，不发消息。
 
@@ -1125,7 +1148,7 @@ def submit_chat_analysis(review_id: int, findings: list[dict]) -> dict:
         from mcp.server.auth.middleware.auth_context import get_access_token
         token = get_access_token()
         if token is None or "jx:notify" not in token.scopes:
-            raise PermissionError("The jx:notify scope is required")
+            return _scope_challenge("jx:notify", settings)
     if not settings.mcp_notifications_enabled or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
     from jx_alert.chat_analysis import submit_review

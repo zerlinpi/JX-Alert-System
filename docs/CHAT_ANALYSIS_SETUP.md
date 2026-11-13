@@ -71,6 +71,8 @@ curl -fsS https://jxmcp.pacefitday.com/.well-known/oauth-authorization-server
 
 若之前创建的连接只允许读取，需重新授权通知权限。工作区工具权限可能要求每次确认；先实测无人值守任务可否使用通知工具，不能通过服务端关闭认证来绕过产品审批。
 
+工具声明各自所需权限；缺少 `jx:notify` 或 `jx:collect` 时返回标准的重新授权提示，让 ChatGPT 发起追加授权，不执行通知或采集。仅修改提示词不能提升连接权限。
+
 先让 ChatGPT 只查询系统状态、启用店铺、覆盖、通知开关。然后试一次 `prepare_chat_analysis`，确认返回的店铺、日期、数据维度和证据正确；无异常调用 `submit_chat_analysis(review_id, [])`，预期 `NO_ANOMALY` 且没有飞书消息。
 
 ## 4. 创建每小时任务
