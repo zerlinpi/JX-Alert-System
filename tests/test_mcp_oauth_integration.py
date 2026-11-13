@@ -185,6 +185,8 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
         assert by_name["submit_chat_analysis"]["_meta"]["securitySchemes"][0]["scopes"] == ["jx:read", "jx:notify"]
         assert by_name["submit_advertising_kpi_analysis"]["_meta"]["securitySchemes"][0]["scopes"] == ["jx:read", "jx:notify"]
         assert by_name["prepare_advertising_kpi_analysis"]["_meta"]["securitySchemes"][0]["scopes"] == ["jx:read"]
+        assert by_name["get_store_health_brief"]["annotations"]["readOnlyHint"] is True
+        assert by_name["send_store_health_brief"]["_meta"]["securitySchemes"][0]["scopes"] == ["jx:read", "jx:notify"]
         workflow_scopes = ["jx:read", "jx:collect", "jx:notify"]
         permission_tool = by_name["check_workflow_permissions"]
         assert permission_tool["annotations"]["readOnlyHint"] is True
@@ -206,6 +208,8 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
         assert 'scope="jx:read jx:notify"' in denied_notification["_meta"]["mcp/www_authenticate"][0]
         denied_kpi = call(client, read_headers, "submit_advertising_kpi_analysis", {"review_id": 1, "findings": []})
         assert denied_kpi.get("isError") is True and "jx:notify" in json.dumps(denied_kpi)
+        denied_health = call(client, read_headers, "send_store_health_brief")
+        assert denied_health.get("isError") is True and "jx:notify" in json.dumps(denied_health)
         assert job_count() == 0, "Read-only scope must never enqueue a job"
 
         notify_token, _ = owner_token(client, ["jx:read", "jx:notify"], account)

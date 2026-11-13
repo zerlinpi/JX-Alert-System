@@ -1,6 +1,5 @@
 """Queue read-only daily snapshots to an explicitly selected test/report group."""
 import hashlib
-import json
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -15,6 +14,8 @@ from jx_alert.notifications.outbox import enqueue_notification, NotificationOutb
 from jx_alert.notifications.routing import _load_routing
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerformance
 from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card, number, change, status_label
+from jx_alert.analysis.store_health import store_health_snapshot
+from jx_alert.notifications.store_health import HEALTH_HEADERS, card_fits, health_detail_rows, health_overview_row
 
 
 def store_advertising_kpis(db, store, day, *, settings=None, data_warning=None):
@@ -40,6 +41,9 @@ def _metric_currency(facts, on, dimension, metric):
 
 def build_daily_card(db, store, day, *, data_warning=None, settings=None):
     """Read two authoritative daily partitions; never fill missing facts with zero."""
+    if settings is None:
+        from jx_alert.config import get_settings
+        settings = get_settings()
     previous = day - timedelta(days=1)
     dimensions = ["store", "campaign_sp", "campaign_sb", "campaign_sd"]
     facts = db.scalars(select(DailyMetric).where(
@@ -81,8 +85,6 @@ def build_daily_card(db, store, day, *, data_warning=None, settings=None):
         metrics.append((label, display(current, current_currency), display(prior, prior_currency), comparison))
     quality = [(label, "待重新采集校验" if data_warning else status_label(coverage.get((day, dimension), "未知"))) for label, dimension in [
         ("店铺销量", "store"), ("商品推广", "campaign_sp"), ("品牌推广", "campaign_sb"), ("展示推广", "campaign_sd")]]
-    performance = db.scalar(select(StorePerformance).where(StorePerformance.store_id == store.sid)
-                            .order_by(StorePerformance.pull_date.desc()).limit(1))
     zone_label = ("美国太平洋时间" if store.timezone == "America/Los_Angeles" else
                   "店铺当地时间" if store.timezone else "保守历史日 · 时区待核实")
     notes = [f"{zone_label} · 对比日期：{previous.isoformat()}"]
@@ -90,11 +92,8 @@ def build_daily_card(db, store, day, *, data_warning=None, settings=None):
         notes.insert(0, data_warning)
     sections = [("经营与广告", ["指标", "当日", "前一日", "环比"], metrics),
                 ("采集状态", ["数据集", "状态"], quality)]
-    if performance:
-        sections.append(("绩效原始观测", ["指标", "观测值", "源状态"], [
-            ("健康评分", number(performance.ahr_score), status_label(performance.freshness_status)),
-            ("账户健康状态", status_label(performance.ahr_status), status_label(performance.freshness_status)),
-        ]))
+    health = store_health_snapshot(db, store, settings)
+    sections.append(("店铺绩效快报", ["指标", "观测值", "判定或依据"], health_detail_rows(health)))
     kpis = store_advertising_kpis(db, store, day, settings=settings, data_warning=data_warning)
     sections.append(("广告指标 · 转化指标采用成熟日", AD_KPI_HEADERS, ad_kpi_rows(kpis)))
     return card(
@@ -118,7 +117,7 @@ def _enqueue_group_digest(db, stores, dates, warnings, *, send_day, due, chat_id
         NotificationOutbox.payload["scheduled_delivery_date"].as_string() == send_day.isoformat())).all()
     if legacy:
         return {"queued": len(legacy), "skipped": False, "outbox_ids": [r.id for r in legacy]}
-    rows, kpi_rows, ids = [], [], []
+    rows, kpi_rows, health_rows, ids = [], [], [], []
     for store in sorted(stores, key=lambda s: s.sid):
         day = dates[store.sid]
         day = date.fromisoformat(day) if isinstance(day, str) else day
@@ -138,19 +137,27 @@ def _enqueue_group_digest(db, stores, dates, warnings, *, send_day, due, chat_id
         judgment = "；".join(label + "：" + "、".join(codes) for label, codes in groups.items()) or "—"
         kpi_rows.append((f"{store.name[:60]}（{store.sid}）",
             ratios[0]["c5"] + " / " + ratios[4]["c5"], *[row["c1"] for row in ratios], judgment))
+        health_rows.append(health_overview_row(store_health_snapshot(db, store, settings)))
         ids.append(store.sid)
     # Bound both table size and encoded payload. No cross-currency totals are formed.
     chunks = []
     headers = ["店铺", "报表日期", "订单", "销量", "销售额", "商品推广", "品牌推广", "展示推广", "状态"]
-    for offset in range(0, len(rows), 5):
-        subset = rows[offset:offset + 5]
-        value = card(f"每日经营日报 · {send_day}", subtitle=f"店铺明细 · 第 {len(chunks) + 1} 页",
-                     sections=[("经营与广告", headers, subset),
+    offset = 0
+    while offset < len(rows):
+        size = min(5, len(rows) - offset)
+        while size:
+            value = card(f"每日经营日报 · {send_day}", subtitle=f"店铺明细 · 第 {len(chunks) + 1} 页",
+                     sections=[("经营与广告", headers, rows[offset:offset + size]),
+                        ("店铺绩效快报", HEALTH_HEADERS, health_rows[offset:offset + size]),
                         ("广告指标", ["店铺", "流量及费用日 / 成熟归因日",
-                         "CTR", "CPC", "CDR", "CPS", "ROAS", "CPA", "TCOAS", "判断"], kpi_rows[offset:offset + 5])])
-        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 16000:
+                         "CTR", "CPC", "CDR", "CPS", "ROAS", "CPA", "TCOAS", "判断"], kpi_rows[offset:offset + size])])
+            if card_fits(value):
+                break
+            size -= 1
+        if not size:
             raise ValueError("Daily digest exceeds the bounded card size")
-        chunks.append((value, ids[offset:offset + 5]))
+        chunks.append((value, ids[offset:offset + size]))
+        offset += size
     inserted = []
     try:
         # A concurrent producer either wins the whole batch or reuses it below.

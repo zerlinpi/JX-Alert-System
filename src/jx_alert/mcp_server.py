@@ -301,6 +301,48 @@ def get_stores() -> list[dict]:
         } for row in rows]
 
 
+@mcp.tool(title="查询亚马逊店铺绩效快报", annotations=ToolAnnotations(readOnlyHint=True),
+          meta=_tool_security("jx:read"))
+def get_store_health_brief(store_id: str | None = None, offset: int = 0, limit: int = 20) -> dict:
+    """逐店查询账户健康源观测、评分、七项绩效指标与平台标准、归档待处理通知数量。
+
+    默认覆盖已配置的全部店铺，包含授权失败、缺失和待确认，不能只查询有数据店铺。
+    返回总店铺数、状态计数和分页；需要遍历所有页才算查完全店。
+    源时区未知、过期或采集失败均不能报告为健康；源评级良好也不能替代当前健康确认。
+    不按健康评分猜阈值，不修改店铺设置或健康业务告警。
+    """
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("Health brief requires nonnegative offset and limit between 1 and 100")
+    from jx_alert.notifications.store_health import health_brief_snapshots
+    with SessionLocal() as db:
+        result = health_brief_snapshots(db, get_settings(), store_id=store_id)
+        result["stores"] = result["stores"][offset:offset + limit]
+        return {**result, "offset": offset, "limit": limit,
+                "next_offset": offset + limit if offset + limit < result["store_count"] else None}
+
+
+@mcp.tool(title="发送亚马逊店铺绩效快报",
+          annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+          meta=_tool_security("jx:read", "jx:notify"))
+def send_store_health_brief() -> dict:
+    """仅在用户要求发送绩效快报时，将全部已配置店铺的中文表格发送到既定飞书日报群。
+
+    包含源评级、评分、七项绩效指标、关注项、归档待处理通知与数据质量。
+    同一北京时间日期和目标群只生成一次，重复调用复用原卡片，不重发。
+    此工具为快报，不用于自动异常巡检；未知数据不标正常，不触发或恢复健康业务告警。
+    返回入队编号，实际送达用get_notification_logs(outbox_id=编号)核实。
+    """
+    settings = get_settings()
+    denied = _notification_guard(settings)
+    if denied:
+        return denied
+    from jx_alert.notifications.store_health import enqueue_store_health_brief
+    with SessionLocal() as db:
+        result = enqueue_store_health_brief(db, settings)
+        db.commit()
+        return result
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_all_anomalies(limit: int = 100, status: str | None = None,
                       severity: str | None = None,
