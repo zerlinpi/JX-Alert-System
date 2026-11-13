@@ -90,6 +90,26 @@ def test_partial_result_has_bounded_retry_without_sending(warehouse, monkeypatch
         assert job.metadata_json["retry_at"]
 
 
+def test_store_progress_is_durable_before_a_later_collection_crash(warehouse, monkeypatch):
+    with warehouse() as db:
+        job_id = operations.enqueue_collection(db)["job_id"]
+        db.commit()
+
+    def interrupted(**kwargs):
+        kwargs["progress"]({"completed_store_dates": {"2": "2026-11-11"},
+                            "store_statuses": {"2": "COMPLETE"}})
+        with warehouse() as db:
+            saved = db.get(SyncJob, job_id)
+            assert saved.status == "RUNNING"
+            assert saved.metadata_json["completed_store_dates"] == {"2": "2026-11-11"}
+        raise RuntimeError("later provider failure")
+
+    monkeypatch.setattr(operations, "run_collection", interrupted)
+    assert operations.process_pending_collection()["status"] == "PENDING"
+    with warehouse() as db:
+        assert db.get(SyncJob, job_id).metadata_json["completed_store_dates"] == {"2": "2026-11-11"}
+
+
 def test_store_scope_rejects_missing_or_zero_ids(tmp_path):
     path = tmp_path / "scope.json"
     for ids in [[0], [True], [5175]]:

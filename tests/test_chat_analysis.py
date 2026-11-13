@@ -46,9 +46,9 @@ def test_no_anomaly_is_audited_without_any_notification(setup):
     db, s = setup
     review = prepare_review(db, s, "5174", now=CLOCK)
     result = submit_review(db, s, review["review_id"], [], now=CLOCK)
-    assert result["status"] == "NO_ANOMALY" and result["outbox_ids"] == []
+    assert result["status"] == "INSUFFICIENT_DATA" and result["outbox_ids"] == []
     assert db.scalars(select(NotificationOutbox)).all() == []
-    assert db.get(SyncJob, review["review_id"]).status == "REVIEWED"
+    assert db.get(SyncJob, review["review_id"]).status == "INSUFFICIENT_DATA"
 
 
 def test_same_incident_deduplicates_across_hourly_reviews_and_keeps_chinese_tables(setup):

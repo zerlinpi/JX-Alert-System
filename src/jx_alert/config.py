@@ -17,11 +17,15 @@ class Settings(BaseSettings):
     daily_sync_cron: str = "0 7 * * *"
     feishu_daily_report_cron: str = "0 8 * * *"
     feishu_daily_report_start_date: str = ""
+    feishu_daily_report_group_digest: bool = False
     # Refresh enough marketplace-local dates for the 14-day attribution window plus its 7-day baseline.
     ad_attribution_refresh_days: int = Field(default=22, ge=1, le=31)
     store_timezones_file: str = "/app/data/store-timezones.json"
     runtime_settings_file: str = "/app/data/runtime-settings.json"
     collection_scope_file: str = "/app/data/collection-scope.json"
+    # Opt-in historical collection without inventing a store's report timezone.
+    # Uses a globally completed calendar day; intraday interpretation stays blocked.
+    allow_unconfigured_timezone_history: bool = False
     sp_collection_enabled: bool = False
     sp_validation_targets_file: str = "/app/data/sp-validation-targets.json"
     sp_refresh_days: int = Field(default=7, ge=1, le=30)
@@ -148,7 +152,9 @@ def get_settings() -> Settings:
         allowed = {
             "app_dry_run", "scheduler_enabled", "daily_sync_cron",
             "feishu_daily_report_cron", "feishu_daily_report_start_date",
+            "feishu_daily_report_group_digest",
             "business_alert_delivery_mode",
+            "allow_unconfigured_timezone_history",
             "collection_scope_file", "sp_collection_enabled", "sp_validation_targets_file",
             "store_timezones_file", "feishu_routing_file",
             "sp_refresh_days", "mcp_operations_enabled", "mcp_notifications_enabled", "feishu_enabled", "feishu_transport",

@@ -5,6 +5,7 @@ Collection requests only enqueue work; the scheduler performs the read-only APIs
 from datetime import date, datetime, timedelta
 import argparse
 import hmac
+import json
 import re
 
 from starlette.middleware.cors import CORSMiddleware
@@ -13,7 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 
 from jx_alert.config import get_settings
 from jx_alert.storage.db import SessionLocal, engine, init_db
@@ -957,7 +958,11 @@ def get_notification_logs(store_id: str | None = None,
             query = query.join(
                 NotificationOutbox,
                 NotificationOutbox.idempotency_key == NotificationLog.dedupe_key,
-            ).where(NotificationOutbox.payload["store_id"].as_string() == str(store_id))
+            ).where(or_(
+                NotificationOutbox.payload["store_id"].as_string() == str(store_id),
+                NotificationOutbox.payload["store_ids"].as_string().contains(
+                    json.dumps(str(store_id)), autoescape=True),
+            ))
         rows = db.scalars(
             query.order_by(NotificationLog.created_at.desc()).limit(_limit(limit, 1000))
         ).all()
@@ -1132,6 +1137,18 @@ def prepare_chat_analysis(store_id: str, dimension: str = "store", entity_id: st
         result = prepare_review(db, get_settings(), store_id, dimension=dimension, entity_id=entity_id)
         db.commit()
         return result
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True), meta=_tool_security("jx:read"))
+def get_analysis_plan() -> dict:
+    """查询全部已启用店铺的分析计划、真实时区核实状态、保守历史日期和数据缺口。
+
+    不采集、不发送通知。未采集、授权异常、未确认时区或缺基线不能解释为经营正常。
+    小时任务先读此计划，逐店处理可用证据，分别记录未完整分析的店铺。
+    """
+    from jx_alert.readiness import analysis_plan
+    with SessionLocal() as db:
+        return analysis_plan(db, get_settings())
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
