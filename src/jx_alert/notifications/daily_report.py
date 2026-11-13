@@ -10,10 +10,22 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from jx_alert.analysis.ad_kpis import advertising_kpis
 from jx_alert.notifications.outbox import enqueue_notification, NotificationOutbox
 from jx_alert.notifications.routing import _load_routing
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerformance
-from jx_alert.notifications.cards import card, number, change, status_label
+from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card, number, change, status_label
+
+
+def store_advertising_kpis(db, store, day, *, settings=None, data_warning=None):
+    if settings is None:
+        from jx_alert.config import get_settings
+        settings = get_settings()
+    result = advertising_kpis(db, settings, store.sid, day)
+    if data_warning:
+        for item in result.values():
+            item.update(current=None, baseline=None, change_ratio=None, status="INSUFFICIENT_DATA")
+    return result
 
 
 def _metric_currency(facts, on, dimension, metric):
@@ -26,7 +38,7 @@ def _metric_currency(facts, on, dimension, metric):
     return values[0]
 
 
-def build_daily_card(db, store, day, *, data_warning=None):
+def build_daily_card(db, store, day, *, data_warning=None, settings=None):
     """Read two authoritative daily partitions; never fill missing facts with zero."""
     previous = day - timedelta(days=1)
     dimensions = ["store", "campaign_sp", "campaign_sb", "campaign_sd"]
@@ -83,6 +95,8 @@ def build_daily_card(db, store, day, *, data_warning=None):
             ("健康评分", number(performance.ahr_score), status_label(performance.freshness_status)),
             ("账户健康状态", status_label(performance.ahr_status), status_label(performance.freshness_status)),
         ]))
+    kpis = store_advertising_kpis(db, store, day, settings=settings, data_warning=data_warning)
+    sections.append(("广告指标 · 转化指标采用成熟日", AD_KPI_HEADERS, ad_kpi_rows(kpis)))
     return card(
         f"每日经营快照 · {day.isoformat()}",
         subtitle=f"{store.name}（{store.sid}）",
@@ -90,7 +104,7 @@ def build_daily_card(db, store, day, *, data_warning=None):
     )
 
 
-def _enqueue_group_digest(db, stores, dates, warnings, *, send_day, due, chat_id, delivery):
+def _enqueue_group_digest(db, stores, dates, warnings, *, send_day, due, chat_id, delivery, settings):
     """Freeze all chunks in one transaction; recovery reuses the original scope/content."""
     prefix = "scheduled-daily:group:" + hashlib.sha256(f"{send_day}:app:{chat_id}".encode()).hexdigest() + ":"
     existing = db.scalars(select(NotificationOutbox).where(
@@ -104,11 +118,11 @@ def _enqueue_group_digest(db, stores, dates, warnings, *, send_day, due, chat_id
         NotificationOutbox.payload["scheduled_delivery_date"].as_string() == send_day.isoformat())).all()
     if legacy:
         return {"queued": len(legacy), "skipped": False, "outbox_ids": [r.id for r in legacy]}
-    rows, ids = [], []
+    rows, kpi_rows, ids = [], [], []
     for store in sorted(stores, key=lambda s: s.sid):
         day = dates[store.sid]
         day = date.fromisoformat(day) if isinstance(day, str) else day
-        source = build_daily_card(db, store, day, data_warning=warnings.get(store.sid))
+        source = build_daily_card(db, store, day, data_warning=warnings.get(store.sid), settings=settings)
         tables = [e for e in source["body"]["elements"] if e["tag"] == "table"]
         values = [r["c1"] for r in tables[0]["rows"]]
         quality = "待校验" if warnings.get(store.sid) else (
@@ -116,17 +130,27 @@ def _enqueue_group_digest(db, stores, dates, warnings, *, send_day, due, chat_id
         if not store.timezone:
             quality += "；时区待核实"
         rows.append((f"{store.name[:60]}（{store.sid}）", day.isoformat(), *values, quality))
+        ratios = tables[-1]["rows"]
+        groups = {}
+        for code, row in zip(("CTR", "CPC", "CDR", "CPS", "ROAS", "CPA", "TCOAS"), ratios):
+            if row["c4"] != "—":
+                groups.setdefault(row["c4"], []).append(code)
+        judgment = "；".join(label + "：" + "、".join(codes) for label, codes in groups.items()) or "—"
+        kpi_rows.append((f"{store.name[:60]}（{store.sid}）",
+            ratios[0]["c5"] + " / " + ratios[4]["c5"], *[row["c1"] for row in ratios], judgment))
         ids.append(store.sid)
     # Bound both table size and encoded payload. No cross-currency totals are formed.
     chunks = []
     headers = ["店铺", "报表日期", "订单", "销量", "销售额", "商品推广", "品牌推广", "展示推广", "状态"]
-    for offset in range(0, len(rows), 10):
-        subset = rows[offset:offset + 10]
+    for offset in range(0, len(rows), 5):
+        subset = rows[offset:offset + 5]
         value = card(f"每日经营日报 · {send_day}", subtitle=f"店铺明细 · 第 {len(chunks) + 1} 页",
-                     sections=[("经营与广告", headers, subset)])
-        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 24000:
+                     sections=[("经营与广告", headers, subset),
+                        ("广告指标", ["店铺", "流量及费用日 / 成熟归因日",
+                         "CTR", "CPC", "CDR", "CPS", "ROAS", "CPA", "TCOAS", "判断"], kpi_rows[offset:offset + 5])])
+        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 16000:
             raise ValueError("Daily digest exceeds the bounded card size")
-        chunks.append((value, ids[offset:offset + 10]))
+        chunks.append((value, ids[offset:offset + 5]))
     inserted = []
     try:
         # A concurrent producer either wins the whole batch or reuses it below.
@@ -217,7 +241,7 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
         if any(s.sid not in dates for s in stores):
             raise ValueError("Daily report store is outside the explicit report scope")
         return _enqueue_group_digest(db, stores, dates, store_warnings or {},
-            send_day=send_day, due=due, chat_id=chat_id, delivery=delivery)
+            send_day=send_day, due=due, chat_id=chat_id, delivery=delivery, settings=settings)
     for store in stores:
         if store_dates is not None and store.sid not in store_dates:
             raise ValueError("Daily report store is outside the explicit report scope")
@@ -284,7 +308,7 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
             lines.append(warning)
         if not store.timezone:
             lines.append("保守历史日 · 报表时区待核实")
-        message_card = build_daily_card(db, store, day, data_warning=warning) if app_transport else None
+        message_card = build_daily_card(db, store, day, data_warning=warning, settings=settings) if app_transport else None
         if send_day is not None:
             delivery_note = f"北京时间提醒日：{send_day} · 计划 {due:%H:%M} · 本次生成 {local_now:%H:%M:%S}"
             if local_now - due > timedelta(minutes=1):

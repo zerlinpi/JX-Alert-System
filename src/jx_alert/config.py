@@ -118,6 +118,8 @@ class Settings(BaseSettings):
     alert_budget_ratio: float = 0.90
     alert_min_spend: float = 20.0
     alert_min_clicks: int = 10
+    alert_kpi_change_ratio: float = Field(default=0.15, gt=0, lt=1)
+    alert_kpi_min_impressions: int = Field(default=1000, ge=1)
     alert_min_orders_baseline: float = 1.0
     alert_escalate_after_days: int = Field(default=2, ge=1, le=30)
     report_dir: str = "./data/reports"
@@ -156,6 +158,7 @@ def get_settings() -> Settings:
             "feishu_daily_report_cron", "feishu_daily_report_start_date",
             "feishu_daily_report_group_digest",
             "business_alert_delivery_mode",
+            "alert_kpi_change_ratio", "alert_kpi_min_impressions",
             "allow_unconfigured_timezone_history",
             "collection_scope_file", "sp_collection_enabled", "sp_validation_targets_file",
             "store_timezones_file", "feishu_routing_file",
