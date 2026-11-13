@@ -24,7 +24,7 @@ def warehouse(tmp_path):
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         for i in range(64):
-            db.add(Store(sid=str(i + 1), name="测试店铺" + str(i + 1), timezone=None, currency_code="BRL"))
+            db.add(Store(sid=str(i + 1), name="测试店铺" + str(i + 1), status=1, timezone=None, currency_code="BRL"))
         db.flush()
         yield db, settings
     engine.dispose()
@@ -46,6 +46,9 @@ def test_group_pages_bound_size_freeze_scope_and_do_not_rearm(warehouse):
         assert row.payload["scheduled_delivery_date"] == "2026-11-14"
         assert len(json.dumps(row.payload["card"], ensure_ascii=False).encode()) < 16000
         tables = [e for e in row.payload["card"]["body"]["elements"] if e["tag"] == "table"]
+        assert len(tables) == 3
+        assert tables[1]["columns"][1]["display_name"] == "当前判定"
+        assert all(item["c1"] == "无绩效数据" for item in tables[1]["rows"])
         assert len(tables[-1]["columns"]) == 10
         assert "数据不足" in tables[-1]["rows"][0]["c9"]
         assert "未知（无记录）" in json.dumps(row.payload["card"], ensure_ascii=False)
