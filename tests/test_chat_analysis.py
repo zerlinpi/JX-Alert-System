@@ -82,6 +82,45 @@ def test_mature_ad_spend_with_usd_is_independent_of_store_currency(setup, orders
     if expected:
         row = db.get(NotificationOutbox, result["outbox_ids"][0])
         assert "美元" in json.dumps(row.payload, ensure_ascii=False)
+        assert result["notification_titles"] == ["广告有花费但无归因订单"]
+        assert row.payload["text"].startswith("广告有花费但无归因订单")
+
+
+def test_ad_cost_increase_uses_cost_title_and_shows_cost_comparison(setup):
+    db, settings = setup
+    for offset in range(8):
+        day = date(2026, 11, 4) - timedelta(days=offset)
+        db.add(DataCoverage(store_id="5174", dimension="campaign_sp", metric_date=day, status="COMPLETE"))
+        for metric, value in {"orders": 3, "spend": 90 if offset == 0 else 30, "clicks": 20}.items():
+            db.add(DailyMetric(store_id="5174", dimension="campaign_sp", entity_id="campaign",
+                metric_date=day, metric_name=metric, value=value, currency="USD" if metric == "spend" else None))
+    db.flush()
+    review = prepare_review(db, settings, "5174", dimension="campaign_sp", now=CLOCK)
+    proposed = [{"topic": "转化异常", "summary": "单均花费较此前七日上升", "action": "核查投放",
+                 "evidence_ids": [r["id"] for r in review["facts"]]}]
+    result = submit_review(db, settings, review["review_id"], proposed, now=CLOCK)
+    assert result["notification_titles"] == ["广告单均花费上升"]
+    row = db.get(NotificationOutbox, result["outbox_ids"][0])
+    table = row.payload["card"]["body"]["elements"][-1]
+    assert table["rows"][0] == {"c0": "单均花费", "c1": "美元 30.00", "c2": "美元 10.00"}
+
+
+@pytest.mark.parametrize("metric,topic,title", [
+    ("orders", "订单异常", "订单下降"), ("units", "销量异常", "销量下降"),
+    ("sales", "销售额异常", "销售额下降"),
+])
+def test_decline_titles_follow_actual_metric(setup, metric, topic, title):
+    db, settings = setup
+    for fact in db.scalars(select(DailyMetric)):
+        fact.metric_name = metric
+        fact.currency = "USD" if metric == "sales" else None
+    db.flush()
+    review = prepare_review(db, settings, "5174", now=CLOCK)
+    proposed = finding(review)
+    proposed[0].update(topic=topic, summary=title)
+    result = submit_review(db, settings, review["review_id"], proposed, now=CLOCK)
+    row = db.get(NotificationOutbox, result["outbox_ids"][0])
+    assert row.payload["card"]["header"]["title"]["content"] == title
 
 
 def test_previous_day_alert_uses_configured_group_when_roles_missing(setup):

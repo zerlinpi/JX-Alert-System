@@ -29,4 +29,8 @@ def test_store_status_event_is_queued_and_recovers_when_status_returns_to_normal
         })
         assert second["non_normal_stores"] == 0
         assert row.status == "RECOVERED"
-        assert db.scalars(select(NotificationOutbox)).all()
+        notifications = db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)).all()
+        assert [item.payload["text"].splitlines()[0] for item in notifications] == [
+            "店铺授权异常 · 重要", "店铺授权异常 · 已恢复",
+        ]
+        assert "请检查" not in notifications[1].payload["text"]

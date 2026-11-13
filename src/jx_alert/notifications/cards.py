@@ -101,12 +101,26 @@ _METRIC_NAMES = {
     "freshness_status": "源数据状态", "source_updated_at": "源更新时间",
     "comparison_date": "比较日期", "metric_name": "指标", "ahr_score": "健康评分",
     "attribution_complete_report_date": "归因成熟日", "currency_code": "币种",
+    "last_over_budget_at": "超预算时间",
 }
 _RULE_NAMES = {
     "orders_increase": "订单增长", "orders_decrease": "订单下降", "sales_increase": "销售额增长",
     "sales_decrease": "销售额下降", "units_increase": "销量增长", "units_decrease": "销量下降",
-    "high_ad_spend": "广告花费增长", "spend_no_conversion": "高花费无转化",
-    "low_spend_no_conversion": "低花费无转化", "budget_consumption": "预算消耗",
+    "high_ad_spend": "广告花费增长", "spend_no_conversion": "广告有花费但无归因订单",
+    "low_spend_no_conversion": "低花费广告有点击但无归因订单", "budget_consumption": "广告花费达到预算提醒线",
+    "campaign_over_budget": "广告活动出现超预算记录",
+    "account_health_at_risk": "店铺账户健康风险",
+    "performance_indicator_breached": "店铺绩效指标未达标",
+    "performance_notice_pending": "业绩通知待处理",
+}
+_STORE_STATUS_TITLES = {0: "店铺停止同步", 2: "店铺授权异常", 3: "店铺欠费停服"}
+_FRESHNESS_DATASETS = {
+    "performance_store_performance_freshness": "店铺绩效",
+    "performance_performance_notices_freshness": "业绩通知",
+}
+_FRESHNESS_TITLES = {
+    "STALE": "数据更新滞后", "MISSING": "缺少源更新时间",
+    "NOT_CONFIGURED": "源时区待确认", "FUTURE": "源更新时间异常", "FAILED": "采集失败",
 }
 _STATUS_NAMES = {"COMPLETE": "采集完成", "NOT_CONFIGURED": "源时区待确认", "STALE": "数据过期",
                  "FUTURE": "源时间异常", "MISSING": "缺少源时间", "FRESH": "数据有效", "FAILED": "采集失败",
@@ -118,13 +132,32 @@ def status_label(value):
     return _STATUS_NAMES.get(value, value if value and re.search(r"[\u4e00-\u9fff]", str(value)) else "待确认")
 
 
+def anomaly_title(rule, metrics, state, severity):
+    if rule == "store_status_not_normal":
+        label = _STORE_STATUS_TITLES.get(metrics.get("status_code"), "店铺同步状态异常")
+    elif rule in _FRESHNESS_DATASETS:
+        label = _FRESHNESS_DATASETS[rule] + _FRESHNESS_TITLES.get(
+            metrics.get("freshness_status"), "源数据待核实",
+        )
+    elif rule == "orders_decrease" and metrics.get("attribution_complete_report_date"):
+        label = "广告归因订单下降"
+    else:
+        label = _RULE_NAMES.get(rule, "监控提醒")
+    if state == "异常恢复":
+        return f"{label} · 已恢复"
+    if state == "异常升级":
+        label += " · 已升级"
+    level = {"P0": "紧急", "P1": "重要", "P2": "关注", "P3": "提示"}.get(severity, "关注")
+    return f"{label} · {level}"
+
+
 def anomaly_card(*, state, severity, store, campaign, product, rule, reason, metrics, currency=None):
     identity = [("店铺", store)]
     if campaign:
         identity.append(("广告活动", campaign))
     if product:
         identity.append(("商品", product))
-    identity.append(("异常类型", _RULE_NAMES.get(rule, "数据异常")))
+    recovered = state == "异常恢复"
     values = []
     for key, value in metrics.items():
         if key not in _METRIC_NAMES:
@@ -144,8 +177,9 @@ def anomaly_card(*, state, severity, store, campaign, product, rule, reason, met
             value = {"orders": "订单", "sales": "销售额", "units": "销量", "spend": "花费"}.get(value, "指标")
         values.append((_METRIC_NAMES[key], value))
     return card(
-        f"{state} · { {'P0': '紧急', 'P1': '重要', 'P2': '关注', 'P3': '提示'}.get(severity, '关注')}", subtitle=reason,
+        anomaly_title(rule, metrics, state, severity),
+        subtitle="监控已恢复，表中为恢复前的观测数据。" if recovered else reason,
         sections=[("定位", ["对象", "内容"], identity),
-                  ("关键指标", ["指标", "值"], values[:20])],
-        color="green" if state == "异常恢复" else "red" if severity in {"P0", "P1"} else "orange",
+                  ("恢复前指标" if recovered else "关键指标", ["指标", "值"], values[:20])],
+        color="green" if recovered else "red" if severity in {"P0", "P1"} else "orange",
     )
