@@ -199,13 +199,14 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
             "ESCALATED": "异常升级",
             "RECOVERED": "异常恢复",
         }[anomaly.status]
-        from jx_alert.notifications.cards import _METRIC_NAMES, _RULE_NAMES, status_label
+        from jx_alert.notifications.cards import _METRIC_NAMES, anomaly_title, status_label
+        observed = anomaly.metrics or {}
         metrics = "；".join(f"{_METRIC_NAMES[key]}：{status_label(value) if key == 'freshness_status' else value}"
-                          for key, value in (anomaly.metrics or {}).items()
+                          for key, value in observed.items()
                           if key in _METRIC_NAMES and not isinstance(value, (dict, list)))
         store_label, campaign_label, product_label = _notification_labels(db, anomaly)
         lines = [
-            f"{state_label} · { {'P0': '紧急', 'P1': '重要', 'P2': '关注', 'P3': '提示'}.get(anomaly.severity, '关注')}",
+            anomaly_title(anomaly.rule, observed, state_label, anomaly.severity),
             f"店铺：{store_label}",
         ]
         if campaign_label:
@@ -214,11 +215,11 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
             lines.append(f"商品：{product_label}")
         elif not campaign_label and anomaly.entity_id and not anomaly.rule.endswith("_freshness"):
             lines.append(f"监控对象：{anomaly.entity_id}")
-        lines.extend([
-            f"异常类型：{_RULE_NAMES.get(anomaly.rule, '数据异常')}",
-            f"说明：{anomaly.reason}",
-            f"指标：{metrics}",
-        ])
+        if anomaly.status != "RECOVERED":
+            lines.append(f"说明：{anomaly.reason}")
+        if metrics:
+            label = "恢复前指标" if anomaly.status == "RECOVERED" else "指标"
+            lines.append(f"{label}：{metrics}")
         message = "\n".join(lines)
         first_seen = anomaly.first_seen.isoformat() if anomaly.first_seen else "unknown"
         event_key = (
@@ -234,8 +235,8 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
                 card=anomaly_card(state=state_label, severity=anomaly.severity,
                                   store=store_label, campaign=campaign_label,
                                   product=product_label, rule=anomaly.rule,
-                                  reason=anomaly.reason, metrics=anomaly.metrics or {},
-                                  currency=(anomaly.metrics or {}).get("currency_code")
+                                  reason=anomaly.reason, metrics=observed,
+                                  currency=observed.get("currency_code")
                                   or (store.currency_code if store and ":sales:" in (anomaly.evaluation_scope or "") else None)),
                 context={
                     "store_id": anomaly.store_id, "entity_id": anomaly.entity_id,

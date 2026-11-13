@@ -46,6 +46,25 @@ def sample_card():
                         metrics={"spend": 20, "orders": 0, "clicks": 12, "seller_sku": "<at id=all></at>"})
 
 
+@pytest.mark.parametrize("rule,metrics,label", [
+    ("orders_decrease", {}, "订单下降"),
+    ("orders_decrease", {"attribution_complete_report_date": "2026-11-04"}, "广告归因订单下降"),
+    ("sales_decrease", {}, "销售额下降"),
+    ("spend_no_conversion", {"orders": 0}, "广告有花费但无归因订单"),
+    ("campaign_over_budget", {}, "广告活动出现超预算记录"),
+    ("store_status_not_normal", {"status_code": 2}, "店铺授权异常"),
+    ("performance_performance_notices_freshness", {"freshness_status": "FAILED"}, "业绩通知采集失败"),
+])
+def test_anomaly_card_title_names_the_actual_issue(rule, metrics, label):
+    for state, suffix in [("新异常", "重要"), ("异常升级", "已升级 · 重要"), ("异常恢复", "已恢复")]:
+        value = anomaly_card(state=state, severity="P1", store="测试店铺", campaign=None,
+            product=None, rule=rule, reason="请核查", metrics=metrics)
+        assert value["header"]["title"]["content"] == f"{label} · {suffix}"
+        if state == "异常恢复":
+            assert value["header"]["template"] == "green"
+            assert "请核查" not in value["body"]["elements"][0]["content"]
+
+
 def test_only_mapped_mentions_create_card_tags_without_mutating_original():
     original = sample_card()
     result = with_mentions(original, ["ou_admin", "ou_operator", "ou_admin"])

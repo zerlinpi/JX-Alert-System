@@ -105,6 +105,8 @@ curl -fsS https://jxmcp.pacefitday.com/.well-known/oauth-authorization-server
 
 提交 `findings` 每项包含四个字段：`topic`（订单异常／销量异常／销售额异常／花费异常／转化异常）、`summary`（中文结论≤160字）、`action`（中文建议≤100字）、`evidence_ids`（2至24条同对象跨日证据）。快照两小时内有效；源事实或覆盖变化时需重新读取。
 
+按实际指标提交。订单、销量和销售额下降各用对应主题；广告有花费但无归因订单、单均花费上升使用转化或花费主题。群卡片根据证据显示具体标题，任务摘要可使用返回的 `notification_titles`。
+
 同店铺、同对象、同日期、同类问题只生成一次异常通知，不因下一小时改写措辞而重发。不同日期独立留档。完整审核和投递分别保存在既有 `sync_jobs`、`notification_outbox` 与 `notification_logs`，没有改业务数据库结构。
 
 ## 5. 仍需人工或外部确认
