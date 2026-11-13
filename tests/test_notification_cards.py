@@ -35,9 +35,9 @@ def test_card_preserves_explicit_zero_missing_and_incomplete_comparison():
         assert table["rows"][1]["c1"] == "未知（无记录）"
         assert table["rows"][3]["c1"] == "未知（无记录）"
         assert table["rows"][3]["c3"] == "待完整采集"
-        assert "America/Los_Angeles" in json.dumps(result, ensure_ascii=False)
+        assert "美国太平洋时间" in json.dumps(result, ensure_ascii=False)
         tables = [e for e in result["body"]["elements"] if e["tag"] == "table"]
-        assert tables[2]["rows"][0] == {"c0": "AHR评分", "c1": "248", "c2": "源时区待确认"}
+        assert tables[2]["rows"][0] == {"c0": "健康评分", "c1": "248", "c2": "源时区待确认"}
 
 
 def sample_card():
@@ -121,5 +121,5 @@ def test_comparison_zero_denominator_and_nonfinite_data_are_explicit():
     assert change(0, 0, complete=True) == "持平"
     assert change(None, 1, complete=True) == "未知（缺少对比）"
     assert change(float('nan'), 1, complete=True) == "未知（无效值）"
-    assert number(0, money=True, currency="USD") == "USD 0.00"
+    assert number(0, money=True, currency="USD") == "美元 0.00"
     assert number(float('inf')) == "未知（无效值）"

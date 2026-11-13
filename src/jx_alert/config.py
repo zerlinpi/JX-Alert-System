@@ -14,7 +14,9 @@ class Settings(BaseSettings):
     app_dry_run: bool = True
     app_timezone: str = "Asia/Shanghai"
     scheduler_enabled: bool = False
-    daily_sync_cron: str = "0 8 * * *"
+    daily_sync_cron: str = "0 7 * * *"
+    feishu_daily_report_cron: str = "0 8 * * *"
+    feishu_daily_report_start_date: str = ""
     # Refresh enough marketplace-local dates for the 14-day attribution window plus its 7-day baseline.
     ad_attribution_refresh_days: int = Field(default=22, ge=1, le=31)
     store_timezones_file: str = "/app/data/store-timezones.json"
@@ -24,6 +26,8 @@ class Settings(BaseSettings):
     sp_validation_targets_file: str = "/app/data/sp-validation-targets.json"
     sp_refresh_days: int = Field(default=7, ge=1, le=30)
     mcp_operations_enabled: bool = False
+    mcp_notifications_enabled: bool = False
+    business_alert_delivery_mode: Literal["rules", "chat"] = "rules"
     mcp_auth_file: str = "/app/data/secrets/mcp-auth.json"
     mcp_auth_mode: Literal["bearer", "oauth"] = "bearer"
     mcp_public_url: str = ""
@@ -143,9 +147,11 @@ def get_settings() -> Settings:
         runtime = json.loads(path.read_text(encoding="utf-8"))
         allowed = {
             "app_dry_run", "scheduler_enabled", "daily_sync_cron",
+            "feishu_daily_report_cron", "feishu_daily_report_start_date",
+            "business_alert_delivery_mode",
             "collection_scope_file", "sp_collection_enabled", "sp_validation_targets_file",
             "store_timezones_file", "feishu_routing_file",
-            "sp_refresh_days", "mcp_operations_enabled", "feishu_enabled", "feishu_transport",
+            "sp_refresh_days", "mcp_operations_enabled", "mcp_notifications_enabled", "feishu_enabled", "feishu_transport",
             "feishu_manager_open_ids", "feishu_daily_report_enabled", "feishu_daily_report_chat_id",
             "lingxing_performance_enabled", "lingxing_performance_source_timezone",
             "lingxing_performance_observation_only",

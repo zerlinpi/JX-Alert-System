@@ -38,7 +38,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
-SCOPES = ("jx:read", "jx:collect")
+SCOPES = ("jx:read", "jx:collect", "jx:notify")
 COOKIE = "__Host-jx-oauth-owner"
 _SECURE_HEADERS = {
     "Cache-Control": "no-store", "Pragma": "no-cache", "X-Frame-Options": "DENY",
@@ -464,7 +464,8 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             return html.escape(str(value), quote=True)
         fields = f'<input type="hidden" name="request" value="{esc(pending_id)}"><input type="hidden" name="csrf" value="{esc(csrf)}">'
         if authenticated:
-            scopes = "、".join({"jx:read": "读取已采集的数据", "jx:collect": "请求采集与分析任务"}[s] for s in data["scopes"])
+            scopes = "、".join({"jx:read": "读取已采集的数据", "jx:collect": "请求采集与分析任务",
+                               "jx:notify": "将有数据证据的中文异常分析发送至已配置飞书群"}[s] for s in data["scopes"])
             content = f'<p>客户端：{esc(data["client_id"])}</p><p>回调：{esc(data["redirect_uri"])}</p><p>权限：{esc(scopes)}</p><button name="action" value="approve">同意</button><button name="action" value="deny">拒绝</button>'
         else:
             content = '<label>所有者口令 <input type="password" name="password" autocomplete="current-password" required maxlength="1024"></label><button name="action" value="login">登录</button>'

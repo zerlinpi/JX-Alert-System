@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select, update
 
@@ -132,18 +133,100 @@ def run_collection(*, report_date=None, backfill_days=1):
             analysis = evaluate_daily_anomalies(db, latest)
             reports = [str(path) for sid, day in latest.items()
                        for path in export_daily_reports(db, day, settings.report_dir, store_id=sid)]
-            from jx_alert.notifications.daily_report import enqueue_daily_snapshots
-            notifications = enqueue_daily_snapshots(db, settings,
-                                                     report_date=min(latest.values()),
-                                                     store_dates=latest)
-            db.commit()
             archive = archive_raw_snapshots(db, settings.raw_dir)
             return {"status": "PARTIAL" if sp["status"] == "PARTIAL" or
                     collected["status"] not in {"SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"} else
                     "COMPLETE_WITH_WARNINGS" if collected["status"] == "SUCCEEDED_WITH_WARNINGS" else "COMPLETE",
                     "report_dates": latest, "collection": collected, "sp": sp,
                     "analysis": analysis, "reports": reports,
-                    "daily_notifications": notifications, "raw_archive": archive}
+                    "daily_notifications": {"queued": 0, "skipped": True,
+                                            "reason": "scheduled_report"},
+                    "raw_archive": archive}
+
+
+def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
+    """Queue the 08:00 Beijing report from stored facts, independently of collection.
+
+    Explicit store scope and confirmed marketplace timezones are prerequisites.
+    No provider calls, collector lock, migrations or historical refresh are used.
+    Missing/stale store mappings produce temporary unknown-data report records;
+    they never create or update business Store rows.
+    """
+    from jx_alert.config import get_settings
+    from jx_alert.storage.db import SessionLocal
+    from jx_alert.storage.models import Store
+    from jx_alert.storage.store_config import load_store_config
+    from jx_alert.notifications.daily_report import enqueue_daily_snapshots
+    from apscheduler.triggers.cron import CronTrigger
+
+    settings = get_settings()
+    if not settings.feishu_daily_report_enabled or not settings.feishu_enabled:
+        return {"status": "DISABLED", "queued": 0, "outbox_ids": []}
+    if settings.app_dry_run:
+        return {"status": "DRY_RUN", "queued": 0, "outbox_ids": []}
+    observed = now if now is not None else datetime.now(timezone.utc)
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        raise ValueError("Scheduled reports require a timezone-aware current time")
+    delivery_now = observed.astimezone(ZoneInfo("Asia/Shanghai"))
+    scheduled_day = delivery_now.date()
+    start_date = getattr(settings, "feishu_daily_report_start_date", "")
+    if start_date:
+        start = date.fromisoformat(_report_date(start_date))
+        scheduled_day = max(scheduled_day, start)
+    trigger = CronTrigger.from_crontab(
+        settings.feishu_daily_report_cron, timezone="Asia/Shanghai",
+    )
+    deadline = trigger.get_next_fire_time(None, datetime.combine(
+        scheduled_day, datetime.min.time(), ZoneInfo("Asia/Shanghai"),
+    ))
+    if deadline is None or deadline.date() != scheduled_day:
+        raise ValueError("Daily report cron has no delivery window on this date")
+    if delivery_now < deadline:
+        return {"status": "WAITING", "queued": 0, "outbox_ids": [],
+                "delivery_date": scheduled_day.isoformat(),
+                "not_before": deadline.isoformat()}
+
+    scope_path = Path(settings.collection_scope_file)
+    if not scope_path.is_file():
+        raise ValueError("Scheduled daily reports require an explicit store scope file")
+    timezones = load_store_config(settings.store_timezones_file)
+    selected = scoped_stores({"data": [{"sid": sid} for sid in timezones]}, scope_path)["data"]
+    selected_ids = sorted({str(row["sid"]) for row in selected})
+    with SessionLocal() as db:
+        stores = {store.sid: store for store in db.scalars(
+            select(Store).where(Store.sid.in_(selected_ids)),
+        ).all()}
+        report_dates, store_records, warnings = {}, [], {}
+        for sid in selected_ids:
+            confirmed = timezones[sid]
+            existing = stores.get(sid)
+            if existing is None:
+                store = Store(sid=sid, name="店铺" + sid, timezone=confirmed["timezone"],
+                              currency_code=confirmed["currency_code"] or None)
+                warnings[sid] = "尚未完成店铺数据同步"
+            elif existing.timezone != confirmed["timezone"]:
+                store = Store(**{column.name: getattr(existing, column.name)
+                                 for column in Store.__table__.columns})
+                store.timezone = confirmed["timezone"]
+                warnings[sid] = "时区配置已更新，等待重新采集校验"
+            else:
+                store = existing
+            if existing is not None and existing.status != 1:
+                note = "店铺当前非正常同步状态，数据待核实"
+                warnings[sid] = warnings.get(sid, "") + ("；" if sid in warnings else "") + note
+            local_date = delivery_now.astimezone(ZoneInfo(confirmed["timezone"])).date()
+            report_dates[sid] = (local_date - timedelta(days=1)).isoformat()
+            store_records.append(store)
+        if not report_dates:
+            raise ValueError("No scoped database stores are available for scheduled reports")
+        notifications = enqueue_daily_snapshots(
+            db, settings, store_dates=report_dates, delivery_date=delivery_now.date(),
+            store_records=store_records, store_warnings=warnings, now=delivery_now,
+        )
+        db.commit()
+    return {"status": "SKIPPED" if notifications.get("skipped") else "QUEUED",
+            "delivery_date": delivery_now.date().isoformat(),
+            "report_dates": report_dates, **notifications}
 
 
 def enqueue_collection(db, *, report_date=None, backfill_days=1, idempotency_key=None):

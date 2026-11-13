@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select
@@ -143,10 +142,10 @@ def _notification_labels(db, anomaly: AnomalyEvent) -> tuple[str, str | None, st
         if campaign:
             campaign_label = (
                 f"{campaign.name or campaign.campaign_id} "
-                f"（{campaign.campaign_type.upper()} / ID {campaign.campaign_id}）"
+                f"（活动编号 {campaign.campaign_id}）"
             )
         else:
-            campaign_label = f"活动 ID {campaign_id}"
+            campaign_label = f"活动编号 {campaign_id}"
 
     product_label = None
     product_key = (
@@ -182,6 +181,11 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
     """Queue first-seen, escalated and recovered events; ongoing events stay quiet."""
     queued = 0
     for anomaly in anomalies:
+        settings = get_settings()
+        if getattr(settings, "business_alert_delivery_mode", "rules") == "chat" and not (
+            anomaly.rule == "store_status_not_normal" or anomaly.rule.endswith("_freshness")
+        ):
+            continue
         if anomaly.status not in {"NEW", "ESCALATED", "RECOVERED"}:
             continue
         state_label = {
@@ -189,10 +193,13 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
             "ESCALATED": "异常升级",
             "RECOVERED": "异常恢复",
         }[anomaly.status]
-        metrics = json.dumps(anomaly.metrics or {}, ensure_ascii=False, default=str)
+        from jx_alert.notifications.cards import _METRIC_NAMES, _RULE_NAMES, status_label
+        metrics = "；".join(f"{_METRIC_NAMES[key]}：{status_label(value) if key == 'freshness_status' else value}"
+                          for key, value in (anomaly.metrics or {}).items()
+                          if key in _METRIC_NAMES and not isinstance(value, (dict, list)))
         store_label, campaign_label, product_label = _notification_labels(db, anomaly)
         lines = [
-            f"【JX Alert】{state_label} · {anomaly.severity}",
+            f"{state_label} · { {'P0': '紧急', 'P1': '重要', 'P2': '关注', 'P3': '提示'}.get(anomaly.severity, '关注')}",
             f"店铺：{store_label}",
         ]
         if campaign_label:
@@ -202,7 +209,7 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         elif not campaign_label and anomaly.entity_id:
             lines.append(f"监控对象：{anomaly.entity_id}")
         lines.extend([
-            f"规则：{anomaly.rule}",
+            f"异常类型：{_RULE_NAMES.get(anomaly.rule, '数据异常')}",
             f"说明：{anomaly.reason}",
             f"指标：{metrics}",
         ])
@@ -212,7 +219,6 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
             f"anomaly:{anomaly.dedupe_key}:{anomaly.status}:"
             f"{anomaly.severity}:{first_seen}"
         )
-        settings = get_settings()
         if getattr(settings, "feishu_transport", "webhook") == "app":
             from jx_alert.notifications.routing import enqueue_application_deliveries
             from jx_alert.notifications.cards import anomaly_card

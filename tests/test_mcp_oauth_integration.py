@@ -167,7 +167,7 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
         metadata = client.get("/.well-known/oauth-authorization-server")
         assert metadata.status_code == 200
         assert metadata.json()["code_challenge_methods_supported"] == ["S256"]
-        assert metadata.json()["scopes_supported"] == ["jx:read", "jx:collect"]
+        assert metadata.json()["scopes_supported"] == ["jx:read", "jx:collect", "jx:notify"]
         protected = client.get("/.well-known/oauth-protected-resource/mcp")
         assert protected.status_code == 200, protected.text
         assert protected.json()["resource"] == resource
@@ -188,6 +188,8 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
             "backfill_days": 1, "idempotency_key": "must-not-enqueue",
         })
         assert denied.get("isError") is True and "jx:collect" in json.dumps(denied)
+        denied_notification = call(client, read_headers, "submit_chat_analysis", {"review_id": 1, "findings": []})
+        assert denied_notification.get("isError") is True and "jx:notify" in json.dumps(denied_notification)
         assert job_count() == 0, "Read-only scope must never enqueue a job"
 
         collect_token = owner_token(client, ["jx:read", "jx:collect"])

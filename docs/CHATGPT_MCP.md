@@ -9,7 +9,7 @@
 
 ## 服务器准备
 
-1. 用户提供专用域名，将 DNS A 记录指向 `43.153.88.94`，确认公网有效 TLS 证书。域名尚未提供，因此当前没有修改既有网站或开放公网入口。
+1. 用户已指定专用域名 `jxmcp.pacefitday.com` 并解析到 `43.153.88.94`。本次增加专用虚拟主机；HTTPS、实际服务器版本及 ChatGPT 接入分别验收，详见 [小时分析设置](CHAT_ANALYSIS_SETUP.md)。
 2. 使用仓库 `deploy/nginx-mcp.conf.example` 新建独立虚拟主机，替换域名和已有证书路径。不要覆盖现有站点。MCP 端口仍绑定 `127.0.0.1:8001`。
 3. 在服务器交互初始化资源所有者口令。口令至少16字符，输入不会回显，只保存PBKDF2哈希；不修改 `.env`，不写Git，不在聊天中发送口令。
 
@@ -23,9 +23,9 @@ sudo docker exec -it jx-alert-app-1 python /app/scripts/setup_mcp_owner.py
 ```json
 {
   "mcp_auth_mode": "oauth",
-  "mcp_public_url": "https://mcp.example.com",
-  "mcp_allowed_hosts": "mcp.example.com,mcp.example.com:443,127.0.0.1:*,localhost:*",
-  "mcp_allowed_origins": "https://chatgpt.com,https://mcp.example.com",
+  "mcp_public_url": "https://jxmcp.pacefitday.com",
+  "mcp_allowed_hosts": "jxmcp.pacefitday.com,jxmcp.pacefitday.com:443,127.0.0.1:*,localhost:*",
+  "mcp_allowed_origins": "https://chatgpt.com,https://jxmcp.pacefitday.com",
   "mcp_forwarded_allow_ips": "127.0.0.1,REPLACE_WITH_VERIFIED_DOCKER_GATEWAY"
 }
 ```
