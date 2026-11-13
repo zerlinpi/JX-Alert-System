@@ -427,6 +427,7 @@ def _notice_last_update(response):
 
 def _store_performance_for_sid(client, db, sid, store_name, settings):
     store_id = str(sid)
+    observation_only = getattr(settings, "lingxing_performance_observation_only", True)
     page_size = int(settings.lingxing_performance_page_size)
     max_pages = int(settings.lingxing_performance_max_pages)
 
@@ -485,7 +486,7 @@ def _store_performance_for_sid(client, db, sid, store_name, settings):
             field: list_row.get(field) for field in INDICATOR_DIRECTIONS
             if field in list_row
         }
-        events, breaches = _build_performance_events(
+        events, breaches = ([], []) if observation_only else _build_performance_events(
             store_id, store_name, list_row, standards, freshness
         )
 
@@ -516,12 +517,13 @@ def _store_performance_for_sid(client, db, sid, store_name, settings):
         status_text = _normalize_key(list_row.get("ahr_status") or "")
         status_known = status_text in _NORMAL_STATUSES or status_text in _RISK_STATUSES
         scope_complete = freshness == "FRESH" and standards_complete and status_known
-        anomalies = upsert_anomalies(
-            db, store_id, events,
-            evaluation_scope=f"{store_id}:store_performance",
-            scope_complete=scope_complete,
-        )
-        enqueue_anomaly_notifications(db, anomalies)
+        if not observation_only:
+            anomalies = upsert_anomalies(
+                db, store_id, events,
+                evaluation_scope=f"{store_id}:store_performance",
+                scope_complete=scope_complete,
+            )
+            enqueue_anomaly_notifications(db, anomalies)
         _upsert_sync_state(
             db, store_id=store_id, dataset="store_performance",
             status=freshness, source_updated_at=list_row.get("update_date"),
@@ -561,7 +563,7 @@ def _store_performance_for_sid(client, db, sid, store_name, settings):
         if not isinstance(row, dict):
             raise RuntimeError("Performance notice list contains a non-object row")
         _save_notice(db, store_id, row, source_updated_at,
-                     evaluate=notice_freshness == "FRESH")
+                     evaluate=not observation_only and notice_freshness == "FRESH")
     _upsert_sync_state(
         db, store_id=store_id, dataset="performance_notices",
         status=notice_freshness, source_updated_at=source_updated_at,
@@ -598,6 +600,7 @@ def collect_store_performance(client, db, *, stores_response, settings):
         "notice_rows": 0,
         "freshness": [],
         "errors": [],
+        "observation_only": getattr(settings, "lingxing_performance_observation_only", True),
     }
     for store in store_rows:
         sid = store.get("sid") if isinstance(store, dict) else None

@@ -48,6 +48,7 @@ class FakePerformanceClient:
 def _settings(timezone_name="UTC"):
     return SimpleNamespace(
         lingxing_performance_page_size=200,
+        lingxing_performance_observation_only=False,
         lingxing_performance_max_pages=10,
         lingxing_performance_source_timezone=timezone_name,
         lingxing_performance_max_age_hours=8,
@@ -241,6 +242,57 @@ def _collect_source(db, client, settings=None):
 
 def _business_events(db):
     return db.scalars(select(AnomalyEvent).where(AnomalyEvent.rule.in_(_BUSINESS_RULES))).all()
+
+
+@pytest.mark.parametrize("explicit_setting", [True, False])
+def test_observation_only_persists_fresh_risk_without_business_events(freshness_db, explicit_setting):
+    settings = _settings()
+    if explicit_setting:
+        settings.lingxing_performance_observation_only = True
+    else:
+        del settings.lingxing_performance_observation_only  # absent setting fails closed
+    db = freshness_db
+    result = _collect_source(db, SourceTimeClient(_NOW.isoformat()), settings)
+    assert result["status"] == "SUCCEEDED"
+    assert result["observation_only"] is True
+    assert _business_events(db) == []
+    assert db.scalars(select(NotificationOutbox)).all() == []
+    assert db.scalar(select(StorePerformance)).ahr_status == "AtRisk"
+    assert db.scalar(select(PerformanceNotice)).status_label == "PENDING"
+    assert len(db.scalars(select(RawSnapshot)).all()) == 3
+
+
+@pytest.mark.parametrize("risk,notice_status", [(True, 1), (False, 2), (False, 3)])
+def test_observation_only_does_not_recover_or_update_existing_business_risks(freshness_db, risk, notice_status):
+    db = freshness_db
+    _collect_source(db, SourceTimeClient(_NOW.isoformat()))
+    def state():
+        return {e.id: (e.status, e.severity, e.last_seen, dict(e.metrics), e.reason, e.recovered_at, e.escalated_at)
+                for e in _business_events(db)}
+    before = state()
+    count = len(db.scalars(select(NotificationOutbox)).all())
+    settings = _settings()
+    settings.lingxing_performance_observation_only = True
+    _collect_source(db, SourceTimeClient(_NOW.isoformat(), risk=risk, notice_status=notice_status), settings)
+    assert state() == before
+    assert len(db.scalars(select(NotificationOutbox)).all()) == count
+    assert db.scalar(select(StorePerformance)).ahr_status == ("AtRisk" if risk else "Healthy")
+    assert db.scalar(select(PerformanceNotice)).status_label == {1: "PENDING", 2: "PROCESSED", 3: "NO_ACTION"}[notice_status]
+
+
+def test_confirmed_source_timezone_does_not_exit_observation_only(freshness_db):
+    db = freshness_db
+    settings = _settings("")
+    settings.lingxing_performance_observation_only = True
+    first = _collect_source(db, SourceTimeClient(_NOW.isoformat()), settings)
+    assert first["status"] == "SUCCEEDED_WITH_WARNINGS"
+    settings.lingxing_performance_source_timezone = "UTC"
+    second = _collect_source(db, SourceTimeClient(_NOW.isoformat()), settings)
+    assert second["freshness"][0]["performance_freshness"] == "FRESH"
+    assert second["observation_only"] is True
+    assert _business_events(db) == []
+    quality = db.scalars(select(AnomalyEvent)).all()
+    assert len(quality) == 2 and all(e.status == "RECOVERED" for e in quality)
 
 
 @pytest.mark.parametrize("state", _NON_FRESH)
