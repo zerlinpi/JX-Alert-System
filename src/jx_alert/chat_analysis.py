@@ -14,7 +14,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from jx_alert.analysis.comparison import metric_comparison
-from jx_alert.notifications.cards import card, number
+from jx_alert.analysis.ad_kpis import advertising_kpis
+from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card, number
 from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.notifications.routing import _load_routing, _routed_open_ids, report_group_delivery
 from jx_alert.storage.models import Campaign, DailyMetric, DataCoverage, Store, SyncJob
@@ -184,6 +185,7 @@ def prepare_review(db, settings, store_id, *, dimension="store", entity_id=None,
     context = {"store_id": store.sid, "store_name": store.name, "timezone": store.timezone,
                "currency": None if dimension.startswith(_AD_PREFIXES) else store.currency_code,
                "dimension": dimension, "last_complete_date": last.isoformat(),
+               "kpi_analysis_tool": "prepare_advertising_kpi_analysis",
                "mature_ad_window": _mature_ad_dates(last, dimension) if dimension.startswith(_AD_PREFIXES) else [],
                "timezone_confirmed": zone["timezone_confirmed"], "date_basis": zone["date_basis"],
                "intraday_enabled": zone["intraday_enabled"], **comparison,
@@ -393,9 +395,13 @@ def submit_review(db, settings, review_id, findings, *, now=None):
                             number(prior_cost, money=True, currency=currency)))
         date_label = f"{selected_dates[-1]} 至 {selected_dates[0]}"
         title = comparison["alert_title"]
-        value = card(title, subtitle=subtitle,
-            sections=[("发现", ["结论", "建议", "比较"], [(summary, action, comparison["comparison_label"])]),
-                      (date_label, ["指标", "观测值", "参考值"], rows)])
+        sections = [("发现", ["结论", "建议", "比较"], [(summary, action, comparison["comparison_label"])])]
+        if context["dimension"] == "store" or context["dimension"].startswith(_AD_PREFIXES):
+            kpis = advertising_kpis(db, settings, context["store_id"], context["last_complete_date"],
+                dimension=context["dimension"], entity_id=entity_id)
+            sections.append(("广告指标", AD_KPI_HEADERS, ad_kpi_rows(kpis)))
+        sections.append((date_label, ["指标", "观测值", "参考值"], rows))
+        value = card(title, subtitle=subtitle, sections=sections)
         row = enqueue_notification(db, idempotency_key=key, text=title + "：" + summary + "；" + action,
             store_id=context["store_id"], entity_id=evidence[0]["entity_id"], chat_id=chat_id, card=value,
             fixed_route=True, delivery=delivery)

@@ -38,13 +38,16 @@ def enqueue(db, settings, **kwargs):
 def test_group_pages_bound_size_freeze_scope_and_do_not_rearm(warehouse):
     db, settings = warehouse
     result = enqueue(db, settings)
-    assert result["queued"] == 7
+    assert result["queued"] == 13
     rows = db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)).all()
     assert len({sid for r in rows for sid in r.payload["store_ids"]}) == 64
     for row in rows:
         assert row.idempotency_key.startswith("scheduled-daily:")
         assert row.payload["scheduled_delivery_date"] == "2026-11-14"
-        assert len(json.dumps(row.payload["card"], ensure_ascii=False).encode()) < 24000
+        assert len(json.dumps(row.payload["card"], ensure_ascii=False).encode()) < 16000
+        tables = [e for e in row.payload["card"]["body"]["elements"] if e["tag"] == "table"]
+        assert len(tables[-1]["columns"]) == 10
+        assert "数据不足" in tables[-1]["rows"][0]["c9"]
         assert "未知（无记录）" in json.dumps(row.payload["card"], ensure_ascii=False)
         assert "时区待核实" in json.dumps(row.payload["card"], ensure_ascii=False)
         row.status = "DELIVERED"

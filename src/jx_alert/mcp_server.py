@@ -1147,6 +1147,47 @@ def submit_chat_analysis(review_id: int, findings: list[dict]) -> dict:
         return result
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
+          meta=_tool_security("jx:read"))
+def prepare_advertising_kpi_analysis(store_id: str, dimension: str = "store",
+                                     entity_id: str | None = None) -> dict:
+    """分析 CTR、CPC、CDR、CPS、ROAS、CPA、TCOAS，返回实际值、对比和样本判断。
+
+    dimension选store（全部广告汇总）、campaign_sp/sb/sd、product_ad_sp/sd。
+    活动或广告商品必须传一个entity_id。CDR=归因订单/点击，CPS=花费/归因销量，
+    TCOAS=全部广告花费/店铺总销售额，仅store适用。转化指标等待SP7日、SB/SD14日成熟。
+    当前默认恶化幅度15%，CTR至少1000曝光，其余广告指标至少10点击，TCOAS使用花费门槛。
+    七日分子分母各自汇总再相除；基线不足用前一日。逐店逐对象复核ADVERSE，
+    使用submit_advertising_kpi_analysis发送具体问题，其他状态保留记录。
+    """
+    from jx_alert.analysis.ad_kpi_review import prepare_kpi_review
+    with SessionLocal() as db:
+        result = prepare_kpi_review(db, get_settings(), store_id, dimension=dimension, entity_id=entity_id)
+        db.commit()
+        return result
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+          meta=_tool_security("jx:read", "jx:notify"))
+def submit_advertising_kpi_analysis(review_id: int, findings: list[dict]) -> dict:
+    """向已配置飞书群发送复核后的广告指标恶化通知，附七项指标表格。
+
+    findings各项仅含metric（CTR/CPC/CDR/CPS/ROAS/CPA/TCOAS）、summary（中文≤160字）、
+    action（中文≤100字）。仅可提交该快照ADVERSE的指标；无异常传[]保持群内静默。
+    优先选择最关键的问题，摘要只说明该问题。数据变化需重新取快照。
+    返回入队编号，送达使用get_notification_logs(outbox_id=编号)核实。
+    """
+    settings = get_settings()
+    denied = _notification_guard(settings)
+    if denied:
+        return denied
+    from jx_alert.analysis.ad_kpi_review import submit_kpi_review
+    with SessionLocal() as db:
+        result = submit_kpi_review(db, settings, review_id, findings)
+        db.commit()
+        return result
+
+
 def _notification_guard(settings):
     if getattr(settings, "mcp_auth_mode", "bearer") == "oauth":
         from mcp.server.auth.middleware.auth_context import get_access_token
@@ -1163,7 +1204,8 @@ def send_chat_report_to_feishu(title: str, markdown: str) -> dict:
     """仅当用户明确要求发送时，将其指定的中文 Chat 报告原文发送到已配置的飞书日报群。
 
     使用原文 Markdown 保留标题、列表、粗体、表格，不添加额外说明或提及群成员。
-    适用于经营日报或用户明确指定的报告。自动异常监控用 submit_chat_analysis，
+    广告报告先用prepare_advertising_kpi_analysis取得七项指标及口径，保留未知状态。
+    适用于经营日报或用户明确指定的报告。自动异常监控用submit_chat_analysis或submit_advertising_kpi_analysis，
     无异常时保持静默。发送前按用户指定范围检查内容，不把改善或持平列作异常。
     返回通知编号和入队状态，实际送达用 get_notification_logs 核实。
     """

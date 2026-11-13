@@ -41,6 +41,38 @@ def change(current, previous, *, complete):
     return f"{(a - b) / abs(b):+.1%}"
 
 
+AD_KPI_HEADERS = ["指标", "本期", "参考", "变化", "判断", "本期日期"]
+_KPI_STATUS = {
+    "ADVERSE": "恶化待复核", "NON_ADVERSE": "—", "INSUFFICIENT_DATA": "数据不足",
+    "CURRENCY_UNCONFIRMED": "币种待确认或不一致", "ZERO_DENOMINATOR": "分母为零",
+    "LOW_SAMPLE": "样本不足", "NO_BASELINE": "缺少可比基线",
+    "SCOPE_UNSUPPORTED": "仅店铺总览适用", "ATTRIBUTION_IMMATURE": "归因未成熟",
+}
+
+
+def ad_kpi_value(entry, key="current"):
+    value = entry.get(key)
+    if value is None:
+        return "—"
+    if entry["format"] == "percent":
+        return f"{value:.2%}"
+    if entry["format"] == "money":
+        return number(value, money=True, currency=entry.get("currency") or "币种待确认")
+    return f"{value:.2f} 倍"
+
+
+def ad_kpi_rows(comparisons):
+    rows = []
+    for entry in comparisons.values():
+        ratio = entry.get("change_ratio")
+        basis = {"SEVEN_DAY": "七日", "PREVIOUS_DAY": "前一日"}.get(entry["comparison_basis"], "")
+        rows.append((entry["label"], ad_kpi_value(entry),
+            (basis + " " + ad_kpi_value(entry, "baseline")).strip(),
+            f"{ratio:+.1%}" if ratio is not None else "—",
+            _KPI_STATUS.get(entry["status"], "待核实"), entry["current_date"]))
+    return rows
+
+
 def table(headers, rows):
     return {
         "tag": "table", "page_size": min(10, max(1, len(rows))),

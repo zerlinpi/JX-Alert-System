@@ -1,5 +1,37 @@
 # 中文日报与 ChatGPT 小时分析设置
 
+## 广告七项指标与定向通知
+
+用户已确认以下计算口径；`CDR` 在领星对应 `CVR`，`TCOAS` 对应 `TACOS`，`CPS` 使用归因销量而不是订单数。
+
+| 指标 | 计算口径 | 待复核方向 |
+| --- | --- | --- |
+| CTR | 广告点击 ÷ 广告曝光 | 下降 |
+| CPC | 广告花费 ÷ 广告点击 | 上升 |
+| CDR | 广告归因订单 ÷ 广告点击 | 下降 |
+| CPS | 广告花费 ÷ 广告归因销量 | 上升 |
+| ROAS | 广告归因销售额 ÷ 广告花费 | 下降 |
+| CPA | 广告花费 ÷ 广告归因订单 | 上升 |
+| TCOAS | 全部广告花费 ÷ 店铺总销售额 | 上升 |
+
+先调用 `prepare_advertising_kpi_analysis(store_id, dimension="store", entity_id=None)`。活动维度可用 `campaign_sp`、`campaign_sb`、`campaign_sd`，广告商品维度可用 `product_ad_sp`、`product_ad_sd`；两者必须指定实体编号。仅店铺全部广告汇总可计算 TCOAS，不把活动花费除以店铺销售额冒充活动 TCOAS。店铺汇总要求 SP、SB、SD 的覆盖均完整；币种不一致时不计算金额比率。
+
+CTR、CPC、TCOAS 使用已完成报表日；CDR、CPS、ROAS、CPA 使用 SP 至少七日、SB/SD 至少十四日的成熟归因日。包含全部类型的店铺汇总统一等待十四日。每项返回自己的 `current_date`，不得把两类日期的值说成同一天表现。
+
+参考值为同对象前七日分子之和除以分母之和，不能平均每日比率。七日不足时仅使用精确前一日，仍需完整、同币种数据。缺失、分母为零、币种未确认、无可比基线、样本不足均保留独立状态，不能说成广告正常。
+
+当前初筛配置为恶化幅度 **15%**：CTR 本期及参考日均曝光至少 **1000**；CPC/CDR/CPS/ROAS/CPA 本期及参考日均点击至少 **10**；TCOAS 本期及参考日均花费至少 **20 个原币单位**。这些是可配置的筛选门槛，不代表已完成人工误报率验收。`data/runtime-settings.json` 可设置 `alert_kpi_change_ratio`、`alert_kpi_min_impressions`，点击和花费门槛沿用 `alert_min_clicks`、`alert_min_spend`。保留文件其他字段，不操作 `.env`。
+
+Chat 结合样本、活动状态和经营背景复核后，用 `submit_advertising_kpi_analysis(review_id, findings)` 提交。每项只含 `metric`、中文 `summary`、中文 `action`，只能发送该冻结快照标为 `ADVERSE` 的指标；无可信异常提交 `[]`，群内静默。数值、覆盖、政策、对象名称或当前状态变化后需重新取快照。通知按具体问题命名，附七项指标表格；改善或持平不标为异常。表格中的“恶化待复核”是初筛结果，不能把未提交的其他指标说成已经确认的异常。
+
+示例提交：`[{"metric":"CPC","summary":"点击花费较七日参考上升，请复核流量成本","action":"检查搜索词、竞价与广告位"}]`。先核对实际返回数据再使用，不能照抄示例断言。
+
+小时任务需在已有订单、销量和零转化分析之外，对每个实际广告对象调用这两个新工具；优先提交最关键问题，避免同一现象按多个相关指标反复提醒。卡片标题和正文只说明具体恶化项，其余七项数值作为对照。`send_chat_report_to_feishu` 仍保留用户指定报告的原 Markdown 格式，不擅自改写正文；生成广告报告时先读取这些指标再写入报告。
+
+早间日报已加入七项指标、日期及判断。多店日报分每页五店发送，保持卡片容量和幂等；已经生成的当日日报不改写或重发。实际送达仍须用 `get_notification_logs(outbox_id=编号)` 确认 `DELIVERED`。
+
+口径参考：[领星广告指标说明](https://www.lingxing.com/help/article/Dashboard)、[领星商品表现及 TACOS](https://www.lingxing.com/help/article/productExpressionNew)。
+
 目标地址：`https://jxmcp.pacefitday.com/mcp`。域名已获用户授权并解析到 `43.153.88.94`。
 代码、Linux 测试、服务器版本和实际送达结果以本次部署回执为准；HTTPS 正常不等于 ChatGPT 已完成授权。
 
