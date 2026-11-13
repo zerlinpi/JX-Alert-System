@@ -1,19 +1,20 @@
 """Read-only daily Amazon ads collection using verified Lingxing report contracts."""
 from datetime import date
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
+from jx_alert.lingxing.ad_currency import advertising_currency, is_ad_money
 from jx_alert.lingxing.report_dates import normalize_store_report_dates
 from jx_alert.lingxing.report_metrics import AD_REPORT_METRICS
 from jx_alert.storage.coverage import mark_coverage
-from jx_alert.storage.models import DailyMetric, RawSnapshot
+from jx_alert.storage.models import Campaign, DailyMetric, RawSnapshot
 
 
 AD_METRICS = AD_REPORT_METRICS
 
 def collect_ads_for_day(client, db,
                         report_date: str | dict[str, str | list[str]], *,
-                        stores_response: dict | None = None) -> dict:
+                        stores_response: dict | None = None, ad_currencies: dict | None = None) -> dict:
     """Fetch SP/SB/SD campaign reports for one or more store-local dates.
 
     The date map may contain a single ISO date or an ordered list per sid. The
@@ -39,6 +40,9 @@ def collect_ads_for_day(client, db,
             raise RuntimeError("Active seller-list record is missing sid")
         store_id = str(sid)
         local_report_dates = normalize_store_report_dates(report_date, store_id)
+        profiles = {(row.campaign_type, row.campaign_id): row.profile_id for row in db.scalars(
+            select(Campaign).where(Campaign.store_id == store_id)
+        )} if ad_currencies else {}
 
         for local_report_date in local_report_dates:
             metric_date = date.fromisoformat(local_report_date)
@@ -81,7 +85,9 @@ def collect_ads_for_day(client, db,
                             raise RuntimeError(
                                 f"Invalid {source_field} value in {report_type.upper()} report"
                             ) from exc
-                    normalized.append((str(campaign_id), values))
+                    code = advertising_currency(ad_currencies or {}, store_id, row,
+                        campaign_profile=profiles.get((report_type, str(campaign_id))))
+                    normalized.append((str(campaign_id), values, code))
 
                 dimension = f"campaign_{report_type}"
                 db.execute(delete(DailyMetric).where(
@@ -99,7 +105,7 @@ def collect_ads_for_day(client, db,
                     },
                 ))
 
-                for campaign_id, values in normalized:
+                for campaign_id, values, code in normalized:
                     for metric_name, numeric_value in values.items():
                         db.add(DailyMetric(
                             store_id=store_id,
@@ -108,7 +114,7 @@ def collect_ads_for_day(client, db,
                             entity_id=campaign_id,
                             metric_name=metric_name,
                             value=numeric_value,
-                            currency=None,
+                            currency=code if is_ad_money(metric_name) else None,
                             source=f"lingxing_ads_{report_type}",
                         ))
                 mark_coverage(

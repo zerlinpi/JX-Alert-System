@@ -7,6 +7,8 @@ from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.storage.models import AnomalyEvent, Campaign, Product, Store
 
 
+_POSITIVE_RULES = frozenset({"orders_increase", "units_increase", "sales_increase"})
+NON_ALERT_RULES = _POSITIVE_RULES | {"high_ad_spend"}
 _SEVERITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 _ESCALATED_SEVERITY = {"P3": "P2", "P2": "P1", "P1": "P1", "P0": "P0"}
 
@@ -31,6 +33,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
         raise ValueError("evaluation_scope is required")
     if escalation_after_days < 1:
         raise ValueError("escalation_after_days must be at least 1")
+    events = [event for event in events if event["rule"] not in _POSITIVE_RULES]
     saved = []
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     active_keys = {
@@ -106,6 +109,7 @@ def upsert_anomalies(db, store_id: str, events: list[dict], *,
             AnomalyEvent.store_id == store_id,
             AnomalyEvent.evaluation_scope == evaluation_scope,
             AnomalyEvent.status.in_(["NEW", "ONGOING", "ESCALATED"]),
+            AnomalyEvent.rule.not_in(_POSITIVE_RULES),
         ]
         if recovery_entity_ids is not None:
             eligible_ids = {str(entity_id) for entity_id in recovery_entity_ids}
@@ -181,6 +185,8 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
     """Queue first-seen, escalated and recovered events; ongoing events stay quiet."""
     queued = 0
     for anomaly in anomalies:
+        if anomaly.rule in NON_ALERT_RULES:
+            continue
         settings = get_settings()
         if getattr(settings, "business_alert_delivery_mode", "rules") == "chat" and not (
             anomaly.rule == "store_status_not_normal" or anomaly.rule.endswith("_freshness")
@@ -229,7 +235,8 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
                                   store=store_label, campaign=campaign_label,
                                   product=product_label, rule=anomaly.rule,
                                   reason=anomaly.reason, metrics=anomaly.metrics or {},
-                                  currency=store.currency_code if store else None),
+                                  currency=(anomaly.metrics or {}).get("currency_code")
+                                  or (store.currency_code if store and ":sales:" in (anomaly.evaluation_scope or "") else None)),
                 context={
                     "store_id": anomaly.store_id, "entity_id": anomaly.entity_id,
                     "metrics": anomaly.metrics or {}, "scope": anomaly.evaluation_scope,

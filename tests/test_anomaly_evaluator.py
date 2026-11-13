@@ -138,7 +138,7 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
         assert result["skipped_incomplete_scopes"] == 3
         events = db.scalars(select(AnomalyEvent)).all()
         assert any(row.rule == "orders_decrease" and row.entity_id == "SKU-1" for row in events)
-        assert any(row.rule == "units_increase" and row.entity_id == "B000000001" for row in events)
+        assert not any(row.rule == "units_increase" for row in events)
         assert any(row.rule == "sales_decrease" and row.entity_id == "SKU-1" for row in events)
         assert any(row.rule == "high_ad_spend" and row.entity_id == "campaign-1" for row in events)
         assert any(row.rule == "campaign_over_budget" for row in events)
@@ -146,6 +146,7 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
         outbox_rows = db.scalars(select(NotificationOutbox)).all()
         assert outbox_rows
         notification_texts = [row.payload["text"] for row in outbox_rows]
+        assert not any("广告花费增长" in text or "销量增长" in text for text in notification_texts)
         assert any("Store A" in text and "SP Campaign" in text for text in notification_texts)
         assert any("SKU-1" in text and "B000000001" in text for text in notification_texts)
 

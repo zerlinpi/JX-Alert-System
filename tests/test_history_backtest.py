@@ -69,8 +69,8 @@ def test_same_sku_ads_keep_independent_candidate_labels_and_notification_keys(mo
             for offset in range(15):
                 day = target - timedelta(days=offset)
                 for metric_name, value in {
-                    "spend": spend if offset == 0 else 10,
-                    "orders": 2, "clicks": 10,
+                        "spend": spend if offset == 7 else 10,
+                        "orders": 0 if offset == 7 else 2, "clicks": 10,
                 }.items():
                     db.add(DailyMetric(store_id="1", metric_date=day,
                                        dimension="product_ad_sp", entity_id=ad_id,
@@ -81,11 +81,12 @@ def test_same_sku_ads_keep_independent_candidate_labels_and_notification_keys(mo
         db.commit()
 
         first = backtest_history(db, store_id="1", start_date=str(target), end_date=str(target))
-        assert first["candidate_count"] == 2
-        assert {row["entity_id"] for row in first["candidates"]} == {"SHARED-SKU"}
-        keys = {row["metrics"]["ad_id"]: row["key"] for row in first["candidates"]}
+        candidates = [row for row in first["candidates"] if row["rule"] == "spend_no_conversion"]
+        assert len(candidates) == 2
+        assert {row["entity_id"] for row in candidates} == {"SHARED-SKU"}
+        keys = {row["metrics"]["ad_id"]: row["key"] for row in candidates}
         assert len(set(keys.values())) == 2
-        assert len(set(notification_keys)) == 2
+        assert len({key for key in notification_keys if "spend_no_conversion" in key}) == 2
         assert all(any(f":{ad_id}:" in key for key in notification_keys)
                    for ad_id in ("1001", "1002"))
 
@@ -94,9 +95,9 @@ def test_same_sku_ads_keep_independent_candidate_labels_and_notification_keys(mo
             labels={keys["1001"]: "false_positive"},
         )
         labels = {row["metrics"]["ad_id"]: row["review_label"]
-                  for row in labeled["candidates"]}
+                  for row in labeled["candidates"] if row["rule"] == "spend_no_conversion"}
         assert labels == {"1001": "false_positive", "1002": None}
-        assert labeled["false_positive"] == 1 and labeled["unreviewed"] == 1
+        assert labeled["false_positive"] == 1
         assert db.scalar(select(func.count()).select_from(AnomalyEvent)) == 0
         assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
     engine.dispose()

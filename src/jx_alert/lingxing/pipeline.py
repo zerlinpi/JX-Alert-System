@@ -4,7 +4,9 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import func, select
 
 from jx_alert.analysis.evaluator import evaluate_store_status_events
+from jx_alert.lingxing.ad_currency import account_currencies
 from jx_alert.lingxing.campaign_collector import collect_campaigns
+from jx_alert.lingxing.client import LingxingError
 from jx_alert.lingxing.collector import collect_ads_for_day
 from jx_alert.lingxing.product_ads_collector import collect_product_ads_for_day
 from jx_alert.lingxing.performance_openapi import collect_store_performance
@@ -15,6 +17,18 @@ from jx_alert.storage.models import RawSnapshot, SyncJob
 from jx_alert.storage.raw_archive import archive_raw_snapshots
 
 
+def ad_account_inventory(client):
+    if not hasattr(client, "seller_ad_accounts"):
+        return None
+    try:
+        return client.seller_ad_accounts()
+    except LingxingError:
+        return None
+
+
+_LOAD_AD_ACCOUNTS = object()
+
+
 def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -22,7 +36,7 @@ def _utcnow():
 def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
                            stores_response: dict | None = None,
                            ad_attribution_refresh_days: int = 22,
-                           settings=None) -> dict:
+                           settings=None, ad_accounts=_LOAD_AD_ACCOUNTS) -> dict:
     """Collect sales, campaign masters, campaign ads and SP/SD product ads.
 
     Each collector is idempotent for its store/date grain. A failed later step
@@ -86,13 +100,22 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         completed_steps.append("campaigns")
 
         results["ad_report_dates"] = ad_report_dates
+        currencies = {}
+        if ad_report_dates:
+            accounts = ad_account_inventory(client) if ad_accounts is _LOAD_AD_ACCOUNTS else ad_accounts
+            if accounts is not None:
+                currencies = account_currencies(accounts)
+                if ad_accounts is _LOAD_AD_ACCOUNTS:
+                    db.add(RawSnapshot(source="lingxing_seller_ad_accounts", payload={"rows": accounts}))
+            results["ad_currency"] = {"status": "COMPLETE" if currencies else "LOOKUP_UNAVAILABLE",
+                                      "accounts_matched": len(currencies)}
         results["campaign_reports"] = collect_ads_for_day(
-            client, db, ad_report_dates, stores_response=stores_response
+            client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies,
         )
         completed_steps.append("campaign_reports")
 
         results["product_ad_reports"] = collect_product_ads_for_day(
-            client, db, ad_report_dates, stores_response=stores_response
+            client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies,
         )
         completed_steps.append("product_ad_reports")
 
@@ -115,7 +138,8 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         job = db.get(SyncJob, job_id)
         performance_status = results.get("performance", {}).get("status", "DISABLED")
         job.status = ("PARTIAL_FAILED" if performance_status == "PARTIAL_FAILED" else
-                      "SUCCEEDED_WITH_WARNINGS" if performance_status == "SUCCEEDED_WITH_WARNINGS" else "SUCCEEDED")
+                      "SUCCEEDED_WITH_WARNINGS" if performance_status == "SUCCEEDED_WITH_WARNINGS"
+                      or results.get("ad_currency", {}).get("status") == "LOOKUP_UNAVAILABLE" else "SUCCEEDED")
         job.finished_at = _utcnow()
         job.store_count = int(results["sales"].get("stores_seen", 0))
         job.record_count = record_count

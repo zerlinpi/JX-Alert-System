@@ -53,6 +53,37 @@ def test_no_anomaly_is_audited_without_any_notification(setup):
     assert db.get(SyncJob, review["review_id"]).status == "PARTIAL_REVIEW"
 
 
+@pytest.mark.parametrize("orders", [10, 15])
+def test_positive_or_unchanged_order_evidence_is_not_sent(setup, orders):
+    db, settings = setup
+    db.scalar(select(DailyMetric).where(DailyMetric.metric_date == date(2026, 11, 11))).value = orders
+    review = prepare_review(db, settings, "5174", now=CLOCK)
+    result = submit_review(db, settings, review["review_id"], finding(review), now=CLOCK)
+    assert result["skipped_nonnegative_findings"] == 1
+    assert result["outbox_ids"] == []
+
+
+@pytest.mark.parametrize("orders,expected", [(0, 1), (4, 0)])
+def test_mature_ad_spend_with_usd_is_independent_of_store_currency(setup, orders, expected):
+    db, settings = setup
+    db.get(Store, "5174").currency_code = "CAD"
+    for offset in range(7):
+        day = date(2026, 11, 4) - timedelta(days=offset)
+        db.add(DataCoverage(store_id="5174", dimension="campaign_sp", metric_date=day, status="COMPLETE"))
+        for metric, value in {"orders": orders, "spend": 30, "clicks": 20}.items():
+            db.add(DailyMetric(store_id="5174", dimension="campaign_sp", entity_id="campaign",
+                metric_date=day, metric_name=metric, value=value, currency="USD" if metric == "spend" else None))
+    db.flush()
+    review = prepare_review(db, settings, "5174", dimension="campaign_sp", now=CLOCK)
+    proposed = [{"topic": "转化异常", "summary": "成熟窗口点击后无订单", "action": "核查投放",
+                 "evidence_ids": [r["id"] for r in review["facts"]]}]
+    result = submit_review(db, settings, review["review_id"], proposed, now=CLOCK)
+    assert len(result["outbox_ids"]) == expected
+    if expected:
+        row = db.get(NotificationOutbox, result["outbox_ids"][0])
+        assert "美元" in json.dumps(row.payload, ensure_ascii=False)
+
+
 def test_previous_day_alert_uses_configured_group_when_roles_missing(setup):
     db, settings = setup
     settings.feishu_group_fallback_enabled = True

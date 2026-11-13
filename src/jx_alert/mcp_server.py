@@ -188,7 +188,7 @@ def _scope_challenge(required_scope, settings, *, current_scopes=()):
     missing = [scope for scope in requested if scope not in current_scopes]
     combined = " ".join(scope for scope in SCOPES if scope in {*current_scopes, *requested, "jx:read"})
     metadata = settings.mcp_public_url.rstrip("/") + "/.well-known/oauth-protected-resource" + settings.mcp_path
-    labels = {"jx:notify": "发送飞书异常通知", "jx:collect": "请求数据采集"}
+    labels = {"jx:notify": "发送飞书通知与报告", "jx:collect": "请求数据采集"}
     label = "、".join(labels[scope] for scope in missing)
     details = {"status": "AUTHORIZATION_REQUIRED", "required_scopes": missing}
     if len(missing) == 1:
@@ -853,8 +853,9 @@ def get_anomaly_history(store_id: str | None = None,
     if start and end and end < start:
         raise ValueError("end_date must not be earlier than start_date")
     init_db()
+    from jx_alert.analysis.service import NON_ALERT_RULES
     with SessionLocal() as db:
-        query = select(AnomalyEvent)
+        query = select(AnomalyEvent).where(AnomalyEvent.rule.not_in(NON_ALERT_RULES))
         if store_id:
             query = query.where(AnomalyEvent.store_id == str(store_id))
         if entity_id:
@@ -893,7 +894,7 @@ def get_notification_logs(store_id: str | None = None,
                           status: str | None = None,
                           start_date: str | None = None,
                           end_date: str | None = None,
-                          limit: int = 200) -> list[dict]:
+                          limit: int = 200, outbox_id: int | None = None) -> list[dict]:
     """Inspect Feishu delivery attempts and persistent outbox state."""
     start = date.fromisoformat(start_date) if start_date else None
     end = date.fromisoformat(end_date) if end_date else None
@@ -902,6 +903,11 @@ def get_notification_logs(store_id: str | None = None,
     init_db()
     with SessionLocal() as db:
         query = select(NotificationLog)
+        if outbox_id is not None:
+            outbox = db.get(NotificationOutbox, outbox_id)
+            if outbox is None:
+                return []
+            query = query.where(NotificationLog.dedupe_key == outbox.idempotency_key)
         if status:
             query = query.where(NotificationLog.status == status.upper())
         if start:
@@ -930,6 +936,7 @@ def get_notification_logs(store_id: str | None = None,
         )).all() if keys else []
         outbox_by_key = {row.idempotency_key: row for row in outbox_rows}
         return [{
+            "outbox_id": outbox_by_key[row.dedupe_key].id if row.dedupe_key in outbox_by_key else None,
             "dedupe_key": row.dedupe_key,
             "channel": row.channel,
             "attempt_status": row.status,
@@ -1121,11 +1128,24 @@ def submit_chat_analysis(review_id: int, findings: list[dict]) -> dict:
 
     每项仅含topic（订单异常/销量异常/销售额异常/花费异常/转化异常）、summary（中文≤160字）、
     action（中文建议≤100字）、evidence_ids（2至24条快照证据ID，跨日同对象）。
-    证据需覆盖同对象同指标的七日均值或前一日比较。权限可先用system_health核对。
+    仅提交负向异常，持平、改善、花费增加但转化效率未下降均不发送。
+    订单、销量和销售额下降需覆盖同对象七日或前一日比较。
+    广告异常引用同一成熟窗口的花费、点击和订单，零转化可用mature_ad_window内21条证据。
     需jx:notify授权和服务开关。人员未映射时按群兜底设置发已配置日报群。
     返回入队结果，实际送达由通知日志确认。不得虚构原因。
     """
     settings = get_settings()
+    denied = _notification_guard(settings)
+    if denied:
+        return denied
+    from jx_alert.chat_analysis import submit_review
+    with SessionLocal() as db:
+        result = submit_review(db, settings, review_id, findings)
+        db.commit()
+        return result
+
+
+def _notification_guard(settings):
     if getattr(settings, "mcp_auth_mode", "bearer") == "oauth":
         from mcp.server.auth.middleware.auth_context import get_access_token
         token = get_access_token()
@@ -1133,9 +1153,25 @@ def submit_chat_analysis(review_id: int, findings: list[dict]) -> dict:
             return _scope_challenge("jx:notify", settings, current_scopes=token.scopes if token else ())
     if not settings.mcp_notifications_enabled or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
-    from jx_alert.chat_analysis import submit_review
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+          meta=_tool_security("jx:read", "jx:notify"))
+def send_chat_report_to_feishu(title: str, markdown: str) -> dict:
+    """仅当用户明确要求发送时，将其指定的中文 Chat 报告原文发送到已配置的飞书日报群。
+
+    使用原文 Markdown 保留标题、列表、粗体、表格，不添加额外说明或提及群成员。
+    适用于经营日报或用户明确指定的报告。自动异常监控用 submit_chat_analysis，
+    无异常时保持静默。发送前按用户指定范围检查内容，不把改善或持平列作异常。
+    返回通知编号和入队状态，实际送达用 get_notification_logs 核实。
+    """
+    settings = get_settings()
+    denied = _notification_guard(settings)
+    if denied:
+        return denied
+    from jx_alert.notifications.chat_report import enqueue_chat_report
     with SessionLocal() as db:
-        result = submit_review(db, settings, review_id, findings)
+        result = enqueue_chat_report(db, settings, title=title, markdown=markdown)
         db.commit()
         return result
 

@@ -46,12 +46,24 @@ def feishu_channel_status(settings):
     else:
         transport, name, status = "unknown", "未知通道", "INVALID_TRANSPORT"
         note = "通知通道配置无效，需要核实；未回退到其他通道。"
+    report_group = None
+    if transport == "app" and getattr(settings, "feishu_routing_file", None):
+        from jx_alert.notifications.routing import ApplicationRoutingError, report_group_delivery
+        routing = _json_file(settings.feishu_routing_file)
+        try:
+            report_group_delivery(settings, routing)
+        except ApplicationRoutingError:
+            pass
+        else:
+            alias = settings.feishu_daily_report_chat_id
+            report_group = routing["groups"][alias].get("display_name") or alias
     return {
         "feishu_transport": transport, "feishu_channel_name": name,
         "feishu_transport_configured": configured,
         "feishu_app_credentials_configured": app_configured,
         "feishu_webhook_required": transport == "webhook",
         "feishu_configuration_status": status,
+        "feishu_report_group": report_group,
         "feishu_delivery_enabled": bool(configured and getattr(settings, "feishu_enabled", False)
                                         and not getattr(settings, "app_dry_run", True)),
         "feishu_check_scope": "configuration_only", "feishu_status_note": note,
