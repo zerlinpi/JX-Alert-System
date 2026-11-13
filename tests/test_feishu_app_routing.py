@@ -16,7 +16,7 @@ from jx_alert.notifications.routing import (
 )
 from jx_alert.storage.db import Base
 from jx_alert.storage.models import (
-    AdProduct, AnomalyEvent, DailyMetric, NotificationLog, Product, Store,
+    AdProduct, AnomalyEvent, DailyMetric, DataCoverage, NotificationLog, Product, Store,
 )
 
 
@@ -235,6 +235,8 @@ def test_daily_snapshot_is_idempotent_fixed_to_test_group_and_preserves_missing_
             store_id="s", metric_date=date(2026, 11, 11), dimension="store", entity_id="s",
             metric_name="orders", value=0,
         ))
+        db.add(DataCoverage(store_id="s", metric_date=date(2026, 11, 11),
+                            dimension="store", status="COMPLETE"))
         db.flush()
         for _ in range(2):
             result = enqueue_daily_snapshots(db, settings, report_date="2026-11-11")
@@ -246,7 +248,7 @@ def test_daily_snapshot_is_idempotent_fixed_to_test_group_and_preserves_missing_
         assert jobs[0].payload["fixed_route"] is True
         assert "订单 0" in jobs[0].payload["text"]
         assert "销量 未知（无记录）" in jobs[0].payload["text"]
-        assert "SP 已返回活动花费合计：未知（无记录）" in jobs[0].payload["text"]
+        assert "商品推广花费：未知（无记录）" in jobs[0].payload["text"]
 
 
 def test_daily_snapshot_disabled_or_missing_destination_never_sends(setup):
@@ -284,3 +286,12 @@ def test_dry_run_prevents_application_or_webhook_clients_being_created(setup, mo
     monkeypatch.setattr(app_module.FeishuAppClient, "from_settings", forbidden)
     monkeypatch.setattr(worker, "FeishuClient", forbidden)
     assert worker.process_outbox_batch()["skipped"] is True
+
+
+def test_chat_delivery_mode_keeps_rule_candidates_out_of_group_notifications(setup):
+    Session, settings, _, _ = setup
+    settings.business_alert_delivery_mode = "chat"
+    enqueue(Session)
+    with Session() as db:
+        assert db.scalar(select(AnomalyEvent)) is not None
+        assert db.scalars(select(NotificationOutbox)).all() == []

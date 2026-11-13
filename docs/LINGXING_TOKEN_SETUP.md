@@ -170,7 +170,8 @@ python scripts/backfill_lingxing.py --collect --days 14
 ```env
 APP_DRY_RUN=false
 SCHEDULER_ENABLED=true
-DAILY_SYNC_CRON=0 8 * * *
+DAILY_SYNC_CRON=0 7 * * *
+FEISHU_DAILY_REPORT_CRON=0 8 * * *
 STORE_TIMEZONES_FILE=/app/data/store-timezones.json
 ```
 

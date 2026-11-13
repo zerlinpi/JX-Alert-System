@@ -62,7 +62,7 @@ docker compose --profile scheduler up -d --build scheduler
 docker compose logs -f scheduler
 ```
 
-保持 scheduler 只运行一个实例。不要横向扩容 scheduler 服务，否则可能产生重复处理。启用后，调度器会按 DAILY_SYNC_CRON 执行只读采集、异常分析、每店 Excel 导出，并每 10 秒处理飞书 outbox。
+保持 scheduler 只运行一个实例。不要横向扩容 scheduler 服务，否则可能产生重复处理。启用后，调度器按北京时间的 DAILY_SYNC_CRON 执行只读采集、异常分析、每店 Excel 导出（默认 07:00）；按 FEISHU_DAILY_REPORT_CRON 独立读取已存数据生成日报（默认北京时间 08:00），并每 10 秒处理飞书 outbox。日报发送不等待采集完成，缺数据保持未知。首次启用可设置 FEISHU_DAILY_REPORT_START_DATE，避免当天过时提醒；具体 JSON 配置、人员映射及验证步骤见 [手工设置手册](MANUAL_SETUP_STEPS.md)。
 
 ## 6. 常用维护命令
 

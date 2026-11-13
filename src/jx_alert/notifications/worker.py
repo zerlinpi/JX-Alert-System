@@ -1,7 +1,8 @@
 """Persistent Feishu application-bot and legacy-webhook outbox worker."""
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select, update
 
@@ -16,6 +17,31 @@ from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import NotificationLog
 
 logger = logging.getLogger(__name__)
+
+
+def _scheduled_window(key, payload, now):
+    """A daily report expires at Beijing midnight; ordinary alerts are unaffected."""
+    if not key.startswith("scheduled-daily:"):
+        return "READY", None
+    try:
+        day = date.fromisoformat(payload["scheduled_delivery_date"])
+        if payload.get("scheduled_timezone") != "Asia/Shanghai":
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return "EXPIRED", None
+    current = now.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
+    if day < current.date():
+        return "EXPIRED", None
+    try:
+        due = datetime.fromisoformat(payload["scheduled_not_before"]) if payload.get("scheduled_not_before") else (
+            datetime.combine(day, time(8), ZoneInfo("Asia/Shanghai")))
+        if due.tzinfo is None or due.astimezone(ZoneInfo("Asia/Shanghai")).date() != day:
+            raise ValueError
+    except (TypeError, ValueError):
+        return "EXPIRED", None
+    if current < due:
+        return "WAITING", due.astimezone(timezone.utc).replace(tzinfo=None)
+    return "READY", None
 
 
 def _database_entity_open_ids(store_id, entity_id):
@@ -60,7 +86,10 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
         )
         db.commit()
 
-        rows = db.scalars(
+        capacity = max(1, min(batch_size, 5))
+        jobs = []
+        while len(jobs) < capacity:
+            rows = db.scalars(
             select(NotificationOutbox)
             .where(NotificationOutbox.id.in_(outbox_ids) if outbox_ids is not None else True)
             .where(
@@ -68,21 +97,30 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                 NotificationOutbox.next_attempt_at <= now,
             )
             .order_by(NotificationOutbox.created_at, NotificationOutbox.id)
-            .limit(max(1, min(batch_size, 5)))
+            .limit(capacity - len(jobs))
             .with_for_update(skip_locked=True)
-        ).all()
-        jobs = []
-        for row in rows:
-            attempts = row.attempts + 1
-            claimed = db.execute(update(NotificationOutbox).where(
+            ).all()
+            if not rows:
+                break
+            for row in rows:
+                window, due = _scheduled_window(row.idempotency_key, row.payload, now)
+                if window == "EXPIRED":
+                    row.status, row.last_error = "EXPIRED", "定时日报已过提醒日，保留记录不跨日补发"
+                    continue
+                if window == "WAITING":
+                    row.next_attempt_at = due
+                    continue
+                attempts = row.attempts + 1
+                claimed = db.execute(update(NotificationOutbox).where(
                 NotificationOutbox.id == row.id,
                 NotificationOutbox.status.in_(["PENDING", "RETRY"]),
                 NotificationOutbox.next_attempt_at <= now,
-            ).values(status="SENDING", claimed_at=claim_time,
-                     attempts=attempts))
-            if not claimed.rowcount:
-                continue
-            jobs.append((row.id, row.idempotency_key, dict(row.payload), attempts, row.chat_id))
+                ).values(status="SENDING", claimed_at=claim_time,
+                         attempts=attempts))
+                if not claimed.rowcount:
+                    continue
+                jobs.append((row.id, row.idempotency_key, dict(row.payload), attempts, row.chat_id))
+            db.flush()
         db.commit()
 
     sent = 0
@@ -96,6 +134,14 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             else existing_chat_id
         )
         try:
+            if _scheduled_window(dedupe_key, payload, datetime.now(timezone.utc).replace(tzinfo=None))[0] != "READY":
+                with SessionLocal() as db:
+                    db.execute(update(NotificationOutbox).where(
+                        NotificationOutbox.id == row_id, NotificationOutbox.status == "SENDING",
+                        NotificationOutbox.claimed_at == claim_time, NotificationOutbox.attempts == attempts,
+                    ).values(status="EXPIRED", claimed_at=None, last_error="定时日报已过提醒日"))
+                    db.commit()
+                continue
             payload_ids = payload.get("open_ids") or []
             if not isinstance(payload_ids, list) or not all(
                 isinstance(item, str) and item.startswith("ou_") for item in payload_ids

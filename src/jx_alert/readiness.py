@@ -72,7 +72,12 @@ def configuration_status(db, settings):
                        .order_by(SyncJob.id.desc()).limit(1))
     return {"stores": stores, "manager_count": len(managers), "manual_mapping_required": missing,
             "scheduler_enabled": settings.scheduler_enabled, "cron": settings.daily_sync_cron,
-            "cron_timezone": settings.app_timezone, "mcp_auth_mode": settings.mcp_auth_mode,
+            "cron_timezone": "Asia/Shanghai", "mcp_auth_mode": settings.mcp_auth_mode,
+            "daily_report_cron": getattr(settings, "feishu_daily_report_cron", "0 8 * * *"),
+            "daily_report_timezone": "Asia/Shanghai",
+            "daily_report_start_date": getattr(settings, "feishu_daily_report_start_date", ""),
+            "business_alert_delivery_mode": getattr(settings, "business_alert_delivery_mode", "rules"),
+            "chat_notifications_enabled": getattr(settings, "mcp_notifications_enabled", False),
             "last_successful_collection": None if latest is None else {
                 "job_id": latest.id, "status": latest.status, "finished_at_utc": str(latest.finished_at)},
             "health_collection_enabled": settings.lingxing_performance_enabled,

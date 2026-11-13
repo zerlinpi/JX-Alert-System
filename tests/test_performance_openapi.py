@@ -317,7 +317,8 @@ def test_unfresh_health_and_pending_data_persist_without_business_alerts(
     assert len(events) == 2 and all("freshness" in event.rule for event in events)
     outbox = db.scalars(select(NotificationOutbox)).all()
     assert len(outbox) == 2
-    assert all("freshness" in row.payload["text"] for row in outbox)
+    assert all("源数据状态" in row.payload["text"] for row in outbox)
+    assert all("freshness" not in row.payload["text"] for row in outbox)
 
 
 @pytest.mark.parametrize("state", _NON_FRESH)

@@ -1,17 +1,20 @@
 """Queue read-only daily snapshots to an explicitly selected test/report group."""
 import hashlib
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from apscheduler.triggers.cron import CronTrigger
 
 from sqlalchemy import select
 
-from jx_alert.notifications.outbox import enqueue_notification
+from jx_alert.notifications.outbox import enqueue_notification, NotificationOutbox
 from jx_alert.notifications.routing import _load_routing
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerformance
 from jx_alert.notifications.cards import card, number, change, status_label
 
 
-def build_daily_card(db, store, day):
+def build_daily_card(db, store, day, *, data_warning=None):
     """Read two authoritative daily partitions; never fill missing facts with zero."""
     previous = day - timedelta(days=1)
     dimensions = ["store", "campaign_sp", "campaign_sb", "campaign_sd"]
@@ -26,6 +29,8 @@ def build_daily_card(db, store, day):
     currency = store.currency_code or "币种未知"
 
     def total(on, dimension, metric):
+        if data_warning or coverage.get((on, dimension)) != "COMPLETE":
+            return None
         values = [r.value for r in facts if r.metric_date == on and r.dimension == dimension
                   and r.metric_name == metric and (dimension != "store" or r.entity_id == store.sid)]
         return sum(values) if values else None
@@ -33,45 +38,67 @@ def build_daily_card(db, store, day):
     metrics = []
     for label, dimension, metric, money in [
         ("订单", "store", "orders", False), ("销量", "store", "units", False),
-        ("销售额", "store", "sales", True), ("SP活动花费", "campaign_sp", "spend", True),
-        ("SB活动花费", "campaign_sb", "spend", True), ("SD活动花费", "campaign_sd", "spend", True),
+        ("销售额", "store", "sales", True), ("商品推广花费", "campaign_sp", "spend", True),
+        ("品牌推广花费", "campaign_sb", "spend", True), ("展示推广花费", "campaign_sd", "spend", True),
     ]:
         current, prior = total(day, dimension, metric), total(previous, dimension, metric)
         complete = all(coverage.get((d, dimension)) == "COMPLETE" for d in [day, previous])
         metrics.append((label, number(current, money=money, currency=currency),
                         number(prior, money=money, currency=currency), change(current, prior, complete=complete)))
-    quality = [(label, status_label(coverage.get((day, dimension), "未知"))) for label, dimension in [
-        ("店铺销量", "store"), ("SP日报", "campaign_sp"), ("SB日报", "campaign_sb"), ("SD日报", "campaign_sd")]]
+    quality = [(label, "待重新采集校验" if data_warning else status_label(coverage.get((day, dimension), "未知"))) for label, dimension in [
+        ("店铺销量", "store"), ("商品推广", "campaign_sp"), ("品牌推广", "campaign_sb"), ("展示推广", "campaign_sd")]]
     performance = db.scalar(select(StorePerformance).where(StorePerformance.store_id == store.sid)
                             .order_by(StorePerformance.pull_date.desc()).limit(1))
-    notes = [f"报表时区：{store.timezone or '待确认'} · 前一日：{previous.isoformat()}",
-             "空记录不代表真实零值；完整采集也不代表每个活动均返回记录。",
-             "广告花费取日报；小时数据单独对账。转化告警按成熟归因日判断。"]
-    notes.append(f"绩效：{performance.pull_date} / {status_label(performance.freshness_status)}；仅展示原始观测。" if performance
-                 else "绩效：未知（尚无记录）")
+    zone_label = "美国太平洋时间" if store.timezone == "America/Los_Angeles" else "店铺当地时间"
+    notes = [f"{zone_label} · 对比日期：{previous.isoformat()}"]
+    if data_warning:
+        notes.insert(0, data_warning)
     sections = [("经营与广告", ["指标", "当日", "前一日", "环比"], metrics),
                 ("采集状态", ["数据集", "状态"], quality)]
     if performance:
         sections.append(("绩效原始观测", ["指标", "观测值", "源状态"], [
-            ("AHR评分", number(performance.ahr_score), status_label(performance.freshness_status)),
-            ("账户健康状态", performance.ahr_status or "未知", status_label(performance.freshness_status)),
+            ("健康评分", number(performance.ahr_score), status_label(performance.freshness_status)),
+            ("账户健康状态", status_label(performance.ahr_status), status_label(performance.freshness_status)),
         ]))
     return card(
         f"每日经营快照 · {day.isoformat()}",
-        subtitle=f"{store.name}（{store.sid}） · {currency}",
+        subtitle=f"{store.name}（{store.sid}）",
         sections=sections, notes=notes,
     )
 
 
 def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = None,
-                            store_dates: dict[str, date | str] | None = None) -> dict:
+                            store_dates: dict[str, date | str] | None = None,
+                            delivery_date: date | str | None = None,
+                            now: datetime | None = None,
+                            store_records: list[Store] | None = None,
+                            store_warnings: dict[str, str] | None = None) -> dict:
     """Persist one snapshot per store/date/destination; never send from this function.
 
     Missing records stay unknown. The caller supplies marketplace-local report
     dates when they differ; this module never assumes missing metrics equal zero.
     """
     if not getattr(settings, "feishu_daily_report_enabled", False):
-        return {"queued": 0, "skipped": True}
+        return {"queued": 0, "skipped": True, "outbox_ids": []}
+    send_day = date.fromisoformat(delivery_date) if isinstance(delivery_date, str) else delivery_date
+    due = local_now = None
+    if send_day is not None:
+        local_now = now or datetime.now(timezone.utc)
+        if local_now.tzinfo is None:
+            raise ValueError("Scheduled delivery requires an aware clock")
+        local_now = local_now.astimezone(ZoneInfo("Asia/Shanghai"))
+        start = getattr(settings, "feishu_daily_report_start_date", "")
+        if start and send_day < date.fromisoformat(start):
+            return {"queued": 0, "skipped": True, "outbox_ids": [], "reason": "before_start_date"}
+        if send_day < local_now.date():
+            raise ValueError("Past delivery dates require explicit manual review")
+        trigger = CronTrigger.from_crontab(
+            getattr(settings, "feishu_daily_report_cron", "0 8 * * *"), timezone="Asia/Shanghai")
+        due = trigger.get_next_fire_time(None, datetime.combine(send_day, time.min, ZoneInfo("Asia/Shanghai")))
+        if due is None or due.date() != send_day:
+            raise ValueError("Daily report cron has no delivery window on this date")
+        if local_now < due:
+            return {"queued": 0, "skipped": True, "outbox_ids": [], "reason": "before_scheduled_time"}
     chat_alias = getattr(settings, "feishu_daily_report_chat_id", "")
     if not chat_alias:
         raise ValueError("A daily snapshot group must be explicitly configured")
@@ -95,13 +122,29 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
     target = date.fromisoformat(report_date) if isinstance(report_date, str) else report_date
     if target is None and not store_dates:
         raise ValueError("Daily snapshots require a report date or per-store report dates")
-    queued = 0
+    queued, outbox_ids = 0, []
     stores_query = select(Store).order_by(Store.sid)
     if store_dates is not None:
         stores_query = stores_query.where(Store.sid.in_(store_dates))
-    for store in db.scalars(stores_query).all():
+    stores = store_records if store_records is not None else db.scalars(stores_query).all()
+    for store in stores:
+        if store_dates is not None and store.sid not in store_dates:
+            raise ValueError("Daily report store is outside the explicit report scope")
+        warning = (store_warnings or {}).get(store.sid)
         day = (store_dates or {}).get(store.sid, target)
         day = date.fromisoformat(day) if isinstance(day, str) else day
+        prefix = "scheduled-daily:" if send_day is not None else "daily:"
+        identity_day = send_day if send_day is not None else day
+        key = prefix + hashlib.sha256(
+            f"{store.sid}:{identity_day}:{'app' if app_transport else 'webhook'}:{chat_id}".encode()
+        ).hexdigest()
+        existing = db.scalar(select(NotificationOutbox).where(NotificationOutbox.idempotency_key == key))
+        if existing is not None:
+            # Recovery checks reuse persisted content and delivery state, even if
+            # newer metrics arrived. They never regenerate or rearm a report.
+            outbox_ids.append(existing.id)
+            queued += 1
+            continue
         rows = db.scalars(select(DailyMetric).where(
             DailyMetric.store_id == store.sid, DailyMetric.metric_date == day,
             DailyMetric.dimension.in_(["store", "campaign_sp"]),
@@ -115,6 +158,8 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
                 DataCoverage.dimension.in_(["store", "campaign_sp"]),
             )).all()
         }
+        if warning or coverage.get("store") != "COMPLETE":
+            sales = {}
         performance = db.scalar(select(StorePerformance).where(
             StorePerformance.store_id == store.sid,
         ).order_by(StorePerformance.pull_date.desc()).limit(1))
@@ -122,32 +167,46 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
         def display(value):
             return "未知（无记录）" if value is None else f"{value:g}"
 
-        spend_rows = [row.value for row in ad_rows if row.metric_name == "spend"]
+        spend_rows = [row.value for row in ad_rows if row.metric_name == "spend"] if (
+            not warning and coverage.get("campaign_sp") == "COMPLETE") else []
         ad_spend = sum(spend_rows) if spend_rows else None
         lines = [
-            f"【JX Alert】日常数据快照 · {day.isoformat()}",
-            f"店铺：{store.name}（{store.sid}） · 币种：{store.currency_code or '未知'}",
+            f"日常经营日报 · {day.isoformat()}",
+            f"店铺：{store.name}（{store.sid}）",
             f"订单 {display(sales.get('orders'))} · 销量 {display(sales.get('units'))}"
             f" · 销售额 {display(sales.get('sales'))}",
-            f"SP 已返回活动花费合计：{display(ad_spend)}",
-            f"采集完整性：店铺 {coverage.get('store', '未知')}"
-            f" / SP活动 {coverage.get('campaign_sp', '未知')}",
-            "无记录或采集不完整均不代表真实零值；SP转化告警另按成熟归因日评估。",
+            f"商品推广花费：{number(ad_spend, money=True, currency=store.currency_code or '币种待确认')}",
+            f"采集状态：店铺 {status_label(coverage.get('store'))}"
+            f" / 商品推广 {status_label(coverage.get('campaign_sp'))}",
         ]
         if performance:
             lines.append(
                 f"绩效快照：{performance.pull_date} · "
-                f"AHR {display(performance.ahr_score)} · {performance.freshness_status}"
+                f"健康评分 {display(performance.ahr_score)} · {status_label(performance.freshness_status)}"
             )
         else:
             lines.append("绩效快照：未知（尚无记录）")
-        key = "daily:" + hashlib.sha256(
-            f"{store.sid}:{day}:{'app' if app_transport else 'webhook'}:{chat_id}".encode()
-        ).hexdigest()
-        enqueue_notification(
+        if warning:
+            lines.append(warning)
+        message_card = build_daily_card(db, store, day, data_warning=warning) if app_transport else None
+        if send_day is not None:
+            delivery_note = f"北京时间提醒日：{send_day} · 计划 {due:%H:%M} · 本次生成 {local_now:%H:%M:%S}"
+            if local_now - due > timedelta(minutes=1):
+                delivery_note += "（延迟补发）"
+            lines.append(delivery_note)
+            if message_card is not None:
+                from jx_alert.notifications.cards import plain
+                message_card["body"]["elements"].append({"tag": "markdown", "content": plain(delivery_note)})
+        row = enqueue_notification(
             db, idempotency_key=key, text="\n".join(lines), store_id=store.sid,
             chat_id=chat_id, delivery=delivery, fixed_route=True,
-            card=build_daily_card(db, store, day) if app_transport else None,
+            card=message_card,
         )
+        if send_day is not None and existing is None:
+            row.next_attempt_at = due.astimezone(timezone.utc).replace(tzinfo=None)
+            row.payload = {**row.payload, "scheduled_delivery_date": send_day.isoformat(),
+                           "scheduled_timezone": "Asia/Shanghai", "scheduled_not_before": due.isoformat()}
+        db.flush()
+        outbox_ids.append(row.id)
         queued += 1
-    return {"queued": queued, "skipped": False}
+    return {"queued": queued, "skipped": False, "outbox_ids": outbox_ids}

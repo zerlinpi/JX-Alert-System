@@ -23,6 +23,8 @@ def number(value, *, money=False, currency=""):
             return "未知（无效值）"
     except (InvalidOperation, ValueError):
         return "未知（无效值）"
+    currency = {"USD": "美元", "CNY": "人民币", "EUR": "欧元", "GBP": "英镑", "JPY": "日元",
+                "CAD": "加元", "AUD": "澳元", "MXN": "墨西哥比索"}.get(currency, currency)
     return f"{currency} {n:,.2f}".strip() if money else f"{n:,.2f}".rstrip("0").rstrip(".")
 
 
@@ -94,9 +96,9 @@ _METRIC_NAMES = {
     "orders_avg_7d": "过去7日平均订单", "clicks": "点击", "daily_budget": "日预算",
     "budget_ratio": "预算消耗比例", "change_ratio": "变化比例", "ratio": "变化比例",
     "report_date": "报表日期", "attribution_date": "归因成熟日", "metric_date": "指标日期",
-    "ad_id": "广告商品 ID", "campaign_id": "活动 ID", "seller_sku": "MSKU", "asin": "ASIN",
+    "ad_id": "广告商品编号", "campaign_id": "活动编号", "seller_sku": "商品编码", "asin": "商品编号",
     "freshness_status": "源数据状态", "source_updated_at": "源更新时间",
-    "comparison_date": "比较日期", "metric_name": "指标", "ahr_score": "AHR评分",
+    "comparison_date": "比较日期", "metric_name": "指标", "ahr_score": "健康评分",
     "attribution_complete_report_date": "归因成熟日", "currency_code": "币种",
 }
 _RULE_NAMES = {
@@ -106,11 +108,13 @@ _RULE_NAMES = {
     "low_spend_no_conversion": "低花费无转化", "budget_consumption": "预算消耗",
 }
 _STATUS_NAMES = {"COMPLETE": "采集完成", "NOT_CONFIGURED": "源时区待确认", "STALE": "数据过期",
-                 "FUTURE": "源时间异常", "MISSING": "缺少源时间", "FRESH": "新鲜度已验证", "FAILED": "采集失败"}
+                 "FUTURE": "源时间异常", "MISSING": "缺少源时间", "FRESH": "数据有效", "FAILED": "采集失败",
+                 "PARTIAL": "采集不完整", "PENDING": "等待采集", "UNKNOWN": "未知",
+                 "Healthy": "正常", "At Risk": "存在风险", "AtRisk": "存在风险", "Unhealthy": "不健康"}
 
 
 def status_label(value):
-    return _STATUS_NAMES.get(value, value or "未知")
+    return _STATUS_NAMES.get(value, value if value and re.search(r"[\u4e00-\u9fff]", str(value)) else "待确认")
 
 
 def anomaly_card(*, state, severity, store, campaign, product, rule, reason, metrics, currency=None):
@@ -119,10 +123,11 @@ def anomaly_card(*, state, severity, store, campaign, product, rule, reason, met
         identity.append(("广告活动", campaign))
     if product:
         identity.append(("商品", product))
-    identity.append(("规则", _RULE_NAMES.get(rule, rule)))
-    identity.append(("币种", currency or "待确认"))
+    identity.append(("异常类型", _RULE_NAMES.get(rule, "数据异常")))
     values = []
     for key, value in metrics.items():
+        if key not in _METRIC_NAMES:
+            continue
         if isinstance(value, (dict, list)):
             continue
         if value is None:
@@ -130,11 +135,14 @@ def anomaly_card(*, state, severity, store, campaign, product, rule, reason, met
         elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
             value = (f"{value:.1%}" if key.endswith("ratio") else number(
                 value, money=key in {"spend", "spend_avg_7d", "daily_budget"}, currency=currency or "币种待确认"))
-        values.append((_METRIC_NAMES.get(key, key), value))
+        elif isinstance(value, str) and key in {"freshness_status", "ahr_status"}:
+            value = status_label(value)
+        elif isinstance(value, str) and key == "metric_name":
+            value = {"orders": "订单", "sales": "销售额", "units": "销量", "spend": "花费"}.get(value, "指标")
+        values.append((_METRIC_NAMES[key], value))
     return card(
-        f"{state} · {severity}", subtitle=reason,
+        f"{state} · { {'P0': '紧急', 'P1': '重要', 'P2': '关注', 'P3': '提示'}.get(severity, '关注')}", subtitle=reason,
         sections=[("定位", ["对象", "内容"], identity),
                   ("关键指标", ["指标", "值"], values[:20])],
-        notes=["基于已采集证据判断；缺失数据不补零。", "请先核对报表日期、归因成熟度与责任人。"],
         color="green" if state == "异常恢复" else "red" if severity in {"P0", "P1"} else "orange",
     )
