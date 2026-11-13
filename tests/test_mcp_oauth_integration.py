@@ -180,6 +180,8 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
         assert {"get_stores", "get_configuration_status", "request_collection"} <= by_name.keys()
         assert by_name["get_stores"]["annotations"]["readOnlyHint"] is True
         assert by_name["request_collection"]["annotations"]["readOnlyHint"] is False
+        assert by_name["request_collection"]["_meta"]["securitySchemes"][0]["scopes"] == ["jx:read", "jx:collect"]
+        assert by_name["submit_chat_analysis"]["_meta"]["securitySchemes"][0]["scopes"] == ["jx:read", "jx:notify"]
         stores = call(client, read_headers, "get_stores")
         assert not stores.get("isError") and "Synthetic integration store" in json.dumps(stores)
         configuration = call(client, read_headers, "get_configuration_status")
@@ -188,8 +190,10 @@ with TestClient(app, base_url=origin, follow_redirects=False) as client:
             "backfill_days": 1, "idempotency_key": "must-not-enqueue",
         })
         assert denied.get("isError") is True and "jx:collect" in json.dumps(denied)
+        assert 'error="insufficient_scope"' in denied["_meta"]["mcp/www_authenticate"][0]
         denied_notification = call(client, read_headers, "submit_chat_analysis", {"review_id": 1, "findings": []})
         assert denied_notification.get("isError") is True and "jx:notify" in json.dumps(denied_notification)
+        assert 'scope="jx:read jx:notify"' in denied_notification["_meta"]["mcp/www_authenticate"][0]
         assert job_count() == 0, "Read-only scope must never enqueue a job"
 
         collect_token = owner_token(client, ["jx:read", "jx:collect"])

@@ -46,10 +46,14 @@ def main():
                 params["page_token"] = page
             response = http.get(client.base_url + "/open-apis/im/v1/chats/" + chat + "/members",
                 params=params, headers={"Authorization": "Bearer " + client._get_token()})
-            response.raise_for_status()
-            value = response.json()
+            try:
+                value = response.json()
+            except ValueError:
+                raise SystemExit(f"Group-member lookup failed (HTTP {response.status_code}); no mappings changed") from None
             if value.get("code") != 0:
                 raise SystemExit(f"Group-member lookup denied (code={value.get('code')}); no mappings changed")
+            if response.status_code != 200:
+                raise SystemExit(f"Group-member lookup failed (HTTP {response.status_code}); no mappings changed")
             data = value.get("data", {})
             items.extend(data.get("items", []))
             if not data.get("has_more"):

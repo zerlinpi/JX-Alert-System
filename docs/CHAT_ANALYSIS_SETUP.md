@@ -3,6 +3,8 @@
 目标地址：`https://jxmcp.pacefitday.com/mcp`。域名已获用户授权并解析到 `43.153.88.94`。
 代码、Linux 测试、服务器版本和实际送达结果以本次部署回执为准；HTTPS 正常不等于 ChatGPT 已完成授权。
 
+2026-11-13 线上核对：HTTPS、OAuth元数据、动态注册、跳转和登录页均通过检查；所有者已私下初始化口令，OAuth已启用。现有用户无需重复第2节初始化，直接补第1节的飞书成员权限，并按第3、4节在ChatGPT连接和设置任务。真实用户授权及小时任务运行仍待验收。
+
 ## 已设计的运行方式
 
 - 北京时间 07:00 自动采集，08:00 独立发送中文表格日报到“独立站交接群”。日报不等待采集任务；缺失数据保持未知。
@@ -71,6 +73,8 @@ curl -fsS https://jxmcp.pacefitday.com/.well-known/oauth-authorization-server
 
 若之前创建的连接只允许读取，需重新授权通知权限。工作区工具权限可能要求每次确认；先实测无人值守任务可否使用通知工具，不能通过服务端关闭认证来绕过产品审批。
 
+工具声明各自所需权限；缺少 `jx:notify` 或 `jx:collect` 时返回标准的重新授权提示，让 ChatGPT 发起追加授权，不执行通知或采集。仅修改提示词不能提升连接权限。
+
 先让 ChatGPT 只查询系统状态、启用店铺、覆盖、通知开关。然后试一次 `prepare_chat_analysis`，确认返回的店铺、日期、数据维度和证据正确；无异常调用 `submit_chat_analysis(review_id, [])`，预期 `NO_ANOMALY` 且没有飞书消息。
 
 ## 4. 创建每小时任务
@@ -81,7 +85,7 @@ curl -fsS https://jxmcp.pacefitday.com/.well-known/oauth-authorization-server
 
 ```text
 每小时检查 JX 项目已启用范围的数据。只处理 get_configuration_status 返回的启用店铺，不扩大范围。
-先查任务及数据覆盖；若需要刷新且授予了采集权限，用该北京时间小时的固定幂等键 request_collection，
+先查任务及数据覆盖；已有等待或运行中的采集任务时不再排队。若需要刷新且授予了采集权限，用该北京时间小时的固定幂等键 request_collection，
 确认任务完成再分析；失败或未完成时标记本轮未完整分析，不能把旧数据称为最新数据。
 逐店、逐维度调用 prepare_chat_analysis：店铺、商品、商品/品牌/展示推广活动与广告商品。
 容量超限时按具体实体拆分，记录未分析部分；不得跳过后声称全部完成。

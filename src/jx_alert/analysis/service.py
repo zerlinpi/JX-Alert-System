@@ -163,15 +163,15 @@ def _notification_labels(db, anomaly: AnomalyEvent) -> tuple[str, str | None, st
         ).order_by(Product.seller_sku)).all()
         if products:
             product_label = "; ".join(
-                f"MSKU {product.seller_sku}"
-                + (f" / ASIN {product.asin}" if product.asin else "")
-                + (f" / Local SKU {product.local_sku}" if product.local_sku else "")
+                f"商品编码 {product.seller_sku}"
+                + (f" / 商品编号 {product.asin}" if product.asin else "")
+                + (f" / 内部编码 {product.local_sku}" if product.local_sku else "")
                 for product in products
             )
         elif metrics.get("asin") or metrics.get("seller_sku"):
             product_label = (
-                f"MSKU {metrics.get('seller_sku') or '-'}"
-                f" / ASIN {metrics.get('asin') or '-'}"
+                f"商品编码 {metrics.get('seller_sku') or '-'}"
+                f" / 商品编号 {metrics.get('asin') or '-'}"
             )
 
     return store_label, campaign_label, product_label
@@ -206,7 +206,7 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
             lines.append(f"广告活动：{campaign_label}")
         if product_label:
             lines.append(f"商品：{product_label}")
-        elif not campaign_label and anomaly.entity_id:
+        elif not campaign_label and anomaly.entity_id and not anomaly.rule.endswith("_freshness"):
             lines.append(f"监控对象：{anomaly.entity_id}")
         lines.extend([
             f"异常类型：{_RULE_NAMES.get(anomaly.rule, '数据异常')}",

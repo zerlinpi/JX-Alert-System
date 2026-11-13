@@ -110,8 +110,12 @@ a reconstruction of what was known at every past collection time.
 ## Rollback
 
 1. Stop the scheduler/MCP processes to stop new jobs; retain outbox and job data.
-2. Switch the server checkout to the recorded previous commit (`4256f30` for this
-   upgrade), or disable the source override and use the previous installed image.
+2. For the morning-report/chat-analysis upgrade, the previous server commit is
+   `0feb56b`. Restore the matching non-sensitive runtime configuration backup
+   before starting that code: older versions reject unknown runtime fields.
+   Preserve the service UID/GID and file mode (currently 10001:10001, 0600).
+   Do not replace private credentials or the OAuth state store. Then switch the
+   checkout to the recorded revision without discarding unrelated changes.
 3. Restart only the application processes using the same data/database volumes.
 4. Keep the six additive SP tables and their evidence for investigation. The old
    code ignores them. Do not drop tables or run `docker compose down -v`.
@@ -119,7 +123,11 @@ a reconstruction of what was known at every past collection time.
    only when data restoration is specifically needed; code rollback does not
    require removing new historical evidence.
 
+The dedicated MCP virtual host is `deploy/jxmcp.pacefitday.com.conf`. Its TLS
+certificate uses webroot renewal; the installed renewal hook is represented by
+`deploy/jx-nginx-reload`. Do not remove other virtual hosts during code rollback.
+
 SB/SD campaign and SD product report adapters already exist in the shared daily
 pipeline. SB creative links are not product performance and must not be used to
-allocate or invent per-ASIN spend. Store-health collection still requires a
-verified source timestamp timezone and freshness checks before it is enabled.
+allocate or invent per-ASIN spend. Store-health observation archiving is enabled
+with business evaluation blocked; source timezone remains unconfigured.
