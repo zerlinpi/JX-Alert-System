@@ -61,6 +61,7 @@ def feishu_channel_status(settings):
 def analysis_plan(db, settings, *, now=None):
     """Enumerate the complete enabled scope and distinguish blocked/missing data."""
     from jx_alert.operations import scoped_stores, store_report_plan
+    from jx_alert.chat_analysis import snapshot_comparisons, comparison_summary, METRICS
     raw = _json_file(settings.collection_scope_file)
     ids = raw.get("store_ids", [])
     if not isinstance(ids, list):
@@ -86,12 +87,22 @@ def analysis_plan(db, settings, *, now=None):
             coverage = {r.metric_date for r in db.scalars(select(DataCoverage).where(
                 DataCoverage.store_id == store.sid, DataCoverage.dimension == "store",
                 DataCoverage.metric_date.in_(dates), DataCoverage.status == "COMPLETE"))}
-            fact = db.scalar(select(DailyMetric.id).where(DailyMetric.store_id == store.sid,
-                DailyMetric.dimension == "store", DailyMetric.metric_date == last).limit(1))
+            rows = db.scalars(select(DailyMetric).where(DailyMetric.store_id == store.sid,
+                DailyMetric.dimension == "store", DailyMetric.entity_id == store.sid,
+                DailyMetric.metric_date.in_(dates), DailyMetric.metric_name.in_(METRICS))).all()
+            facts = [{"entity_id": r.entity_id, "metric": r.metric_name, "date": r.metric_date.isoformat(),
+                      "value": r.value, "currency": r.currency, "complete": r.metric_date in coverage} for r in rows]
+            comparisons = snapshot_comparisons(facts, last, "store", confirmed_currency=store.currency_code,
+                                               entity_ids=[store.sid])
+            comparison = comparison_summary(comparisons)
+            item.update(comparison)
             item["missing_baseline_dates"] = [d.isoformat() for d in dates if d not in coverage]
-            item["state"] = "NO_DATA" if fact is None else "INSUFFICIENT_DATA" if len(coverage) < 8 else "READY"
-            item["analysis_ready"] = item["state"] == "READY"
-            item["amount_analysis_ready"] = item["analysis_ready"] and item["currency_confirmed"]
+            item["state"] = ("NO_DATA" if not any(r.metric_date == last for r in rows) else
+                "READY" if comparison["comparison_coverage"] == "COMPLETE" else
+                "READY_WITH_GAPS" if comparison["data_sufficient"] else "INSUFFICIENT_DATA")
+            item["analysis_ready"] = comparison["data_sufficient"]
+            item["amount_analysis_ready"] = any(r["metric"] in {"sales", "spend"}
+                for r in comparison["eligible_comparisons"])
     return {"checked_at_utc": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
             "enabled_store_count": len(plan), "collection_ready_count": sum(x["collection_ready"] for x in plan),
             "analysis_ready_count": sum(x["analysis_ready"] for x in plan), "stores": plan}
@@ -170,4 +181,18 @@ def configuration_status(db, settings):
         except (OSError, ValueError, RuntimeError):
             report["analysis_plan"] = {"status": "CONFIGURATION_INVALID", "enabled_store_count": len(scope)}
     report.update(feishu_channel_status(settings))
+    fallback_enabled = bool(getattr(settings, "feishu_group_fallback_enabled", False))
+    report["feishu_group_fallback_enabled"] = fallback_enabled
+    if fallback_enabled:
+        from jx_alert.notifications.routing import ApplicationRoutingError, report_group_delivery
+        try:
+            report_group_delivery(settings, routing)
+        except ApplicationRoutingError:
+            report["feishu_group_fallback_configured"] = False
+        else:
+            report["feishu_group_fallback_configured"] = True
+            optional_roles = {"admin_count", "operator_count", "management.open_ids"}
+            report["optional_mention_mappings"] = [item for item in missing if item["field"] in optional_roles]
+            report["manual_mapping_required"] = [item for item in missing if item["field"] not in optional_roles]
+            report["feishu_group_fallback_note"] = "人员未映射时使用已配置日报群。实际送达以通知日志为准。"
     return report

@@ -19,8 +19,15 @@
 - The user confirmed SID 5174 uses `America/Los_Angeles`. Analyze completed local
   dates and mature attribution windows. Do not assume this timezone applies to
   other stores or to offset-free store-health source timestamps.
-- Test Feishu in the explicitly selected group. Unknown administrator, operator,
-  or manager mappings remain empty and block affected anomaly deliveries.
+- Test Feishu in the explicitly selected group. The owner authorized missing
+  administrator/operator/manager mappings to fall back to the verified report
+  group without unverified mentions when `feishu_group_fallback_enabled=true`.
+  Keep missing identities empty; a missing/invalid group still blocks delivery.
+  Do not batch replay historical failures merely because this policy changed.
+- Prefer a complete seven-day baseline. The owner authorized previous-day
+  comparison when seven days are unavailable and both exact adjacent dates have
+  complete, explicit facts. Missing facts, failed authorization, unconfirmed
+  currencies and immature advertising attribution remain protected.
 - Database changes are additive with backups and explicit persistence checks.
   Code rollback retains new historical evidence and never removes Docker volumes.
 - The user approved automatic health observation archiving only. Keep

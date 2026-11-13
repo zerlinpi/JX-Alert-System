@@ -134,8 +134,8 @@ def test_evaluator_detects_sales_campaign_and_product_ad_anomalies():
         db.commit()
 
         result = evaluate_daily_anomalies(db, target)
-        assert result["evaluated_scopes"] == 8
-        assert result["skipped_incomplete_scopes"] == 0
+        assert result["evaluated_scopes"] == 5
+        assert result["skipped_incomplete_scopes"] == 3
         events = db.scalars(select(AnomalyEvent)).all()
         assert any(row.rule == "orders_decrease" and row.entity_id == "SKU-1" for row in events)
         assert any(row.rule == "units_increase" and row.entity_id == "B000000001" for row in events)
@@ -258,6 +258,9 @@ def test_product_ad_anomaly_uses_configured_escalation_window():
         _add_metric(db, "store-1", "product_ad_sp", "ad-1", "spend", mature_day, 25)
         _add_metric(db, "store-1", "product_ad_sp", "ad-1", "orders", mature_day, 0)
         _add_metric(db, "store-1", "product_ad_sp", "ad-1", "clicks", mature_day, 15)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "spend", target, 10)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "spend", target - timedelta(days=1), 10)
+        _add_metric(db, "store-1", "product_ad_sp", "ad-1", "clicks", target, 10)
         existing = AnomalyEvent(
             dedupe_key="store-1:ad-1:spend_no_conversion",
             store_id="store-1",

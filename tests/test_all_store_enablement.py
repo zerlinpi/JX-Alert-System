@@ -112,7 +112,7 @@ def test_complete_count_baseline_can_be_normal_without_assuming_currency(setup):
         db.flush()
         review = prepare_review(db, settings, "2", now=CLOCK)
         assert review["data_sufficient"]
-        assert submit_review(db, settings, review["review_id"], [], now=CLOCK)["status"] == "NO_ANOMALY"
+        assert submit_review(db, settings, review["review_id"], [], now=CLOCK)["status"] == "PARTIAL_REVIEW"
         plan = analysis_plan(db, settings, now=CLOCK)
         item = next(x for x in plan["stores"] if x["store_id"] == "2")
         assert item["analysis_ready"] and not item["amount_analysis_ready"]
