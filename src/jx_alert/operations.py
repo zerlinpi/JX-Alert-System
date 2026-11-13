@@ -192,7 +192,7 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
     from jx_alert.storage.db import SessionLocal, engine, init_db
     from jx_alert.storage.job_lock import database_job_lock
     from jx_alert.lingxing.client import LingxingClient
-    from jx_alert.lingxing.pipeline import collect_daily_snapshot
+    from jx_alert.lingxing.pipeline import ad_account_inventory, collect_daily_snapshot
     from jx_alert.lingxing.sales_collector import collect_sales_for_day
     from jx_alert.analysis.evaluator import evaluate_daily_anomalies
     from jx_alert.reporting.excel import export_daily_reports
@@ -227,7 +227,12 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
         completed = {str(sid) for sid, day in (completed_store_dates or {}).items()
                      if latest.get(str(sid)) == day}
         results, failures, sp_runs = {}, [], []
+        accounts = ad_account_inventory(client)
         with SessionLocal() as db:
+            from jx_alert.storage.models import RawSnapshot
+            if accounts is not None:
+                db.add(RawSnapshot(source="lingxing_seller_ad_accounts", payload={"rows": accounts}))
+                db.commit()
             for sid, day in latest.items():
                 if sid in completed:
                     results[sid] = {"status": "REUSED_COMPLETED_CHECKPOINT"}
@@ -245,7 +250,8 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                         older = (date.fromisoformat(day) - timedelta(days=offset)).isoformat()
                         collect_sales_for_day(client, db, {sid: older}, stores_response=one)
                     collected = collect_daily_snapshot(client, db, {sid: day}, stores_response=one,
-                        settings=settings, ad_attribution_refresh_days=max(backfill_days, settings.ad_attribution_refresh_days))
+                        settings=settings, ad_accounts=accounts,
+                        ad_attribution_refresh_days=max(backfill_days, settings.ad_attribution_refresh_days))
                     currency_state = _observed_sales_currency(db, sid)
                     db.commit()
                     analysis = evaluate_daily_anomalies(db, {sid: day})

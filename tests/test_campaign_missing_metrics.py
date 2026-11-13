@@ -147,7 +147,7 @@ def test_missing_campaign_preserves_scope_but_other_complete_campaign_still_aler
     assert existing.status == "ONGOING"
     assert _campaign_gaps(result)[0]["campaign_id"] == CAMPAIGN
     assert result["events_touched"] == 1
-    assert result["notifications_queued"] == 1
+    assert result["notifications_queued"] == 0
     other_alert = db.scalar(select(AnomalyEvent).where(AnomalyEvent.entity_id == other))
     assert other_alert.rule == "high_ad_spend"
     assert other_alert.metrics["spend"] == 30
@@ -168,7 +168,7 @@ def test_complete_campaign_recovers_without_recovering_campaign_missing_history(
     assert complete_alert.status == "RECOVERED"
     assert missing_alert.status == "ONGOING"
     assert _campaign_gaps(result)[0]["campaign_id"] == missing_campaign
-    assert result["notifications_queued"] == 1
+    assert result["notifications_queued"] == 0
 
 
 @pytest.mark.parametrize("scope_complete", [False, True])

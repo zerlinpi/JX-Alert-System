@@ -75,7 +75,9 @@ curl -fsS https://jxmcp.pacefitday.com/.well-known/oauth-authorization-server
 
 工具声明各自所需权限；缺少 `jx:notify` 或 `jx:collect` 时返回标准的重新授权提示，让 ChatGPT 发起追加授权，不执行通知或采集。仅修改提示词不能提升连接权限。
 
-先让 ChatGPT 只查询系统状态、启用店铺、覆盖、通知开关。然后试一次 `prepare_chat_analysis`，确认返回的店铺、日期、数据维度和证据正确；无异常调用 `submit_chat_analysis(review_id, [])`，预期 `NO_ANOMALY` 且没有飞书消息。
+先让 ChatGPT 查询系统状态、启用店铺、覆盖和通知开关。用 `prepare_chat_analysis` 查看店铺、日期、数据维度和证据。无负向异常时调用 `submit_chat_analysis(review_id, [])`，群内保持静默。归因成熟的广告零转化可引用 `mature_ad_window` 中连续七日的同活动花费、点击和订单；单纯花费上涨或经营指标改善不会触发群告警。
+
+需要分享 Chat 已生成的经营报告时，在同一对话明确说「把上一条报告按原格式发送到独立站交接群」。`send_chat_report_to_feishu` 接收报告标题与原 Markdown 正文，使用已配置日报群和 `jx:notify` 权限，保留标题、列表、粗体和表格。报告超过单卡容量时按完整章节拆开。通过 `get_notification_logs(outbox_id=通知编号)` 确认 `DELIVERED`。小时巡检继续使用有证据校验的 `submit_chat_analysis`。
 
 ## 4. 创建每小时任务
 

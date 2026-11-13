@@ -18,6 +18,9 @@ class FakeDailyClient:
             "sid": 101, "name": "Store A", "status": 1, "has_ads_setting": 1,
         }]}
 
+    def seller_ad_accounts(self):
+        return [{"sid": "101", "profile_id": "888", "type": "seller", "currency_code": "CAD"}]
+
     def sales_daily(self, payload):
         return {"code": 0, "total": 1, "data": [{
             "sid": 101,
@@ -32,6 +35,7 @@ class FakeDailyClient:
     def iter_advertising_campaigns(self, campaign_type, payload, **kwargs):
         return iter([{
             "campaign_id": {"sp": 1001, "sb": 2001, "sd": 3001}[campaign_type],
+            "profile_id": "888",
             "name": f"{campaign_type.upper()} Campaign",
             "state": "enabled",
             "budget": 50,
@@ -100,6 +104,10 @@ def test_daily_pipeline_records_successful_job_and_all_steps(tmp_path):
         ]
         assert db.scalar(select(func.count()).select_from(DailyMetric)) > 0
         assert db.scalar(select(func.count()).select_from(DataCoverage)) == 8
+        ad_facts = db.scalars(select(DailyMetric).where(DailyMetric.dimension.in_(
+            ["campaign_sp", "campaign_sb", "campaign_sd", "product_ad_sp", "product_ad_sd"]))).all()
+        assert all(r.currency == "CAD" if r.metric_name in {"sales", "spend"} else r.currency is None
+                   for r in ad_facts)
 
 
 def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps(tmp_path):

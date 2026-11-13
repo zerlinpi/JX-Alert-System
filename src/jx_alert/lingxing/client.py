@@ -231,6 +231,26 @@ class LingxingClient:
     def get_stores(self):
         return self._request("GET", "/erp/sc/data/seller/lists")
 
+    def seller_ad_accounts(self, *, length: int = 100, max_pages: int = 1000) -> list[dict]:
+        """Return the full seller advertising account inventory from the official endpoint."""
+        accounts = []
+        expected_total = None
+        for _ in range(max_pages):
+            response = self._request("POST", "/basicOpen/baseData/account/list", json_body={
+                "type": "seller", "offset": len(accounts), "length": length,
+            })
+            rows, total = response.get("data"), response.get("total")
+            if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+                    or type(total) is not int or total < 0 or (expected_total is not None and total != expected_total)):
+                raise LingxingError("Invalid or changing seller ad account inventory")
+            expected_total = total
+            accounts.extend(rows)
+            if len(accounts) == total:
+                return accounts
+            if not rows or len(accounts) > total:
+                break
+        raise LingxingError("Incomplete seller ad account inventory")
+
     def sales_daily(self, payload: dict):
         return self._request(
             "POST", "/erp/sc/data/sales_report/asinDailyLists", json_body=payload

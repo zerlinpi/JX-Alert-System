@@ -8,11 +8,12 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy import delete, select
 
+from jx_alert.lingxing.ad_currency import advertising_currency, is_ad_money
 from jx_alert.lingxing.report_dates import normalize_store_report_dates
 from jx_alert.lingxing.report_metrics import AD_REPORT_METRICS
 from jx_alert.lingxing.sales_collector import _upsert_store
 from jx_alert.storage.coverage import mark_coverage
-from jx_alert.storage.models import AdProduct, DailyMetric, Product, RawSnapshot
+from jx_alert.storage.models import AdProduct, Campaign, DailyMetric, Product, RawSnapshot
 
 
 AD_METRICS = AD_REPORT_METRICS
@@ -114,7 +115,7 @@ def _sync_product_ad_master_data(client, db, store_id: str, sid, report_type: st
 def collect_product_ads_for_day(client, db,
                                 report_dates: str | dict[str, str | list[str]], *,
                                 stores_response: dict | None = None,
-                                page_size: int = 100) -> dict:
+                                page_size: int = 100, ad_currencies: dict | None = None) -> dict:
     stores_response = stores_response or client.get_stores()
     stores = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(stores, list):
@@ -130,6 +131,9 @@ def collect_product_ads_for_day(client, db,
     row_counts = {"sp": 0, "sd": 0}
     master_counts = {"sp": 0, "sd": 0}
     for store_id, store in active_ad_stores:
+        profiles = {(row.campaign_type, row.campaign_id): row.profile_id for row in db.scalars(
+            select(Campaign).where(Campaign.store_id == store_id)
+        )} if ad_currencies else {}
         for report_type in ("sp", "sd"):
             master_counts[report_type] += _sync_product_ad_master_data(
                 client, db, store_id, store["sid"], report_type, page_size
@@ -236,6 +240,8 @@ def collect_product_ads_for_day(client, db,
                     ad_product.seller_sku = seller_sku
                     ad_product.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
+                    code = advertising_currency(ad_currencies or {}, store_id, record,
+                        campaign_profile=profiles.get((report_type, campaign_id)))
                     for metric_name, value in values.items():
                         db.add(DailyMetric(
                             store_id=store_id,
@@ -244,7 +250,7 @@ def collect_product_ads_for_day(client, db,
                             entity_id=ad_id,
                             metric_name=metric_name,
                             value=value,
-                            currency=product.currency_code,
+                            currency=code if is_ad_money(metric_name) else None,
                             source=f"lingxing_{report_type}_product_ad_report",
                         ))
 

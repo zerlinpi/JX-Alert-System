@@ -527,7 +527,7 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         fields = f'<input type="hidden" name="request" value="{esc(pending_id)}"><input type="hidden" name="csrf" value="{esc(csrf)}">'
         if authenticated:
             scopes = "、".join({"jx:read": "读取已采集的数据", "jx:collect": "请求采集与分析任务",
-                               "jx:notify": "将有数据证据的中文异常分析发送至已配置飞书群"}[s] for s in data["scopes"])
+                               "jx:notify": "将有证据的异常或用户指定的中文报告发送至已配置飞书群"}[s] for s in data["scopes"])
             content = f'<p>客户端：{esc(data["client_id"])}</p><p>回调：{esc(data["redirect_uri"])}</p><p>权限：{esc(scopes)}</p><button name="action" value="approve">同意</button><button name="action" value="deny">拒绝</button>'
         else:
             content = '<label>所有者口令 <input type="password" name="password" autocomplete="current-password" required maxlength="1024"></label><button name="action" value="login">登录</button>'
