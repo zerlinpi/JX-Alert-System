@@ -28,3 +28,12 @@ def test_runtime_rejects_credentials_and_database_overrides(runtime):
     runtime.write_text(json.dumps({"database_url": "sqlite:///unexpected.db"}))
     with pytest.raises(ValueError, match="unsupported"):
         get_settings()
+
+
+def test_health_observation_only_is_default_and_explicit_runtime_mode(runtime):
+    assert get_settings().lingxing_performance_observation_only is True
+    get_settings.cache_clear()
+    runtime.write_text(json.dumps({"lingxing_performance_enabled": True,
+                                  "lingxing_performance_observation_only": True}))
+    settings = get_settings()
+    assert settings.lingxing_performance_enabled and settings.lingxing_performance_observation_only

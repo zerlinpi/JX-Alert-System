@@ -23,3 +23,7 @@
   or manager mappings remain empty and block affected anomaly deliveries.
 - Database changes are additive with backups and explicit persistence checks.
   Code rollback retains new historical evidence and never removes Docker volumes.
+- The user approved automatic health observation archiving only. Keep
+  `lingxing_performance_observation_only=true`; even a FRESH source cannot create,
+  update, escalate, or recover health business alerts in this mode. Data-quality
+  notices are allowed. Business evaluation requires separate authorization.

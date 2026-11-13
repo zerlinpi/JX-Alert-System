@@ -76,5 +76,6 @@ def configuration_status(db, settings):
             "last_successful_collection": None if latest is None else {
                 "job_id": latest.id, "status": latest.status, "finished_at_utc": str(latest.finished_at)},
             "health_collection_enabled": settings.lingxing_performance_enabled,
+            "health_observation_only": getattr(settings, "lingxing_performance_observation_only", True),
             "health_source_timezone_configured": bool(settings.lingxing_performance_source_timezone),
             "acceptance_note": "Configured flags do not prove external HTTPS or continuous-run acceptance"}

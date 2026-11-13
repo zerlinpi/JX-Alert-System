@@ -90,6 +90,13 @@ warnings return `SUCCEEDED_WITH_WARNINGS`; the manual dispatcher records that
 state without repeating a successful full collection. Request failures retain
 failure/retry behavior. Freshness must be verified before health-risk evaluation.
 
+The user approved observation archiving only. Set both
+`lingxing_performance_enabled=true` and
+`lingxing_performance_observation_only=true` in runtime settings. The latter
+defaults to true and blocks health/notice business alert creation, updates,
+escalation and recovery even when a future source is FRESH. Raw observations and
+data-quality notices continue. Do not disable this mode without separate approval.
+
 ## Historical rule replay
 
 `analysis.backtest.backtest_history()` copies the selected store's historical

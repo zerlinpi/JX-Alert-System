@@ -80,6 +80,7 @@ class Settings(BaseSettings):
 
     # Performance source timestamps have no UTC offset; configure their real IANA timezone.
     lingxing_performance_enabled: bool = False
+    lingxing_performance_observation_only: bool = True
     lingxing_performance_source_timezone: str = ""
     lingxing_performance_max_age_hours: int = Field(default=8, ge=1, le=168)
     lingxing_performance_page_size: int = Field(default=200, ge=1, le=200)
@@ -147,6 +148,7 @@ def get_settings() -> Settings:
             "sp_refresh_days", "mcp_operations_enabled", "feishu_enabled", "feishu_transport",
             "feishu_manager_open_ids", "feishu_daily_report_enabled", "feishu_daily_report_chat_id",
             "lingxing_performance_enabled", "lingxing_performance_source_timezone",
+            "lingxing_performance_observation_only",
             "mcp_allowed_hosts", "mcp_allowed_origins",
             "mcp_auth_mode", "mcp_public_url", "mcp_oauth_database_path", "mcp_owner_credentials_file",
             "mcp_forwarded_allow_ips",
