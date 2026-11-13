@@ -110,7 +110,7 @@ _RULE_NAMES = {
 _STATUS_NAMES = {"COMPLETE": "采集完成", "NOT_CONFIGURED": "源时区待确认", "STALE": "数据过期",
                  "FUTURE": "源时间异常", "MISSING": "缺少源时间", "FRESH": "数据有效", "FAILED": "采集失败",
                  "PARTIAL": "采集不完整", "PENDING": "等待采集", "UNKNOWN": "未知",
-                 "Healthy": "正常", "At Risk": "存在风险", "Unhealthy": "不健康"}
+                 "Healthy": "正常", "At Risk": "存在风险", "AtRisk": "存在风险", "Unhealthy": "不健康"}
 
 
 def status_label(value):
