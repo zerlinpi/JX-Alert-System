@@ -24,7 +24,7 @@ def number(value, *, money=False, currency=""):
     except (InvalidOperation, ValueError):
         return "未知（无效值）"
     currency = {"USD": "美元", "CNY": "人民币", "EUR": "欧元", "GBP": "英镑", "JPY": "日元",
-                "CAD": "加元", "AUD": "澳元", "MXN": "墨西哥比索"}.get(currency, currency)
+                "CAD": "加元", "AUD": "澳元", "MXN": "墨西哥比索", "BRL": "巴西雷亚尔"}.get(currency, currency)
     return f"{currency} {n:,.2f}".strip() if money else f"{n:,.2f}".rstrip("0").rstrip(".")
 
 

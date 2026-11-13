@@ -24,7 +24,7 @@ def warehouse(tmp_path):
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         for i in range(64):
-            db.add(Store(sid=str(i + 1), name="测试店铺" + str(i + 1), timezone=None, currency_code="CAD"))
+            db.add(Store(sid=str(i + 1), name="测试店铺" + str(i + 1), timezone=None, currency_code="BRL"))
         db.flush()
         yield db, settings
     engine.dispose()
@@ -61,6 +61,8 @@ def test_digest_respects_warning_and_explicit_zero_and_avoids_legacy_duplicate(w
     day = date(2026, 11, 11)
     db.add_all([DailyMetric(store_id="1", entity_id="1", dimension="store", metric_date=day,
                           metric_name="orders", value=0),
+                DailyMetric(store_id="1", entity_id="1", dimension="store", metric_date=day,
+                          metric_name="sales", value=12.3, currency="BRL"),
                 DataCoverage(store_id="1", dimension="store", metric_date=day, status="COMPLETE"),
                 DailyMetric(store_id="2", entity_id="2", dimension="store", metric_date=day,
                           metric_name="orders", value=999),
@@ -70,6 +72,7 @@ def test_digest_respects_warning_and_explicit_zero_and_avoids_legacy_duplicate(w
     all_rows = [r for id in result["outbox_ids"] for e in db.get(NotificationOutbox, id).payload["card"]["body"]["elements"]
                 if e["tag"] == "table" for r in e["rows"]]
     assert next(r for r in all_rows if "（1）" in r["c0"])["c2"] == "0"
+    assert next(r for r in all_rows if "（1）" in r["c0"])["c4"] == "巴西雷亚尔 12.30"
     assert next(r for r in all_rows if "（2）" in r["c0"])["c2"] == "未知（无记录）"
     assert "999" not in json.dumps(all_rows)
 
