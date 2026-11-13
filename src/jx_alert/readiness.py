@@ -18,6 +18,46 @@ def _json_file(path):
         return {}
 
 
+def feishu_channel_status(settings):
+    """Inspect only the selected transport locally; never request tokens or send messages."""
+    transport = getattr(settings, "feishu_transport", "webhook")
+    app_configured = None
+    configured = False
+    status = "NOT_CONFIGURED"
+    if transport == "app":
+        from jx_alert.notifications.feishu_app import FeishuAppClient, FeishuAppError
+        try:
+            FeishuAppClient.from_settings(settings)
+        except (FeishuAppError, ValueError, TypeError, AttributeError):
+            # Never expose private paths, values or the original exception text.
+            app_configured = False
+            status = "INVALID_CONFIGURATION"
+        else:
+            app_configured = configured = True
+            status = "CONFIGURED"
+        name = "飞书自建应用"
+        note = ("当前使用飞书自建应用，" + ("应用凭据已配置" if configured else "应用凭据需核实")
+                + "；此模式不需要Webhook。实际送达以通知日志为准。")
+    elif transport == "webhook":
+        configured = bool(getattr(settings, "feishu_webhook_url", ""))
+        status = "CONFIGURED" if configured else "NOT_CONFIGURED"
+        name = "飞书Webhook"
+        note = "仅检查默认Webhook配置；按群路由需另查对应配置。实际送达以通知日志为准。"
+    else:
+        transport, name, status = "unknown", "未知通道", "INVALID_TRANSPORT"
+        note = "通知通道配置无效，需要核实；未回退到其他通道。"
+    return {
+        "feishu_transport": transport, "feishu_channel_name": name,
+        "feishu_transport_configured": configured,
+        "feishu_app_credentials_configured": app_configured,
+        "feishu_webhook_required": transport == "webhook",
+        "feishu_configuration_status": status,
+        "feishu_delivery_enabled": bool(configured and getattr(settings, "feishu_enabled", False)
+                                        and not getattr(settings, "app_dry_run", True)),
+        "feishu_check_scope": "configuration_only", "feishu_status_note": note,
+    }
+
+
 def analysis_plan(db, settings, *, now=None):
     """Enumerate the complete enabled scope and distinguish blocked/missing data."""
     from jx_alert.operations import scoped_stores, store_report_plan
@@ -129,4 +169,5 @@ def configuration_status(db, settings):
             report["analysis_plan"] = analysis_plan(db, settings)
         except (OSError, ValueError, RuntimeError):
             report["analysis_plan"] = {"status": "CONFIGURATION_INVALID", "enabled_store_count": len(scope)}
+    report.update(feishu_channel_status(settings))
     return report

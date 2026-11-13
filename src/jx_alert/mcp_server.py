@@ -195,7 +195,13 @@ def _scope_challenge(required_scope, settings):
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def system_health() -> dict:
-    """Return application/database configuration status without exposing secrets."""
+    """查询服务、数据库及实际飞书通道的本机配置状态，不发送消息或暴露凭据。
+
+    判断飞书通道使用feishu_transport及feishu_transport_configured。
+    自建应用app模式无需Webhook，不能因feishu_webhook_configured=false判断未连接。
+    配置就绪不等于消息已送达；实际送达查get_notification_logs。
+    """
+    from jx_alert.readiness import feishu_channel_status
     settings = get_settings()
     try:
         init_db()
@@ -226,6 +232,7 @@ def system_health() -> dict:
         "lingxing_token_mode": token_mode,
         "feishu_enabled": settings.feishu_enabled,
         "feishu_webhook_configured": bool(settings.feishu_webhook_url),
+        **feishu_channel_status(settings),
         "remote_mcp_bearer_configured": bool(settings.mcp_bearer_token),
         "remote_mcp_path": settings.mcp_path,
         "remote_mcp_port": settings.mcp_port,
@@ -1090,7 +1097,11 @@ def get_sp_reconciliations(store_id: str, campaign_id: str, limit: int = 100) ->
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_configuration_status() -> dict:
-    """List missing owner/store/timezone/domain mappings without exposing credentials or IDs."""
+    """查询实际通知通道、店铺及角色配置缺口，不暴露密钥或人员ID。
+
+    自建应用不需要Webhook；以feishu_transport_configured判断当前通道配置。
+    管理员等映射缺失只影响相应投递，配置通过不代表消息已送达。
+    """
     from jx_alert.readiness import configuration_status
     init_db()
     with SessionLocal() as db:

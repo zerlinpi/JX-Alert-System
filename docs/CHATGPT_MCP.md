@@ -78,6 +78,16 @@ Chromium会把`form-action 'self'`应用到表单提交后的跨站302跳转。
 
 域名、TLS与所有者口令填好后，仍必须在ChatGPT实际完成授权并成功调用一次；单元测试或服务器本机初始化不能替代该项外部验收。
 
+## 飞书通道状态
+
+`system_health`和`get_configuration_status`按`feishu_transport`报告实际选用的通道。
+`app`表示自建应用，凭据可由现有私有文件加载，此模式不需要Webhook。
+兼容字段`feishu_webhook_configured=false`仅表示默认Webhook未配置，不能据此说自建应用未连接。
+请使用`feishu_transport_configured`和`feishu_status_note`判断当前通道配置；
+`feishu_delivery_enabled`仅表示本机开关允许执行，不证明某条消息已发送或某个接收人已映射。
+检查不请求飞书令牌、不发送测试消息；实际成功以通知日志和outbox的`DELIVERED`为准。
+未知通道或应用凭据无效不会自动退回Webhook，也不返回密钥、路径或原始错误。
+
 ## 本地原生浏览器回归
 
 `scripts/verify_oauth_browser.py` 使用全新隔离的Chrome／Chromium profile，在loopback临时TLS服务中验证原生登录、同意、跨源回调与PKCE换令牌；不连接生产、不读取用户浏览器或生产凭据。
