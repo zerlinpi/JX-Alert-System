@@ -16,6 +16,16 @@ from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerfo
 from jx_alert.notifications.cards import card, number, change, status_label
 
 
+def _metric_currency(facts, on, dimension, metric):
+    """Currency belongs to the observed metric, not the store's country/sales setting."""
+    values = [r.currency for r in facts if r.metric_date == on and r.dimension == dimension
+              and r.metric_name == metric]
+    if (not values or any(not isinstance(v, str) or not re.fullmatch(r"[A-Z]{3}", v) for v in values)
+            or len(set(values)) != 1):
+        return None
+    return values[0]
+
+
 def build_daily_card(db, store, day, *, data_warning=None):
     """Read two authoritative daily partitions; never fill missing facts with zero."""
     previous = day - timedelta(days=1)
@@ -28,7 +38,6 @@ def build_daily_card(db, store, day, *, data_warning=None):
         DataCoverage.store_id == store.sid, DataCoverage.metric_date.in_([day, previous]),
         DataCoverage.dimension.in_(dimensions),
     ))}
-    currency = store.currency_code or "币种未知"
 
     def total(on, dimension, metric):
         if data_warning or coverage.get((on, dimension)) != "COMPLETE":
@@ -45,8 +54,19 @@ def build_daily_card(db, store, day, *, data_warning=None):
     ]:
         current, prior = total(day, dimension, metric), total(previous, dimension, metric)
         complete = all(coverage.get((d, dimension)) == "COMPLETE" for d in [day, previous])
-        metrics.append((label, number(current, money=money, currency=currency),
-                        number(prior, money=money, currency=currency), change(current, prior, complete=complete)))
+        current_currency = _metric_currency(facts, day, dimension, metric) if money else None
+        prior_currency = _metric_currency(facts, previous, dimension, metric) if money else None
+        def display(value, currency):
+            if value is not None and money and currency is None:
+                return "未知（币种待确认）"
+            return number(value, money=money, currency=currency or "")
+        comparison = change(current, prior, complete=complete)
+        if money and current is not None and prior is not None and complete:
+            if not current_currency or not prior_currency:
+                comparison = "币种待确认"
+            elif current_currency != prior_currency:
+                comparison = "币种不一致"
+        metrics.append((label, display(current, current_currency), display(prior, prior_currency), comparison))
     quality = [(label, "待重新采集校验" if data_warning else status_label(coverage.get((day, dimension), "未知"))) for label, dimension in [
         ("店铺销量", "store"), ("商品推广", "campaign_sp"), ("品牌推广", "campaign_sb"), ("展示推广", "campaign_sd")]]
     performance = db.scalar(select(StorePerformance).where(StorePerformance.store_id == store.sid)
@@ -241,12 +261,15 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
         spend_rows = [row.value for row in ad_rows if row.metric_name == "spend"] if (
             not warning and coverage.get("campaign_sp") == "COMPLETE") else []
         ad_spend = sum(spend_rows) if spend_rows else None
+        ad_currency = _metric_currency(ad_rows, day, "campaign_sp", "spend")
+        ad_display = ("未知（币种待确认）" if ad_spend is not None and not ad_currency
+                      else number(ad_spend, money=True, currency=ad_currency or ""))
         lines = [
             f"日常经营日报 · {day.isoformat()}",
             f"店铺：{store.name}（{store.sid}）",
             f"订单 {display(sales.get('orders'))} · 销量 {display(sales.get('units'))}"
             f" · 销售额 {display(sales.get('sales'))}",
-            f"商品推广花费：{number(ad_spend, money=True, currency=store.currency_code or '币种待确认')}",
+            f"商品推广花费：{ad_display}",
             f"采集状态：店铺 {status_label(coverage.get('store'))}"
             f" / 商品推广 {status_label(coverage.get('campaign_sp'))}",
         ]
