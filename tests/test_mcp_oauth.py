@@ -15,7 +15,7 @@ import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
-from jx_alert.mcp_oauth import COOKIE, SCOPES, SqliteOAuthProvider, create_owner_credentials
+from jx_alert.mcp_oauth import COOKIE, SCOPES, SqliteOAuthProvider, create_owner_credentials, _callback_origin
 
 ISSUER = "https://jx.example.com/"
 RESOURCE = "https://jx.example.com/mcp"
@@ -274,6 +274,39 @@ def test_login_form_preserves_browser_origin_without_accepting_opaque_origin(set
     accepted = owner_post(client, request_id, csrf, action="login", password=PASSWORD)
     assert accepted.status_code == 200 and "同意" in accepted.text
     assert accepted.headers["referrer-policy"] == "same-origin"
+
+
+def test_only_authenticated_consent_allows_its_registered_callback_origin(setup):
+    _, client, _ = setup
+    account = register(client)
+    request_id, csrf, login = begin(client, account)
+    assert "form-action 'self';" in login.headers["content-security-policy"]
+    accepted = owner_post(client, request_id, csrf, action="login", password=PASSWORD)
+    policy = accepted.headers["content-security-policy"]
+    assert "form-action 'self' https://chatgpt.com;" in policy
+    assert "default-src 'none'" in policy and "frame-ancestors 'none'" in policy
+    csrf = re.search(r'name="csrf" value="([^"]+)"', accepted.text)[1]
+    redirect = owner_post(client, request_id, csrf, action="approve")
+    assert redirect.status_code == 302
+    assert redirect.headers["content-security-policy"] == policy
+    assert owner_post(client, request_id, csrf, action="approve").status_code == 403
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("https://chatgpt.com/connector_platform_oauth_redirect?state=a;b", "https://chatgpt.com"),
+    ("https://example.test:8443/path;script-src%20*?x='", "https://example.test:8443"),
+    ("http://127.0.0.1:8123/callback", "http://127.0.0.1:8123"),
+    ("http://[::1]:8123/callback", "http://[::1]:8123"),
+])
+def test_callback_csp_uses_only_normalized_origin(value, expected):
+    assert _callback_origin(value) == expected
+
+
+@pytest.mark.parametrize("value", ["http://evil.example/cb", "https://user:password@example.test/cb",
+                                  "https://example.test/cb#fragment", "https://bad'host.test/cb"])
+def test_callback_csp_rejects_unsafe_uri(value):
+    with pytest.raises(ValueError):
+        _callback_origin(value)
 
 
 def test_transactionally_consumes_code_under_two_independent_connections(setup):
