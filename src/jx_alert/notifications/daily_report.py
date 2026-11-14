@@ -50,10 +50,16 @@ def build_daily_card(db, store, day, *, data_warning=None, settings=None):
         DailyMetric.store_id == store.sid, DailyMetric.metric_date.in_([day, previous]),
         DailyMetric.dimension.in_(dimensions),
     )).all()
-    coverage = {(r.metric_date, r.dimension): r.status for r in db.scalars(select(DataCoverage).where(
+    coverage_rows = {(r.metric_date, r.dimension): r for r in db.scalars(select(DataCoverage).where(
         DataCoverage.store_id == store.sid, DataCoverage.metric_date.in_([day, previous]),
         DataCoverage.dimension.in_(dimensions),
     ))}
+    coverage = {key: row.status for key, row in coverage_rows.items()}
+
+    def empty_partition(on, dimension):
+        record = coverage_rows.get((on, dimension))
+        return (not data_warning and record is not None and record.status == "COMPLETE" and record.row_count == 0
+                and not any(r.metric_date == on and r.dimension == dimension for r in facts))
 
     def total(on, dimension, metric):
         if data_warning or coverage.get((on, dimension)) != "COMPLETE":
@@ -72,18 +78,23 @@ def build_daily_card(db, store, day, *, data_warning=None, settings=None):
         complete = all(coverage.get((d, dimension)) == "COMPLETE" for d in [day, previous])
         current_currency = _metric_currency(facts, day, dimension, metric) if money else None
         prior_currency = _metric_currency(facts, previous, dimension, metric) if money else None
-        def display(value, currency):
+        def display(value, currency, on):
+            if empty_partition(on, dimension):
+                return "接口无记录"
             if value is not None and money and currency is None:
                 return "未知（币种待确认）"
             return number(value, money=money, currency=currency or "")
         comparison = change(current, prior, complete=complete)
+        if empty_partition(day, dimension) or empty_partition(previous, dimension):
+            comparison = "接口无记录，无法比较"
         if money and current is not None and prior is not None and complete:
             if not current_currency or not prior_currency:
                 comparison = "币种待确认"
             elif current_currency != prior_currency:
                 comparison = "币种不一致"
-        metrics.append((label, display(current, current_currency), display(prior, prior_currency), comparison))
-    quality = [(label, "待重新采集校验" if data_warning else status_label(coverage.get((day, dimension), "未知"))) for label, dimension in [
+        metrics.append((label, display(current, current_currency, day), display(prior, prior_currency, previous), comparison))
+    quality = [(label, "待重新采集校验" if data_warning else "接口无记录" if empty_partition(day, dimension)
+                else status_label(coverage.get((day, dimension), "未知"))) for label, dimension in [
         ("店铺销量", "store"), ("商品推广", "campaign_sp"), ("品牌推广", "campaign_sb"), ("展示推广", "campaign_sd")]]
     zone_label = ("美国太平洋时间" if store.timezone == "America/Los_Angeles" else
                   "店铺当地时间" if store.timezone else "保守历史日 · 时区待核实")
@@ -125,7 +136,7 @@ def _enqueue_group_digest(db, stores, dates, warnings, *, send_day, due, chat_id
         tables = [e for e in source["body"]["elements"] if e["tag"] == "table"]
         values = [r["c1"] for r in tables[0]["rows"]]
         quality = "待校验" if warnings.get(store.sid) else (
-            "完整" if all(r["c1"] == "采集完成" for r in tables[1]["rows"]) else "数据不完整")
+            "采集完成" if all(r["c1"] in {"采集完成", "接口无记录"} for r in tables[1]["rows"]) else "数据不完整")
         if not store.timezone:
             quality += "；时区待核实"
         rows.append((f"{store.name[:60]}（{store.sid}）", day.isoformat(), *values, quality))

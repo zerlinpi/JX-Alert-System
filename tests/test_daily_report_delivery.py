@@ -103,3 +103,41 @@ def test_incomplete_partition_values_masked_but_complete_explicit_zero_is_real(s
     warned_table = next(e for e in warned["body"]["elements"] if e["tag"] == "table")
     assert warned_table["rows"][0]["c1"] == "未知（无记录）"
 
+
+def test_successful_empty_report_is_distinct_from_missing_failed_and_explicit_zero(setup):
+    db, settings, store = setup
+    for dimension, status in (("campaign_sb", "COMPLETE"), ("campaign_sd", "FAILED")):
+        db.add(DataCoverage(store_id=store.sid, metric_date=DAY, dimension=dimension, status=status, row_count=0))
+    db.add(DataCoverage(store_id=store.sid, metric_date=DAY, dimension="campaign_sp", status="COMPLETE", row_count=1))
+    db.add(DailyMetric(store_id=store.sid, entity_id="sp", metric_date=DAY,
+        dimension="campaign_sp", metric_name="spend", value=0, currency="USD"))
+    db.flush()
+    value = build_daily_card(db, store, DAY, settings=settings)
+    tables = [e for e in value["body"]["elements"] if e["tag"] == "table"]
+    metrics = {r["c0"]: r for r in tables[0]["rows"]}
+    quality = {r["c0"]: r["c1"] for r in tables[1]["rows"]}
+    assert metrics["商品推广花费"]["c1"] == "美元 0.00"
+    assert metrics["品牌推广花费"]["c1"] == "接口无记录"
+    assert metrics["品牌推广花费"]["c3"] == "接口无记录，无法比较"
+    assert metrics["展示推广花费"]["c1"] == "未知（无记录）"
+    assert quality["商品推广"] == "采集完成" and quality["品牌推广"] == "接口无记录"
+    assert quality["展示推广"] == "采集失败" and quality["店铺销量"] == "未知"
+    warned = build_daily_card(db, store, DAY, settings=settings, data_warning="最新采集失败")
+    warned_tables = [e for e in warned["body"]["elements"] if e["tag"] == "table"]
+    assert all(r["c1"] != "接口无记录" for r in warned_tables[0]["rows"])
+
+
+def test_empty_coverage_requires_no_actual_rows_and_failed_partition_masks_stale_values(setup):
+    db, settings, store = setup
+    for dimension, status, value in (("campaign_sb", "COMPLETE", 13), ("campaign_sd", "FAILED", 99)):
+        db.add(DataCoverage(store_id=store.sid, metric_date=DAY, dimension=dimension, status=status, row_count=0))
+        db.add(DailyMetric(store_id=store.sid, entity_id=dimension, metric_date=DAY,
+            dimension=dimension, metric_name="spend", value=value, currency="USD"))
+    db.flush()
+    card = build_daily_card(db, store, DAY, settings=settings)
+    tables = [e for e in card["body"]["elements"] if e["tag"] == "table"]
+    assert tables[0]["rows"][4]["c1"] != "接口无记录"
+    assert tables[0]["rows"][5]["c1"] == "未知（无记录）"
+    assert tables[1]["rows"][3]["c1"] == "采集失败"
+    assert "99" not in json.dumps(tables[0]["rows"])
+

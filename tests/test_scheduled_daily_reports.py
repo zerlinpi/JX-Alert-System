@@ -276,7 +276,7 @@ def test_separate_scheduler_executor_runs_deadline_report_during_long_collection
         assert release.wait(5), "Test must release collection"
         return {"status": "COMPLETE"}
 
-    monkeypatch.setattr(operations, "run_collection", long_collection)
+    monkeypatch.setattr(operations, "process_pending_collection", long_collection)
     monkeypatch.setattr(operations, "queue_scheduled_daily_reports", lambda: {
         "status": "QUEUED", "outbox_ids": [901],
     })
@@ -289,7 +289,7 @@ def test_separate_scheduler_executor_runs_deadline_report_during_long_collection
     })
     try:
         running.start()
-        running.add_job(scheduler.daily_job, "date", executor="default")
+        running.add_job(scheduler.manual_collection_job, "date", executor="default")
         assert entered.wait(3)
         running.add_job(scheduler.daily_report_job, "date", executor="daily_reports")
         assert reported.wait(3), "The deadline report must not wait for the collection executor"
