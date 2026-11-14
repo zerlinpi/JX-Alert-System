@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     feishu_daily_report_group_digest: bool = False
     # Refresh enough marketplace-local dates for the 14-day attribution window plus its 7-day baseline.
     ad_attribution_refresh_days: int = Field(default=22, ge=1, le=31)
+    sb_sd_detail_reports_enabled: bool = True
     store_timezones_file: str = "/app/data/store-timezones.json"
     runtime_settings_file: str = "/app/data/runtime-settings.json"
     collection_scope_file: str = "/app/data/collection-scope.json"
@@ -170,6 +171,7 @@ def get_settings() -> Settings:
             "app_dry_run", "scheduler_enabled", "daily_sync_cron",
             "feishu_daily_report_cron", "feishu_daily_report_start_date",
             "feishu_daily_report_group_digest",
+            "sb_sd_detail_reports_enabled",
             "business_alert_delivery_mode",
             "feishu_bot_enabled", "feishu_bot_open_id", "feishu_bot_max_pending",
             "feishu_bot_question_max_age_minutes", "deepseek_credentials_file", "deepseek_model",

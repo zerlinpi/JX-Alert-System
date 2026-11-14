@@ -4,6 +4,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY scripts/export_daily_snapshot.py ./scripts/export_daily_snapshot.py
+COPY scripts/collect_sb_sd_details.py ./scripts/collect_sb_sd_details.py
 RUN pip install --no-cache-dir .
 RUN useradd --create-home --uid 10001 appuser && mkdir -p /app/data/raw /app/data/reports && chown -R appuser:appuser /app
 USER appuser

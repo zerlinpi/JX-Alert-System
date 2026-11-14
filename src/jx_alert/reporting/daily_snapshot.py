@@ -39,12 +39,20 @@ from jx_alert.storage.sp import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 EXCEL_DATA_ROWS = 1_048_575
-FACT_DIMENSIONS = {
+_V1_FACT_DIMENSIONS = {
     "store": "店铺销量事实", "sku_msku": "MSKU销量事实", "sku_asin": "ASIN销量事实",
     "campaign_sp": "SP活动事实", "campaign_sb": "SB活动事实", "campaign_sd": "SD活动事实",
     "product_ad_sp": "SP商品广告事实", "product_ad_sd": "SD商品广告事实",
+}
+FACT_DIMENSIONS = {
+    **_V1_FACT_DIMENSIONS,
+    "creative_sb": "SB广告创意",
+    "target_sb": "SB广告投放",
+    "purchased_asin_sb": "SB归因购买商品",
+    "target_sd": "SD商品定位",
+    "purchased_asin_sd": "SD已购买商品",
 }
 SP_METRICS = ("cost", "clicks", "impressions", "orders", "sales")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -349,13 +357,17 @@ def _completed(directory, day):
         if manifest_path.stat().st_size > 1024 * 1024:
             return None
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if (manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("status") != "COMPLETE"
+        version = manifest.get("schema_version")
+        if (type(version) is not int or version not in {1, SCHEMA_VERSION} or manifest.get("status") != "COMPLETE"
                 or manifest.get("snapshot_date") != day.isoformat() or not manifest.get("datasets")):
             return None
         required = {item[0] for item in BASE_DATASETS} | {item[0] for item in SP_DATASETS}
         required |= {"health_indicators", "reconciliations", "collection_counts", "anomaly_metrics",
                      "advertising_kpis", "00_归档目录"}
-        required |= {"facts_" + hashlib.sha256(dimension.encode()).hexdigest()[:16] for dimension in FACT_DIMENSIONS}
+        # A completed pre-upgrade archive is immutable. Only new manifests
+        # require the separate SB and SD detail workbooks.
+        dimensions = _V1_FACT_DIMENSIONS if version == 1 else FACT_DIMENSIONS
+        required |= {"facts_" + hashlib.sha256(dimension.encode()).hexdigest()[:16] for dimension in dimensions}
         keys = [item["key"] for item in manifest["datasets"]]
         if not required.issubset(keys) or len(keys) != len(set(keys)):
             return None

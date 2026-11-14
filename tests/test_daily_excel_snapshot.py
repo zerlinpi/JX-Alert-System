@@ -157,6 +157,43 @@ def test_daily_success_is_immutable_and_repeated_call_cannot_accumulate_facts(wa
     assert len(list(Path(first["manifest_path"]).parent.parent.iterdir())) == 1
 
 
+def test_new_detail_workbooks_preserve_previous_archive_and_original_identifiers(warehouse, tmp_path, monkeypatch):
+    with monkeypatch.context() as old_format:
+        old_format.setattr(snapshot, "FACT_DIMENSIONS", snapshot._V1_FACT_DIMENSIONS)
+        old_format.setattr(snapshot, "SCHEMA_VERSION", 1)
+        original = export(warehouse, tmp_path)
+    manifest_path = Path(original["manifest_path"])
+    manifest_bytes = manifest_path.read_bytes()
+
+    db, settings = warehouse
+    detail_dimensions = {
+        "creative_sb": "SB广告创意", "target_sb": "SB广告投放", "purchased_asin_sb": "SB归因购买商品",
+        "target_sd": "SD商品定位", "purchased_asin_sd": "SD已购买商品",
+    }
+    numeric_dimensions = {"creative_sb", "target_sb", "target_sd"}
+    identifiers = json.dumps([LONG_ID, "other-ASIN"], separators=(",", ":"))
+    db.add_all(DailyMetric(store_id="5174", metric_date=REPORT_DAY, dimension=dimension,
+        entity_id=identifiers, metric_name="spend", value=0, currency="USD") for dimension in numeric_dimensions)
+    db.commit()
+
+    assert export(warehouse, tmp_path)["status"] == "ALREADY_COMPLETE"
+    assert manifest_path.read_bytes() == manifest_bytes
+    updated = snapshot.export_daily_snapshot(db, tmp_path / "excel", date(2026, 11, 15), now=NOW, settings=settings)
+    assert updated["status"] == "COMPLETE"
+    assert json.loads(Path(updated["manifest_path"]).read_bytes())["schema_version"] == 2
+    by_dimension = {item.get("dimension"): item for item in updated["datasets"]}
+    for dimension, title in detail_dimensions.items():
+        item = by_dimension[dimension]
+        assert item["title"] == title
+        rows = table(updated, item["key"])
+        if dimension in numeric_dimensions:
+            assert item["state"] == "PRESENT" and item["row_count"] == 1
+            assert rows[0]["对象ID"] == identifiers and rows[0]["数值"] == 0 and rows[0]["币种"] == "USD"
+        else:
+            assert item["state"] == "EMPTY" and item["row_count"] == 0
+            assert rows == []
+
+
 def test_split_sheets_does_not_drop_duplicate_or_reorder_rows_and_discovers_new_dimensions(warehouse, tmp_path):
     db, _ = warehouse
     for index in range(5):

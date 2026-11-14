@@ -10,6 +10,7 @@ import hashlib
 import json
 import time
 from collections.abc import Iterator
+from datetime import date
 from urllib.parse import urljoin
 
 import httpx
@@ -29,6 +30,16 @@ _SP_HOUR_ARRAY_PATHS = frozenset({
     "/pb/openapi/newad/spAdvertiseHourData",
     "/pb/openapi/newad/spTargetHourData",
 })
+
+# The detail reports have their own reporting grains. Never add these amounts
+# to the activity totals, which come from the campaign-report endpoints.
+_AD_DETAIL_PATHS = {
+    "creative_sb": "/pb/openapi/newad/listHsaProductAdReport",
+    "target_sb": "/pb/openapi/newad/listHsaTargetingReport",
+    "purchased_asin_sb": "/pb/openapi/newad/hsaPurchasedAsinReports",
+    "target_sd": "/pb/openapi/newad/sdTargetReports",
+    "purchased_asin_sd": "/pb/openapi/newad/sdAsinReports",
+}
 
 
 def _endpoint_signature_params(path: str, params: dict) -> dict:
@@ -284,12 +295,7 @@ class LingxingClient:
     def iter_advertising_report(self, report_type: str, payload: dict, *,
                                 length: int = 100, max_pages: int = 1000
                                 ) -> Iterator[dict]:
-        """Yield all campaign-report rows; cursor for SP/SD, offset for SB.
-
-        SP/SD OpenAPI v2 return next_token. SB campaign report documentation
-        specifies offset/length pagination. Incomplete pagination raises instead
-        of silently presenting a partial report as complete.
-        """
+        """Prefer the V2 cursor while supporting SB responses that use offsets."""
         report_type = report_type.lower()
         if report_type not in {"sp", "sb", "sd"}:
             raise ValueError("report_type must be sp, sb or sd")
@@ -328,11 +334,11 @@ class LingxingClient:
             if not rows:
                 raise LingxingError("Campaign report pagination stopped before the reported total")
 
-            if report_type == "sb":
+            next_token = result.get("next_token")
+            if report_type == "sb" and not next_token and not seen_tokens:
                 request["offset"] = offset
                 continue
 
-            next_token = result.get("next_token")
             if not isinstance(next_token, str) or not next_token:
                 raise LingxingError(
                     f"{report_type.upper()} report pagination incomplete: "
@@ -478,7 +484,7 @@ class LingxingClient:
     def iter_advertising_product_report(self, report_type: str, payload: dict, *,
                                         length: int = 100, max_pages: int = 1000
                                         ) -> Iterator[dict]:
-        """Yield SP (cursor) and SD (offset) advertised-product report rows."""
+        """Prefer the V2 cursor while supporting SD responses that use offsets."""
         report_type = report_type.lower()
         if report_type not in {"sp", "sd"}:
             raise ValueError("product report_type must be sp or sd")
@@ -489,6 +495,7 @@ class LingxingClient:
         request = {**payload, "offset": 0, "length": length}
         seen_tokens: set[str] = set()
         offset = 0
+        expected_total: int | None = None
 
         for _ in range(max_pages):
             result = self.advertising_product_report(report_type, request)
@@ -499,6 +506,9 @@ class LingxingClient:
                 total = int(result["total"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise LingxingError("Product ad report response total is missing or invalid") from exc
+            if expected_total is not None and total != expected_total:
+                raise LingxingError("Product ad report total changed during pagination")
+            expected_total = total
             yield from rows
             offset += len(rows)
             if offset > total:
@@ -510,20 +520,103 @@ class LingxingClient:
                     f"{report_type.upper()} product report pagination incomplete"
                 )
 
-            if report_type == "sd":
+            next_token = result.get("next_token")
+            if report_type == "sd" and not next_token and not seen_tokens:
                 request["offset"] = offset
                 continue
 
-            next_token = result.get("next_token")
             if not isinstance(next_token, str) or not next_token:
-                raise LingxingError("SP product report missing next_token")
+                raise LingxingError(f"{report_type.upper()} product report missing next_token")
             if next_token in seen_tokens:
-                raise LingxingError("SP product report returned a repeated next_token")
+                raise LingxingError("Product report returned a repeated next_token")
             seen_tokens.add(next_token)
             request.pop("offset", None)
             request["next_token"] = next_token
 
         raise LingxingError(f"Product ad report exceeded max_pages={max_pages}")
+
+    def iter_advertising_detail_report(self, dimension: str, payload: dict, *,
+                                      length: int = 100, max_pages: int = 1000
+                                      ) -> Iterator[dict]:
+        """Yield a complete SB/SD detail partition using the official v2 cursor."""
+        if dimension not in _AD_DETAIL_PATHS:
+            raise ValueError("Unsupported advertising detail dimension")
+        if type(length) is not int or length <= 0 or type(max_pages) is not int or max_pages <= 0:
+            raise ValueError("Advertising detail pagination limits must be positive integers")
+
+        # Allow only whole-partition requests. A filter or a caller-supplied
+        # cursor could otherwise store an incomplete partition as complete.
+        allowed = {"sid", "profile_id", "report_date", "offset", "length"}
+        if dimension == "target_sb":
+            allowed.update({"sponsored_type", "target_type"})
+        elif dimension == "purchased_asin_sd":
+            allowed.add("show_detail")
+        if set(payload) - allowed:
+            raise ValueError("Unsupported advertising detail report parameter")
+        request = {**payload, "offset": 0, "length": length}
+        keys = [key for key in ("sid", "profile_id") if key in request]
+        if len(keys) != 1:
+            raise ValueError("Advertising detail report requires one sid or profile_id")
+        key = keys[0]
+        identifier = request[key]
+        if type(identifier) is str and identifier.isascii() and identifier.isdigit():
+            identifier = int(identifier)
+        if type(identifier) is not int or identifier <= 0:
+            raise ValueError("Advertising detail account identifier must be a positive integer")
+        request[key] = identifier
+        report_date = request.get("report_date")
+        try:
+            if date.fromisoformat(report_date).isoformat() != report_date:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("Advertising detail report requires a date in YYYY-MM-DD format") from None
+        if dimension == "target_sb":
+            for key in ("sponsored_type", "target_type"):
+                if request.get(key, "ALL") != "ALL":
+                    raise ValueError("SB targeting detail requires all target types")
+                request[key] = "ALL"
+        if "show_detail" in request and (
+            type(request["show_detail"]) is not int or request["show_detail"] not in {0, 1}
+        ):
+            raise ValueError("Advertising detail show_detail must be 0 or 1")
+
+        expected_total = None
+        received = 0
+        seen_tokens: set[str] = set()
+        for _ in range(max_pages):
+            result = self._request(
+                "POST", _AD_DETAIL_PATHS[dimension], json_body=request, advertising=True
+            )
+            if str(result.get("code")) != "0":
+                raise LingxingError("Advertising detail response is missing its success code")
+            rows = result.get("data")
+            total = result.get("total")
+            next_token = result.get("next_token")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise LingxingError("Advertising detail response data must be an array of objects")
+            if type(total) is not int or total < 0:
+                raise LingxingError("Advertising detail response total is missing or invalid")
+            if expected_total is not None and total != expected_total:
+                raise LingxingError("Advertising detail report total changed during pagination")
+            expected_total = total
+            received += len(rows)
+            if received > total:
+                raise LingxingError("Advertising detail report returned more rows than its total")
+            if next_token is not None and not isinstance(next_token, str):
+                raise LingxingError("Advertising detail response next_token is invalid")
+            if next_token and next_token in seen_tokens:
+                raise LingxingError("Advertising detail report returned a repeated next_token")
+            if received == total:
+                yield from rows
+                return
+            if not rows or not next_token or not next_token.strip():
+                raise LingxingError("Advertising detail pagination stopped before its total without a usable page")
+
+            yield from rows
+            seen_tokens.add(next_token)
+            request.pop("offset", None)
+            request["next_token"] = next_token
+        raise LingxingError(f"Advertising detail report exceeded max_pages={max_pages}")
 
     def performance(self, path: str, payload: dict):
         if not path.startswith("/") or path.startswith("//"):
