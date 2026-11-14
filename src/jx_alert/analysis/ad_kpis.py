@@ -60,7 +60,10 @@ def compare_kpis(by_day, target, *, min_clicks=10, ratio=0.15, maturity_days=0,
                  "formula": numerator + "/" + denominator, "title": title, "direction": direction,
                  "current": None, "baseline": None, "currency": None, "change_ratio": None,
                  "status": "INSUFFICIENT_DATA", "comparison_basis": "INSUFFICIENT_DATA",
-                 "comparison_dates": [], "threshold": ratio, "attribution_mature": conversion}
+                 "comparison_dates": [], "threshold": ratio,
+                 "attribution_maturity_required": conversion,
+                 "attribution_mature": True if conversion else None,
+                 "date_basis": "mature_attribution_date" if conversion else "completed_report_date"}
         results[code] = entry
         if code == "TCOAS" and not store_scope:
             entry["status"] = "SCOPE_UNSUPPORTED"

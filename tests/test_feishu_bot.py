@@ -1,5 +1,6 @@
 from copy import deepcopy
 import json
+import io
 import logging
 import sys
 from types import ModuleType, SimpleNamespace
@@ -9,6 +10,22 @@ import pytest
 
 from jx_alert import feishu_bot as bot
 from jx_alert.notifications.feishu_app import FeishuAppClient
+
+
+@pytest.fixture
+def sdk_logging():
+    names = ("Lark", "websockets.client")
+    saved = {name: (list(logging.getLogger(name).handlers), logging.getLogger(name).level,
+                    logging.getLogger(name).disabled, logging.getLogger(name).propagate)
+             for name in names}
+    try:
+        yield
+    finally:
+        for name, (handlers, level, disabled, propagate) in saved.items():
+            target = logging.getLogger(name)
+            target.handlers = handlers
+            target.setLevel(level)
+            target.disabled, target.propagate = disabled, propagate
 
 
 def incoming():
@@ -170,7 +187,7 @@ def test_dry_run_bot_refuses_connection_before_reading_credentials(monkeypatch):
         bot.run_bot(settings)
 
 
-def test_long_connection_uses_official_dispatcher_and_separate_worker(monkeypatch):
+def test_long_connection_uses_official_dispatcher_and_separate_worker(monkeypatch, sdk_logging):
     state = {}
     class Builder:
         def register_p2_im_message_receive_v1(self, callback):
@@ -186,7 +203,7 @@ def test_long_connection_uses_official_dispatcher_and_separate_worker(monkeypatc
     class Ws:
         def __init__(self, app_id, secret, **kwargs):
             assert app_id == "cli_bot" and secret == "test-secret"
-            assert kwargs == {"event_handler": "handler", "log_level": "error"}
+            assert kwargs == {"event_handler": "handler", "log_level": "info"}
         def start(self):
             state["started"] = True
     class Thread:
@@ -204,7 +221,7 @@ def test_long_connection_uses_official_dispatcher_and_separate_worker(monkeypatc
     monkeypatch.setattr(bot.FeishuAppClient, "from_settings", lambda settings: SimpleNamespace(_app_id="cli_bot", _app_secret="test-secret"))
     monkeypatch.setattr(bot, "fetch_bot_open_id", lambda client: "ou_this_bot")
     monkeypatch.setattr(bot, "_load_sdk", lambda: SimpleNamespace(EventDispatcherHandler=Dispatcher,
-        LogLevel=SimpleNamespace(ERROR="error"), ws=SimpleNamespace(Client=Ws)))
+        LogLevel=SimpleNamespace(INFO="info"), ws=SimpleNamespace(Client=Ws)))
     monkeypatch.setattr(bot.threading, "Thread", Thread)
     bot.run_bot(settings)
     assert settings.feishu_bot_open_id == "ou_this_bot"
@@ -212,5 +229,56 @@ def test_long_connection_uses_official_dispatcher_and_separate_worker(monkeypatc
     assert state["started"] and state["worker_started"]
     assert state["thread"]["target"] is module.run_question_worker
     assert state["thread"]["daemon"] is True
-    assert logging.getLogger("Lark").disabled
+    sdk_logger = logging.getLogger("Lark")
+    assert not sdk_logger.disabled and not sdk_logger.propagate
+    assert sdk_logger.level == logging.INFO
+    assert len(sdk_logger.handlers) == 1
+    assert isinstance(sdk_logger.handlers[0], bot.SafeSdkConnectionHandler)
     assert "jx_alert.mcp_server" not in bot.__dict__
+
+
+@pytest.mark.parametrize("sdk_message,safe_message", [
+    ("connected to wss://private.invalid?secret=private-url [conn_id=private-id]", "飞书长连接已建立"),
+    ("disconnected to wss://private.invalid?secret=private-url [conn_id=private-id]", "飞书长连接已断开"),
+    ("trying to reconnect for the 1st time [conn_id=private-id]", "飞书长连接正在重连"),
+    ("connect failed, err: secret=private-error [conn_id=private-id]", "飞书长连接失败"),
+])
+def test_sdk_lifecycle_is_visible_without_forwarding_any_original_record(
+    sdk_logging, sdk_message, safe_message, caplog, capsys,
+):
+    original_output = io.StringIO()
+    sdk_logger = logging.getLogger("Lark")
+    sdk_logger.handlers = [logging.StreamHandler(original_output), logging.StreamHandler(original_output)]
+    sdk_logger.propagate = True
+    sdk_logger.disabled = True
+    bot._install_safe_sdk_logging()
+    with caplog.at_level(logging.INFO, logger=bot.logger.name):
+        sdk_logger.info(sdk_message)
+    assert [record.getMessage() for record in caplog.records] == [safe_message]
+    output = capsys.readouterr()
+    combined = original_output.getvalue() + output.out + output.err + caplog.text
+    assert original_output.getvalue() == ""
+    assert "private" not in combined and "wss://" not in combined
+    assert "conn_id" not in combined and "secret=" not in combined
+
+
+def test_unknown_sdk_payloads_and_tracebacks_are_not_logged(sdk_logging, caplog, capsys):
+    bot._install_safe_sdk_logging()
+    sdk_logger = logging.getLogger("Lark")
+    with caplog.at_level(logging.INFO, logger=bot.logger.name):
+        sdk_logger.info("receive message, payload: private-event-header-and-customer-text")
+        try:
+            raise RuntimeError("private-provider-error")
+        except RuntimeError:
+            sdk_logger.exception("handle message failed: private-payload")
+        logging.getLogger("websockets.client").error("wss://private.invalid?credential=private-key")
+    output = capsys.readouterr()
+    assert caplog.records == []
+    assert "private" not in output.out + output.err + caplog.text
+
+
+def test_safe_sdk_logger_replacement_is_idempotent(sdk_logging):
+    bot._install_safe_sdk_logging()
+    bot._install_safe_sdk_logging()
+    assert len(logging.getLogger("Lark").handlers) == 1
+    assert isinstance(logging.getLogger("Lark").handlers[0], bot.SafeSdkConnectionHandler)

@@ -181,3 +181,13 @@ def test_untrusted_or_excessive_context_is_rejected_before_network(monkeypatch, 
 def test_question_is_required_and_bounded(question):
     with pytest.raises(DeepSeekError):
         DeepSeekClient(KEY).analyze(CONTEXT, question)
+
+
+def test_internal_statuses_are_localized_without_changing_kpis_or_values(monkeypatch):
+    text = "待确认：CTR=0.35%，status=LOW_SAMPLE；freshness=NOT_CONFIGURED。CPC=1.47 USD，NON_ADVERSE。状态LOW_SAMPLE待确认。"
+    mock_http(monkeypatch, lambda request: response(text))
+    result = DeepSeekClient(KEY).analyze(CONTEXT, "分析店铺")
+    assert "LOW_SAMPLE" not in result and "NON_ADVERSE" not in result and "NOT_CONFIGURED" not in result
+    assert "样本不足" in result and "源时区待确认" in result
+    assert "CTR=0.35%" in result and "CPC=1.47 USD" in result
+    assert "状态样本不足待确认" in result

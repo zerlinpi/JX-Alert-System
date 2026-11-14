@@ -26,6 +26,52 @@ class BotTransportError(RuntimeError):
     """An intentionally sanitized startup/queue failure."""
 
 
+class SafeSdkConnectionHandler(logging.Handler):
+    """Translate SDK lifecycle records without forwarding their private fields.
+
+    The official SDK logs an authenticated WebSocket URL after a successful
+    handshake. A fixed lifecycle message retains that evidence without its URL,
+    connection ID, provider error, event payload, or attached traceback.
+    """
+
+    _MESSAGES = (
+        ("connected to ", "飞书长连接已建立"),
+        ("disconnected to ", "飞书长连接已断开"),
+        ("trying to reconnect for ", "飞书长连接正在重连"),
+        ("connect failed, err: ", "飞书长连接失败"),
+    )
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+            for prefix, safe_message in self._MESSAGES:
+                if message.startswith(prefix):
+                    logger.info(safe_message)
+                    return
+        except Exception:
+            # Logging must not affect SDK processing, and handleError(record)
+            # would itself print the original, potentially credentialed record.
+            return
+
+
+def _install_safe_sdk_logging():
+    sdk_logger = logging.getLogger("Lark")
+    # The SDK adds a stdout handler on import. Adding our handler alongside it
+    # would still expose URLs. Own its complete output path in this bot process.
+    for handler in tuple(sdk_logger.handlers):
+        sdk_logger.removeHandler(handler)
+    sdk_logger.propagate = False
+    sdk_logger.disabled = False
+    sdk_logger.setLevel(logging.INFO)
+    sdk_logger.addHandler(SafeSdkConnectionHandler())
+    websocket_logger = logging.getLogger("websockets.client")
+    websocket_logger.disabled = True
+    websocket_logger.propagate = False
+    for handler in tuple(websocket_logger.handlers):
+        websocket_logger.removeHandler(handler)
+    websocket_logger.addHandler(logging.NullHandler())
+
+
 def fetch_bot_open_id(client):
     """Resolve only this authenticated application's active bot identity."""
     if client.base_url != "https://open.feishu.cn":
@@ -159,16 +205,13 @@ def run_bot(settings):
     settings.feishu_bot_open_id = identity
     settings.feishu_app_id = credentials._app_id
     sdk = _load_sdk()
-    # Official SDK INFO logs include the full authenticated WebSocket URL.
-    # Keep its unredacted logging disabled in this isolated receiver process.
-    logging.getLogger("Lark").disabled = True
-    logging.getLogger("websockets.client").disabled = True
+    _install_safe_sdk_logging()
     callback = build_event_callback(settings, app_id=credentials._app_id,
         bot_open_id=identity, chat_id=route["receive_id"], sdk=sdk)
     handler = sdk.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(callback).build()
     client = sdk.ws.Client(credentials._app_id, credentials._app_secret,
-        event_handler=handler, log_level=sdk.LogLevel.ERROR)
+        event_handler=handler, log_level=sdk.LogLevel.INFO)
     from jx_alert.bot_service import run_question_worker
     threading.Thread(target=run_question_worker, name="feishu-question-worker", daemon=True).start()
     logger.info("Feishu group question intake is starting")

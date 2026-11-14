@@ -47,6 +47,13 @@ def test_conversion_maturity_keeps_recent_declines_out_of_final_comparisons():
     assert result["CPA"]["current_date"] == (DAY - timedelta(days=7)).isoformat()
     assert result["CPA"]["status"] == result["ROAS"]["status"] == "NON_ADVERSE"
     assert result["CPC"]["current_date"] == DAY.isoformat()
+    for code in ("CTR", "CPC", "TCOAS"):
+        assert result[code]["attribution_mature"] is None
+        assert result[code]["attribution_maturity_required"] is False
+        assert result[code]["date_basis"] == "completed_report_date"
+    for code in ("CDR", "CPS", "ROAS", "CPA"):
+        assert result[code]["attribution_mature"] is True
+        assert result[code]["attribution_maturity_required"] is True
 
 
 @pytest.mark.parametrize("problem,status", [

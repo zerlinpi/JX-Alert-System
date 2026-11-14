@@ -19,6 +19,8 @@ sudo docker compose -p jx-alert exec app python /app/scripts/setup_deepseek.py
 
 ## 二、飞书应用开通接收
 
+**保存长连接模式之前，必须已有在线客户端。** 完成第一节私有密钥初始化后，先执行第三节命令启动机器人，再保存下列订阅方式。未完成订阅发布前，不声称群内问答已验收。
+
 1. 在飞书开放平台进入现有自建应用，确认机器人能力已启用且已经加入“独立站交接群”。
 2. 在“权限管理”启用群内 @消息读取权限 `im:message.group_at_msg:readonly`；发送沿用 `im:message:send_as_bot`。不需要申请读取群全部消息。
 3. 在“事件与回调”选择“使用长连接接收事件”，订阅 **接收消息 v2.0**，事件名 `im.message.receive_v1`。不填写公网Webhook或回调URL。
@@ -28,7 +30,7 @@ sudo docker compose -p jx-alert exec app python /app/scripts/setup_deepseek.py
 
 ## 三、启用独立机器人
 
-代码已通过测试并同步服务器、上述两步完成后执行：
+代码已通过测试并同步服务器、私有密钥初始化完成后执行，以便在飞书保存长连接模式：
 
 ```bash
 sudo docker compose -p jx-alert exec -T app python /app/scripts/activate_feishu_bot.py
