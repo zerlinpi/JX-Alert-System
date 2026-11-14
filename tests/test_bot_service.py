@@ -110,6 +110,20 @@ def process(warehouse, *, factory=FakeClient.from_settings):
     return bot_service.process_one_question(settings, sessions, engine, client_factory=factory)
 
 
+def test_store_country_disambiguates_same_name_without_guessing(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        for sid, country in [("5174", "美国"), ("5175", "加拿大")]:
+            store = db.get(Store, sid)
+            store.name, store.country = "Campx", country
+        db.commit()
+        _, matched = bot_service._resolve_store(db, settings, "Campx美国广告情况")
+        assert matched == ["5174"]
+        candidates, ambiguous = bot_service._resolve_store(db, settings, "Campx广告情况")
+        assert set(ambiguous) == {"5174", "5175"}
+        assert {r["country"] for r in candidates} == {"美国", "加拿大"}
+
+
 def test_ingestion_persists_only_needed_fields_and_same_message_is_one_durable_job(warehouse):
     first = enqueue(warehouse)
     second = enqueue(warehouse)

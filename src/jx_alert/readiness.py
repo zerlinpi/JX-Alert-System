@@ -18,6 +18,24 @@ def _json_file(path):
         return {}
 
 
+def group_bot_status(settings):
+    """Read activation flags without resetting MCP's cached OAuth configuration."""
+    runtime = _json_file(getattr(settings, "runtime_settings_file", ""))
+    def value(key, fallback):
+        configured = getattr(settings, key, fallback)
+        latest = runtime.get(key, configured)
+        return latest if type(latest) is type(fallback) else configured
+    key_file = value("deepseek_credentials_file", "/app/data/secrets/deepseek.json")
+    return {
+        "feishu_bot_enabled": value("feishu_bot_enabled", False),
+        "deepseek_credentials_present": bool(getattr(settings, "deepseek_api_key", "")) or Path(key_file).is_file(),
+        "deepseek_model": value("deepseek_model", "deepseek-flash"),
+        "excel_archive_enabled": value("excel_archive_enabled", False),
+        "excel_archive_directory": value("excel_archive_dir", "/app/data/excel"),
+        "bot_status_check_scope": "configuration_only",
+    }
+
+
 def feishu_channel_status(settings):
     """Inspect only the selected transport locally; never request tokens or send messages."""
     transport = getattr(settings, "feishu_transport", "webhook")

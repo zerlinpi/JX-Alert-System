@@ -69,6 +69,8 @@ services:
       dockerfile: Dockerfile.bot
     command: ["python", "-m", "jx_alert.feishu_bot"]
     env_file: .env
+    environment:
+      PYTHONPATH: /app/src
     restart: unless-stopped
     profiles: ["bot"]
     depends_on:
