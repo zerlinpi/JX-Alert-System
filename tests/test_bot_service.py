@@ -137,6 +137,18 @@ def test_model_context_lists_adverse_evidence_explicitly_for_review(warehouse):
         assert candidate["current"] == 10 and candidate["baseline"] == 5
 
 
+def test_model_context_cannot_confuse_previous_day_values_with_missing_current_day(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1))
+        orders = next(row for row in context["sales_and_spend"] if row["metric"] == "订单")
+        assert orders["current_date"] == (DAY + timedelta(days=1)).isoformat()
+        assert orders["current_display"] == "未知（无记录）"
+        assert orders["previous_date"] == DAY.isoformat()
+        assert orders["previous_display"] == "10"
+        assert context["coverage"][0] == {"dataset": "店铺销量", "status_label": "未知"}
+
+
 def test_ingestion_persists_only_needed_fields_and_same_message_is_one_durable_job(warehouse):
     first = enqueue(warehouse)
     second = enqueue(warehouse)

@@ -36,7 +36,7 @@ def main():
     finally:
         if Path(temporary).exists():
             Path(temporary).unlink()
-    print("Bot enabled in runtime settings. Start only the bot service after publishing its Feishu event subscription.")
+    print("Bot enabled. Start the bot connection first, then save and publish its Feishu event subscription.")
 
 
 if __name__ == "__main__":
