@@ -12,6 +12,24 @@ def _client():
     )
 
 
+@pytest.mark.parametrize("kind, method, iterate", [
+    ("sb", "advertising_report", "iter_advertising_report"),
+    ("sd", "advertising_product_report", "iter_advertising_product_report"),
+])
+def test_sb_activity_and_sd_product_follow_v2_cursor_when_available(monkeypatch, kind, method, iterate):
+    client = _client()
+    calls = []
+    def read(report_type, request):
+        calls.append(dict(request))
+        return {"code": 0, "total": 2, "next_token": "first" if len(calls) == 1 else "last",
+                "data": [{"id": len(calls)}]}
+    monkeypatch.setattr(client, method, read)
+    assert list(getattr(client, iterate)(kind, {"sid": 101, "report_date": "2026-11-13"}, length=1)) == [
+        {"id": 1}, {"id": 2}]
+    assert calls[0]["offset"] == 0
+    assert calls[1].get("next_token") == "first" and "offset" not in calls[1]
+
+
 def test_sp_report_uses_next_token_cursor(monkeypatch):
     client = _client()
     calls = []

@@ -11,6 +11,7 @@ from sqlalchemy import func, or_, select
 from jx_alert.analysis.ad_kpis import advertising_kpis
 from jx_alert.analysis.store_health import store_health_snapshot
 from jx_alert.chat_analysis import _scope
+from jx_alert.lingxing.ad_details import DETAIL_LABELS
 from jx_alert.notifications.cards import card, number
 from jx_alert.notifications.daily_report import build_daily_card
 from jx_alert.notifications.outbox import enqueue_notification
@@ -277,6 +278,17 @@ def question_context(db, settings, store_id, *, now=None, question=None):
         for row in totals:
             row.update({m: None for m in ("spend", "orders", "units", "sales", "clicks", "impressions")})
             row["no_records"] = False
+    detail_labels = {**DETAIL_LABELS, "product_ad_sd": "展示推广广告商品"}
+    detail_rows = {r.dimension: r for r in db.scalars(select(DataCoverage).where(
+        DataCoverage.store_id == store_id, DataCoverage.metric_date == target,
+        DataCoverage.dimension.in_(detail_labels)))} if not warning else {}
+    detail_coverage = []
+    for dim, label in detail_labels.items():
+        row = detail_rows.get(dim)
+        state = (warning if warning else "尚未采集" if row is None else "采集失败" if row.status == "FAILED"
+                 else "待核实" if row.status != "COMPLETE" else "接口无记录" if row.row_count == 0 else "采集完成")
+        detail_coverage.append({"dataset": label, "status": state,
+                                "rows": row.row_count if row and row.status == "COMPLETE" else None})
     candidates = db.scalars(select(Campaign).where(Campaign.store_id == store_id)).all()
     masters = {(c.campaign_type, c.campaign_id): c for c in candidates}
     highest_spend = db.scalars(select(DailyMetric).where(DailyMetric.store_id == store_id,
@@ -308,6 +320,7 @@ def question_context(db, settings, store_id, *, now=None, question=None):
              "comparison_display": row["c3"]} for row in tables[0]["rows"]],
         "coverage": [{"dataset": row["c0"], "status_label": row["c1"]} for row in tables[1]["rows"]],
         "advertising_totals": totals, "advertising_kpis": kpis,
+        "ad_detail_coverage": detail_coverage,
         "health": store_health_snapshot(db, store, settings, now=clock),
         "screening_candidates": screening, "screening_candidate_count": len(screening),
         "campaigns": campaigns, "campaign_count": len(candidates),
@@ -327,6 +340,17 @@ def _answer_cards(context, data_card, analysis):
     # Combine all required data when it fits. Preserve separate dates in KPI rows.
     combined = {**data_card, "body": {"elements": data_card["body"]["elements"] + raw["body"]["elements"][1:]}}
     cards = [combined] if card_fits(combined) else [data_card, raw]
+    detail_rows = [(r["dataset"], r["status"], r["rows"] if r["rows"] is not None else "—")
+                   for r in context.get("ad_detail_coverage", [])]
+    if detail_rows:
+        detail_card = card("品牌与展示推广接口", subtitle=context["report_date"],
+                           sections=[("明细采集状态", ["报表", "状态", "源记录数"], detail_rows)])
+        combined_detail = {**cards[-1], "body": {"elements": (cards[-1]["body"]["elements"]
+                           + detail_card["body"]["elements"][1:])}}
+        if card_fits(combined_detail):
+            cards[-1] = combined_detail
+        else:
+            cards.append(detail_card)
     if analysis:
         text = html.escape(analysis, quote=False)
         # Small slices bound UTF-8 and JSON escaping even for Chinese responses.
