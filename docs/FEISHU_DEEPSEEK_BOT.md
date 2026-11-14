@@ -1,0 +1,61 @@
+# 飞书 @店铺问答与 Excel 归档
+
+在已有自建应用和“独立站交接群”内增加长连接问答。群成员明确 @机器人并给店铺名称或SID，机器人在原消息话题内回复数据表与简短中文分析。同名店铺先确认SID，不猜店铺。仅指定日报群可使用，不读取其他群的消息。
+
+回复包含订单、销量、销售额、SP/SB/SD广告花费及归因订单/销量/销售额/点击/曝光，CTR、CPC、CDR、CPS、ROAS、CPA、TCOAS，以及账户源评级、健康评分、七项绩效指标和数据质量。金额币种、比较日期、成熟归因日与数据缺失均保留。表格由数据库生成，分析由DeepSeek基于本次冻结数据生成；模型没有广告修改、执行命令或任意工具能力。活动分析使用当前花费前10个样本，不能称已完成全部活动巡检。
+
+问答进程独立于Chat MCP。消息事件先持久化，模型请求在独立工作线程执行；原MCP地址、OAuth及已安装连接保持兼容。每个消息ID只入队一次，投递重试复用UUID；恢复不会重复累加花费。输入最多1200字、模型回复最多6000字，同一成员每分钟最多3个新问题，队列有上限。等待超过30分钟的旧问题不延迟刷群。未配置或模型暂不可用时只返回已有数据与不可用提示，不冒充分析完成。
+
+## 一、私下保存 DeepSeek API Key
+
+在自己的服务器终端执行，不要将密钥粘贴进聊天或命令参数：
+
+```bash
+cd /opt/jx-alert-system
+sudo docker compose -p jx-alert exec app python /app/scripts/setup_deepseek.py
+```
+
+脚本隐藏输入并二次确认，保存到 `/app/data/secrets/deepseek.json`（宿主机 `data/secrets/deepseek.json`），权限0600，拒绝覆盖已有文件。不会修改`.env`。默认模型 `deepseek-flash`，可在运行配置中选 `deepseek-v4-pro`；只使用官方HTTPS地址。此步骤不发起计费请求，真实请求仍需账户余额和可用额度。
+
+## 二、飞书应用开通接收
+
+1. 在飞书开放平台进入现有自建应用，确认机器人能力已启用且已经加入“独立站交接群”。
+2. 在“权限管理”启用群内 @消息读取权限 `im:message.group_at_msg:readonly`；发送沿用 `im:message:send_as_bot`。不需要申请读取群全部消息。
+3. 在“事件与回调”选择“使用长连接接收事件”，订阅 **接收消息 v2.0**，事件名 `im.message.receive_v1`。不填写公网Webhook或回调URL。
+4. 创建新版本并发布，按企业要求审批。只保存权限和事件配置尚未生效。
+
+机器人启动时用官方机器人信息接口核实自身Open ID，不需要把机器人、管理员或运营ID硬填到问答代码中。白名单群沿用 `feishu_daily_report_chat_id` 和现有路由文件。运营/管理员映射仍服务原有定向告警，不会被问答改写。
+
+## 三、启用独立机器人
+
+代码已通过测试并同步服务器、上述两步完成后执行：
+
+```bash
+sudo docker compose -p jx-alert exec -T app python /app/scripts/activate_feishu_bot.py
+sudo docker compose -p jx-alert --profile bot build bot
+sudo docker compose -p jx-alert --profile bot up -d --no-deps bot
+```
+
+只构建/启动新增bot服务，不重建数据库、应用、MCP或调度器。激活脚本为原运行配置创建私有备份，再启用机器人与Excel归档。机器人可独立重启，Chat MCP不依赖DeepSeek。
+
+群内示例：`@机器人 5174 店铺的广告和绩效情况，列出需要关注的内容`。正常情况下，话题内会出现真实数据卡和分析卡。新鲜度未确认、授权失败、缺少基线、分母为零和样本不足均保留状态。源时区未确认时只展示健康观测，不新增或恢复健康风险业务告警。
+
+使用MCP仍可说：“查询全部店铺绩效快报”或“检查5174的广告指标”。原来的日报与异常通知不受群问答开关影响。
+
+## 四、Excel 保存位置与实时含义
+
+宿主机目录为 `/opt/jx-alert-system/data/excel/YYYY/MM/DD/`，容器内为 `/app/data/excel/`。每次采集步骤成功提交后更新对应店铺、报表日的Excel；部分采集失败也保留已成功提交的数据。
+
+普通报表保留原有七张工作表，增加原始事实、采集覆盖、七项广告指标、健康快报和归档信息。“最新”文件原子替换，内容版本文件保留。真实零值与缺失空白分开，长ID按文本存储，外部名称不能变成Excel公式；不导出密钥、客户身份信息或任意原始响应。
+
+SP独立采集版本保存在采集UTC日的 `YYYY/MM/DD/SP/`：日报、小时、广告商品、投放和对账分别列出，保留run_id和差异，不把多个版本相加。原始JSON和数据库仍保留。Excel失败进入独立重试队列，不靠重新调用领星来弥补文件写入失败。
+
+这里的实时是“采集成功后归档”，不是宣称领星接口本身每秒更新。文件内标明报表日期和采集时间。可用SFTP/WinSCP登录现有服务器后下载该目录，不将含业务数据的文件夹公开到互联网。
+
+## 验证与停用
+
+实际模型联调必须在私钥初始化后执行。群内实测同时核对问题消息ID、持久化任务、outbox及飞书返回的message_id；“已入队”不代表已送达。配置关闭或外部调用失败不影响MCP读取和现有定时任务。
+
+停用新增问答：`sudo docker compose -p jx-alert --profile bot stop bot`。不删除数据目录或Docker卷；保留已归档Excel和历史业务事实。
+
+官方依据：[DeepSeek调用方式](https://api-docs.deepseek.com/)、[飞书Python长连接](https://open.feishu.cn/document/server-side-sdk/python--sdk/handle-events)、[接收消息事件](https://open.feishu.cn/document/server-docs/im-v1/message/events/receive)。

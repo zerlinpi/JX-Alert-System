@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     mcp_operations_enabled: bool = False
     mcp_notifications_enabled: bool = False
     business_alert_delivery_mode: Literal["rules", "chat"] = "rules"
+    # Group questions run in a separate process; MCP never waits on this model.
+    feishu_bot_enabled: bool = False
+    feishu_bot_open_id: str = ""
+    feishu_bot_max_pending: int = Field(default=50, ge=1, le=200)
+    feishu_bot_question_max_age_minutes: int = Field(default=30, ge=1, le=120)
+    deepseek_api_key: SecretStr = SecretStr("")
+    deepseek_credentials_file: str = "/app/data/secrets/deepseek.json"
+    deepseek_model: str = "deepseek-flash"
+    deepseek_request_timeout: float = Field(default=45.0, ge=1, le=120)
+    excel_archive_enabled: bool = False
+    excel_archive_dir: str = "/app/data/excel"
     mcp_auth_file: str = "/app/data/secrets/mcp-auth.json"
     mcp_auth_mode: Literal["bearer", "oauth"] = "bearer"
     mcp_public_url: str = ""
@@ -158,6 +169,9 @@ def get_settings() -> Settings:
             "feishu_daily_report_cron", "feishu_daily_report_start_date",
             "feishu_daily_report_group_digest",
             "business_alert_delivery_mode",
+            "feishu_bot_enabled", "feishu_bot_open_id", "feishu_bot_max_pending",
+            "feishu_bot_question_max_age_minutes", "deepseek_credentials_file", "deepseek_model",
+            "deepseek_request_timeout", "excel_archive_enabled", "excel_archive_dir",
             "alert_kpi_change_ratio", "alert_kpi_min_impressions",
             "allow_unconfigured_timezone_history",
             "collection_scope_file", "sp_collection_enabled", "sp_validation_targets_file",

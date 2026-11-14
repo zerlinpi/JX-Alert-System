@@ -175,7 +175,8 @@ def test_excel_report_contains_store_sku_campaign_and_alert_rows(tmp_path):
         path = export_daily_report(tmp_path / "daily.xlsx", rows)
         workbook = load_workbook(path, read_only=True)
         assert workbook.sheetnames == [
-            "店铺总览", "店铺绩效", "SKU销量", "广告活动", "广告商品", "异常记录", "采集日志"
+            "店铺总览", "店铺绩效", "SKU销量", "广告活动", "广告商品", "异常记录", "采集日志",
+            "原始事实", "采集覆盖", "广告指标", "健康快报", "归档信息",
         ]
         assert workbook["SKU销量"].max_row == 2
         assert workbook["店铺总览"]["L2"].number_format == "0.00%"
