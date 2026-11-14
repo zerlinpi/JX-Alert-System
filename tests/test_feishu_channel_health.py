@@ -6,6 +6,22 @@ import pytest
 
 from jx_alert.notifications.feishu_app import FeishuAppClient
 from jx_alert.readiness import feishu_channel_status
+from jx_alert.readiness import group_bot_status
+
+
+def test_bot_activation_is_visible_without_restarting_cached_mcp_settings(tmp_path):
+    path = tmp_path / "runtime.json"
+    key_file = tmp_path / "private.json"
+    config = SimpleNamespace(runtime_settings_file=str(path), feishu_bot_enabled=False,
+        deepseek_credentials_file=str(key_file), deepseek_model="deepseek-flash", excel_archive_enabled=False)
+    path.write_text(json.dumps({"feishu_bot_enabled": True, "excel_archive_enabled": True}))
+    result = group_bot_status(config)
+    assert result["feishu_bot_enabled"] and result["excel_archive_enabled"]
+    assert config.feishu_bot_enabled is False
+    assert not result["deepseek_credentials_present"]
+    key_file.write_text('{"api_key":"synthetic-private-key"}')
+    assert group_bot_status(config)["deepseek_credentials_present"]
+    assert "synthetic-private-key" not in json.dumps(group_bot_status(config))
 
 
 def settings(tmp_path, **overrides):

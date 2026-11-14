@@ -6,7 +6,6 @@ from datetime import date, datetime, timedelta
 import argparse
 import hmac
 import json
-from pathlib import Path
 import re
 
 from starlette.middleware.cors import CORSMiddleware
@@ -234,7 +233,7 @@ def system_health() -> dict:
     自建应用app模式无需Webhook，不能因feishu_webhook_configured=false判断未连接。
     配置就绪不等于消息已送达；实际送达查get_notification_logs。
     """
-    from jx_alert.readiness import feishu_channel_status
+    from jx_alert.readiness import feishu_channel_status, group_bot_status
     settings = get_settings()
     try:
         init_db()
@@ -264,12 +263,7 @@ def system_health() -> dict:
         "database": database_status,
         "dry_run": settings.app_dry_run,
         "scheduler_enabled": settings.scheduler_enabled,
-        "feishu_bot_enabled": getattr(settings, "feishu_bot_enabled", False),
-        "deepseek_credentials_present": bool(getattr(settings, "deepseek_api_key", "")) or Path(
-            getattr(settings, "deepseek_credentials_file", "/app/data/secrets/deepseek.json")).is_file(),
-        "deepseek_model": getattr(settings, "deepseek_model", "deepseek-flash"),
-        "excel_archive_enabled": getattr(settings, "excel_archive_enabled", False),
-        "excel_archive_directory": getattr(settings, "excel_archive_dir", "/app/data/excel"),
+        **group_bot_status(settings),
         "lingxing_credentials_configured": bool(
             settings.lingxing_app_id and settings.lingxing_app_secret
         ),

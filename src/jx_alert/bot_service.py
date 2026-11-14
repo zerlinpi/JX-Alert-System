@@ -112,9 +112,18 @@ def enqueue_group_question(db, settings, event_dict):
 
 def _resolve_store(db, settings, question):
     snapshots = health_brief_snapshots(db, settings)["stores"]
+    countries = {s.sid: s.country for s in db.scalars(select(Store).where(Store.sid.in_([s["store_id"] for s in snapshots])))}
+    for snapshot in snapshots:
+        snapshot["country"] = countries.get(snapshot["store_id"]) or "待确认"
     ids = [s["store_id"] for s in snapshots if re.search(r"(?<!\d)" + re.escape(s["store_id"]) + r"(?!\d)", question)]
     if not ids:
         ids = [s["store_id"] for s in snapshots if s["store_name"] and s["store_name"].casefold() in question.casefold()]
+        if len(ids) > 1:
+            localized = [s["store_id"] for s in snapshots if s["store_id"] in ids and s["country"] != "待确认"
+                and re.search((r"(?<![A-Za-z])" + re.escape(s["country"]) + r"(?![A-Za-z])")
+                    if s["country"].isascii() else re.escape(s["country"]), question, re.IGNORECASE)]
+            if localized:
+                ids = localized
     return snapshots, list(dict.fromkeys(ids))
 
 
@@ -244,9 +253,9 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
             snapshots, ids = _resolve_store(db, settings, meta["question"])
             if len(ids) != 1:
                 options = [s for s in snapshots if s["store_id"] in ids]
-                rows = [(s["store_id"], s["store_name"]) for s in options[:20]]
+                rows = [(s["store_id"], s["store_name"], s["country"]) for s in options[:20]]
                 value = card("请确认店铺", subtitle="请在提问中注明店铺ID，例如：5174 店铺广告和绩效情况",
-                             sections=[("匹配店铺", ["店铺ID", "店铺"], rows)])
+                             sections=[("匹配店铺", ["店铺ID", "店铺", "站点"], rows)])
                 cards, provider = [value], "store_clarification"
             else:
                 context, data_card = question_context(db, settings, ids[0])
