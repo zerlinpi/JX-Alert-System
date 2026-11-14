@@ -180,6 +180,9 @@ def collect_sp_targets(client, db, settings, report_dates, *, days=None, scope_s
                                        report_dates=dates)
         saved = persist_sp_validation(db, result)
         db.commit()
+        if getattr(settings, "excel_archive_enabled", False):
+            from jx_alert.reporting.archive import archive_sp_partition
+            saved["excel_archive"] = archive_sp_partition(db, settings, saved["run_id"])
         runs.append(saved)
     return {"status": "PARTIAL" if any(r["status"] != "COMPLETE" for r in runs)
             else "COMPLETE", "runs": runs}

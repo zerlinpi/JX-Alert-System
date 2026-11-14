@@ -78,6 +78,16 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
     completed_steps: list[str] = []
     results: dict = {}
 
+    def archive_excel(dates=report_dates):
+        from jx_alert.reporting.archive import archive_partitions
+        selected = {}
+        for store in store_rows:
+            sid = str(store.get("sid"))
+            if isinstance(dates, dict) and sid not in dates:
+                continue
+            selected[sid] = normalize_store_report_dates(dates, sid)
+        results["excel_archive"] = archive_partitions(db, settings, selected)
+
     try:
         results["stores"] = {
             "count": len(stores_response.get("data", []))
@@ -93,6 +103,7 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             client, db, report_dates, stores_response=stores_response
         )
         completed_steps.append("sales")
+        archive_excel()
 
         results["campaigns"] = collect_campaigns(
             client, db, stores_response=stores_response
@@ -113,17 +124,20 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies,
         )
         completed_steps.append("campaign_reports")
+        archive_excel(ad_report_dates)
 
         results["product_ad_reports"] = collect_product_ads_for_day(
             client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies,
         )
         completed_steps.append("product_ad_reports")
+        archive_excel(ad_report_dates)
 
         if settings.lingxing_performance_enabled:
             results["performance"] = collect_store_performance(
                 client, db, stores_response=stores_response, settings=settings
             )
             completed_steps.append("performance")
+            archive_excel()
         else:
             results["performance"] = {"status": "DISABLED", "stores_seen": 0}
 
@@ -171,6 +185,11 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         }
     except Exception as exc:
         db.rollback()
+        # A later provider failure must not hide already committed partitions.
+        try:
+            archive_excel(ad_report_dates or report_dates)
+        except Exception:
+            pass  # Preserve the original collection failure; disk retries are durable.
         archive_error = None
         try:
             results["raw_archive"] = archive_raw_snapshots(

@@ -63,5 +63,20 @@ services:
     volumes:
       - ./data:/app/data
 
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    command: ["python", "-m", "jx_alert.feishu_bot"]
+    env_file: .env
+    restart: unless-stopped
+    profiles: ["bot"]
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src:ro
+
 volumes:
   db_data:

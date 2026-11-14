@@ -42,6 +42,14 @@ def outbox_job():
         logger.info("Feishu outbox batch: %s", result)
 
 
+def excel_archive_job():
+    from jx_alert.reporting.archive import retry_pending_archives
+    try:
+        retry_pending_archives()
+    except Exception as exc:
+        logger.error("Excel archive retry failed: %s", type(exc).__name__)
+
+
 def daily_report_job():
     """Send only the independently queued Beijing daily reports, without backlog."""
     from jx_alert.operations import queue_scheduled_daily_reports
@@ -113,6 +121,8 @@ def main():
         id="manual_collection", max_instances=1, coalesce=True,
         misfire_grace_time=30,
     )
+    scheduler.add_job(excel_archive_job, IntervalTrigger(minutes=1), id="excel_archive_retry",
+                      max_instances=1, coalesce=True, misfire_grace_time=60)
     logger.info(
         "Scheduler started (daily_timezone=Asia/Shanghai, collection_cron=%s, report_cron=%s, dry_run=%s)",
         settings.daily_sync_cron, settings.feishu_daily_report_cron, settings.app_dry_run,

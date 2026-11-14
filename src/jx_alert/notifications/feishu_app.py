@@ -101,7 +101,9 @@ class FeishuAppClient:
             raise FeishuAppError("Feishu app response did not contain a valid status code")
         if not 200 <= response.status_code < 300:
             # An expired token can be reported with a non-2xx HTTP status.
-            if not (path == self._MESSAGE_PATH and code == self._EXPIRED_TOKEN_CODE):
+            message_path = path == self._MESSAGE_PATH or re.fullmatch(
+                re.escape(self._MESSAGE_PATH) + r"/om_[A-Za-z0-9_-]+/reply", path)
+            if not (message_path and code == self._EXPIRED_TOKEN_CODE):
                 raise FeishuAppError(
                     f"Feishu app HTTP request rejected: HTTP {response.status_code}, code={code}"
                 )
@@ -195,15 +197,26 @@ class FeishuAppClient:
         }
         return self._send_message_payload(payload, receive_id_type)
 
-    def _send_message_payload(self, payload, receive_id_type):
+    def reply_card(self, message_id: str, card: dict, *, idempotency_key: str) -> dict:
+        """Reply in the original question's thread with a stable retry UUID."""
+        from jx_alert.notifications.cards import with_mentions
+        if not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]+", message_id):
+            raise ValueError("Feishu reply requires a valid original message ID")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("Feishu reply requires an idempotency key")
+        payload = {"msg_type": "interactive", "content": json.dumps(with_mentions(card, []), ensure_ascii=False),
+                   "uuid": hashlib.sha256(idempotency_key.encode()).hexdigest()[:40], "reply_in_thread": True}
+        return self._send_message_payload(payload, None, path=f"{self._MESSAGE_PATH}/{message_id}/reply")
+
+    def _send_message_payload(self, payload, receive_id_type, *, path=None):
         # Bound operational alerts conservatively, including JSON escaping.
         if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 20 * 1024:
             raise ValueError("Feishu app text message exceeds the 20 KB application limit")
         token = self._get_token()
         for attempt in range(2):
             data = self._post_json(
-                self._MESSAGE_PATH, payload, token=token,
-                params={"receive_id_type": receive_id_type},
+                path or self._MESSAGE_PATH, payload, token=token,
+                params={"receive_id_type": receive_id_type} if receive_id_type else None,
             )
             if data["code"] == self._EXPIRED_TOKEN_CODE and attempt == 0:
                 token = self._get_token(rejected_token=token)

@@ -154,14 +154,20 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                 destination = payload["delivery"]
                 chat_id = destination["receive_id"]
                 card = payload.get("card")
-                send_message = client_cache["app"].send_card if card is not None else client_cache["app"].send_text
-                response = send_message(
-                    card if card is not None else str(payload.get("text") or ""),
-                    receive_id=chat_id,
-                    receive_id_type=destination["receive_id_type"],
-                    open_ids=destination.get("open_ids", []),
-                    idempotency_key=dedupe_key,
-                )
+                if destination.get("reply_to_message_id"):
+                    if destination.get("role") != "group_question" or card is None:
+                        raise ValueError("Only verified group question cards can reply in a thread")
+                    response = client_cache["app"].reply_card(destination["reply_to_message_id"], card,
+                                                            idempotency_key=dedupe_key)
+                else:
+                    send_message = client_cache["app"].send_card if card is not None else client_cache["app"].send_text
+                    response = send_message(
+                        card if card is not None else str(payload.get("text") or ""),
+                        receive_id=chat_id,
+                        receive_id_type=destination["receive_id_type"],
+                        open_ids=destination.get("open_ids", []),
+                        idempotency_key=dedupe_key,
+                    )
                 message_id = response["message_id"]
             else:
                 # Retain compatibility for persisted webhook notifications.
