@@ -185,12 +185,20 @@ def question_context(db, settings, store_id, *, now=None):
         campaigns.append({"campaign_id": fact.entity_id, "name": master.name if master else fact.entity_id,
             "ad_type": kind, "current_state": master.state if master else None,
             "kpis": advertising_kpis(db, settings, store_id, target, dimension=fact.dimension, entity_id=fact.entity_id)})
+    screening = []
+    for entity, name, comparisons in [(store_id, store.name, kpis),
+            *[(c["campaign_id"], c["name"], c["kpis"]) for c in campaigns]]:
+        for metric, item in comparisons.items():
+            if item["status"] == "ADVERSE":
+                screening.append({"entity_id": entity, "name": name, "metric": metric,
+                    **{key: item[key] for key in ("current", "baseline", "current_date", "currency", "change_ratio", "title")}})
     return {"store_id": store_id, "store_name": store.name, "country": store.country,
         "report_date": target.isoformat(), "date_basis": zone["date_basis"],
         "timezone_confirmed": zone["timezone_confirmed"], "authorization_warning": warning,
         "snapshot_at_utc": clock.isoformat(), "sales_and_spend": tables[0]["rows"],
         "coverage": tables[1]["rows"], "advertising_totals": totals, "advertising_kpis": kpis,
         "health": store_health_snapshot(db, store, settings, now=clock),
+        "screening_candidates": screening, "screening_candidate_count": len(screening),
         "campaigns": campaigns, "campaign_count": len(candidates),
         "campaign_selection": "仅当前花费最高的至多10个活动样本，不代表全活动逐一巡检"}, value
 

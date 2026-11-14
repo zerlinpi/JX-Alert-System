@@ -124,6 +124,19 @@ def test_store_country_disambiguates_same_name_without_guessing(warehouse):
         assert {r["country"] for r in candidates} == {"美国", "加拿大"}
 
 
+def test_model_context_lists_adverse_evidence_explicitly_for_review(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        metric = db.scalar(select(DailyMetric).where(DailyMetric.store_id == "5174",
+            DailyMetric.metric_date == DAY, DailyMetric.dimension == "campaign_sp", DailyMetric.metric_name == "spend"))
+        metric.value = 200
+        db.commit()
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW)
+        assert context["screening_candidate_count"] == len(context["screening_candidates"]) > 0
+        candidate = next(c for c in context["screening_candidates"] if c["metric"] == "CPC" and c["entity_id"] == "sp-campaign")
+        assert candidate["current"] == 10 and candidate["baseline"] == 5
+
+
 def test_ingestion_persists_only_needed_fields_and_same_message_is_one_durable_job(warehouse):
     first = enqueue(warehouse)
     second = enqueue(warehouse)
