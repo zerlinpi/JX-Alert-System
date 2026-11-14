@@ -140,13 +140,188 @@ def test_model_context_lists_adverse_evidence_explicitly_for_review(warehouse):
 def test_model_context_cannot_confuse_previous_day_values_with_missing_current_day(warehouse):
     settings, sessions, _ = warehouse
     with sessions() as db:
-        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1))
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1),
+                                                 question="2026-11-13 店铺情况")
         orders = next(row for row in context["sales_and_spend"] if row["metric"] == "订单")
         assert orders["current_date"] == (DAY + timedelta(days=1)).isoformat()
         assert orders["current_display"] == "未知（无记录）"
         assert orders["previous_date"] == DAY.isoformat()
         assert orders["previous_display"] == "10"
         assert context["coverage"][0] == {"dataset": "店铺销量", "status_label": "未知"}
+
+
+def test_default_question_uses_one_recent_complete_report_date_with_explicit_target_notice(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        context, value = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1))
+        assert context["requested_report_date"] == "2026-11-13"
+        assert context["report_date"] == DAY.isoformat()
+        assert context["date_selection"] == "LATEST_COMPLETE_DATE"
+        assert context["sales_and_spend"][0]["current_display"] == "10"
+        assert context["sales_and_spend"][0]["current_date"] == DAY.isoformat()
+        assert context["advertising_kpis"]["CTR"]["current_date"] == DAY.isoformat()
+        assert context["advertising_kpis"]["CDR"]["current_date"] == (DAY - timedelta(days=14)).isoformat()
+        assert all(r["report_date"] == DAY.isoformat() for r in context["advertising_totals"])
+        text = json.dumps(value, ensure_ascii=False)
+        assert "查询目标日 2026-11-13 尚未完成采集" in text
+        assert "报表日 2026-11-12" in text and "前一日 2026-11-11" in text
+
+
+@pytest.mark.parametrize("status", ["FAILED", "PARTIAL", "PENDING", "COMPLETE"])
+def test_default_question_does_not_hide_any_existing_target_partition(warehouse, status):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        db.add(DataCoverage(store_id="5174", metric_date=DAY + timedelta(days=1), dimension="store", status=status))
+        db.commit()
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1))
+        assert context["report_date"] == "2026-11-13"
+        assert context["date_selection"] == "REQUESTED_DATE"
+        assert context["sales_and_spend"][0]["current_display"] == ("接口无记录" if status == "COMPLETE" else "未知（无记录）")
+
+
+def test_default_question_does_not_relabel_stale_history_or_unauthorized_store(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=9))
+        assert context["date_selection"] == "NOT_COLLECTED"
+        assert context["report_date"] != DAY.isoformat()
+        db.get(Store, "5174").status = 2
+        db.commit()
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1))
+        assert context["date_selection"] == "STORE_UNAVAILABLE"
+        assert context["report_date"] == "2026-11-13"
+        assert context["authorization_warning"]
+
+
+def test_report_date_fallback_requires_consistent_same_day_coverage_and_actual_store_facts(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        coverage = db.scalar(select(DataCoverage).where(DataCoverage.store_id == "5174",
+            DataCoverage.metric_date == DAY, DataCoverage.dimension == "campaign_sp"))
+        coverage.row_count = 99
+        db.commit()
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1))
+        assert context["report_date"] == (DAY - timedelta(days=1)).isoformat()
+        assert all(r["report_date"] == context["report_date"] for r in context["advertising_totals"])
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_failed_collection_without_new_coverage_is_not_masked_by_historical_fallback(warehouse, explicit):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        db.add(SyncJob(job_type="daily_collection", status="PARTIAL_FAILED", metadata_json={
+            "report_dates": {"5174": "2026-11-13"}, "completed_steps": ["store_status"]}))
+        db.commit()
+        context, value = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1),
+            question="2026-11-13 店铺情况" if explicit else None)
+        assert context["date_selection"] == "COLLECTION_FAILED"
+        assert context["report_date"] == "2026-11-13"
+        assert "采集失败" in json.dumps(value, ensure_ascii=False)
+
+
+def test_failed_refresh_masks_old_complete_facts_and_latest_success_removes_failure_guard(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        db.add(SyncJob(job_type="daily_collection", status="FAILED", metadata_json={"report_dates": {"5174": DAY.isoformat()}}))
+        db.commit()
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW)
+        assert context["date_selection"] == "COLLECTION_FAILED"
+        assert context["sales_and_spend"][0]["current_display"] == "未知（无记录）"
+        assert all(r["spend"] is None for r in context["advertising_totals"])
+        db.add(SyncJob(job_type="daily_collection", status="SUCCEEDED", metadata_json={"report_dates": {"5174": DAY.isoformat()}}))
+        db.commit()
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW)
+        assert context["date_selection"] == "REQUESTED_DATE"
+        assert context["sales_and_spend"][0]["current_display"] == "10"
+
+
+def test_later_product_or_health_failure_keeps_committed_daily_values_with_a_warning(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        db.add(SyncJob(job_type="daily_collection", status="PARTIAL_FAILED", metadata_json={
+            "report_dates": {"5174": DAY.isoformat()}, "completed_steps": ["sales", "campaign_reports"]}))
+        db.commit()
+        context, value = bot_service.question_context(db, settings, "5174", now=NOW)
+        assert context["sales_and_spend"][0]["current_display"] == "10"
+        assert context["advertising_totals"][0]["spend"] == 100
+        assert "其他维度采集未完成" in context["report_date_warning"]
+        assert "其他维度采集未完成" in json.dumps(value, ensure_ascii=False)
+
+
+def test_other_stores_cannot_push_a_relevant_failed_attempt_out_of_a_global_job_limit(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        db.add(SyncJob(job_type="daily_collection", status="FAILED", metadata_json={"report_dates": {"5174": "2026-11-13"}}))
+        db.flush()
+        db.add_all([SyncJob(job_type="daily_collection", status="SUCCEEDED", metadata_json={
+            "report_dates": {"5175": "2026-11-13"}}) for _ in range(350)])
+        db.commit()
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1))
+        assert context["date_selection"] == "COLLECTION_FAILED"
+        assert context["report_date"] == "2026-11-13"
+
+
+@pytest.mark.parametrize("metadata", [{"report_dates": "2026-11-13"},
+                                      {"ad_report_dates": {"5174": ["2026-11-12", "2026-11-13"]}}])
+def test_failure_guard_supports_legacy_scalar_dates_and_advertising_refresh_ranges(warehouse, metadata):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        db.add(SyncJob(job_type="daily_collection", status="FAILED", metadata_json=metadata))
+        db.commit()
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1))
+        assert context["date_selection"] == "COLLECTION_FAILED"
+
+
+def test_current_or_future_day_is_explicitly_incomplete_and_cannot_move_conversion_maturity_forward(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        context, value = bot_service.question_context(db, settings, "5174", now=NOW, question="今天店铺情况")
+        assert context["requested_report_date"] == context["report_date"] == "2026-11-13"
+        assert context["last_completed_report_date"] == DAY.isoformat()
+        assert context["report_date_is_complete"] is False
+        assert context["authorization_warning"] is None
+        assert all(row["current"] is None for row in context["advertising_kpis"].values())
+        assert "查询报表日期尚未结束" in json.dumps(value, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("query", ["2026-11-13 店铺情况", "2026年11月13日店铺情况", "11月13日店铺情况", "昨天店铺情况"])
+def test_explicit_date_and_relative_yesterday_never_fall_back(warehouse, query):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW + timedelta(days=1), question=query)
+        assert context["report_date"] == "2026-11-13" and context["date_selection"] == "EXPLICIT_DATE"
+
+
+@pytest.mark.parametrize("query", ["2026-11-31店铺情况", "2026-11-12和2026-11-13店铺情况"])
+def test_invalid_or_multiple_report_dates_get_a_clarification_without_a_model_call(warehouse, query):
+    enqueue(warehouse, event("@_user_1 5174 " + query))
+    result = process(warehouse)
+    assert FakeClient.calls == []
+    with warehouse[1]() as db:
+        job = db.get(SyncJob, result["job_id"])
+        assert job.metadata_json["analysis_provider"] == "date_clarification"
+        row = db.get(NotificationOutbox, result["outbox_ids"][0])
+        assert "请确认报表日期" in json.dumps(row.payload["card"], ensure_ascii=False)
+
+
+def test_empty_ad_response_is_labelled_without_inventing_currency_or_zero_cost(warehouse):
+    settings, sessions, _ = warehouse
+    with sessions() as db:
+        for fact in db.scalars(select(DailyMetric).where(DailyMetric.store_id == "5174",
+                DailyMetric.metric_date == DAY, DailyMetric.dimension == "campaign_sb")).all():
+            db.delete(fact)
+        coverage = db.scalar(select(DataCoverage).where(DataCoverage.store_id == "5174",
+            DataCoverage.metric_date == DAY, DataCoverage.dimension == "campaign_sb"))
+        coverage.row_count = 0
+        db.commit()
+        context, value = bot_service.question_context(db, settings, "5174", now=NOW)
+        sb = next(row for row in context["advertising_totals"] if row["ad_type"] == "品牌推广")
+        assert sb["no_records"] is True and sb["coverage"] == "COMPLETE"
+        assert sb["spend"] is None and sb["spend_currency"] is None
+        result = bot_service._answer_cards(context, value, "")
+        rows = [r for card in result for e in card["body"]["elements"] if e["tag"] == "table" for r in e["rows"]]
+        raw_sb = next(row for row in rows if row["c0"] == "品牌推广" and "c6" in row)
+        assert all(raw_sb[f"c{i}"] == "接口无记录" for i in range(1, 7))
 
 
 def test_ingestion_persists_only_needed_fields_and_same_message_is_one_durable_job(warehouse):

@@ -48,6 +48,8 @@ sudo docker compose -p jx-alert --profile bot up -d --no-deps bot
 
 使用MCP仍可说：“查询全部店铺绩效快报”或“检查5174的广告指标”。原来的日报与异常通知不受群问答开关影响。
 
+普通问答的目标日尚无任何采集证据时，可展示近七日最近同一天完整采集的日报，并明确列出查询目标日与实际展示日。不会把历史数值称为当日；明确指定日期、最新采集失败或授权异常时，不静默改用其他日期。接口成功但返回空记录与未采集分别展示，空记录不自动变成零花费。
+
 ## 四、Excel 保存位置与实时含义
 
 宿主机目录为 `/opt/jx-alert-system/data/excel/YYYY/MM/DD/`，容器内为 `/app/data/excel/`。每次采集步骤成功提交后更新对应店铺、报表日的Excel；部分采集失败也保留已成功提交的数据。
@@ -57,6 +59,8 @@ sudo docker compose -p jx-alert --profile bot up -d --no-deps bot
 SP独立采集版本保存在采集UTC日的 `YYYY/MM/DD/SP/`：日报、小时、广告商品、投放和对账分别列出，保留run_id和差异，不把多个版本相加。原始JSON和数据库仍保留。Excel失败进入独立重试队列，不靠重新调用领星来弥补文件写入失败。
 
 这里的实时是“采集成功后归档”，不是宣称领星接口本身每秒更新。文件内标明报表日期和采集时间。可用SFTP/WinSCP登录现有服务器后下载该目录，不将含业务数据的文件夹公开到互联网。
+
+此外，每天北京时间23:30将服务器已有全部业务历史保存为一套全维度Excel快照，目录 `/opt/jx-alert-system/data/excel/daily/YYYY/MM/DD/`。这与按报表分区更新的Excel同时保留；维度、手动导出和校验方法见[每日完整Excel](DAILY_EXCEL_ARCHIVE.md)。
 
 ## 验证与停用
 

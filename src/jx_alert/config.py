@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     app_dry_run: bool = True
     app_timezone: str = "Asia/Shanghai"
     scheduler_enabled: bool = False
-    daily_sync_cron: str = "0 7 * * *"
+    daily_sync_cron: str = "30 18 * * *"
     feishu_daily_report_cron: str = "0 8 * * *"
     feishu_daily_report_start_date: str = ""
     feishu_daily_report_group_digest: bool = False
@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     deepseek_request_timeout: float = Field(default=45.0, ge=1, le=120)
     excel_archive_enabled: bool = False
     excel_archive_dir: str = "/app/data/excel"
+    excel_daily_snapshot_enabled: bool = True
+    excel_daily_snapshot_cron: str = "30 23 * * *"
     mcp_auth_file: str = "/app/data/secrets/mcp-auth.json"
     mcp_auth_mode: Literal["bearer", "oauth"] = "bearer"
     mcp_public_url: str = ""
@@ -172,6 +174,7 @@ def get_settings() -> Settings:
             "feishu_bot_enabled", "feishu_bot_open_id", "feishu_bot_max_pending",
             "feishu_bot_question_max_age_minutes", "deepseek_credentials_file", "deepseek_model",
             "deepseek_request_timeout", "excel_archive_enabled", "excel_archive_dir",
+            "excel_daily_snapshot_enabled", "excel_daily_snapshot_cron",
             "alert_kpi_change_ratio", "alert_kpi_min_impressions",
             "allow_unconfigured_timezone_history",
             "collection_scope_file", "sp_collection_enabled", "sp_validation_targets_file",
