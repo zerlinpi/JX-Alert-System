@@ -49,6 +49,20 @@ services:
     volumes:
       - ./data:/app/data
 
+  console:
+    build: .
+    command: ["python", "-m", "jx_alert.admin_console"]
+    env_file: .env
+    restart: unless-stopped
+    profiles: ["console"]
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8002:8002"
+    volumes:
+      - ./data:/app/data
+
   scheduler:
     build: .
     command: ["python", "-m", "jx_alert.scheduler"]
