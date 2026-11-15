@@ -40,6 +40,7 @@ requested_report_date是查询目标日，report_date是实际展示日；不同
 不要把改善、持平标作异常；异常必须有输入证据，不能把初筛待复核说成已确认原因。
 先核对screening_candidates中的实质恶化项；遵守notification_policy。WATCH仅观察，
 小幅波动、单日普通波动和低样本只留在数据表，不单列异常。活动样本不代表全部活动已完成巡检。
+用户未询问覆盖范围时，样本范围限制不单列为问题；WATCH与正常或改善项不得出现在发现条目中。
 没有数据、授权失败、缺少基线、分母为零、币种未确认或样本不足均须明确为待确认，不能称正常。
 优先使用输入中的七日比较，七日不足时仅使用输入中完整的精确前一日，不自行补齐或混合币种。
 CTR=点击/曝光，CPC=花费/点击，CDR=广告归因订单/点击，CPS=花费/广告归因销量，
@@ -170,6 +171,56 @@ def analysis_cache_key(context, question, model):
     return hashlib.sha256((SYSTEM_PROMPT + model + packet).encode()).hexdigest()
 
 
+def _actionable_text(text, context, question):
+    """Do not publish model-written watch/positive KPI bullets as findings."""
+    if not context.get("notification_policy"):
+        return text
+    labels = {"CTR": "点击率", "CPC": "点击花费", "CDR": "点击转化率", "CPS": "单件转化花费",
+              "ROAS": "广告投入产出", "CPA": "单均花费", "TCOAS": "总销售广告费占比"}
+    retained = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if (not re.search(r"覆盖|全量|所有活动|全部活动|巡检范围", question)
+                and re.match(r"\s*-\s*(?:活动)?样本(?:仅|只|范围)", line)):
+            continue
+        objects = [row for row in context.get("campaigns", []) if row.get("name") and row["name"] in line]
+        groups = [row.get("kpis", {}) for row in objects] if objects else [context.get("advertising_kpis", {}),
+            *[row.get("kpis", {}) for row in context.get("campaigns", [])]]
+        metrics = [code for code, label in labels.items() if re.search(
+            r"(?<![A-Za-z0-9_])" + code + r"(?![A-Za-z0-9_])", line) or label in line]
+        states = [group[code]["status"] for group in groups for code in metrics if code in group]
+        if metrics and states and all(state in {"WATCH", "NON_ADVERSE"} for state in states):
+            continue
+        retained.append(line)
+    candidates = context.get("screening_candidates", [])
+    if candidates and (not retained or re.search(r"未发现.*异常|没有异常|无异常", "\n".join(retained))):
+        def value(row, key):
+            number = row[key]
+            code = row["metric"]
+            return (f"{number * 100:.2f}%" if code in {"CTR", "CDR", "TCOAS"} else
+                    f"{number:.2f}倍" if code == "ROAS" else
+                    f"美元 {number:.2f}" if row.get("currency") == "USD" else str(number))
+        return "\n".join(f"- {row['name']}：{row['title']}，本期{value(row, 'current')}、"
+            f"参考{value(row, 'baseline')}（{row['current_date']}）；请复核对应明细。" for row in candidates[:6])
+    if retained:
+        return "\n".join(retained)
+    gaps = [row["dataset"] + "：" + row["status_label"] for row in context.get("coverage", [])
+            if row.get("status_label") != "采集完成"]
+    missing_kpis = [code + "（" + _DISPLAY_TERMS.get(row.get("status"), "待确认") + "）"
+        for code, row in context.get("advertising_kpis", {}).items()
+        if row.get("status") not in {"WATCH", "NON_ADVERSE", "ADVERSE", "SCOPE_UNSUPPORTED", "NOT_APPLICABLE"}]
+    if missing_kpis:
+        gaps.append("广告指标：" + "、".join(missing_kpis))
+    health = context.get("health", {})
+    if health.get("status") != "HEALTHY" and health.get("confirmation_reason"):
+        gaps.append("店铺绩效：" + health["confirmation_reason"])
+    for key in ("data_warning", "authorization_warning", "report_date_warning"):
+        if context.get(key):
+            gaps.append(str(context[key]))
+    return "- 待确认：" + "；".join(dict.fromkeys(gaps)) + "。" if gaps else "本次可比数据未发现达到通知门槛的异常。"
+
+
 def _http_error(status):
     messages = {
         400: "DeepSeek请求格式未被接受。", 401: "DeepSeek凭据无效。",
@@ -233,7 +284,7 @@ class DeepSeekClient:
                             continue
                     if response.status_code != 200:
                         raise _http_error(response.status_code)
-                    return self._result(response)
+                    return _actionable_text(self._result(response), context, question)
         except httpx.TimeoutException:
             raise DeepSeekError("DeepSeek分析超时，请稍后重试。") from None
         except httpx.HTTPError:
