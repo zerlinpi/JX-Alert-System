@@ -5,6 +5,7 @@ import json
 import math
 import re
 import time
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
@@ -15,7 +16,7 @@ from jx_alert.lingxing.ad_details import DETAIL_LABELS
 from jx_alert.notifications.cards import card, number
 from jx_alert.notifications.daily_report import build_daily_card
 from jx_alert.notifications.outbox import enqueue_notification
-from jx_alert.notifications.routing import _load_routing, report_group_delivery
+from jx_alert.notifications.routing import _load_routing, _route_entry, report_group_delivery
 from jx_alert.notifications.store_health import card_fits, health_brief_snapshots
 from jx_alert.storage.collection_attempts import collection_issue_for_date as _collection_issue_for_date
 from jx_alert.storage.job_lock import database_job_lock, JobAlreadyRunning
@@ -127,6 +128,143 @@ def _resolve_store(db, settings, question):
             if localized:
                 ids = localized
     return snapshots, list(dict.fromkeys(ids))
+
+
+_COLLECTION_VERB = r"(?:立即采集|实时采集|重新采集|现在采集|手动采集)"
+_COLLECTION_REQUEST = re.compile(
+    rf"(?:请\s*)?(?:{_COLLECTION_VERB}\s*(?:店铺\s*)?([1-9][0-9]{{0,17}})\s*(?:店铺)?"
+    rf"|([1-9][0-9]{{0,17}})\s*店铺\s*{_COLLECTION_VERB})[。！!]?"
+)
+_COLLECTION_STATUS = re.compile(r"(?:查询\s*)?采集任务\s*([1-9][0-9]{0,17})\s*状态[。？?]?")
+_COLLECTION_BLOCK_REASONS = {
+    "STORE_OUT_OF_SCOPE": "店铺不在采集范围内",
+    "STORE_NOT_SYNCED": "系统尚未同步该店铺",
+    "AUTHORIZATION_FAILED": "请先恢复该店铺的领星授权",
+    "STORE_UNAVAILABLE": "店铺当前不可采集",
+    "SKIPPED_COLLECTION_DISABLED": "该店铺的采集开关已关闭",
+    "WAITING_TIMEZONE": "店铺报表时区尚未确认",
+    "INVALID_TIMEZONE": "店铺报表时区配置不可用",
+}
+_COLLECTION_STATES = {
+    "PENDING": "等待采集",
+    "RUNNING": "采集中",
+    "SUCCEEDED": "采集完成",
+    "SUCCEEDED_WITH_WARNINGS": "采集完成，部分数据待确认",
+    "PARTIAL_FAILED": "部分采集失败",
+    "FAILED": "采集失败",
+    "BLOCKED": "当前条件无法采集",
+    "SKIPPED": "本次未执行采集",
+}
+
+
+def _collection_command(question):
+    status = _COLLECTION_STATUS.fullmatch(question)
+    if status:
+        return "status", int(status[1])
+    request = _COLLECTION_REQUEST.fullmatch(question)
+    if request:
+        return "request", request[1] or request[2]
+    if re.match(rf"(?:请\s*)?{_COLLECTION_VERB}", question):
+        return "clarify", None
+    return None
+
+
+def _collection_permission(settings, meta, sid):
+    routing = _load_routing(settings.feishu_routing_file)
+    group = report_group_delivery(settings, routing, role="group_question")
+    if meta["chat_id"] != group["receive_id"]:
+        return False
+    admins = routing["groups"][settings.feishu_daily_report_chat_id].get("admin_open_ids", [])
+    operators = _route_entry(routing.get("stores", {}), sid).get("open_ids", [])
+    return meta["sender_id"] in admins or meta["sender_id"] in operators
+
+
+def _collection_status_card(job, sid):
+    args = job.metadata_json or {}
+    state = _COLLECTION_STATES.get(job.status, "待确认")
+    retry_at = args.get("retry_at")
+    if job.status == "PENDING" and retry_at:
+        try:
+            retry = datetime.fromisoformat(retry_at)
+            if retry.tzinfo is None:
+                retry = retry.replace(tzinfo=timezone.utc)
+            state = f"等待重试，最早北京时间 {retry.astimezone(ZoneInfo('Asia/Shanghai')):%m-%d %H:%M:%S}"
+        except (TypeError, ValueError):
+            state = "等待重试"
+    # A follow-up can read the same report day that this job actually completed.
+    report_date = (args.get("completed_store_dates") or {}).get(sid)
+    subtitle = f"报表日 {report_date}。可继续查询店铺数据。" if report_date else "可使用任务号查询进度。"
+    return card("采集任务状态", subtitle=subtitle,
+                sections=[("任务", ["店铺ID", "任务号", "进度"], [(sid, job.id, state)])])
+
+
+def _lookup_collection(db, settings, meta, collection_id):
+    from jx_alert.operations import CollectionConfigurationError, _checked_scope
+
+    receipt = db.scalar(select(SyncJob).where(
+        SyncJob.job_type == "feishu_question", SyncJob.status == "SUCCEEDED",
+        SyncJob.metadata_json["chat_id"].as_string() == meta["chat_id"],
+        SyncJob.metadata_json["collection_job_id"].as_integer() == collection_id,
+        SyncJob.metadata_json["analysis_provider"].as_string() == "collection_request",
+    ).order_by(SyncJob.id.desc()).limit(1))
+    if receipt is not None:
+        sid = receipt.metadata_json.get("collection_store_id")
+        job = db.get(SyncJob, collection_id)
+        if (sid and job is not None and job.job_type == "manual_collection"
+                and (job.metadata_json or {}).get("store_ids") == [sid]
+                and _collection_permission(settings, meta, sid)):
+            try:
+                _checked_scope(settings, [sid])
+            except CollectionConfigurationError:
+                pass
+            else:
+                return _collection_status_card(job, sid)
+    return card("未找到可查询的采集任务", subtitle="请使用本群返回的任务号，由店铺负责人或管理员查询。", sections=[])
+
+
+def _complete_question(db, settings, job_id, meta, cards, provider):
+    response_ids = _reply(db, settings, meta["message_id"], meta["chat_id"], cards)
+    job = db.get(SyncJob, job_id)
+    job.status, job.finished_at = "SUCCEEDED", _utcnow().replace(tzinfo=None)
+    job.metadata_json = {**meta, "outbox_ids": response_ids, "analysis_provider": provider}
+    db.commit()
+    return {"status": "QUEUED", "job_id": job_id, "outbox_ids": response_ids}
+
+
+def _process_collection_command(db, settings, job_id, meta, command):
+    """Interpret only explicit user commands; model output cannot initiate work."""
+    from jx_alert.operations import CollectionBlocked, enqueue_collection
+
+    action, value = command
+    if action == "status":
+        reply = _lookup_collection(db, settings, meta, value)
+        return _complete_question(db, settings, job_id, meta, [reply], "collection_status")
+    if action == "clarify":
+        reply = card("请确认要采集的店铺", subtitle="请使用单个店铺ID，例如：实时采集 5174。", sections=[])
+    elif not _collection_permission(settings, meta, value):
+        reply = card("采集请求未受理", subtitle="请由该店铺负责人或群管理员发起采集。", sections=[])
+    elif not settings.scheduler_enabled or not settings.mcp_operations_enabled:
+        reply = card("采集请求未受理", subtitle="主动采集或调度服务未启用。", sections=[])
+    else:
+        try:
+            with database_job_lock(db.get_bind(), "collection_enqueue"):
+                try:
+                    result = enqueue_collection(db, store_ids=[value])
+                except CollectionBlocked as exc:
+                    reply = card("采集请求未受理",
+                        subtitle=_COLLECTION_BLOCK_REASONS.get(exc.status, "请检查店铺采集设置。"), sections=[])
+                except ValueError:
+                    reply = card("采集请求未受理", subtitle="请检查店铺采集设置。", sections=[])
+                else:
+                    meta.update(collection_job_id=result["job_id"], collection_store_id=value)
+                    collection_job = db.get(SyncJob, result["job_id"])
+                    reply = _collection_status_card(collection_job, value)
+                    # Publish the queue entry and the receipt together before
+                    # releasing the enqueue lock.
+                    return _complete_question(db, settings, job_id, meta, [reply], "collection_request")
+        except JobAlreadyRunning:
+            reply = card("采集请求繁忙", subtitle="请稍后再试。", sections=[])
+    return _complete_question(db, settings, job_id, meta, [reply], "collection_request")
 
 
 def _ad_totals(db, store_id, on):
@@ -378,6 +516,9 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
             meta["attempts"] = meta.get("attempts", 0) + 1
             job.metadata_json = meta
             db.commit()
+            collection = _collection_command(meta["question"])
+            if collection is not None:
+                return _process_collection_command(db, settings, job_id, meta, collection)
             snapshots, ids = _resolve_store(db, settings, meta["question"])
             if len(ids) != 1:
                 options = [s for s in snapshots if s["store_id"] in ids]
@@ -404,12 +545,7 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
             # Recheck scope and route after a possibly slow model request.
             if len(ids) == 1 and ids[0] not in {s["store_id"] for s in health_brief_snapshots(db, settings)["stores"]}:
                 raise ValueError("Question store left the allowed scope")
-            response_ids = _reply(db, settings, meta["message_id"], meta["chat_id"], cards)
-            job = db.get(SyncJob, job_id)
-            job.status, job.finished_at = "SUCCEEDED", _utcnow().replace(tzinfo=None)
-            job.metadata_json = {**meta, "outbox_ids": response_ids, "analysis_provider": provider}
-            db.commit()
-            return {"status": "QUEUED", "job_id": job_id, "outbox_ids": response_ids}
+            return _complete_question(db, settings, job_id, meta, cards, provider)
 
 
 def run_question_worker():

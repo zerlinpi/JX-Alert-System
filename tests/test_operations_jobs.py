@@ -66,11 +66,20 @@ def test_future_retry_does_not_block_ready_job(warehouse, monkeypatch):
 
 
 def test_crashed_running_job_recovers_under_lock(warehouse, monkeypatch):
+    clock = datetime(2026, 11, 13, 20, 0)
+    monkeypatch.setattr(operations, "_utcnow", lambda: clock)
     with warehouse() as db:
         db.add(SyncJob(job_type="manual_collection", status="RUNNING", metadata_json={
             "attempts": 0, "backfill_days": 1}))
         db.commit()
     monkeypatch.setattr(operations, "run_collection", lambda **kwargs: {"status": "COMPLETE"})
+    assert operations.process_pending_collection()["status"] == "IDLE"
+    with warehouse() as db:
+        job = db.scalar(select(SyncJob))
+        assert job.status == "PENDING"
+        assert job.metadata_json["retry_at"] == (clock + timedelta(minutes=1)).isoformat()
+        assert job.metadata_json["error_type"] == "InterruptedCollection"
+    clock += timedelta(minutes=1)
     assert operations.process_pending_collection()["status"] == "SUCCEEDED"
     with warehouse() as db:
         job = db.scalar(select(SyncJob))
@@ -88,6 +97,93 @@ def test_partial_result_has_bounded_retry_without_sending(warehouse, monkeypatch
         job = db.scalar(select(SyncJob))
         assert job.metadata_json["attempts"] == 1
         assert job.metadata_json["retry_at"]
+
+
+def test_retries_keep_the_original_store_dates_and_wait_between_attempts(warehouse, monkeypatch):
+    clock = datetime(2026, 11, 13, 23, 59, 50)
+    planned = {"5174": "2026-11-12", "5175": "2026-11-13"}
+    completed = {"5174": "2026-11-12"}
+    monkeypatch.setattr(operations, "_utcnow", lambda: clock)
+    with warehouse() as db:
+        job = SyncJob(job_type="manual_collection", status="PENDING",
+                      metadata_json={"store_ids": ["5174", "5175"], "attempts": 0})
+        db.add(job)
+        db.commit()
+        job_id = job.id
+    calls = []
+
+    def partial(**kwargs):
+        assert kwargs["store_ids"] == ["5174", "5175"]
+        if not calls:
+            kwargs["progress"]({
+                "planned_store_dates": planned, "completed_store_dates": completed,
+            })
+        else:
+            assert kwargs["planned_store_dates"] == planned
+            assert kwargs["completed_store_dates"] == completed
+        calls.append(clock)
+        return {"status": "PARTIAL", "completed_store_ids": ["5174"],
+                "completed_store_dates": completed, "failed_store_ids": ["5175"]}
+
+    monkeypatch.setattr(operations, "run_collection", partial)
+    for wait_seconds in (60, 120):
+        assert operations.process_pending_collection() == {"job_id": job_id, "status": "PENDING"}
+        with warehouse() as db:
+            assert db.get(SyncJob, job_id).metadata_json["retry_at"] == (
+                clock + timedelta(seconds=wait_seconds)).isoformat()
+        clock += timedelta(seconds=wait_seconds - 1)
+        assert operations.process_pending_collection()["status"] == "IDLE"
+        clock += timedelta(seconds=1)
+    assert operations.process_pending_collection() == {"job_id": job_id, "status": "PARTIAL_FAILED"}
+    with warehouse() as db:
+        job = db.get(SyncJob, job_id)
+        assert job.finished_at == clock
+        assert job.metadata_json["planned_store_dates"] == planned
+        assert "retry_at" not in job.metadata_json
+    assert operations.process_pending_collection()["status"] == "IDLE"
+    assert len(calls) == 3
+
+
+def test_legacy_partial_job_reuses_its_recorded_report_dates(warehouse, monkeypatch):
+    planned = {"5174": "2026-11-12", "5175": "2026-11-13"}
+    completed = {"5174": "2026-11-12"}
+    with warehouse() as db:
+        job = SyncJob(job_type="manual_collection", status="PENDING", metadata_json={
+            "attempts": 1, "result": {"status": "PARTIAL", "report_dates": planned},
+            "completed_store_dates": completed,
+        })
+        db.add(job)
+        db.commit()
+
+    def resume(**kwargs):
+        assert kwargs["planned_store_dates"] == planned
+        assert kwargs["completed_store_dates"] == completed
+        return {"status": "COMPLETE"}
+
+    monkeypatch.setattr(operations, "run_collection", resume)
+    assert operations.process_pending_collection()["status"] == "SUCCEEDED"
+    with warehouse() as db:
+        assert db.get(SyncJob, job.id).metadata_json["planned_store_dates"] == planned
+
+
+@pytest.mark.parametrize("reason", [None, "WAITING_TIMEZONE"])
+def test_configuration_blocked_job_does_not_consume_retries(warehouse, monkeypatch, reason):
+    def blocked(**kwargs):
+        if reason:
+            raise operations.CollectionBlocked(reason)
+        return {"status": "CONFIGURATION_BLOCKED"}
+
+    monkeypatch.setattr(operations, "run_collection", blocked)
+    with warehouse() as db:
+        job_id = operations.enqueue_collection(db)["job_id"]
+        db.commit()
+    assert operations.process_pending_collection() == {"job_id": job_id, "status": "BLOCKED"}
+    with warehouse() as db:
+        job = db.get(SyncJob, job_id)
+        assert job.metadata_json["attempts"] == 0
+        assert "retry_at" not in job.metadata_json
+        assert job.metadata_json["result"].get("reason") == reason
+    assert operations.process_pending_collection()["status"] == "IDLE"
 
 
 def test_store_progress_is_durable_before_a_later_collection_crash(warehouse, monkeypatch):

@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from jx_alert.analysis.evaluator import evaluate_store_status_events
 from jx_alert.lingxing.ad_currency import account_currencies
 from jx_alert.lingxing.campaign_collector import collect_campaigns
-from jx_alert.lingxing.client import LingxingError
+from jx_alert.lingxing.client import LingxingError, LingxingTransientError
 from jx_alert.lingxing.collector import collect_ads_for_day
 from jx_alert.lingxing.product_ads_collector import collect_product_ads_for_day
 from jx_alert.lingxing.performance_openapi import collect_store_performance
@@ -171,9 +171,12 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         )
         job = db.get(SyncJob, job_id)
         performance_status = results.get("performance", {}).get("status", "DISABLED")
-        job.status = ("PARTIAL_FAILED" if performance_status == "PARTIAL_FAILED" else
+        detail_reports = results.get("sb_sd_detail_reports", {})
+        transient_detail_failure = any(item["error_type"] == LingxingTransientError.__name__
+                                       for item in detail_reports.get("failures", []))
+        job.status = ("PARTIAL_FAILED" if performance_status == "PARTIAL_FAILED" or transient_detail_failure else
                       "SUCCEEDED_WITH_WARNINGS" if performance_status == "SUCCEEDED_WITH_WARNINGS"
-                      or results.get("sb_sd_detail_reports", {}).get("status") == "PARTIAL_FAILED"
+                      or detail_reports.get("status") == "PARTIAL_FAILED"
                       or results.get("ad_currency", {}).get("status") == "LOOKUP_UNAVAILABLE" else "SUCCEEDED")
         job.finished_at = _utcnow()
         job.store_count = int(results["sales"].get("stores_seen", 0))

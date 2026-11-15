@@ -6,6 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from jx_alert.storage.db import Base
 from jx_alert.storage import models  # noqa: F401
 from jx_alert.storage.models import DataCoverage, DailyMetric, SyncJob
+from jx_alert.lingxing.client import LingxingError, LingxingTransientError
 from jx_alert.lingxing.pipeline import collect_daily_snapshot
 from jx_alert.store_controls import get_store_controls, save_store_controls
 
@@ -141,6 +142,35 @@ def test_daily_pipeline_marks_partial_failure_and_keeps_completed_steps(tmp_path
             "store_status", "sales", "campaigns", "campaign_reports"
         ]
         assert db.scalar(select(func.count()).select_from(DailyMetric)) > 0
+
+
+@pytest.mark.parametrize(("detail_error", "expected"), (
+    (LingxingTransientError, "PARTIAL_FAILED"),
+    (LingxingError, "SUCCEEDED_WITH_WARNINGS"),
+    (None, "SUCCEEDED"),
+))
+def test_daily_detail_retries_use_transient_failures_not_empty_partitions(tmp_path, detail_error, expected):
+    class DetailClient(FakeDailyClient):
+        def iter_advertising_detail_report(self, dimension, payload):
+            if dimension == "creative_sb" and detail_error:
+                raise detail_error("simulated supplement failure")
+            return iter([])
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine)() as db:
+        result = collect_daily_snapshot(
+            DetailClient(), db, {"101": "2026-11-10"},
+            ad_attribution_refresh_days=1,
+            settings=SimpleNamespace(lingxing_performance_enabled=False,
+                                     sb_sd_detail_reports_enabled=True, raw_dir=str(tmp_path / "raw")),
+        )
+        assert result["status"] == expected
+        assert db.get(SyncJob, result["job_id"]).status == expected
+        coverage = {row.dimension: row for row in db.scalars(select(DataCoverage))}
+        assert coverage["store"].status == "COMPLETE"
+        assert coverage["target_sb"].status == "COMPLETE" and coverage["target_sb"].row_count == 0
+        assert coverage["creative_sb"].status == ("FAILED" if detail_error else "COMPLETE")
 
 
 

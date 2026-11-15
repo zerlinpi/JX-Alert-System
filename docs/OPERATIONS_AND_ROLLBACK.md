@@ -46,7 +46,11 @@ window. Current-day SP evidence may be inspected separately, but is never
 substituted for authoritative daily reports or mature conversion baselines.
 
 `request_collection` in MCP requires `mcp_operations_enabled` and returns a job
-ID immediately. A running scheduler executes the request. SP query tools expose
+ID immediately. `store_ids` optionally limits the request to configured stores.
+A running scheduler executes the request. The job fixes its initial report dates.
+After the first failed attempt it waits at least 60 seconds, then at least 120
+seconds after a second failure, with three attempts total. Already completed
+store/date checkpoints are reused. SP query tools expose
 separate daily/hour versions, stale-after-failure indicators and reconciliations.
 Keep MCP bound to loopback unless an authenticated HTTPS reverse proxy is ready.
 

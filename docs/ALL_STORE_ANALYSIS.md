@@ -57,6 +57,10 @@ docker exec jx-alert-app-1 python /app/scripts/enable_all_store_analysis.py --ap
 - 领星授权失效的店铺需要在领星重新授权；系统保留阻塞状态。
 - 其他店铺的实际报表时区待官方证据，不以国家默认值替代；确认后逐项更新
   `data/sp-runtime/store-timezones.json` 中 `stores.<店铺ID>.timezone`。
+  [领星销量统计](https://apidoc.lingxing.com/new/api-docs/Statistics/AsinDailyLists/)使用站点日期。
+  [店铺列表](https://apidoc.lingxing.com/new/api-docs/BasicData/SellerLists/)和[市场列表](https://apidoc.lingxing.com/new/api-docs/BasicData/AllMarketplace/)未提供对应时区。
+  [Amazon Ads Profiles](https://d3a0d0y2hgofx6.cloudfront.net/openapi/en-us/profiles/3-0/openapi.yaml)的时区只描述广告口径，须与销量来源分别核实。
+  [店铺绩效](https://apidoc.lingxing.com/new/api-docs/Service/storePerformanceList/)及[业绩通知](https://apidoc.lingxing.com/new/api-docs/Service/PerformanceNoticeList/)的源更新时间未声明时区，仍按观测归档。
 - 运营已映射到群内唯一核实的“皮泽霖”；管理员与管理层如需对应投递，仍由用户明确填写
   `data/sp-runtime/feishu-routing.json` 的 `groups.test.admin_open_ids` 与 `management.open_ids`。
 - 用户在 ChatGPT 发起新的 OAuth 登录并实测调用。每小时任务需在实际账户验证可使用本插件、

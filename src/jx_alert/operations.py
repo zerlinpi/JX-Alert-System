@@ -11,15 +11,60 @@ from sqlalchemy import or_, select, update
 from jx_alert.store_controls import collection_enabled, collection_states, notification_states
 
 
+class CollectionConfigurationError(ValueError):
+    """A local configuration or collection scope must change before retrying."""
+
+
+_COLLECTION_MAX_ATTEMPTS = 3
+_COLLECTION_RETRY_DELAY_SECONDS = 60
+
+
+def _collection_retry_at(failed_at, failures):
+    delay = _COLLECTION_RETRY_DELAY_SECONDS * 2 ** max(failures - 1, 0)
+    return (failed_at + timedelta(seconds=delay)).isoformat()
+
+
 def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class CollectionBlocked(CollectionConfigurationError):
+    def __init__(self, status):
+        super().__init__(status)
+        self.status = status
+
+
+def _requested_store_ids(store_ids):
+    if store_ids is None:
+        return None
+    if (not isinstance(store_ids, list) or not 1 <= len(store_ids) <= 100
+            or any(not isinstance(sid, str) or not re.fullmatch(r"[1-9][0-9]{0,29}", sid) for sid in store_ids)):
+        raise CollectionConfigurationError("store_ids must contain positive store ID strings")
+    return sorted(set(store_ids))
+
+
+def _checked_scope(settings, selected):
+    path = Path(settings.collection_scope_file)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        ids = raw["store_ids"]
+        scope = {str(row["sid"]) for row in scoped_stores(
+            {"data": [{"sid": str(int(sid))} for sid in ids]}, path)["data"]}
+    except (KeyError, OSError, TypeError, ValueError):
+        raise CollectionConfigurationError("Explicit store scope is not available") from None
+    if selected is not None and not set(selected) <= scope:
+        raise CollectionBlocked("STORE_OUT_OF_SCOPE")
+    return scope
 
 
 def _report_date(value):
     if value is None:
         return None
-    if not isinstance(value, str) or date.fromisoformat(value).isoformat() != value:
-        raise ValueError("report_date must use YYYY-MM-DD")
+    try:
+        if not isinstance(value, str) or date.fromisoformat(value).isoformat() != value:
+            raise ValueError
+    except ValueError:
+        raise CollectionConfigurationError("report_date must use YYYY-MM-DD") from None
     return value
 
 
@@ -27,7 +72,7 @@ def _completed_dates(requested, latest):
     if requested is None:
         return latest
     if any(requested > last for last in latest.values()):
-        raise ValueError("Only completed marketplace-local dates may be analyzed")
+        raise CollectionConfigurationError("Only completed marketplace-local dates may be analyzed")
     return {sid: requested for sid in latest}
 
 
@@ -125,11 +170,15 @@ def _observed_sales_currency(db, sid):
     return "CURRENCY_CONFLICT" if len(currencies) > 1 or (currencies and store and store.currency_code not in currencies) else "WAITING_CURRENCY"
 
 
-def sync_scoped_store_inventory(db, settings, stores_response):
+def sync_scoped_store_inventory(db, settings, stores_response, *, selected=None):
     """Save authorized metadata only; caller commits, no metrics or provider writes."""
     from jx_alert.lingxing.sales_collector import _upsert_store
     from jx_alert.storage.models import Store
     stores = scoped_stores(stores_response, settings.collection_scope_file, allow_missing=True)
+    if selected is not None:
+        stores = {**stores,
+                  "data": [row for row in stores["data"] if str(row["sid"]) in selected],
+                  "missing_store_ids": [sid for sid in stores.get("missing_store_ids", []) if sid in selected]}
     plan = store_report_plan(stores["data"], settings.store_timezones_file,
         allow_unknown_timezone_history=getattr(settings, "allow_unconfigured_timezone_history", False))
     for record in stores["data"]:
@@ -193,7 +242,7 @@ def collect_sp_targets(client, db, settings, report_dates, *, days=None, scope_s
 
 
 def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=None,
-                   completed_store_dates=None, progress=None):
+                   completed_store_dates=None, progress=None, store_ids=None, planned_store_dates=None):
     """Run one locked pipeline and optional sales baseline backfill."""
     from jx_alert.config import get_settings
     from jx_alert.storage.db import SessionLocal, engine, init_db
@@ -205,19 +254,33 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
     from jx_alert.reporting.excel import export_daily_reports
     from jx_alert.storage.raw_archive import archive_raw_snapshots
     if type(backfill_days) is not int or not 1 <= backfill_days <= 30:
-        raise ValueError("backfill_days must be between 1 and 30")
+        raise CollectionConfigurationError("backfill_days must be between 1 and 30")
     report_date = _report_date(report_date)
+    selected = _requested_store_ids(store_ids)
+    if planned_store_dates is not None:
+        if (not isinstance(planned_store_dates, dict)
+                or any(not isinstance(day, str) or _report_date(day) != day
+                       for day in planned_store_dates.values())):
+            raise CollectionConfigurationError("Invalid persisted report date plan")
     settings = get_settings()
     if settings.app_dry_run:
         return {"status": "DRY_RUN"}
     with database_job_lock(engine):
+        allowed = None
+        if selected is not None:
+            allowed = _checked_scope(settings, selected)
+            active = collection_states(settings, selected)
+            if not any(active.values()):
+                return {"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": selected}
         init_db()
         client = LingxingClient.from_settings()
         inventory = client.get_stores()
         with SessionLocal() as db:
-            synced = sync_scoped_store_inventory(db, settings, inventory)
+            synced = sync_scoped_store_inventory(db, settings, inventory, selected=selected)
             db.commit()
         stores, plan = synced["stores_response"], synced["store_plan"]
+        scope_ids = allowed if allowed is not None else {str(r["sid"]) for r in stores["data"]}
+        missing = stores.get("missing_store_ids", [])
         switches = collection_states(settings, (x["store_id"] for x in plan))
         paused = sorted(sid for sid, enabled in switches.items() if not enabled)
         for item in plan:
@@ -226,18 +289,33 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
         latest = {x["store_id"]: x["report_date"] for x in plan if x["state"] == "READY"}
         blocked = [x for x in plan if x["state"] != "READY"] + [
             {"store_id": sid, "enabled": True, "state": "SOURCE_STORE_MISSING"}
-            for sid in stores.get("missing_store_ids", [])]
+            for sid in missing]
         # Metadata is saved even for blocked stores, so the configured analysis
         # scope remains visible. No metric partition is fabricated for them.
+        latest = _completed_dates(report_date, latest)
+        if planned_store_dates is None:
+            if progress is not None and latest:
+                progress({"planned_store_dates": dict(latest)})
+        else:
+            # A retry remains on its original dates even after store midnight.
+            # A changed timezone can make a previously planned day unsafe.
+            pinned = {}
+            for sid, due in latest.items():
+                if sid not in planned_store_dates:
+                    continue
+                intended = planned_store_dates[sid]
+                if intended > due:
+                    item = next(row for row in plan if row["store_id"] == sid)
+                    blocked.append({**item, "state": "PLANNED_DATE_NOT_COMPLETE"})
+                    continue
+                pinned[sid] = intended
+            latest = pinned
         if not latest:
             return {"status": ("SKIPPED_COLLECTION_DISABLED" if blocked and
                     all(x["state"] == "SKIPPED_COLLECTION_DISABLED" for x in blocked)
                     else "CONFIGURATION_BLOCKED"), "store_plan": plan, "blocked_stores": blocked,
                     "completed_store_ids": []}
-        latest = _completed_dates(report_date, latest)
-        scope_ids = {str(r["sid"]) for r in stores["data"]}
-        # Store IDs alone do not prove which report date completed. A retry that
-        # crosses a local midnight must not reuse yesterday's checkpoint today.
+        # Store IDs alone do not prove which report date completed.
         completed = {str(sid) for sid, day in (completed_store_dates or {}).items()
                      if latest.get(str(sid)) == day}
         results, failures, sp_runs = {}, [], []
@@ -414,48 +492,69 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
             "notification_disabled_store_ids": paused, **notifications}
 
 
-def enqueue_collection(db, *, report_date=None, backfill_days=1, idempotency_key=None):
+def enqueue_collection(db, *, report_date=None, backfill_days=1, idempotency_key=None, store_ids=None):
     """Queue bounded work so an MCP request can return immediately."""
     from jx_alert.storage.models import SyncJob
     if type(backfill_days) is not int or not 1 <= backfill_days <= 30:
         raise ValueError("backfill_days must be between 1 and 30")
     report_date = _report_date(report_date)
+    selected = _requested_store_ids(store_ids)
     if idempotency_key is not None and (
         not isinstance(idempotency_key, str)
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", idempotency_key)
     ):
         raise ValueError("idempotency_key must contain 1-100 letters, digits or _.:-")
-    if report_date is not None:
+    if report_date is not None or selected is not None:
         from jx_alert.config import get_settings
         from jx_alert.storage.models import Store
         settings = get_settings()
-        raw = json.loads(Path(settings.collection_scope_file).read_text(encoding="utf-8"))
-        candidates = [{"sid": str(sid), "status": getattr(db.get(Store, str(sid)), "status", 1)}
-                      for sid in raw.get("store_ids", [])]
-        stores = scoped_stores({"data": candidates}, settings.collection_scope_file)
-        plan = store_report_plan(stores["data"], settings.store_timezones_file,
+        configured = _checked_scope(settings, selected)
+        scope = selected if selected is not None else sorted(configured)
+        candidates = []
+        for sid in scope:
+            store = db.get(Store, sid)
+            if selected is not None and store is None:
+                raise CollectionBlocked("STORE_NOT_SYNCED")
+            candidates.append({"sid": sid, "status": getattr(store, "status", 1)})
+        plan = store_report_plan(candidates, settings.store_timezones_file,
             allow_unknown_timezone_history=getattr(settings, "allow_unconfigured_timezone_history", False))
         switches = collection_states(settings, (x["store_id"] for x in plan))
+        if selected is not None:
+            for item in plan:
+                if not switches[item["store_id"]]:
+                    raise CollectionBlocked("SKIPPED_COLLECTION_DISABLED")
+                if item["state"] != "READY":
+                    raise CollectionBlocked("STORE_UNAVAILABLE" if item["state"] == "INACTIVE" else item["state"])
         latest = {x["store_id"]: x["report_date"] for x in plan
                   if x["state"] == "READY" and switches[x["store_id"]]}
         if not latest and not any(not enabled for enabled in switches.values()):
             raise ValueError("No configured store dates are available")
         _completed_dates(report_date, latest)
     query = select(SyncJob).where(SyncJob.job_type == "manual_collection")
-    if idempotency_key is not None:
-        query = query.where(SyncJob.metadata_json["idempotency_key"].as_string() == idempotency_key)
-    else:
-        query = query.where(SyncJob.status.in_(["PENDING", "RUNNING"]))
-    for existing in db.scalars(query.order_by(SyncJob.id.desc())).all():
+
+    def same_request(existing):
         args = existing.metadata_json or {}
-        same = args.get("report_date") == report_date and args.get("backfill_days", 1) == backfill_days
-        if idempotency_key is not None and not same:
-            raise ValueError("Idempotency key already belongs to different collection arguments")
-        if same:
+        return (args.get("report_date") == report_date and args.get("backfill_days", 1) == backfill_days
+                and args.get("store_ids") == selected)
+
+    if idempotency_key is not None:
+        existing = db.scalar(query.where(SyncJob.metadata_json["idempotency_key"].as_string() == idempotency_key)
+                             .order_by(SyncJob.id.desc()).limit(1))
+        if existing is not None:
+            if not same_request(existing):
+                raise ValueError("Idempotency key already belongs to different collection arguments")
             return {"job_id": existing.id, "status": existing.status, "reused": True}
+    if idempotency_key is None:
+        for existing in db.scalars(query.where(SyncJob.status.in_(["PENDING", "RUNNING"]))
+                                   .order_by(SyncJob.id.desc())):
+            if same_request(existing):
+                return {"job_id": existing.id, "status": existing.status, "reused": True}
+    metadata = {"report_date": report_date, "backfill_days": backfill_days,
+                "attempts": 0, "idempotency_key": idempotency_key}
+    if selected is not None:
+        metadata["store_ids"] = selected
     job = SyncJob(job_type="manual_collection", status="PENDING",
-                  metadata_json={"report_date": report_date, "backfill_days": backfill_days,
-                                 "attempts": 0, "idempotency_key": idempotency_key})
+                  metadata_json=metadata)
     db.add(job)
     db.flush()
     return {"job_id": job.id, "status": "PENDING", "reused": False}
@@ -465,6 +564,7 @@ def process_pending_collection():
     from jx_alert.storage.db import SessionLocal, engine
     from jx_alert.storage.models import SyncJob
     from jx_alert.storage.job_lock import database_job_lock, JobAlreadyRunning
+    from jx_alert.store_controls import StoreControlError
     now = _utcnow()
     with database_job_lock(engine, "manual_dispatch"), SessionLocal() as db:
         # The dispatcher holds this crash-released lock for the whole collection.
@@ -477,8 +577,11 @@ def process_pending_collection():
             args = dict(old.metadata_json or {})
             args["attempts"] = args.get("attempts", 0) + 1
             args["error_type"] = "InterruptedCollection"
-            args["retry_at"] = now.isoformat()
-            old.status = "PENDING" if args["attempts"] < 3 else "FAILED"
+            old.status = "PENDING" if args["attempts"] < _COLLECTION_MAX_ATTEMPTS else "FAILED"
+            if old.status == "PENDING":
+                args["retry_at"] = _collection_retry_at(now, args["attempts"])
+            else:
+                args.pop("retry_at", None)
             old.metadata_json = args
             old.finished_at = None if old.status == "PENDING" else now
         db.commit()
@@ -491,6 +594,13 @@ def process_pending_collection():
         if job is None:
             return {"status": "IDLE"}
         args = dict(job.metadata_json or {})
+        if "planned_store_dates" not in args:
+            # Jobs written before date plans were persisted may already have
+            # recorded the exact dates in their partial result.
+            previous = args.get("result")
+            previous_dates = previous.get("report_dates") if isinstance(previous, dict) else None
+            if isinstance(previous_dates, dict) and previous_dates:
+                args["planned_store_dates"] = previous_dates
         claim_token = uuid4().hex
         args["claim_token"] = claim_token
         args["claim_started_at"] = now.isoformat()
@@ -502,7 +612,6 @@ def process_pending_collection():
             db.rollback()
             return {"job_id": job.id, "status": "LOST_CLAIM"}
         db.commit()
-        retry = False
         def persist_progress(checkpoint):
             args.update(checkpoint)
             saved = db.execute(update(SyncJob).where(
@@ -515,17 +624,20 @@ def process_pending_collection():
             db.commit()
 
         try:
-            result = run_collection(report_date=args.get("report_date"),
-                                    backfill_days=args.get("backfill_days", 1),
-                                    completed_store_ids=args.get("completed_store_ids"),
-                                    completed_store_dates=args.get("completed_store_dates"),
-                                    progress=persist_progress)
+            scope = {name: args[name] for name in ("store_ids", "planned_store_dates") if name in args}
+            result = run_collection(
+                report_date=args.get("report_date"),
+                backfill_days=args.get("backfill_days", 1),
+                completed_store_ids=args.get("completed_store_ids"),
+                completed_store_dates=args.get("completed_store_dates"),
+                progress=persist_progress,
+                **scope,
+            )
             if result.get("completed_store_ids"):
                 args["completed_store_ids"] = result["completed_store_ids"]
                 args["completed_store_dates"] = result.get("completed_store_dates", {})
             if result["status"] in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}:
                 status = "SUCCEEDED_WITH_WARNINGS" if result["status"] == "COMPLETE_WITH_WARNINGS" else "SUCCEEDED"
-                args.pop("retry_at", None)
                 args.pop("error_type", None)
             elif result["status"] in {"DRY_RUN", "SKIPPED_COLLECTION_DISABLED"}:
                 status = "SKIPPED"
@@ -534,21 +646,25 @@ def process_pending_collection():
             else:
                 args["attempts"] = args.get("attempts", 0) + 1
                 args["error_type"] = "PartialCollection"
-                retry = True
-                status = "PENDING" if args["attempts"] < 3 else "PARTIAL_FAILED"
+                status = "PENDING" if args["attempts"] < _COLLECTION_MAX_ATTEMPTS else "PARTIAL_FAILED"
             args["result"] = result
         except JobAlreadyRunning:
             status = "PENDING"
-            retry = True
+        except (CollectionConfigurationError, StoreControlError) as exc:
+            status = "BLOCKED"
+            args["error_type"] = type(exc).__name__
+            args["result"] = {"status": "CONFIGURATION_BLOCKED"}
+            if isinstance(exc, CollectionBlocked):
+                args["result"]["reason"] = exc.status
         except Exception as exc:
             args["attempts"] = args.get("attempts", 0) + 1
             args["error_type"] = type(exc).__name__
-            retry = True
-            status = "PENDING" if args["attempts"] < 3 else "FAILED"
+            status = "PENDING" if args["attempts"] < _COLLECTION_MAX_ATTEMPTS else "FAILED"
         finished = _utcnow()
-        if retry and status == "PENDING":
-            delay = 30 * 2 ** max(args.get("attempts", 0) - 1, 0)
-            args["retry_at"] = (finished + timedelta(seconds=delay)).isoformat()
+        if status == "PENDING":
+            args["retry_at"] = _collection_retry_at(finished, args.get("attempts", 0))
+        else:
+            args.pop("retry_at", None)
         saved = db.execute(update(SyncJob).where(
             SyncJob.id == job.id, SyncJob.status == "RUNNING",
             SyncJob.metadata_json["claim_token"].as_string() == claim_token,
