@@ -269,6 +269,223 @@ def test_store_country_disambiguates_same_name_without_guessing(warehouse):
         assert {r["country"] for r in candidates} == {"美国", "加拿大"}
 
 
+def _name_stores(warehouse, *, same_brand=False):
+    with warehouse[1].begin() as db:
+        first, second = db.get(Store, "5174"), db.get(Store, "5175")
+        first.name, first.country = "梵界-Geteen-主账号-US", "美国"
+        second.name = "梵界-Geteen-主账号-CA" if same_brand else "耀强-Campx-主账号-CA"
+        second.country = "加拿大"
+
+
+@pytest.mark.parametrize("query", [
+    "Geteen", "geteen 美国广告情况", "ＧＥＴＥＥＮ 美国", "梵界的情况", "Get 美国", "梵界 Geteen 主账号 US",
+])
+def test_store_name_and_brand_fragments_resolve_without_id(warehouse, query):
+    _name_stores(warehouse)
+    with warehouse[1]() as db:
+        assert bot_service._resolve_store(db, warehouse[0], query)[1] == ["5174"]
+
+
+@pytest.mark.parametrize("query", ["US", "美国店铺广告情况", "主账号", "amz", "你好", "范围外店铺", "不存在品牌"])
+def test_generic_country_or_out_of_scope_names_do_not_select_a_store(warehouse, query):
+    _name_stores(warehouse)
+    with warehouse[1]() as db:
+        assert bot_service._resolve_store(db, warehouse[0], query)[1] == []
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("Geteen", ["5174", "5175"]), ("Geteen 美国", ["5174"]),
+    ("Geteen CA", ["5175"]), ("Geteen 德国", []),
+])
+def test_partial_brand_uses_real_country_for_disambiguation(warehouse, query, expected):
+    _name_stores(warehouse, same_brand=True)
+    with warehouse[1]() as db:
+        assert bot_service._resolve_store(db, warehouse[0], query)[1] == expected
+
+
+def test_complete_name_wins_over_shared_chinese_prefix_and_embedded_us_token(warehouse):
+    with warehouse[1].begin() as db:
+        a, b = db.get(Store, "5174"), db.get(Store, "5175")
+        a.name, a.country = "AMZ-义乌昌泉-主账号-US-BR", "巴西"
+        b.name, b.country = "AMZ-义乌昌泉-主账号-US", "美国"
+        # The full Brazil name contains US as an internal account label.
+        assert bot_service._resolve_store(db, warehouse[0], "AMZ 义乌昌泉 主账号 US BR 广告情况")[1] == ["5174"]
+        a.name, b.name = "梵界-Geteen-主账号-US", "梵界-Campx-主账号-US"
+        a.country = b.country = "美国"
+        assert bot_service._resolve_store(db, warehouse[0], "梵界 Geteen 主账号 US情况")[1] == ["5174"]
+
+
+def test_report_date_numbers_cannot_select_a_store(warehouse):
+    settings = warehouse[0]
+    with warehouse[1].begin() as db:
+        db.add(Store(sid="2026", name="另一品牌", country="美国", status=1))
+    Path(settings.collection_scope_file).write_text(json.dumps({"store_ids": [5174, 5175, 2026]}))
+    with warehouse[1]() as db:
+        assert bot_service._resolve_store(db, settings, "2026-11-14广告情况")[1] == []
+
+
+def test_partial_name_question_uses_correct_store_without_starting_collection(warehouse):
+    _name_stores(warehouse)
+    enqueue(warehouse, event("@_user_1 geteen 美国广告和绩效情况"))
+    process(warehouse)
+    assert len(FakeClient.calls) == 1 and FakeClient.calls[0][0]["store_id"] == "5174"
+    with warehouse[1]() as db:
+        assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == "manual_collection")) is None
+
+
+def test_unknown_full_brand_cannot_fall_back_to_shared_chinese_prefix(warehouse):
+    _name_stores(warehouse)
+    with warehouse[1]() as db:
+        assert bot_service._resolve_store(db, warehouse[0], "梵界-UnknownBrand-主账号-US")[1] == []
+        assert bot_service._resolve_store(db, warehouse[0], "梵界-其他品牌-主账号-US")[1] == []
+        assert bot_service._resolve_store(db, warehouse[0], "Geteen CPC ROAS情况")[1] == ["5174"]
+
+
+def test_identical_frozen_question_reuses_model_but_changed_evidence_does_not(warehouse):
+    for i in range(2):
+        enqueue(warehouse, event(message_id="om_cache_" + str(i)))
+        process(warehouse)
+    assert len(FakeClient.calls) == 1
+    with warehouse[1].begin() as db:
+        fact = db.scalar(select(DailyMetric).where(DailyMetric.store_id == "5174",
+            DailyMetric.metric_date == DAY, DailyMetric.dimension == "store", DailyMetric.metric_name == "orders"))
+        fact.value += 1
+    enqueue(warehouse, event(message_id="om_changed"))
+    process(warehouse)
+    assert len(FakeClient.calls) == 2
+
+
+def test_compact_prompt_preserves_all_kpis_values_dates_and_gaps(warehouse):
+    from jx_alert.ai.deepseek import _input_json, compact_context
+    with warehouse[1]() as db:
+        context, _ = bot_service.question_context(db, warehouse[0], "5174", now=NOW)
+    compact = compact_context(context)
+    assert set(compact["advertising_kpis"]) == {"CTR", "CPC", "CDR", "CPS", "ROAS", "CPA", "TCOAS"}
+    for key, item in context["advertising_kpis"].items():
+        assert compact["advertising_kpis"][key]["current"] == item["current"]
+        assert compact["advertising_kpis"][key]["current_date"] == item["current_date"]
+        assert compact["advertising_kpis"][key]["status"] == item["status"]
+    assert compact["coverage"] == context["coverage"]
+    assert compact["health"]["confirmation_reason"] == context["health"]["confirmation_reason"]
+    original = json.dumps(context, ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(_input_json(context, "广告情况").encode()) < len(original) * .75
+
+
+def test_model_cache_expires_and_does_not_roll_forward_on_cache_hits(warehouse, monkeypatch):
+    enqueue(warehouse)
+    process(warehouse)
+    monkeypatch.setattr(bot_service, "_utcnow", lambda: NOW + timedelta(minutes=9))
+    enqueue(warehouse, event(message_id="om_cache_hit"))
+    process(warehouse)
+    assert len(FakeClient.calls) == 1
+    monkeypatch.setattr(bot_service, "_utcnow", lambda: NOW + timedelta(minutes=11))
+    enqueue(warehouse, event(message_id="om_cache_expired"))
+    process(warehouse)
+    assert len(FakeClient.calls) == 2
+
+
+def test_materiality_policy_applies_to_kpi_context_without_changing_source_tables(warehouse):
+    settings, sessions, _ = warehouse
+    settings.alert_materiality_enabled = True
+    with sessions.begin() as db:
+        metric = db.scalar(select(DailyMetric).where(DailyMetric.store_id == "5174",
+            DailyMetric.metric_date == DAY, DailyMetric.dimension == "campaign_sp", DailyMetric.metric_name == "spend"))
+        metric.value = 200
+    with sessions() as db:
+        context, _ = bot_service.question_context(db, settings, "5174", now=NOW)
+        assert context["advertising_kpis"]["CPC"]["status"] == "WATCH"
+        assert context["notification_policy"]["version"] == 1
+        assert not any(row["metric"] == "CPC" for row in context["screening_candidates"])
+
+
+def test_ambiguous_collection_name_returns_names_and_sites_without_queueing(warehouse, monkeypatch):
+    _name_stores(warehouse, same_brand=True)
+    _enable_collection(warehouse, monkeypatch, role="admin")
+    enqueue(warehouse, event("@_user_1 实时采集Geteen"))
+    reply = _collection_receipt(warehouse, process(warehouse))
+    assert all(label in reply for label in ("请确认要采集的店铺", "梵界-Geteen-主账号-US", "加拿大", "完整店铺名和站点"))
+    assert "店铺ID" not in reply and "5174" not in reply
+    with warehouse[1]() as db:
+        assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == "manual_collection")) is None
+    assert not FakeClient.calls
+
+
+@pytest.mark.parametrize("role", ["operator", "admin"])
+def test_named_collection_and_named_progress_keep_existing_receipts_and_deduplication(warehouse, monkeypatch, role):
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch, role=role)
+    request = event("@_user_1 实时采集 geteen 美国")
+    first = enqueue(warehouse, request)
+    reply = _collection_receipt(warehouse, process(warehouse))
+    assert "梵界-Geteen-主账号-US" in reply and "等待采集" in reply
+    assert "店铺ID" not in reply and "任务号" not in reply
+    assert enqueue(warehouse, request)["status"] == "REUSED"
+    enqueue(warehouse, event("@_user_1 重新采集 梵界 美国", message_id="om_again"))
+    process(warehouse)
+    with warehouse[1].begin() as db:
+        jobs = db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")).all()
+        assert len(jobs) == 1 and jobs[0].metadata_json["store_ids"] == ["5174"]
+        jobs[0].metadata_json = {**jobs[0].metadata_json, "retry_at": "2026-11-14T00:03:00"}
+        assert db.get(SyncJob, first["job_id"]).metadata_json["collection_store_id"] == "5174"
+    enqueue(warehouse, event("@_user_1 查询Geteen美国采集状态", message_id="om_progress"))
+    reply = _collection_receipt(warehouse, process(warehouse))
+    assert "等待重试，最早北京时间 11-14 08:03:00" in reply and "梵界-Geteen-主账号-US" in reply
+    assert not FakeClient.calls
+
+
+@pytest.mark.parametrize("query", [
+    "Geteen 暂时不要实时采集", "Geteen 是否可以实时采集", "请说明Geteen实时采集",
+    "实时采集Geteen和未知店铺", "实时采集Geteen以及Campx", "实时采集Geteen，不要实际运行",
+])
+def test_negation_description_and_multi_store_requests_never_queue_a_partial_match(warehouse, monkeypatch, query):
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch, role="admin")
+    enqueue(warehouse, event("@_user_1 " + query))
+    process(warehouse)
+    with warehouse[1]() as db:
+        assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == "manual_collection")) is None
+
+
+@pytest.mark.parametrize("condition", ["no_role", "paused", "authorization"])
+def test_named_collection_cannot_bypass_role_switch_or_authorization(warehouse, monkeypatch, condition):
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch, role="other" if condition == "no_role" else "operator")
+    if condition == "paused":
+        from jx_alert.store_controls import get_store_controls, save_store_controls
+        current = get_store_controls(warehouse[0], "5174")
+        save_store_controls(warehouse[0], "5174", False, True, current["revision"])
+    elif condition == "authorization":
+        with warehouse[1].begin() as db:
+            db.get(Store, "5174").status = 2
+    enqueue(warehouse, event("@_user_1 实时采集Geteen美国"))
+    process(warehouse)
+    with warehouse[1]() as db:
+        assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == "manual_collection")) is None
+    assert not FakeClient.calls
+
+
+@pytest.mark.parametrize("condition", ["other_group", "unreceipted", "permission_revoked"])
+def test_named_progress_rechecks_group_receipt_and_current_permission(warehouse, monkeypatch, condition):
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch)
+    queued = enqueue(warehouse, event("@_user_1 实时采集Geteen美国"))
+    process(warehouse)
+    with warehouse[1].begin() as db:
+        receipt = db.get(SyncJob, queued["job_id"])
+        original = db.get(SyncJob, receipt.metadata_json["collection_job_id"])
+        original.status = "SUCCEEDED"
+        if condition == "other_group":
+            receipt.metadata_json = {**receipt.metadata_json, "chat_id": "oc_other"}
+        elif condition == "unreceipted":
+            receipt.metadata_json = {**receipt.metadata_json, "analysis_provider": "deepseek"}
+        else:
+            _enable_collection(warehouse, monkeypatch, role="other")
+    enqueue(warehouse, event("@_user_1 Geteen美国采集进度", message_id="om_progress"))
+    reply = _collection_receipt(warehouse, process(warehouse))
+    assert "未找到可查询的采集任务" in reply and "采集完成" not in reply
+    assert not FakeClient.calls
+
+
 def test_model_context_lists_adverse_evidence_explicitly_for_review(warehouse):
     settings, sessions, _ = warehouse
     with sessions() as db:
@@ -554,7 +771,8 @@ def test_ambiguous_or_outside_scope_store_gets_clarification_without_model_call(
         assert "请确认店铺" in value
         assert "范围外店铺" not in value
         if question.startswith("同创美国"):
-            assert "5174" in value and "5175" in value
+            assert "同创美国" in value and "完整店铺名和站点" in value
+            assert "店铺ID" not in value
 
 
 def test_missing_deepseek_key_still_replies_with_real_data_without_network(warehouse):

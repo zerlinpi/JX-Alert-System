@@ -188,6 +188,9 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         if anomaly.rule in NON_ALERT_RULES:
             continue
         settings = get_settings()
+        from jx_alert.analysis.materiality import material_rule_notification
+        if not material_rule_notification(db, settings, anomaly):
+            continue
         from jx_alert.store_controls import notifications_enabled, StoreControlError
         try:
             if not notifications_enabled(settings, anomaly.store_id):
@@ -200,11 +203,21 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         ):
             continue
         if anomaly.status not in {"NEW", "ESCALATED", "RECOVERED"}:
-            continue
+            if anomaly.status != "ONGOING" or not getattr(settings, "alert_materiality_enabled", False):
+                continue
+            from jx_alert.notifications.outbox import NotificationOutbox
+            # A broad screening incident may first become material later.
+            # Notify that transition once; do not revive historical failures.
+            prior = db.scalar(select(NotificationOutbox.id).where(
+                NotificationOutbox.idempotency_key.startswith(f"anomaly:{anomaly.dedupe_key}:"),
+                NotificationOutbox.idempotency_key.contains(anomaly.first_seen.isoformat())).limit(1))
+            if prior is not None:
+                continue
         state_label = {
             "NEW": "新异常",
             "ESCALATED": "异常升级",
             "RECOVERED": "异常恢复",
+            "ONGOING": "新异常",
         }[anomaly.status]
         from jx_alert.notifications.cards import _METRIC_NAMES, anomaly_title, status_label
         observed = anomaly.metrics or {}

@@ -18,7 +18,8 @@ def _policy(settings):
         "ratio": settings.alert_kpi_change_ratio, "min_impressions": settings.alert_kpi_min_impressions,
         "min_clicks": settings.alert_min_clicks, "min_spend": settings.alert_min_spend,
         "group": settings.feishu_daily_report_chat_id,
-        "group_fallback": settings.feishu_group_fallback_enabled, "version": 1,
+        "group_fallback": settings.feishu_group_fallback_enabled,
+        "materiality": getattr(settings, "alert_materiality_enabled", False), "version": 2,
     }
 
 

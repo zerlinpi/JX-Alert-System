@@ -5,6 +5,7 @@ import json
 import math
 import re
 import time
+import unicodedata
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -113,21 +114,109 @@ def enqueue_group_question(db, settings, event_dict):
         return {"status": "BUSY" if busy else "QUEUED", "job_id": job.id}
 
 
+_COUNTRY_NAMES = {
+    "美国": ("美国", "us", "usa", "united states"),
+    "加拿大": ("加拿大", "ca", "canada"),
+    "墨西哥": ("墨西哥", "mx", "mexico"),
+    "巴西": ("巴西", "br", "brazil"),
+    "德国": ("德国", "de", "germany"),
+    "西班牙": ("西班牙", "es", "spain"),
+}
+_NAME_NOISE = {
+    "主账号", "子账号", "主账户", "子账户", "账号", "账户", "店铺", "站点", "亚马逊",
+    "实时", "采集", "查询", "查看", "分析", "广告", "绩效", "健康", "数据", "情况",
+    "订单", "销量", "销售", "进度", "状态", "amazon", "amz", "llc", "inc", "ltd",
+    "ctr", "cpc", "cdr", "cvr", "cps", "roas", "cpa", "tcoas", "tacos", "acos", "sku", "asin", "msku",
+    *(alias for aliases in _COUNTRY_NAMES.values() for alias in aliases),
+}
+
+
+def _name_text(value):
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _name_parts(value):
+    parts = re.findall(r"[a-z0-9]+|[\u3400-\u9fff]+", _name_text(value))
+    result = []
+    for part in parts:
+        if part.isascii():
+            if part not in _NAME_NOISE:
+                result.append(part)
+        else:
+            for noise in sorted((p for p in _NAME_NOISE if not p.isascii()), key=len, reverse=True):
+                part = part.replace(noise, " ")
+            result.extend(part.split())
+    return result
+
+
+def _country_matches(question, country):
+    for label, aliases in _COUNTRY_NAMES.items():
+        if _name_text(country) in aliases:
+            country = label
+            break
+    requested = set()
+    for label, aliases in _COUNTRY_NAMES.items():
+        if any(re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", question)
+               if alias.isascii() else alias in question for alias in aliases):
+            requested.add(label)
+    return not requested or country in requested
+
+
 def _resolve_store(db, settings, question):
     snapshots = health_brief_snapshots(db, settings)["stores"]
     countries = {s.sid: s.country for s in db.scalars(select(Store).where(Store.sid.in_([s["store_id"] for s in snapshots])))}
     for snapshot in snapshots:
         snapshot["country"] = countries.get(snapshot["store_id"]) or "待确认"
-    ids = [s["store_id"] for s in snapshots if re.search(r"(?<!\d)" + re.escape(s["store_id"]) + r"(?!\d)", question)]
+    question = _name_text(question)
+    compact = re.sub(r"[\W_]+", "", question)
+    exact = []
+    for snapshot in snapshots:
+        name = snapshot["store_name"]
+        key = re.sub(r"[\W_]+", "", _name_text(name or ""))
+        if (name != "未同步店铺" and key and _name_parts(name)
+                and re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", compact)):
+            exact.append((len(key), snapshot["store_id"]))
+    if exact:
+        longest = max(length for length, _ in exact)
+        exact = [sid for length, sid in exact if length == longest]
+        return snapshots, [s["store_id"] for s in snapshots if s["store_id"] in exact
+                           and (s["country"] == "待确认" or _country_matches(question, s["country"]))]
+    # A requested report date is not a store identifier.
+    without_dates = re.sub(r"\d{4}[-年/]\d{1,2}[-月/]\d{1,2}日?|\d{1,2}月\d{1,2}日", "", question)
+    ids = [s["store_id"] for s in snapshots
+           if re.search(r"(?<!\d)" + re.escape(s["store_id"]) + r"(?!\d)", without_dates)]
     if not ids:
-        ids = [s["store_id"] for s in snapshots if s["store_name"] and s["store_name"].casefold() in question.casefold()]
-        if len(ids) > 1:
-            localized = [s["store_id"] for s in snapshots if s["store_id"] in ids and s["country"] != "待确认"
-                and re.search((r"(?<![A-Za-z])" + re.escape(s["country"]) + r"(?![A-Za-z])")
-                    if s["country"].isascii() else re.escape(s["country"]), question, re.IGNORECASE)]
-            if localized:
-                ids = localized
+        parts = _name_parts(question)
+        latin = [p for p in parts if p.isascii() and len(p) >= 3 and not p.isdigit()]
+        chinese = {p[i:i + 2] for p in parts if not p.isascii() for i in range(len(p) - 1)}
+        literal_parts = []
+        for literal in re.findall(r"\w+(?:[-_]\w+)+", question):
+            components = [p for p in _name_parts(literal) if not p.isdigit() and len(p) >= 2]
+            if len(components) >= 2:
+                literal_parts.extend(components)
+        for snapshot in snapshots:
+            name = snapshot["store_name"]
+            if not name or name == "未同步店铺":
+                continue
+            aliases = _name_parts(name)
+            aliases.append("".join(p for p in aliases if p.isascii()))
+            # Brand fragments are deterministic substring matches, never model
+            # guesses. Country/common account terms cannot select a store.
+            matched = (all(any(p in alias for alias in aliases if alias.isascii()) for p in latin)
+                       if latin else any(p in alias for p in chinese for alias in aliases if not alias.isascii()))
+            matched = matched and all(p in _name_text(name) for p in literal_parts)
+            if matched and _country_matches(question, snapshot["country"]):
+                ids.append(snapshot["store_id"])
     return snapshots, list(dict.fromkeys(ids))
+
+
+def _store_clarification(snapshots, ids, *, collection=False):
+    options = [s for s in snapshots if s["store_id"] in ids]
+    subtitle = ("匹配到多家店铺，请补充完整店铺名和站点，例如：Geteen 美国。" if options else
+                "未匹配到店铺，请提供店铺名或品牌片段及站点，例如：Geteen 美国。")
+    return card("请确认要采集的店铺" if collection else "请确认店铺", subtitle=subtitle,
+                sections=[("匹配店铺", ["店铺", "站点"],
+                           [(s["store_name"], s["country"]) for s in options[:20]])])
 
 
 _COLLECTION_VERB = r"(?:立即采集|实时采集|重新采集|现在采集|手动采集)"
@@ -136,6 +225,10 @@ _COLLECTION_REQUEST = re.compile(
     rf"|([1-9][0-9]{{0,17}})\s*店铺\s*{_COLLECTION_VERB})[。！!]?"
 )
 _COLLECTION_STATUS = re.compile(r"(?:查询\s*)?采集任务\s*([1-9][0-9]{0,17})\s*状态[。？?]?")
+_COLLECTION_NAME_REQUEST = re.compile(
+    rf"(?:请\s*)?{_COLLECTION_VERB}\s*([\w\s\-/&()（）]+?)[。！!]?"
+)
+_COLLECTION_STORE_STATUS = re.compile(r"(?:请\s*)?(?:查询\s*)?(.+?)\s*采集(?:进度|状态)[。？?]?")
 _COLLECTION_BLOCK_REASONS = {
     "STORE_OUT_OF_SCOPE": "店铺不在采集范围内",
     "STORE_NOT_SYNCED": "系统尚未同步该店铺",
@@ -158,12 +251,23 @@ _COLLECTION_STATES = {
 
 
 def _collection_command(question):
+    question = unicodedata.normalize("NFKC", question).strip()
+    if re.search(_COLLECTION_VERB, question) and re.search(
+            r"不要|不用|不必|禁止|取消|停止|别|只看|仅查看|不采集|是否|能否|可以吗|"
+            r"如何|怎么|说明|例如|示例|演示|假设|引用|写出|输出|解释", question):
+        return None
     status = _COLLECTION_STATUS.fullmatch(question)
     if status:
         return "status", int(status[1])
     request = _COLLECTION_REQUEST.fullmatch(question)
     if request:
         return "request", request[1] or request[2]
+    status = _COLLECTION_STORE_STATUS.fullmatch(question)
+    if status:
+        return "store_status", status[1]
+    request = _COLLECTION_NAME_REQUEST.fullmatch(question)
+    if request:
+        return "name_request", request[1]
     if re.match(rf"(?:请\s*)?{_COLLECTION_VERB}", question):
         return "clarify", None
     return None
@@ -179,7 +283,7 @@ def _collection_permission(settings, meta, sid):
     return meta["sender_id"] in admins or meta["sender_id"] in operators
 
 
-def _collection_status_card(job, sid):
+def _collection_status_card(db, job, sid):
     args = job.metadata_json or {}
     state = _COLLECTION_STATES.get(job.status, "待确认")
     retry_at = args.get("retry_at")
@@ -193,9 +297,11 @@ def _collection_status_card(job, sid):
             state = "等待重试"
     # A follow-up can read the same report day that this job actually completed.
     report_date = (args.get("completed_store_dates") or {}).get(sid)
-    subtitle = f"报表日 {report_date}。可继续查询店铺数据。" if report_date else "可使用任务号查询进度。"
+    subtitle = f"报表日 {report_date}。可继续查询店铺数据。" if report_date else "可发送店铺名加“采集进度”查询。"
+    store = db.get(Store, sid)
     return card("采集任务状态", subtitle=subtitle,
-                sections=[("任务", ["店铺ID", "任务号", "进度"], [(sid, job.id, state)])])
+                sections=[("任务", ["店铺", "站点", "进度"],
+                           [(store.name if store else "未同步店铺", store.country if store else "待确认", state)])])
 
 
 def _lookup_collection(db, settings, meta, collection_id):
@@ -218,8 +324,20 @@ def _lookup_collection(db, settings, meta, collection_id):
             except CollectionConfigurationError:
                 pass
             else:
-                return _collection_status_card(job, sid)
-    return card("未找到可查询的采集任务", subtitle="请使用本群返回的任务号，由店铺负责人或管理员查询。", sections=[])
+                return _collection_status_card(db, job, sid)
+    return card("未找到可查询的采集任务", subtitle="请由店铺负责人或管理员查询本群发起的采集任务。", sections=[])
+
+
+def _lookup_store_collection(db, settings, meta, sid):
+    receipt = db.scalar(select(SyncJob).where(
+        SyncJob.job_type == "feishu_question", SyncJob.status == "SUCCEEDED",
+        SyncJob.metadata_json["chat_id"].as_string() == meta["chat_id"],
+        SyncJob.metadata_json["collection_store_id"].as_string() == sid,
+        SyncJob.metadata_json["analysis_provider"].as_string() == "collection_request",
+    ).order_by(SyncJob.id.desc()).limit(1))
+    if receipt is not None and type(receipt.metadata_json.get("collection_job_id")) is int:
+        return _lookup_collection(db, settings, meta, receipt.metadata_json["collection_job_id"])
+    return card("未找到可查询的采集任务", subtitle="本群尚未发起该店铺的采集，可发送：实时采集 店铺名。", sections=[])
 
 
 def _complete_question(db, settings, job_id, meta, cards, provider):
@@ -239,8 +357,18 @@ def _process_collection_command(db, settings, job_id, meta, command):
     if action == "status":
         reply = _lookup_collection(db, settings, meta, value)
         return _complete_question(db, settings, job_id, meta, [reply], "collection_status")
+    if action in {"name_request", "store_status"}:
+        snapshots, ids = _resolve_store(db, settings, value)
+        multiple = re.search(r"和|以及|还有|及|与|同时|并且|(?<![a-z])and(?![a-z])", _name_text(value))
+        if len(ids) != 1 or multiple:
+            reply = _store_clarification(snapshots, ids, collection=action == "name_request")
+            return _complete_question(db, settings, job_id, meta, [reply], "store_clarification")
+        value = ids[0]
+        if action == "store_status":
+            reply = _lookup_store_collection(db, settings, meta, value)
+            return _complete_question(db, settings, job_id, meta, [reply], "collection_status")
     if action == "clarify":
-        reply = card("请确认要采集的店铺", subtitle="请使用单个店铺ID，例如：实时采集 5174。", sections=[])
+        reply = card("请确认要采集的店铺", subtitle="请提供单个店铺名，例如：实时采集 Geteen 美国。", sections=[])
     elif not _collection_permission(settings, meta, value):
         reply = card("采集请求未受理", subtitle="请由该店铺负责人或群管理员发起采集。", sections=[])
     elif not settings.scheduler_enabled or not settings.mcp_operations_enabled:
@@ -258,7 +386,7 @@ def _process_collection_command(db, settings, job_id, meta, command):
                 else:
                     meta.update(collection_job_id=result["job_id"], collection_store_id=value)
                     collection_job = db.get(SyncJob, result["job_id"])
-                    reply = _collection_status_card(collection_job, value)
+                    reply = _collection_status_card(db, collection_job, value)
                     # Publish the queue entry and the receipt together before
                     # releasing the enqueue lock.
                     return _complete_question(db, settings, job_id, meta, [reply], "collection_request")
@@ -428,7 +556,9 @@ def question_context(db, settings, store_id, *, now=None, question=None):
             if item["status"] == "ADVERSE":
                 screening.append({"entity_id": entity, "name": name, "metric": metric,
                     **{key: item[key] for key in ("current", "baseline", "current_date", "currency", "change_ratio", "title")}})
-    return {"store_id": store_id, "store_name": store.name, "country": store.country,
+    from jx_alert.analysis.materiality import POLICY
+    return {"notification_policy": POLICY if getattr(settings, "alert_materiality_enabled", False) else {},
+        "store_id": store_id, "store_name": store.name, "country": store.country,
         "report_date": target.isoformat(), "requested_report_date": requested.isoformat(),
         "date_selection": selection, "report_date_warning": date_warning, "date_basis": zone["date_basis"],
         "last_completed_report_date": completed.isoformat(), "report_date_is_complete": target <= completed,
@@ -492,7 +622,7 @@ def _answer_cards(context, data_card, analysis):
 def process_one_question(settings, session_factory, warehouse_engine, *, client_factory=None):
     if not settings.feishu_bot_enabled or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
-    from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError
+    from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError, analysis_cache_key
     factory = client_factory or DeepSeekClient.from_settings
     with database_job_lock(warehouse_engine, "feishu_question_worker"):
         with session_factory() as db:
@@ -521,10 +651,7 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                 return _process_collection_command(db, settings, job_id, meta, collection)
             snapshots, ids = _resolve_store(db, settings, meta["question"])
             if len(ids) != 1:
-                options = [s for s in snapshots if s["store_id"] in ids]
-                rows = [(s["store_id"], s["store_name"], s["country"]) for s in options[:20]]
-                value = card("请确认店铺", subtitle="请在提问中注明店铺ID，例如：5174 店铺广告和绩效情况",
-                             sections=[("匹配店铺", ["店铺ID", "店铺", "站点"], rows)])
+                value = _store_clarification(snapshots, ids)
                 cards, provider = [value], "store_clarification"
             else:
                 try:
@@ -534,10 +661,28 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                     provider = "date_clarification"
                 else:
                     meta.update({key: context[key] for key in ("report_date", "requested_report_date", "date_selection")})
+                    cache_key = analysis_cache_key(context, meta["question"], settings.deepseek_model)
+                    cached = db.scalar(select(SyncJob).where(SyncJob.job_type == "feishu_question",
+                        SyncJob.status == "SUCCEEDED", SyncJob.finished_at >= _utcnow().replace(tzinfo=None) - timedelta(minutes=10),
+                        SyncJob.metadata_json["chat_id"].as_string() == meta["chat_id"],
+                        SyncJob.metadata_json["analysis_cache_key"].as_string() == cache_key,
+                        SyncJob.metadata_json["analysis_provider"].as_string().in_(["deepseek", "deepseek_cache"]))
+                        .order_by(SyncJob.id.desc()).limit(1))
+                    cached_text = (cached.metadata_json or {}).get("analysis_text") if cached else None
+                    cached_at = (cached.metadata_json or {}).get("analysis_created_at") if cached else None
+                    if not isinstance(cached_at, str) or cached_at < (_utcnow() - timedelta(minutes=10)).isoformat():
+                        cached_text = None
                     db.rollback()  # Release warehouse reads before the network request.
                     try:
-                        analysis = factory(settings).analyze(context, meta["question"])
-                        provider = "deepseek"
+                        if isinstance(cached_text, str) and cached_text:
+                            analysis, provider = cached_text, "deepseek_cache"
+                        else:
+                            client = factory(settings)
+                            analysis = client.analyze(context, meta["question"])
+                            provider = "deepseek"
+                            meta["model_usage"] = getattr(client, "last_usage", {})
+                        meta.update(analysis_cache_key=cache_key, analysis_text=analysis,
+                            analysis_created_at=cached_at if provider == "deepseek_cache" else _utcnow().isoformat())
                     except DeepSeekError:
                         analysis, provider = "智能分析暂不可用；以上为已采集数据，缺失项仍待确认。", "unavailable"
                     cards = _answer_cards(context, data_card, analysis)
