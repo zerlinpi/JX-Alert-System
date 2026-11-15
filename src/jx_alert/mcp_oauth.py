@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import html
 from ipaddress import ip_address
 import json
 import os
@@ -36,8 +35,10 @@ from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOption
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Route
+
+from jx_alert.oauth_pages import expired_screen, owner_screen
 
 SCOPES = ("jx:read", "jx:collect", "jx:notify")
 COOKIE = "__Host-jx-oauth-owner"
@@ -522,26 +523,17 @@ class SqliteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
 
     @staticmethod
     def _page(*, pending_id, csrf, authenticated, data, error=False):
-        def esc(value):
-            return html.escape(str(value), quote=True)
-        fields = f'<input type="hidden" name="request" value="{esc(pending_id)}"><input type="hidden" name="csrf" value="{esc(csrf)}">'
-        if authenticated:
-            scopes = "、".join({"jx:read": "读取已采集的数据", "jx:collect": "请求采集与分析任务",
-                               "jx:notify": "将有证据的异常或用户指定的中文报告发送至已配置飞书群"}[s] for s in data["scopes"])
-            content = f'<p>客户端：{esc(data["client_id"])}</p><p>回调：{esc(data["redirect_uri"])}</p><p>权限：{esc(scopes)}</p><button name="action" value="approve">同意</button><button name="action" value="deny">拒绝</button>'
-        else:
-            content = '<label>所有者口令 <input type="password" name="password" autocomplete="current-password" required maxlength="1024"></label><button name="action" value="login">登录</button>'
-        message = "<p>登录未成功，请重试。</p>" if error else ""
         # no-referrer makes a native form POST send Origin: null in browsers,
         # which our strict same-origin CSRF check must reject. same-origin keeps
         # the legitimate Origin and still suppresses referrers to other sites.
         headers = ({**_consent_headers(data["redirect_uri"]), "Referrer-Policy": "same-origin"}
                    if authenticated else _OWNER_PAGE_HEADERS)
-        return HTMLResponse('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>JX Alert 授权</title><h1>JX Alert 授权</h1>' + message + '<form method="post" action="/oauth/owner">' + fields + content + '</form></html>', headers=headers)
+        return owner_screen(pending_id=pending_id, csrf=csrf, authenticated=authenticated, data=data,
+                            headers=headers, error=error)
 
     async def _owner(self, request: Request):
         def failure():
-            return HTMLResponse("授权请求无效或已过期，请重新连接。", 403, headers=_SECURE_HEADERS)
+            return expired_screen(_SECURE_HEADERS)
         if request.method == "POST":
             origin = request.headers.get("origin", "")
             expected = urlsplit(self.issuer_url)

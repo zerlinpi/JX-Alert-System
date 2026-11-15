@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>登录店铺运营台 · JX Alert</title>
+  <link rel="stylesheet" href="/console/assets/console.css">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="login-intro"><div class="brand"><span class="brand-mark" aria-hidden="true">JX</span><span><strong>JX Alert</strong><small>店铺运营台</small></span></div>
+      <div class="login-copy"><p class="eyebrow">授权访问</p><h1>店铺运营台</h1><p>查看经营数据并管理飞书负责人。</p></div>
+    </div>
+    <form method="post" action="/console/login" class="login-form">
+      <input type="hidden" name="csrf" value="{{CSRF}}">
+      <h2>所有者登录</h2>
+      <label for="owner-password">所有者口令</label>
+      <input id="owner-password" name="password" type="password" required maxlength="1024" autocomplete="current-password">
+      <p class="login-error" role="alert">{{ERROR}}</p>
+      <button class="button primary" type="submit">登录</button>
+    </form>
+  </main>
+</body>
+</html>

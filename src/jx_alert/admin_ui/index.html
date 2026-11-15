@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="jx-console-csrf" content="{{CSRF}}">
+  <title>店铺运营台 · JX Alert</title>
+  <link rel="stylesheet" href="/console/assets/console.css">
+  <script src="/console/assets/console.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#workspace">跳到工作区</a>
+  <div class="shell">
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="/console/">
+        <span class="brand-mark" aria-hidden="true">JX</span>
+        <span><strong>JX Alert</strong><small>店铺运营台</small></span>
+      </a>
+      <nav class="navigation" aria-label="工作区">
+        <button type="button" data-view="overview" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg>经营概览</button>
+        <button type="button" data-view="owners"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2M16 5a3 3 0 0 1 0 6m4 9v-2a4 4 0 0 0-3-4"/></svg>负责人映射</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <span class="owner-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4-3 7-7 10-4-3-7-6-7-10V6z"/><path d="m9 12 2 2 4-4"/></svg></span>
+        <span>所有者后台</span>
+        <button type="button" id="logout" class="logout">退出</button>
+      </div>
+    </aside>
+    <main class="workspace" id="workspace" tabindex="-1">
+      <header class="page-heading">
+        <div><p class="eyebrow">亚马逊运营</p><h1 id="page-title">经营概览</h1><p id="page-description" class="muted">查看各店铺的销售、广告与账户绩效。</p></div>
+        <button type="button" id="refresh" class="button secondary"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6M20 4v7h-7"/></svg>刷新数据</button>
+      </header>
+      <div id="global-status" class="notice" role="status" hidden></div>
+      <section class="stats" aria-label="店铺统计">
+        <article class="stat"><span>店铺总数</span><strong id="total-stores">—</strong></article>
+        <article class="stat"><span>广告已授权</span><strong id="total-authorized">—</strong></article>
+        <article class="stat"><span>已映射负责人</span><strong id="total-mapped">—</strong></article>
+      </section>
+      <div class="board">
+        <section class="panel store-list" aria-labelledby="list-title">
+          <div class="list-head"><h2 id="list-title">店铺</h2><span id="list-count" class="count">—</span></div>
+          <div class="list-inputs">
+            <label for="store-search" class="sr-only">搜索店铺</label>
+            <div class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg><input id="store-search" type="search" placeholder="店铺名称、编号或站点" autocomplete="off"></div>
+            <label for="store-filter" class="sr-only">筛选店铺</label>
+            <select id="store-filter"><option value="all">所有店铺</option><option value="unmapped">未映射负责人</option><option value="mapped">已映射负责人</option><option value="unauthorized">广告授权待核实</option></select>
+          </div>
+          <ul class="stores" id="stores" aria-label="选择店铺" aria-busy="true"></ul>
+          <p id="stores-empty" class="empty" hidden></p>
+        </section>
+        <section class="detail" aria-label="店铺详情" aria-busy="true" id="detail">
+          <div class="panel empty-detail" id="detail-placeholder" role="status">正在读取店铺数据…</div>
+          <div id="detail-content" hidden>
+            <header class="panel store-heading">
+              <div><p id="store-eyebrow" class="eyebrow"></p><h2 id="store-name"></h2><p id="store-meta" class="muted"></p></div>
+              <button id="edit-owners" type="button" class="button secondary">设置负责人</button>
+            </header>
+            <div id="overview" class="detail-content">
+              <section class="panel report" aria-labelledby="report-title">
+                <div class="section-heading">
+                  <div><h3 id="report-title">日报</h3><p id="report-note" class="muted"></p></div>
+                  <form id="date-form" class="date-form">
+                    <label class="sr-only" for="report-date">报表日期</label><input id="report-date" type="date" required>
+                    <button class="button secondary" type="submit">查询</button>
+                    <button class="link-button" id="latest-date" type="button">回到最新</button>
+                  </form>
+                </div>
+                <dl id="metric-summary" class="metrics"></dl>
+              </section>
+              <section class="panel trends" aria-labelledby="trend-title">
+                <div class="section-heading"><div><h3 id="trend-title">近日报表趋势</h3><p class="muted" id="trend-note">使用已采集的店铺报表。</p></div>
+                  <div class="segments" role="group" aria-label="趋势指标"><button type="button" data-metric="orders" aria-pressed="true">订单</button><button type="button" data-metric="sales" aria-pressed="false">销售额</button><button type="button" data-metric="spend" aria-pressed="false">广告花费</button></div>
+                </div>
+                <div id="trend-chart" role="img" aria-label="趋势图"></div>
+                <details id="trend-data" class="trend-data"><summary>查看趋势明细</summary><div class="table-scroll"><table><thead><tr><th scope="col">报表日期</th><th scope="col">订单</th><th scope="col">销售额</th><th scope="col">广告花费</th></tr></thead><tbody id="trend-rows"></tbody></table></div></details>
+              </section>
+              <section class="panel" aria-labelledby="kpi-title">
+                <div class="section-heading"><div><h3 id="kpi-title">广告指标</h3><p class="muted">转化指标使用达到归因等待期的报表。</p></div></div>
+                <div class="table-scroll"><table><thead><tr><th scope="col">指标</th><th scope="col">数值</th><th scope="col">数据日期</th><th scope="col">判断</th></tr></thead><tbody id="kpi-rows"></tbody></table></div>
+              </section>
+              <section id="ad-breakdown" class="panel" aria-labelledby="ad-breakdown-title" hidden><div class="section-heading"><h3 id="ad-breakdown-title">广告类型明细</h3></div><div class="table-scroll"><table><thead><tr><th scope="col">类型</th><th scope="col">广告花费</th><th scope="col">归因订单</th><th scope="col">点击</th><th scope="col">曝光</th><th scope="col">采集状态</th></tr></thead><tbody id="ad-breakdown-rows"></tbody></table></div></section>
+              <div class="lower-grid">
+                <section class="panel" aria-labelledby="coverage-title"><div class="section-heading"><h3 id="coverage-title">采集状态</h3></div><div class="table-scroll"><table><thead><tr><th scope="col">数据集</th><th scope="col">状态</th><th scope="col">源记录</th></tr></thead><tbody id="coverage-rows"></tbody></table></div></section>
+                <section class="panel" aria-labelledby="health-title"><div class="section-heading"><h3 id="health-title">店铺绩效</h3></div><dl id="health-data" class="health-data"></dl></section>
+              </div>
+              <section id="recent-alerts" class="panel" aria-labelledby="alerts-title" hidden><div class="section-heading"><h3 id="alerts-title">近期异常</h3></div><div class="table-scroll"><table><thead><tr><th scope="col">异常</th><th scope="col">状态</th><th scope="col">日期</th></tr></thead><tbody id="alert-rows"></tbody></table></div></section>
+            </div>
+            <section class="panel ownership" aria-labelledby="owners-title" id="ownership" hidden>
+              <div class="section-heading"><div><h3 id="owners-title">飞书负责人</h3><p class="muted" id="group-label"></p></div></div>
+              <div class="owner-body">
+                <p class="eyebrow">当前负责人</p><ul id="current-owners" class="owner-chips" aria-label="当前负责人"></ul>
+                <div id="mapping-status" class="notice" role="status" hidden></div>
+                <div class="picker-heading"><div><h4>选择群成员</h4><p class="muted">保存后用于该店铺的后续告警。</p></div><button type="button" id="reload-members" class="button secondary">刷新成员</button></div>
+                <label for="member-search" class="sr-only">搜索群成员</label><div class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg><input id="member-search" type="search" placeholder="搜索群成员" autocomplete="off" disabled></div>
+                <fieldset id="members-field" disabled><legend class="sr-only">群成员列表</legend><div id="members" class="members"></div></fieldset>
+                <p id="member-empty" class="empty" hidden></p>
+                <div class="save-bar"><span id="selection-label" class="muted">正在加载群成员…</span><button id="save-owners" type="button" class="button primary" disabled>保存负责人</button></div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

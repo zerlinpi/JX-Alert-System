@@ -27,6 +27,10 @@ def _load_routing(path: str) -> dict:
         return {}
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("Feishu routing file cannot be read or parsed") from exc
+    return _validate_routing_data(data)
+
+
+def _validate_routing_data(data: dict) -> dict:
     if not isinstance(data, dict):
         raise RuntimeError("Feishu routing file root must be a JSON object")
 

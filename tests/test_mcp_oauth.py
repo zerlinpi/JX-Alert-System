@@ -317,7 +317,7 @@ def test_only_authenticated_consent_allows_its_registered_callback_origin(setup)
     csrf = re.search(r'name="csrf" value="([^"]+)"', accepted.text)[1]
     redirect = owner_post(client, request_id, csrf, action="approve")
     assert redirect.status_code == 302
-    assert redirect.headers["content-security-policy"] == policy
+    assert redirect.headers["content-security-policy"] == policy.split("; style-src", 1)[0]
     assert owner_post(client, request_id, csrf, action="approve").status_code == 403
 
 
@@ -467,7 +467,7 @@ def test_owner_denial_never_creates_a_code_and_returns_issuer(setup):
     assert owner_post(client, request_id, csrf, action="approve").status_code == 403
 
 
-def test_consent_html_escapes_data_and_does_not_render_external_scripts():
+def test_consent_html_escapes_data_and_only_enables_the_embedded_stylesheet():
     response = SqliteOAuthProvider._page(
         pending_id="safe", csrf="safe", authenticated=True,
         data={"client_id": '<script>alert("bad")</script>',
@@ -475,6 +475,13 @@ def test_consent_html_escapes_data_and_does_not_render_external_scripts():
     )
     assert b"<script>" not in response.body
     assert b"&lt;script&gt;" in response.body
+    css = re.search(rb"<style>(.*?)</style>", response.body, flags=re.DOTALL)[1]
+    digest = base64.b64encode(hashlib.sha256(css).digest()).decode("ascii")
+    policy = response.headers["Content-Security-Policy"]
+    assert f"style-src 'sha256-{digest}'" in policy
+    assert "default-src 'none'" in policy
+    assert "'unsafe-inline'" not in policy
+    assert "http" not in policy.split("style-src", 1)[1]
 
 
 def test_invalid_registration_scope_or_unsafe_redirect_is_rejected(setup):
