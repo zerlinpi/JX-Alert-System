@@ -16,10 +16,11 @@ CONTEXT = {"store_id": "5174", "report_date": "2026-11-12", "currency": "USD",
 ANALYSIS = "点击花费未见恶化；转化数据不足，待确认。"
 
 
-def test_materiality_output_removes_watch_and_sample_caveats_but_keeps_real_gaps():
+@pytest.mark.parametrize("prefix", ["样本仅覆盖", "活动样本仅覆盖", "广告活动样本仅覆盖"])
+def test_materiality_output_removes_watch_and_sample_caveats_but_keeps_real_gaps(prefix):
     from jx_alert.ai.deepseek import _actionable_text
     context = {"notification_policy": {"version": 1}, "advertising_kpis": {"CTR": {"status": "WATCH"}}}
-    text = "- CTR较前日下降25%，观察，未达通知门槛。\n- 活动样本仅覆盖3个活动，不代表全量。\n- 店铺源时区待确认。"
+    text = "- CTR较前日下降25%，观察，未达通知门槛。\n- " + prefix + "3个活动，不代表全量。\n- 店铺源时区待确认。"
     assert _actionable_text(text, context, "店铺异常情况") == "- 店铺源时区待确认。"
     assert "样本仅覆盖" in _actionable_text(text, context, "覆盖所有活动吗")
 
