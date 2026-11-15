@@ -8,8 +8,21 @@
 
 ## 部署
 
-运行现有 OAuth 配置时，用 `docker compose --profile console up -d --build --no-deps console` 启动浏览器服务。容器只映射本机 `127.0.0.1:8002`，与现有 MCP 使用同一个受保护的数据目录。管理登录沿用所有者口令校验；管理会话保存到单独的私有 SQLite 文件。
+线上服务器沿用现有 OAuth 配置、Compose 项目名与运行配置，在项目目录启动浏览器服务：
+
+```sh
+cd /opt/jx-alert-system
+sudo docker compose -p jx-alert -f docker-compose.yml -f docker-compose.runtime.yml --profile console up -d --build --no-deps console
+```
+
+`docker-compose.runtime.yml` 是服务器已有运行配置，必须保留。省略项目名或运行配置可能创建其他 Compose 项目，或使服务无法连接现有数据库。其他安装环境应沿用其原有项目名和配置文件。容器只映射本机 `127.0.0.1:8002`，与现有 MCP 使用同一个受保护的数据目录。管理登录沿用所有者口令校验；管理会话保存到单独的私有 SQLite 文件。
 
 在现有 HTTPS 站点内添加 `location = /console`、`location ^~ /console/` 与 `location = /oauth/owner`，将这三项代理至 `http://127.0.0.1:8002`。沿用现有 TLS、代理信任和安全日志方案。设置 `Host` 为 `$host`、`X-Forwarded-Proto` 为 `$scheme`，并沿用站点对真实客户端 IP 的可信传递。`/authorize`、`/token`、`/mcp` 等继续由 MCP 服务处理。OAuth 页面读取现有短期授权请求，回跳后由原 MCP 服务完成换令牌。
 
-上线前运行 `nginx -t`，并验证管理台未登录时重定向到登录页、未登录 API 返回 401、HTTPS 授权页和 MCP 元数据可访问。关闭时移除这三个代理位置，再停止 `console` 服务。原路由配置备份保留在 `feishu-routing.json` 所在目录。
+上线前运行 `nginx -t`，并验证管理台未登录时重定向到登录页、未登录 API 返回 401、HTTPS 授权页和 MCP 元数据可访问。关闭时恢复修改前的 Nginx 配置，通过 `nginx -t` 后重新加载，再停止浏览器服务：
+
+```sh
+sudo docker compose -p jx-alert -f docker-compose.yml -f docker-compose.runtime.yml --profile console stop console
+```
+
+原路由配置备份保留在 `feishu-routing.json` 所在目录。停用运营台不删除数据库、人员映射备份或 Docker 数据卷，原 MCP、采集和通知服务继续运行。
