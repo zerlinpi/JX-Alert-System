@@ -504,10 +504,11 @@ def export_daily_report(path: str | Path,
         headers = schemas[name]
         worksheet = workbook.create_sheet(name)
         worksheet.append(headers)
-        for row in rows.get(name, []):
+        column_count = len(headers)
+        for row_number, row in enumerate(rows.get(name, []), start=2):
             if len(row) > len(headers):
                 raise ValueError("Excel row exceeds its declared schema")
-            if worksheet.max_row >= 1_048_576:
+            if row_number > 1_048_576:
                 raise ValueError("Excel worksheet row limit exceeded; export a smaller partition")
             prepared = []
             for index, item in enumerate(row):
@@ -521,7 +522,12 @@ def export_daily_report(path: str | Path,
                     item = None
                 prepared.append(item)
             worksheet.append(prepared)
-            for cell in worksheet[worksheet.max_row]:
+            if not prepared:
+                continue
+            # The schema header is the widest row. Access known coordinates
+            # rather than rescanning every existing cell for row/column bounds.
+            for column in range(1, column_count + 1):
+                cell = worksheet.cell(row_number, column)
                 # All external text, including =, +, -, and @ prefixes, remains
                 # literal text. No untrusted workbook formulas are authored.
                 if isinstance(cell.value, str):
