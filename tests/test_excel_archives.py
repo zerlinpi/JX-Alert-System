@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from zipfile import ZipFile
 
 from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -133,6 +134,54 @@ def test_content_versions_are_idempotent_and_prior_revision_survives(warehouse, 
     with closing(load_workbook(second, read_only=True)) as workbook:
         assert data_rows(workbook, "店铺总览")[0]["订单"] == 4
     assert len(list(latest.parent.glob("*.xlsx"))) == 3
+
+
+def test_large_multisheet_export_preserves_cells_without_per_row_dimension_scans(tmp_path, monkeypatch):
+    dimension_reads = {"rows": 0, "columns": 0}
+    original_row = Worksheet.max_row.fget
+    original_column = Worksheet.max_column.fget
+
+    def max_row(worksheet):
+        dimension_reads["rows"] += 1
+        return original_row(worksheet)
+
+    def max_column(worksheet):
+        dimension_reads["columns"] += 1
+        return original_column(worksheet)
+
+    monkeypatch.setattr(Worksheet, "max_row", property(max_row))
+    monkeypatch.setattr(Worksheet, "max_column", property(max_column))
+    campaign = [5174, '=HYPERLINK("https://example.invalid","x")', "SP", LONG_ID,
+                "+external campaign", "@state", "daily", 50.0, DAY.isoformat(),
+                0.0, 1, 200.0, 0.1, 10.0, 4, 500, None, None, None, None,
+                None, None, None, None, None, "USD", "USD"]
+    reads = []
+    for count in (3, 4000):
+        dimension_reads.update(rows=0, columns=0)
+        target = tmp_path / f"large-{count}.xlsx"
+        excel.export_daily_report(target, {
+            "广告活动": [campaign] * count,
+            "SP小时观测": [["run", 1, 5174, DAY.isoformat(), LONG_ID], [],
+                         ["run", 3, 5174, DAY.isoformat(), LONG_ID, "=literal", 23], []],
+        }, sheet_names=["广告活动", "SP小时观测"])
+        reads.append(dict(dimension_reads))
+        with closing(load_workbook(target, read_only=True)) as workbook:
+            assert workbook.sheetnames == ["广告活动", "SP小时观测"]
+            worksheet = workbook["广告活动"]
+            assert worksheet.max_row == count + 1
+            assert list(worksheet.values)[-1] == tuple(
+                str(value) if header.endswith("ID") and value is not None else value
+                for header, value in zip(excel.SHEETS["广告活动"], campaign)
+            )
+            assert worksheet["B2"].data_type == worksheet["E2"].data_type == "s"
+            assert worksheet["B2"].value.startswith("=HYPERLINK")
+            assert worksheet["J2"].value == 0
+            assert worksheet["M2"].number_format == "0.00%"
+            assert worksheet["N2"].number_format == '0.00"x"'
+            assert workbook["SP小时观测"]["F4"].value == "=literal"
+            assert workbook["SP小时观测"]["F4"].data_type == "s"
+            assert workbook["SP小时观测"].max_row == 4
+    assert reads[0] == reads[1]
 
 
 @pytest.mark.parametrize("sid", ["../escape", "1/../2", "1\\..\\2", True, 0, "-1"])
