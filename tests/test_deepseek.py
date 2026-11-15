@@ -16,6 +16,39 @@ CONTEXT = {"store_id": "5174", "report_date": "2026-11-12", "currency": "USD",
 ANALYSIS = "点击花费未见恶化；转化数据不足，待确认。"
 
 
+def test_materiality_output_removes_watch_and_sample_caveats_but_keeps_real_gaps():
+    from jx_alert.ai.deepseek import _actionable_text
+    context = {"notification_policy": {"version": 1}, "advertising_kpis": {"CTR": {"status": "WATCH"}}}
+    text = "- CTR较前日下降25%，观察，未达通知门槛。\n- 活动样本仅覆盖3个活动，不代表全量。\n- 店铺源时区待确认。"
+    assert _actionable_text(text, context, "店铺异常情况") == "- 店铺源时区待确认。"
+    assert "样本仅覆盖" in _actionable_text(text, context, "覆盖所有活动吗")
+
+
+def test_materiality_output_never_discards_supported_adverse_kpis_or_missing_metrics():
+    from jx_alert.ai.deepseek import _actionable_text
+    context = {"notification_policy": {"version": 1}, "advertising_kpis": {
+        "CPC": {"status": "ADVERSE"}, "CDR": {"status": "NO_BASELINE"}}}
+    text = "- CPC上升80%，请复核。\n- CDR缺少基线，待确认。"
+    assert _actionable_text(text, context, "异常情况") == text
+
+
+def test_empty_filtered_output_does_not_claim_missing_evidence_is_normal():
+    from jx_alert.ai.deepseek import _actionable_text
+    context = {"notification_policy": {"version": 1}, "advertising_kpis": {
+        "CTR": {"status": "WATCH"}, "CDR": {"status": "INSUFFICIENT_DATA"}}}
+    result = _actionable_text("- CTR下降25%，观察。", context, "异常情况")
+    assert "CDR" in result and "待确认" in result and "未发现" not in result
+
+
+def test_model_no_anomaly_claim_cannot_hide_material_evidence_or_mislabel_roas_as_money():
+    from jx_alert.ai.deepseek import _actionable_text
+    context = {"notification_policy": {"version": 1}, "screening_candidates": [{
+        "name": "活动甲", "title": "广告投入产出下降", "metric": "ROAS", "current": 1.,
+        "baseline": 3., "currency": "USD", "current_date": "2026-11-01"}]}
+    result = _actionable_text("本次未发现异常。", context, "异常情况")
+    assert "1.00倍" in result and "3.00倍" in result and "美元" not in result
+
+
 def response(text=ANALYSIS, finish="stop", **message):
     return httpx.Response(200, json={"choices": [{"finish_reason": finish,
         "message": {"role": "assistant", "content": text, **message}}]})
