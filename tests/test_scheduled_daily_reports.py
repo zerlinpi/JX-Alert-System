@@ -1,5 +1,5 @@
 from contextlib import nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from threading import Event
 from types import SimpleNamespace
@@ -16,7 +16,7 @@ from jx_alert.notifications import daily_report, worker
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage import db as database
 from jx_alert.storage.db import Base
-from jx_alert.storage.models import DailyMetric, Store, SyncJob
+from jx_alert.storage.models import DailyMetric, DataCoverage, Store, SyncJob
 from jx_alert.store_controls import get_store_controls, save_store_controls
 
 
@@ -168,6 +168,61 @@ def test_multiple_scoped_stores_keep_each_marketplace_date(setup, monkeypatch):
     result = operations.queue_scheduled_daily_reports(now=DEADLINE)
     assert result["report_dates"] == {"5174": "2026-11-11", "5175": "2026-11-12"}
     assert calls[0]["store_dates"] == result["report_dates"]
+
+
+@pytest.mark.parametrize("digest", [False, True])
+def test_report_keeps_target_and_actual_dates_and_masks_failed_recollection(setup, digest):
+    settings, sessions, scope, zones = setup
+    settings.allow_unconfigured_timezone_history = True
+    settings.feishu_daily_report_group_digest = digest
+    scope.write_text(json.dumps({"store_ids": [5174, 5175, 5176, 5177, 5178, 5179]}), encoding="utf-8")
+    zones.write_text(json.dumps({"stores": {"5174": {"timezone": "America/Los_Angeles"}}}), encoding="utf-8")
+    target_day = date(2026, 11, 11)
+    prior_day = target_day - timedelta(days=1)
+    dimensions = ("store", "campaign_sp", "campaign_sb", "campaign_sd")
+    with sessions.begin() as db:
+        db.get(Store, "5175").timezone = None
+        for sid in ("5176", "5177", "5178", "5179"):
+            db.add(Store(sid=sid, name="Store " + sid, status=2 if sid == "5178" else 1, currency_code="USD"))
+        for sid in ("5174", "5175", "5176", "5177", "5179"):
+            db.add_all(DailyMetric(store_id=sid, entity_id=sid, dimension="store",
+                metric_date=prior_day, metric_name=metric, value=value, currency=currency)
+                for metric, value, currency in (("orders", 8, None), ("units", 9, None), ("sales", 52, "USD")))
+            db.add_all(DataCoverage(store_id=sid, metric_date=prior_day, dimension=dim,
+                status="COMPLETE", row_count=int(dim == "store")) for dim in dimensions)
+        db.add(DataCoverage(store_id="5176", metric_date=target_day, dimension="store",
+            status="COMPLETE", row_count=0))
+        for sid in ("5177", "5178"):
+            db.add(DailyMetric(store_id=sid, entity_id=sid, dimension="store", metric_date=target_day,
+                metric_name="orders", value=9187))
+            db.add(DataCoverage(store_id=sid, metric_date=target_day, dimension="store",
+                status="COMPLETE", row_count=1))
+        db.add(SyncJob(job_type="daily_collection", status="FAILED",
+            metadata_json={"report_dates": {"5177": target_day.isoformat()}}))
+        db.add(SyncJob(job_type="daily_collection", status="RUNNING",
+            metadata_json={"report_dates": {"5179": target_day.isoformat()}}))
+
+    result = operations.queue_scheduled_daily_reports(now=DEADLINE)
+    assert set(result["report_dates"].values()) == {target_day.isoformat()}
+    with sessions() as db:
+        payloads = [db.get(NotificationOutbox, row_id).payload for row_id in result["outbox_ids"]]
+        report_dates = {sid: dates for payload in payloads for sid, dates in payload["store_report_dates"].items()}
+        assert set(report_dates) == {"5174", "5175", "5176", "5177", "5178", "5179"}
+        for sid, dates in report_dates.items():
+            assert dates == {"target": target_day.isoformat(),
+                             "actual": (prior_day if sid == "5175" else target_day).isoformat()}
+        serialized = json.dumps(payloads, ensure_ascii=False)
+        assert "9187" not in serialized
+        assert all(label in serialized for label in ("采集失败", "授权失败", "接口无记录"))
+        assert "目标" in serialized and prior_day.isoformat() in serialized
+        tables = [next(e for e in payload["card"]["body"]["elements"] if e["tag"] == "table")
+                  for payload in payloads]
+        if digest:
+            fallback = next(row for table in tables for row in table["rows"] if "（5175）" in row["c0"])
+            assert fallback["c1"] == f"{prior_day}（目标 {target_day}）" and fallback["c2"] == "8"
+        else:
+            table = next(table for payload, table in zip(payloads, tables) if payload["store_id"] == "5175")
+            assert table["rows"][0]["c1"] == "8"
 
 
 @pytest.mark.parametrize("failure", ["missing_scope", "invalid_scope", "missing_timezone", "invalid_timezone"])

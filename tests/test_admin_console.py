@@ -6,7 +6,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
@@ -107,11 +107,35 @@ def test_dashboard_keeps_zero_and_empty_separate_from_missing(console):
     assert response.status_code == 200
     data = response.json()
     assert data["metrics"] == {"orders": 0, "units": 0, "sales": 0, "spend": 100, "ad_orders": 1}
+    assert data["sales_data_status"] == "ZERO"
     assert data["currency_codes"] == {"sales": "USD", "spend": "USD"}
     assert data["ad_breakdown"][1]["status"] == "接口无记录"
     assert data["ad_breakdown"][1]["spend"] is None
     assert data["trend"][0]["spend"] is None and data["trend"][-1]["spend"] == 100
     assert client.get("/console/api/stores/5174?date=9999-01-01").status_code == 400
+
+
+def test_dashboard_reads_legacy_empty_sales_from_partition_evidence(console):
+    client, routing, _, _ = console
+    empty_day = date(2024, 10, 11)
+    engine = create_engine(f"sqlite:///{routing.parent / 'warehouse.sqlite'}")
+    try:
+        with sessionmaker(engine).begin() as db:
+            db.add_all(DataCoverage(store_id="5174", metric_date=empty_day, dimension=dim,
+                       status="COMPLETE", row_count=count)
+                       for dim, count in (("store", 1), ("sku_asin", 0), ("sku_msku", 0)))
+        assert login(client).is_redirect
+        data = client.get("/console/api/stores/5174", params={"date": empty_day.isoformat()}).json()
+        assert data["metrics"]["orders"] is None
+        assert data["sales_data_status"] == "EMPTY"
+        assert data["coverage"][0] == {"name": "店铺销量", "status": "接口无记录", "rows": 0}
+        assert data["coverage"][1]["status"] == "尚未采集"
+        with sessionmaker(engine)() as db:
+            row = db.scalar(select(DataCoverage).where(DataCoverage.dimension == "store",
+                            DataCoverage.metric_date == empty_day))
+            assert row.row_count == 1
+    finally:
+        engine.dispose()
 
 
 def test_mapping_configuration_failure_leaves_store_data_accessible(console):

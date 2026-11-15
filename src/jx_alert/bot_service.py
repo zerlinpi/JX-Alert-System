@@ -6,7 +6,7 @@ import math
 import re
 import time
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 
 from jx_alert.analysis.ad_kpis import advertising_kpis
 from jx_alert.analysis.store_health import store_health_snapshot
@@ -17,6 +17,7 @@ from jx_alert.notifications.daily_report import build_daily_card
 from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.notifications.routing import _load_routing, report_group_delivery
 from jx_alert.notifications.store_health import card_fits, health_brief_snapshots
+from jx_alert.storage.collection_attempts import collection_issue_for_date as _collection_issue_for_date
 from jx_alert.storage.job_lock import database_job_lock, JobAlreadyRunning
 from jx_alert.storage.models import Campaign, DailyMetric, DataCoverage, Store, SyncJob
 
@@ -182,28 +183,6 @@ def _question_date(question, latest, *, timezone_confirmed):
     return None
 
 
-def _collection_issue_for_date(db, store_id, target):
-    """A failed attempt must not be hidden just because it wrote no coverage."""
-    sales = SyncJob.metadata_json["report_dates"]
-    ads = SyncJob.metadata_json["ad_report_dates"]
-    day = target.isoformat()
-    jobs = db.execute(select(SyncJob.status, SyncJob.metadata_json["report_dates"],
-        SyncJob.metadata_json["ad_report_dates"], SyncJob.metadata_json["completed_steps"])
-        .where(SyncJob.job_type == "daily_collection", or_(
-            sales[store_id].as_string().like(f"%{day}%"), ads[store_id].as_string().like(f"%{day}%"),
-            sales.as_string() == day, ads.as_string() == day))
-        .order_by(SyncJob.id.desc())).all()
-    for status, sales_dates, ad_dates, completed in jobs:
-        for selected in (sales_dates, ad_dates):
-            value = selected.get(store_id) if isinstance(selected, dict) else selected
-            dates = value if isinstance(value, list) else [value]
-            if target.isoformat() in dates:
-                if status == "PARTIAL_FAILED" and {"sales", "campaign_reports"} <= set(completed or []):
-                    return "OTHER_DIMENSIONS_FAILED"
-                return "DAILY_FAILED" if status in {"FAILED", "PARTIAL_FAILED"} else None
-    return None
-
-
 def _question_report_date(db, store, requested, *, explicit):
     """Use one recent complete date only when the default date has no attempt."""
     if store.status != 1:
@@ -215,6 +194,8 @@ def _question_report_date(db, store, requested, *, explicit):
                      if issue == "OTHER_DIMENSIONS_FAILED" else None)
     if explicit:
         return requested, "EXPLICIT_DATE", other_warning
+    if issue is not None:
+        return requested, "REQUESTED_DATE", other_warning
     dimensions = {"store", "campaign_sp", "campaign_sb", "campaign_sd"}
     first = requested - timedelta(days=7)
     coverage = db.scalars(select(DataCoverage).where(DataCoverage.store_id == store.sid,
@@ -264,7 +245,8 @@ def question_context(db, settings, store_id, *, now=None, question=None):
     if target > completed:
         warning = "查询报表日期尚未结束，不能作为完整日报分析"
         date_warning = (date_warning + " " if date_warning else "") + f"{warning}；最近已结束报表日为 {completed}。"
-    value = build_daily_card(db, store, target, settings=settings, data_warning=warning)
+    data_status = "采集失败" if selection == "COLLECTION_FAILED" else None
+    value = build_daily_card(db, store, target, settings=settings, data_warning=warning, data_status=data_status)
     tables = [e for e in value["body"]["elements"] if e["tag"] == "table"]
     tables[0]["columns"][1]["display_name"] = "报表日 " + target.isoformat()
     tables[0]["columns"][2]["display_name"] = "前一日 " + (target - timedelta(days=1)).isoformat()

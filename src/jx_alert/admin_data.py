@@ -10,10 +10,12 @@ from sqlalchemy import select
 
 from jx_alert.analysis.ad_kpis import advertising_kpis
 from jx_alert.analysis.store_health import store_health_snapshot
-from jx_alert.bot_service import _collection_issue_for_date, _question_report_date
+from jx_alert.bot_service import _question_report_date
 from jx_alert.lingxing.ad_details import DETAIL_LABELS
 from jx_alert.notifications.cards import status_label
 from jx_alert.operations import scoped_stores, store_report_plan
+from jx_alert.storage.collection_attempts import collection_issue_for_date
+from jx_alert.storage.coverage import SALES_DATA_LABELS, store_sales_data_status
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store
 
 
@@ -103,10 +105,12 @@ def store_detail(db, settings, store, *, requested=None, now=None):
     metrics = dict.fromkeys(["orders", "units", "sales", "spend", "ad_orders"])
     currencies = dict.fromkeys(["sales", "spend"])
     coverage, breakdown, trend, kpis = [], [], [], []
+    sales_state = store_sales_data_status(store.status, None, [])
     health = store_health_snapshot(db, store, settings, now=clock)
     authorized = store.status == 1
-    collection_issue = _collection_issue_for_date(db, store.sid, target) if target else None
-    data_warning = ("该报表日最近一次采集失败，等待重新采集校验。" if collection_issue == "DAILY_FAILED" else
+    collection_issue = collection_issue_for_date(db, store.sid, target) if target and authorized else None
+    data_warning = ("店铺授权失败，数据待核实。" if store.status == 2 else
+                    "该报表日最近一次采集失败，等待重新采集校验。" if collection_issue == "DAILY_FAILED" else
                     "经营与活动日报已提交，其他维度采集未完成。" if collection_issue == "OTHER_DIMENSIONS_FAILED" else selection_warning)
     if collection_issue == "DAILY_FAILED":
         authorized = False
@@ -114,7 +118,7 @@ def store_detail(db, settings, store, *, requested=None, now=None):
         first = target - timedelta(days=13)
         partition = {(r.metric_date, r.dimension): r for r in db.scalars(select(DataCoverage).where(
             DataCoverage.store_id == store.sid, DataCoverage.metric_date.between(first, target),
-            DataCoverage.dimension.in_(_DATASETS)))}
+            DataCoverage.dimension.in_((*_DATASETS, "sku_asin", "sku_msku"))))}
         facts = defaultdict(list)
         for row in db.scalars(select(DailyMetric).where(DailyMetric.store_id == store.sid,
                 DailyMetric.metric_date.between(first, target), DailyMetric.dimension.in_(("store", *_ADS)))):
@@ -142,9 +146,22 @@ def store_detail(db, settings, store, *, requested=None, now=None):
 
         for dim, label in _DATASETS.items():
             record, rows = partition.get((target, dim)), facts[target, dim]
-            unavailable = "采集失败待核实" if collection_issue == "DAILY_FAILED" else "店铺授权待核实"
-            coverage.append({"name": label, "status": unavailable if not authorized else _coverage_label(record, rows),
-                             "rows": record.row_count if authorized and record and record.status == "COMPLETE" else None})
+            source_rows = record.row_count if record and record.status == "COMPLETE" else None
+            state = _coverage_label(record, rows)
+            if dim == "store":
+                sales_state = store_sales_data_status(store.status, record, rows,
+                    partition.get((target, "sku_asin")), partition.get((target, "sku_msku")),
+                    issue=collection_issue)
+                state = SALES_DATA_LABELS[sales_state]
+                if sales_state == "EMPTY":
+                    source_rows = 0
+                elif not rows:
+                    source_rows = None
+            if not authorized:
+                state = ("采集失败待核实" if collection_issue == "DAILY_FAILED" else
+                         "授权失败" if store.status == 2 else "店铺启用状态待核实")
+                source_rows = None
+            coverage.append({"name": label, "status": state, "rows": source_rows})
         if authorized:
             for offset in range(13, -1, -1):
                 day = target - timedelta(days=offset)
@@ -167,6 +184,7 @@ def store_detail(db, settings, store, *, requested=None, now=None):
                      "baseline": item["baseline"], "change_ratio": item["change_ratio"]}
                     for code, item in advertising_kpis(db, settings, store.sid, target).items()]
     return {**report, "metrics": metrics, "currency_codes": currencies, "coverage": coverage, "data_warning": data_warning,
+            "sales_data_status": sales_state, "sales_data_status_label": SALES_DATA_LABELS[sales_state],
             "trend": trend, "ad_breakdown": breakdown, "kpis": kpis,
             "health": {"status": health["status_label"], "score": health["ahr_score"],
                        "source_rating": health["source_status_label"], "updated_at": health["source_updated_at"],

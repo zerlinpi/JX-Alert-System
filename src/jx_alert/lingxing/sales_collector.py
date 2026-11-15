@@ -235,7 +235,7 @@ def collect_sales_for_day(client, db, report_dates: str | dict[str, str], *,
             )
         mark_coverage(
             db, store_id=store_id, metric_date=metric_date,
-            dimension="store", row_count=1,
+            dimension="store", row_count=int(any(collected[1].values())),
         )
         # Only complete, explicit sales observations establish sales currency;
         # advertising-profile currency and country labels are not substitutes.

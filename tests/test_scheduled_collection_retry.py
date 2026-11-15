@@ -18,7 +18,8 @@ def warehouse(tmp_path, monkeypatch):
     sessions = sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", sessions)
-    monkeypatch.setattr(scheduler, "get_settings", lambda: SimpleNamespace(app_dry_run=False))
+    settings = SimpleNamespace(app_dry_run=False, daily_sync_cron="30 18 * * *")
+    monkeypatch.setattr(scheduler, "get_settings", lambda: settings)
     yield sessions
     engine.dispose()
 
@@ -28,12 +29,12 @@ def test_daily_plan_is_once_per_beijing_day_and_never_collects_in_cron(warehouse
         pytest.fail("The cron callback must persist work without running provider requests")
 
     monkeypatch.setattr(operations, "run_collection", forbidden)
-    before_midnight = datetime(2026, 11, 13, 15, 59, tzinfo=timezone.utc)
-    after_midnight = before_midnight + timedelta(minutes=2)
-    scheduler.daily_job(now=before_midnight)
-    scheduler.daily_job(now=before_midnight + timedelta(seconds=30))
-    scheduler.daily_job(now=after_midnight)
-    scheduler.daily_job(now=after_midnight + timedelta(hours=1))
+    first_due = datetime(2026, 11, 13, 10, 30, tzinfo=timezone.utc)
+    second_due = first_due + timedelta(days=1)
+    scheduler.daily_job(now=first_due)
+    scheduler.daily_job(now=first_due + timedelta(seconds=30))
+    scheduler.daily_job(now=second_due)
+    scheduler.daily_job(now=second_due + timedelta(minutes=1))
     with warehouse() as db:
         jobs = db.scalars(select(SyncJob).order_by(SyncJob.id)).all()
         assert len(jobs) == 2
@@ -42,6 +43,82 @@ def test_daily_plan_is_once_per_beijing_day_and_never_collects_in_cron(warehouse
         assert all(row.job_type == "manual_collection" and row.status == "PENDING" for row in jobs)
         assert all(row.metadata_json["report_date"] is None for row in jobs)
         assert all(row.metadata_json["backfill_days"] == 2 for row in jobs)
+
+
+@pytest.mark.parametrize("startup_enqueue_fails", [False, True])
+def test_startup_and_periodic_recovery_restore_missed_collection_once(
+    warehouse, monkeypatch, startup_enqueue_fails,
+):
+    settings = scheduler.get_settings()
+    settings.scheduler_enabled = True
+    settings.app_timezone = "UTC"
+    settings.feishu_daily_report_cron = "0 8 * * *"
+    settings.excel_archive_enabled = True
+    settings.excel_daily_snapshot_cron = "30 23 * * *"
+    jobs = {}
+
+    class FakeScheduler:
+        def __init__(self, **kwargs):
+            pass
+
+        def add_job(self, callback, trigger, *, id, **kwargs):
+            jobs[id] = (callback, trigger)
+
+        def start(self):
+            pass
+
+    due = datetime(2026, 11, 14, 10, 30, tzinfo=timezone.utc)
+    clock = due - timedelta(minutes=1)
+    daily_job = scheduler.daily_job
+    monkeypatch.setattr(scheduler, "daily_job", lambda: daily_job(now=clock))
+    monkeypatch.setattr(scheduler, "BlockingScheduler", FakeScheduler)
+    monkeypatch.setattr(scheduler, "init_db", lambda: None)
+    monkeypatch.setattr(scheduler, "daily_report_job", lambda: None)
+    monkeypatch.setattr(scheduler, "daily_excel_snapshot_job", lambda: None)
+    enqueue = operations.enqueue_collection
+    if startup_enqueue_fails:
+        def transient_failure(*args, **kwargs):
+            if clock == due + timedelta(minutes=10):
+                raise RuntimeError("temporary database failure")
+            return enqueue(*args, **kwargs)
+
+        monkeypatch.setattr(operations, "enqueue_collection", transient_failure)
+
+    def job_keys():
+        with warehouse() as db:
+            return [row.metadata_json["idempotency_key"] for row in db.scalars(
+                select(SyncJob).order_by(SyncJob.id),
+            )]
+
+    scheduler.main()  # Stop at 18:29 without allowing the cron callback to fire.
+    assert job_keys() == []
+    clock = due + timedelta(minutes=10)
+    scheduler.main()
+    expected = ["scheduled-collection:2026-11-14"]
+    assert job_keys() == ([] if startup_enqueue_fails else expected)
+    clock += timedelta(minutes=1)
+    recovery_callback, recovery_trigger = jobs["daily_pipeline_recovery"]
+    assert recovery_trigger.interval == timedelta(minutes=1)
+    recovery_callback()
+    scheduler.main()
+    assert job_keys() == expected
+
+    assert jobs["daily_pipeline"][1].get_next_fire_time(None, due) == due
+    for job_id, deadline in (
+        ("feishu_daily_report", due.replace(hour=0, minute=0)),
+        ("excel_daily_snapshot", due.replace(hour=15, minute=30)),
+    ):
+        assert jobs[job_id][1].get_next_fire_time(None, deadline) == deadline
+
+
+def test_recovery_window_does_not_enqueue_after_grace_or_across_midnight(warehouse):
+    due = datetime(2026, 11, 14, 10, 30, tzinfo=timezone.utc)
+    scheduler.daily_job(now=due + timedelta(minutes=30, seconds=1))
+    settings = scheduler.get_settings()
+    settings.daily_sync_cron = "50 23 * * *"
+    scheduler.daily_job(now=due.replace(hour=16, minute=5))  # Beijing 00:05 next day.
+    with warehouse() as db:
+        assert db.scalar(select(SyncJob)) is None
 
 
 def test_daily_retry_preserves_checkpoint_and_repeated_cron_does_not_reset_it(warehouse, monkeypatch):

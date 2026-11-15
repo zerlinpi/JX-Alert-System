@@ -1,4 +1,6 @@
 import logging
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
@@ -13,25 +15,30 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("jx_alert.scheduler")
+DAILY_COLLECTION_GRACE_SECONDS = 30 * 60
 
 
 def daily_job(*, now=None):
-    """Persist the daily plan; the existing dispatcher owns collection retries."""
-    from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-
+    """Persist today's due plan inside its grace window for cron or recovery."""
     from jx_alert.operations import enqueue_collection
     from jx_alert.storage.db import SessionLocal, engine
     from jx_alert.storage.job_lock import database_job_lock, JobAlreadyRunning
 
     try:
-        if get_settings().app_dry_run:
-            logger.info("Daily collection status=DRY_RUN")
+        settings = get_settings()
+        if settings.app_dry_run:
             return
         clock = now if now is not None else datetime.now(timezone.utc)
         if clock.tzinfo is None or clock.utcoffset() is None:
             raise ValueError("Scheduled collection requires a timezone-aware clock")
-        day = clock.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        local = clock.astimezone(ZoneInfo("Asia/Shanghai"))
+        midnight = datetime.combine(local.date(), time.min, local.tzinfo)
+        earliest = max(midnight, local - timedelta(seconds=DAILY_COLLECTION_GRACE_SECONDS))
+        trigger = CronTrigger.from_crontab(settings.daily_sync_cron, timezone=local.tzinfo)
+        due = trigger.get_next_fire_time(None, earliest)
+        if due is None or due > local:
+            return
+        day = local.date().isoformat()
         # A fixed Beijing delivery day identifies the plan, while each store's
         # completed local report date is still resolved by the dispatcher. Two
         # sales dates cover a missed previous collection without inventing facts.
@@ -39,8 +46,9 @@ def daily_job(*, now=None):
             result = enqueue_collection(db, report_date=None, backfill_days=2,
                                         idempotency_key="scheduled-collection:" + day)
             db.commit()
-        logger.info("Daily collection queued job=%s status=%s reused=%s",
-                    result["job_id"], result["status"], result["reused"])
+        if not result["reused"]:
+            logger.info("Daily collection queued job=%s status=%s reused=%s",
+                        result["job_id"], result["status"], result["reused"])
     except JobAlreadyRunning:
         logger.info("Daily collection enqueue is already running")
     except Exception as exc:
@@ -138,7 +146,12 @@ def main():
         replace_existing=True,
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=1800,
+        misfire_grace_time=DAILY_COLLECTION_GRACE_SECONDS,
+    )
+    scheduler.add_job(
+        daily_job, IntervalTrigger(minutes=1),
+        id="daily_pipeline_recovery",
+        replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=60,
     )
     scheduler.add_job(
         outbox_job,
@@ -167,6 +180,8 @@ def main():
         "Scheduler started (daily_timezone=Asia/Shanghai, collection_cron=%s, report_cron=%s, dry_run=%s)",
         settings.daily_sync_cron, settings.feishu_daily_report_cron, settings.app_dry_run,
     )
+    # Recover a missing collection plan before starting independent reports and exports.
+    daily_job()
     # The independent gate prevents pre-08:00 sends and respects the configured
     # first delivery date; persistent idempotency makes restarts safe.
     daily_report_job()
