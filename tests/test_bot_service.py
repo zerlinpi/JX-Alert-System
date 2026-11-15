@@ -384,6 +384,26 @@ def test_model_cache_expires_and_does_not_roll_forward_on_cache_hits(warehouse, 
     assert len(FakeClient.calls) == 2
 
 
+def test_oversized_model_context_keeps_the_existing_real_data_card_fallback(warehouse, monkeypatch):
+    from jx_alert.ai.deepseek import DeepSeekClient, MAX_CONTEXT_BYTES
+    original = bot_service.question_context
+
+    def large_context(*args, **kwargs):
+        context, data_card = original(*args, **kwargs)
+        context["oversized_metadata"] = "x" * MAX_CONTEXT_BYTES
+        return context, data_card
+
+    monkeypatch.setattr(bot_service, "question_context", large_context)
+    enqueue(warehouse)
+    result = process(warehouse, factory=lambda settings: DeepSeekClient("test-only-key"))
+    with warehouse[1]() as db:
+        job = db.get(SyncJob, result["job_id"])
+        assert job.status == "SUCCEEDED" and job.metadata_json["analysis_provider"] == "unavailable"
+        assert "analysis_cache_key" not in job.metadata_json
+        content = json.dumps([db.get(NotificationOutbox, key).payload["card"] for key in result["outbox_ids"]], ensure_ascii=False)
+    assert "智能分析暂不可用" in content and "经营与广告" in content
+
+
 def test_materiality_policy_applies_to_kpi_context_without_changing_source_tables(warehouse):
     settings, sessions, _ = warehouse
     settings.alert_materiality_enabled = True

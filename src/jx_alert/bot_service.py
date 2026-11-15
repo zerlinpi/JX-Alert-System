@@ -661,13 +661,18 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                     provider = "date_clarification"
                 else:
                     meta.update({key: context[key] for key in ("report_date", "requested_report_date", "date_selection")})
-                    cache_key = analysis_cache_key(context, meta["question"], settings.deepseek_model)
+                    try:
+                        cache_key = analysis_cache_key(context, meta["question"], settings.deepseek_model)
+                    except DeepSeekError:
+                        # Preserve the ordinary data-card fallback when model
+                        # input is too large or rejected; never cache this case.
+                        cache_key = None
                     cached = db.scalar(select(SyncJob).where(SyncJob.job_type == "feishu_question",
                         SyncJob.status == "SUCCEEDED", SyncJob.finished_at >= _utcnow().replace(tzinfo=None) - timedelta(minutes=10),
                         SyncJob.metadata_json["chat_id"].as_string() == meta["chat_id"],
                         SyncJob.metadata_json["analysis_cache_key"].as_string() == cache_key,
                         SyncJob.metadata_json["analysis_provider"].as_string().in_(["deepseek", "deepseek_cache"]))
-                        .order_by(SyncJob.id.desc()).limit(1))
+                        .order_by(SyncJob.id.desc()).limit(1)) if cache_key else None
                     cached_text = (cached.metadata_json or {}).get("analysis_text") if cached else None
                     cached_at = (cached.metadata_json or {}).get("analysis_created_at") if cached else None
                     if not isinstance(cached_at, str) or cached_at < (_utcnow() - timedelta(minutes=10)).isoformat():
