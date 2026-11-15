@@ -63,6 +63,17 @@ def test_positive_or_unchanged_order_evidence_is_not_sent(setup, orders):
     assert result["outbox_ids"] == []
 
 
+@pytest.mark.parametrize("current,expected", [(8, 0), (6, 0), (0, 1)])
+def test_materiality_blocks_small_or_unconfirmed_declines_before_outbox(setup, current, expected):
+    db, settings = setup
+    settings.alert_materiality_enabled = True
+    db.scalar(select(DailyMetric).where(DailyMetric.metric_date == date(2026, 11, 11))).value = current
+    review = prepare_review(db, settings, "5174", now=CLOCK)
+    result = submit_review(db, settings, review["review_id"], finding(review), now=CLOCK)
+    assert len(result["outbox_ids"]) == expected
+    assert len(db.scalars(select(NotificationOutbox)).all()) == expected
+
+
 @pytest.mark.parametrize("orders,expected", [(0, 1), (4, 0)])
 def test_mature_ad_spend_with_usd_is_independent_of_store_currency(setup, orders, expected):
     db, settings = setup

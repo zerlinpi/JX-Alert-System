@@ -43,7 +43,7 @@ def change(current, previous, *, complete):
 
 AD_KPI_HEADERS = ["指标", "本期", "参考", "变化", "判断", "本期日期"]
 _KPI_STATUS = {
-    "ADVERSE": "恶化待复核", "NON_ADVERSE": "—", "INSUFFICIENT_DATA": "数据不足",
+    "ADVERSE": "恶化待复核", "WATCH": "观察", "NON_ADVERSE": "—", "INSUFFICIENT_DATA": "数据不足",
     "CURRENCY_UNCONFIRMED": "币种待确认或不一致", "ZERO_DENOMINATOR": "分母为零",
     "LOW_SAMPLE": "样本不足", "NO_BASELINE": "缺少可比基线",
     "SCOPE_UNSUPPORTED": "仅店铺总览适用", "ATTRIBUTION_IMMATURE": "归因未成熟",

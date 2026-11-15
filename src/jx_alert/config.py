@@ -128,6 +128,8 @@ class Settings(BaseSettings):
     feishu_daily_report_chat_id: str = ""
 
     alert_order_change_ratio: float = 0.15
+    # Retain broad screening; opt-in materiality controls outbound alerts only.
+    alert_materiality_enabled: bool = False
     alert_high_spend_ratio: float = 1.30
     alert_low_spend_ratio: float = 0.50
     alert_budget_ratio: float = 0.90
@@ -178,7 +180,7 @@ def get_settings() -> Settings:
             "feishu_bot_question_max_age_minutes", "deepseek_credentials_file", "deepseek_model",
             "deepseek_request_timeout", "excel_archive_enabled", "excel_archive_dir",
             "excel_daily_snapshot_enabled", "excel_daily_snapshot_cron",
-            "alert_kpi_change_ratio", "alert_kpi_min_impressions",
+            "alert_kpi_change_ratio", "alert_kpi_min_impressions", "alert_materiality_enabled",
             "allow_unconfigured_timezone_history",
             "collection_scope_file", "store_controls_file", "sp_collection_enabled", "sp_validation_targets_file",
             "store_timezones_file", "feishu_routing_file",

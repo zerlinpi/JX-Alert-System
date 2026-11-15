@@ -26,7 +26,7 @@ METRICS = {"orders": "订单", "units": "销量", "sales": "销售额", "spend":
            "clicks": "点击", "impressions": "曝光"}
 DIMENSIONS = {"store", "sku_msku", "sku_asin", "campaign_sp", "campaign_sb", "campaign_sd",
               "product_ad_sp", "product_ad_sd"}
-COMPARISON_POLICY_VERSION = 3
+COMPARISON_POLICY_VERSION = 4
 _COMPARABLE_BASES = {"SEVEN_DAY", "PREVIOUS_DAY"}
 _TOPIC_METRICS = {"订单异常": {"orders"}, "销量异常": {"units"}, "销售额异常": {"sales"},
                   "花费异常": {"spend"}, "转化异常": {"orders"}}
@@ -191,6 +191,7 @@ def prepare_review(db, settings, store_id, *, dimension="store", entity_id=None,
                "intraday_enabled": zone["intraday_enabled"], **comparison,
                "comparison_policy_version": COMPARISON_POLICY_VERSION,
                "notification_policy": {
+                   "materiality_enabled": bool(getattr(settings, "alert_materiality_enabled", False)),
                    "group_fallback_enabled": bool(getattr(settings, "feishu_group_fallback_enabled", False)),
                    "report_group_alias": settings.feishu_daily_report_chat_id},
                "missing_baseline_dates": missing_dates,
@@ -265,7 +266,8 @@ def submit_review(db, settings, review_id, findings, *, now=None):
         return {"status": "SKIPPED", "reason": "该店铺已关闭飞书通知", "outbox_ids": []}
     if context.get("comparison_policy_version") != COMPARISON_POLICY_VERSION:
         raise ValueError("Analysis comparison policy changed; fetch a fresh snapshot")
-    policy = {"group_fallback_enabled": bool(getattr(settings, "feishu_group_fallback_enabled", False)),
+    policy = {"materiality_enabled": bool(getattr(settings, "alert_materiality_enabled", False)),
+              "group_fallback_enabled": bool(getattr(settings, "feishu_group_fallback_enabled", False)),
               "report_group_alias": settings.feishu_daily_report_chat_id}
     if context.get("notification_policy") != policy:
         raise ValueError("Notification policy changed; fetch a fresh snapshot")
@@ -326,6 +328,19 @@ def submit_review(db, settings, review_id, findings, *, now=None):
             if comparison is None:
                 skipped_nonnegative += 1
                 continue
+            if getattr(settings, "alert_materiality_enabled", False):
+                from jx_alert.analysis.materiality import material_finding
+                if comparison["comparison_label"] == "归因成熟的连续七日":
+                    sufficient = (sum(r["value"] for r in evidence if r["metric"] == "spend") >= 50
+                        and sum(r["value"] for r in evidence if r["metric"] == "clicks") >= 30
+                        and {r.get("currency") for r in evidence if r["metric"] == "spend"} == {"USD"})
+                else:
+                    metric = "CPA" if "cost_per_order" in comparison else "zero_conversion"
+                    sufficient = material_finding(db, settings, context["store_id"], context["dimension"],
+                        evidence[0]["entity_id"], comparison["current_date"], metric)
+                if not sufficient:
+                    skipped_nonnegative += 1
+                    continue
             validated.append((topic, summary, action, evidence, comparison))
             continue
         if topic in {"花费异常", "转化异常"}:
@@ -335,6 +350,11 @@ def submit_review(db, settings, review_id, findings, *, now=None):
         if comparison is None:
             raise ValueError("Cite the selected seven-day or exact previous-day comparison for this topic")
         if comparison["current"] >= comparison["comparison_value"]:
+            skipped_nonnegative += 1
+            continue
+        from jx_alert.analysis.materiality import material_finding
+        if not material_finding(db, settings, context["store_id"], context["dimension"],
+                evidence[0]["entity_id"], comparison["current_date"], comparison["metric"]):
             skipped_nonnegative += 1
             continue
         title = ("广告归因" if is_ad else "") + _DECLINE_TITLES[comparison["metric"]]
@@ -410,11 +430,13 @@ def submit_review(db, settings, review_id, findings, *, now=None):
             fixed_route=True, delivery=delivery)
         ids.append(row.id)
         titles.append(row.payload["card"]["header"]["title"]["content"])
-    result = {"status": "QUEUED" if ids else "NO_ANOMALY" if context["comparison_coverage"] == "COMPLETE"
+    result = {"status": "QUEUED" if ids else ("NO_ACTIONABLE_ANOMALY"
+                if findings and getattr(settings, "alert_materiality_enabled", False) else "NO_ANOMALY") if context["comparison_coverage"] == "COMPLETE"
               else "PARTIAL_REVIEW" if context.get("data_sufficient") else "INSUFFICIENT_DATA",
               "outbox_ids": ids, "review_id": review_id, "finding_count": len(validated),
               "notification_titles": titles,
               "skipped_nonnegative_findings": skipped_nonnegative,
+              "skipped_non_actionable_findings": skipped_nonnegative,
               "data_sufficient": bool(context.get("data_sufficient")),
               "comparison_basis": context["comparison_basis"], "comparison_label": context["comparison_label"],
               "comparison_coverage": context["comparison_coverage"], "assessed_metrics": context["assessed_metrics"],
