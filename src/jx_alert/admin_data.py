@@ -23,7 +23,7 @@ _DATASETS = {"store": "店铺销量", "campaign_sp": "商品推广", "campaign_s
              "campaign_sd": "展示推广", "product_ad_sp": "商品推广广告商品",
              "product_ad_sd": "展示推广广告商品", **DETAIL_LABELS}
 _ADS = ("campaign_sp", "campaign_sb", "campaign_sd")
-_KPI_LABELS = {"NON_ADVERSE": "未见恶化", "ADVERSE": "恶化待复核", "INSUFFICIENT_DATA": "数据不足",
+_KPI_LABELS = {"NON_ADVERSE": "未见恶化", "ADVERSE": "恶化待复核", "WATCH": "观察", "INSUFFICIENT_DATA": "数据不足",
                "LOW_SAMPLE": "样本不足", "NO_BASELINE": "缺少可比基线", "ZERO_DENOMINATOR": "分母为零",
                "CURRENCY_UNCONFIRMED": "币种待确认或不一致"}
 
