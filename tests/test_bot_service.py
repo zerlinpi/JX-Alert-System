@@ -436,6 +436,7 @@ def test_named_collection_and_named_progress_keep_existing_receipts_and_deduplic
 @pytest.mark.parametrize("query", [
     "Geteen 暂时不要实时采集", "Geteen 是否可以实时采集", "请说明Geteen实时采集",
     "实时采集Geteen和未知店铺", "实时采集Geteen以及Campx", "实时采集Geteen，不要实际运行",
+    "实时采集Geteen是什么意思", "实时采集Geteen吗",
 ])
 def test_negation_description_and_multi_store_requests_never_queue_a_partial_match(warehouse, monkeypatch, query):
     _name_stores(warehouse)
