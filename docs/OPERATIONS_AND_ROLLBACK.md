@@ -1,9 +1,9 @@
 # Collection, notifications and rollback
 
-All changes are developed on a feature branch based on upstream `4256f30`.
-Keep `main` intact until review. Pull the feature branch on the server before
-changing the running source. Never copy credentials or the `data/` directory
-into Git. Existing `.env` is retained.
+Develop changes on a feature branch and review them through a PR. After the
+authorized merge, verify that GitHub `main` has the tested tree, then pull that
+identified revision on the server and verify the running source. Never copy
+credentials or the `data/` directory into Git. Existing `.env` is retained.
 
 ## Persistent data and source updates
 
@@ -57,10 +57,18 @@ Keep MCP bound to loopback unless an authenticated HTTPS reverse proxy is ready.
 ## Feishu testing and ownership
 
 The application bot sends to an explicitly configured test/report group. Daily
-snapshots are deduplicated by store, local date and destination. Group anomaly
-alerts require both administrator and operator mappings; missing mappings become
-`ROUTING_FAILED`, never guessed recipients. Management DMs are independent
-deliveries. An unresolved operator does not prevent a daily test snapshot.
+snapshots are deduplicated by store, local date and destination. When
+`feishu_group_fallback_enabled=true`, missing administrator, operator or manager
+mappings may fall back to the verified report group without unverified mentions.
+Malformed mappings, an unreadable routing file or an invalid group still produce
+`ROUTING_FAILED`. With fallback disabled, missing required mappings also fail.
+Configured management DMs remain independent deliveries. Notification fallback
+does not grant collection permission: manual bot requests still require the
+sender to be a mapped store operator or report-group administrator.
+
+Use `@机器人 实时采集 5174`, then query the returned task number with
+`@机器人 采集任务 <任务号> 状态`. Group status queries accept only tasks with a
+collection receipt from that group; an MCP-created task has no such receipt.
 
 The outbox retries with a persistent delay, records provider message IDs, and
 prevents a stale worker from overwriting a newer result. API UUIDs are reused
@@ -114,9 +122,12 @@ a reconstruction of what was known at every past collection time.
 ## Rollback
 
 1. Stop the scheduler/MCP processes to stop new jobs; retain outbox and job data.
-2. For the morning-report/chat-analysis upgrade, the previous server commit is
-   `0feb56b`. Restore the matching non-sensitive runtime configuration backup
-   before starting that code: older versions reject unknown runtime fields.
+2. To roll back scoped collection and delayed retries together with the Excel
+   performance change, use the verified pre-upgrade commit
+   `50ad03a2dc191871e5887126afbb7d25e39341ca`. To undo only the Excel performance
+   change while retaining scoped collection and retries, use
+   `21a603d5c505e2065b8f0357a03a7e728f518e72`. Restore the matching non-sensitive
+   runtime configuration backup if needed: older versions reject unknown fields.
    Preserve the service UID/GID and file mode (currently 10001:10001, 0600).
    Do not replace private credentials or the OAuth state store. Then switch the
    checkout to the recorded revision without discarding unrelated changes.
