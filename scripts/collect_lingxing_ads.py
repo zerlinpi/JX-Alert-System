@@ -7,6 +7,7 @@ from jx_alert.config import get_settings
 from jx_alert.lingxing.client import LingxingClient
 from jx_alert.lingxing.collector import collect_ads_for_day
 from jx_alert.storage.db import SessionLocal, init_db
+from jx_alert.store_controls import collection_states
 
 
 def main():
@@ -39,8 +40,17 @@ def main():
 
     init_db()
     client = LingxingClient.from_settings()
+    inventory = client.get_stores()
+    switches = collection_states(settings, (str(row.get("sid")) for row in inventory["data"]))
+    paused = sorted(sid for sid, enabled in switches.items() if not enabled)
+    selected = [row for row in inventory["data"] if switches[str(row.get("sid"))]]
+    if paused and not selected:
+        print(json.dumps({"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": paused}))
+        return
     with SessionLocal() as db:
-        summary = collect_ads_for_day(client, db, report_dates)
+        summary = collect_ads_for_day(client, db, report_dates, stores_response={**inventory, "data": selected})
+    if paused:
+        summary["collection_disabled_store_ids"] = paused
     print("Read-only Lingxing ads collection completed:")
     print(json.dumps(summary, ensure_ascii=False))
 

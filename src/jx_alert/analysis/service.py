@@ -188,6 +188,13 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         if anomaly.rule in NON_ALERT_RULES:
             continue
         settings = get_settings()
+        from jx_alert.store_controls import notifications_enabled, StoreControlError
+        try:
+            if not notifications_enabled(settings, anomaly.store_id):
+                continue
+        except StoreControlError:
+            # Notification configuration must not roll back collected facts.
+            continue
         if getattr(settings, "business_alert_delivery_mode", "rules") == "chat" and not (
             anomaly.rule == "store_status_not_normal" or anomaly.rule.endswith("_freshness")
         ):

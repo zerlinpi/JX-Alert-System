@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 import json
+from pathlib import Path
 import re
 import sqlite3
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ def console(tmp_path, monkeypatch):
     ):
         path.write_text(json.dumps(value), encoding="utf-8")
     settings = Settings(_env_file=None, collection_scope_file=str(scope), store_timezones_file=str(zones),
+                        store_controls_file=str(tmp_path / "controls.json"),
                         feishu_routing_file=str(routing), feishu_transport="app",
                         feishu_daily_report_chat_id="ops", feishu_group_fallback_enabled=True)
     engine = create_engine(f"sqlite:///{tmp_path / 'warehouse.sqlite'}")
@@ -166,3 +168,41 @@ def test_default_date_does_not_fall_back_over_latest_failed_collection(console):
             assert all(v is None for v in value["metrics"].values())
     finally:
         engine.dispose()
+
+
+def test_store_controls_are_independent_persistent_and_private(console):
+    client, _, _, settings = console
+    path = "/console/api/stores/5174/controls"
+    assert client.post(path, json={}).status_code == 401
+    assert login(client).is_redirect
+    overview = client.get("/console/api/stores").json()
+    initial = next(row["controls"] for row in overview["stores"] if row["sid"] == "5174")
+    assert initial["collection_enabled"] is True and initial["notifications_enabled"] is True
+    change = {"collection_enabled": False, "notifications_enabled": True, "revision": initial["revision"]}
+    assert client.post(path, json=change, headers={"Origin": ORIGIN}).status_code == 403
+    headers = {"Origin": ORIGIN, "X-CSRF-Token": overview["csrf"]}
+    assert client.post("/console/api/stores/999/controls", json=change, headers=headers).status_code == 404
+    result = client.post(path, json=change, headers=headers)
+    assert result.status_code == 200 and result.json()["collection_enabled"] is False
+    assert result.json()["notifications_enabled"] is True
+    assert client.post(path, json=change, headers=headers).status_code == 409
+    change.update(collection_enabled=True, notifications_enabled=False, revision=result.json()["revision"])
+    result = client.post(path, json=change, headers=headers)
+    assert result.status_code == 200 and result.json()["collection_enabled"] is True
+    assert result.json()["notifications_enabled"] is False
+    assert client.get("/console/api/stores/5174?date=" + DAY.isoformat()).json()["metrics"]["spend"] == 100
+    controls = json.loads(Path(settings.store_controls_file).read_text(encoding="utf-8"))
+    assert controls["stores"]["5174"]["notifications_enabled"] is False
+
+
+def test_invalid_controls_keep_history_visible_but_never_allow_saving(console):
+    client, _, _, settings = console
+    Path(settings.store_controls_file).write_text('{"stores": "corrupt"}', encoding="utf-8")
+    assert login(client).is_redirect
+    overview = client.get("/console/api/stores").json()
+    assert all(row["controls"]["collection_enabled"] is None for row in overview["stores"])
+    detail = client.get("/console/api/stores/5174?date=" + DAY.isoformat()).json()
+    assert detail["controls"]["error"] and detail["metrics"]["spend"] == 100
+    headers = {"Origin": ORIGIN, "X-CSRF-Token": overview["csrf"]}
+    assert client.post("/console/api/stores/5174/controls", headers=headers, json={
+        "collection_enabled": True, "notifications_enabled": True, "revision": "0" * 64}).status_code == 503

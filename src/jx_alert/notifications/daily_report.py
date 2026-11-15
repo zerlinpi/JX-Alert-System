@@ -253,6 +253,13 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
     if store_dates is not None:
         stores_query = stores_query.where(Store.sid.in_(store_dates))
     stores = store_records if store_records is not None else db.scalars(stores_query).all()
+    from jx_alert.store_controls import notification_states
+    switches = notification_states(settings, (store.sid for store in stores))
+    paused = [store.sid for store in stores if not switches[store.sid][0]]
+    if paused:
+        stores = [store for store in stores if switches[store.sid][0]]
+        if not stores:
+            return {"queued": 0, "skipped": True, "outbox_ids": [], "reason": "store_notifications_disabled"}
     if (send_day is not None and app_transport and len(stores) > 1
             and getattr(settings, "feishu_daily_report_group_digest", False)):
         dates = store_dates if store_dates is not None else {s.sid: target for s in stores}

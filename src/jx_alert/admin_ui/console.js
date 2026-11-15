@@ -13,7 +13,8 @@ const state = {
   stores: [], sid: null, data: null, csrf: /^[0-9a-f]{64}$/.test(initialCsrf || "") ? initialCsrf : null,
   view: "overview", metric: "orders",
   storeSeq: 0, detailSeq: 0, memberSeq: 0, members: null, revision: null,
-  selected: new Set(), saving: false,
+  selected: new Set(), saving: false, controlsDraft: null, controlsSaving: false, controlsLoading: false,
+  controlsSeq: 0,
 };
 
 function node(tag, text, name) {
@@ -63,7 +64,11 @@ async function api(path, options) {
   }
   let json;
   try { json = await response.json(); } catch { throw new Error("服务暂时不可用，请刷新重试。"); }
-  if (!response.ok) throw new Error(typeof json.error === "string" ? json.error : "请求失败，请稍后重试。");
+  if (!response.ok) {
+    const error = new Error(typeof json.error === "string" ? json.error : "请求失败，请稍后重试。");
+    error.status = response.status;
+    throw error;
+  }
   return json;
 }
 
@@ -100,6 +105,8 @@ function findVisibleStoreRows() {
     if (filter === "unmapped") return s.owner_count === 0;
     if (filter === "mapped") return s.owner_count > 0;
     if (filter === "unauthorized") return s.ads_authorized !== true;
+    if (filter === "collection_paused") return s.controls?.collection_enabled === false;
+    if (filter === "notifications_paused") return s.controls?.notifications_enabled === false;
     return true;
   });
 }
@@ -123,6 +130,10 @@ function renderStoreList() {
       : store.owner_count > 0 ? `已映射 ${store.owner_count} 人` : "待映射";
     meta.append(node("span", [sid, store.country].filter(Boolean).join(" · ")), badge(ownerStatus));
     btn.append(node("strong", store.name || sid), meta);
+    const paused = [];
+    if (store.controls?.collection_enabled === false) paused.push("采集已关闭");
+    if (store.controls?.notifications_enabled === false) paused.push("通知已关闭");
+    if (paused.length) btn.append(node("span", paused.join(" · "), "store-paused"));
     li.append(btn);
     fragment.append(li);
   }
@@ -171,11 +182,14 @@ function detailPlaceholder(text) {
 async function selectStore(sid, date) {
   const seq = ++state.detailSeq;
   ++state.memberSeq;
+  ++state.controlsSeq;
   state.sid = sid;
   state.data = null;
   state.members = null;
   state.revision = null;
   state.selected = new Set();
+  state.controlsDraft = null;
+  state.controlsLoading = false;
   detailPlaceholder("正在读取店铺数据…");
   $("detail").setAttribute("aria-busy", "true");
   renderStoreList();
@@ -261,9 +275,121 @@ function renderDetail() {
     money(r.spend, r.spend_currency)]), 4, "暂无可用趋势数据。");
   renderTrend();
   renderRouting();
+  renderControls();
   $("detail-placeholder").hidden = true;
   $("detail-content").hidden = false;
   renderView();
+}
+
+function validControls(controls) {
+  return controls && typeof controls.collection_enabled === "boolean"
+    && typeof controls.notifications_enabled === "boolean" && /^[0-9a-f]{64}$/.test(controls.revision || "");
+}
+
+function controlBadges(controls) {
+  if (!validControls(controls)) return [badge("开关待核实")];
+  return [["采集", controls.collection_enabled], ["通知", controls.notifications_enabled]].map(([label, enabled]) =>
+    node("span", `${label}${enabled ? "开启" : "已关闭"}`, `badge control-badge ${enabled ? "active" : "paused"}`));
+}
+
+function storeControlsChanged() {
+  const saved = state.data?.controls;
+  const draft = state.controlsDraft;
+  return validControls(saved) && draft && (draft.collection_enabled !== saved.collection_enabled
+    || draft.notifications_enabled !== saved.notifications_enabled);
+}
+
+function updateControls() {
+  const controls = state.data?.controls;
+  const ready = validControls(controls) && state.controlsDraft !== null;
+  const busy = state.controlsSaving || state.controlsLoading;
+  $("controls-field").disabled = !ready || busy;
+  $("reload-controls").disabled = busy || !state.data;
+  $("save-controls").disabled = !ready || busy || !state.csrf || !storeControlsChanged();
+  for (const [name, input, label] of [["collection_enabled", "control-collection", "collection-state"],
+    ["notifications_enabled", "control-notifications", "notifications-state"]]) {
+    $(input).checked = ready && state.controlsDraft[name];
+    $(label).textContent = !ready ? "待核实" : state.controlsDraft[name] ? "开启" : "关闭";
+  }
+  $("controls-save-note").textContent = !ready ? "无法核实开关状态，请刷新重试。"
+    : state.controlsSaving ? "正在保存…" : state.controlsLoading ? "正在读取…"
+      : storeControlsChanged() ? "修改尚未保存" : "设置已保存；后续任务按此执行。";
+}
+
+function renderControls() {
+  const controls = state.data?.controls;
+  state.controlsDraft = validControls(controls) ? {
+    collection_enabled: controls.collection_enabled, notifications_enabled: controls.notifications_enabled,
+  } : null;
+  $("store-control-badges").replaceChildren(...controlBadges(controls));
+  notice("controls-status", validControls(controls) ? "" : "开关状态暂时不可用，历史数据仍可查看。", "error");
+  updateControls();
+}
+
+function acceptControls(sid, controls) {
+  const row = state.stores.find((store) => String(store.sid) === sid);
+  if (row) row.controls = controls;
+  renderStoreList();
+}
+
+async function reloadControls({ conflict = false } = {}) {
+  if (!state.data || state.controlsLoading || (state.controlsSaving && !conflict)) return;
+  const details = state.data;
+  const sid = state.sid;
+  const seq = ++state.controlsSeq;
+  state.controlsLoading = true;
+  updateControls();
+  notice("controls-status", "正在读取最新开关状态…");
+  const query = details.requested_date || details.report_date;
+  try {
+    const response = await api(`stores/${encodeURIComponent(sid)}${query ? `?date=${encodeURIComponent(query)}` : ""}`);
+    if (seq !== state.controlsSeq || state.data !== details) return;
+    if (!validControls(response.controls)) throw new Error("无法核实开关状态，请稍后重试。");
+    state.data.controls = response.controls;
+    acceptControls(sid, response.controls);
+    renderControls();
+    notice("controls-status", conflict ? "开关已被其他页面更新，已载入最新设置。请重新选择后保存。" : "已载入最新开关状态。", conflict ? "error" : "success");
+  } catch (error) {
+    if (seq === state.controlsSeq && state.data === details) {
+      // An unknown current revision must never be submitted after a conflict.
+      state.controlsDraft = null;
+      notice("controls-status", error.message || "无法读取最新开关状态。", "error");
+    }
+  } finally {
+    if (seq === state.controlsSeq) {
+      state.controlsLoading = false;
+      updateControls();
+    }
+  }
+}
+
+async function saveControls() {
+  if (!state.data || !validControls(state.data.controls) || $("save-controls").disabled) return;
+  const sid = state.sid;
+  const details = state.data;
+  const payload = { ...state.controlsDraft, revision: details.controls.revision };
+  state.controlsSaving = true;
+  updateControls();
+  notice("controls-status", "正在保存店铺开关…");
+  try {
+    const controls = await api(`stores/${encodeURIComponent(sid)}/controls`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf },
+      body: JSON.stringify(payload),
+    });
+    if (!validControls(controls)) throw new Error("无法确认保存结果，请刷新开关核实。");
+    acceptControls(sid, controls);
+    if (state.data === details) {
+      state.data.controls = controls;
+      renderControls();
+      notice("controls-status", "店铺开关已保存。", "success");
+    } else notice("global-status", `店铺 ${sid} 的开关已保存。`, "success");
+  } catch (error) {
+    if (state.data === details && error.status === 409) await reloadControls({ conflict: true });
+    else notice(state.data === details ? "controls-status" : "global-status", error.message || "开关保存失败。", "error");
+  } finally {
+    state.controlsSaving = false;
+    updateControls();
+  }
 }
 
 function chartElement(tag, attrs = {}, label) {
@@ -510,6 +636,16 @@ $("edit-owners").addEventListener("click", () => setView("owners"));
 $("reload-members").addEventListener("click", loadMembers);
 $("member-search").addEventListener("input", renderMembers);
 $("save-owners").addEventListener("click", saveOwners);
+for (const [id, key] of [["control-collection", "collection_enabled"], ["control-notifications", "notifications_enabled"]]) {
+  $(id).addEventListener("change", () => {
+    if (!state.controlsDraft || state.controlsSaving || state.controlsLoading) return;
+    state.controlsDraft[key] = $(id).checked;
+    notice("controls-status");
+    updateControls();
+  });
+}
+$("save-controls").addEventListener("click", saveControls);
+$("reload-controls").addEventListener("click", () => reloadControls());
 $("date-form").addEventListener("submit", (event) => {
   event.preventDefault();
   if (state.sid && $("report-date").value) void selectStore(state.sid, $("report-date").value);

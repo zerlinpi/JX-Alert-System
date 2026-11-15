@@ -500,6 +500,9 @@ def repair_application_notification(db, settings, outbox_id: int) -> dict:
     if row is None or row.status != "ROUTING_FAILED":
         raise ValueError("Only a failed application routing job can be repaired")
     payload = row.payload
+    from jx_alert.notifications.store_policy import paused_delivery
+    if paused_delivery(settings, payload, row.created_at):
+        return {"status": "SKIPPED", "reason": "store_notifications_disabled", "outbox_ids": []}
     context = payload.get("routing_context")
     role, event_key = payload.get("routing_role"), payload.get("event_key")
     if not isinstance(context, dict) or role not in {"group", "management"} or not event_key:

@@ -28,9 +28,15 @@ def main(argv=None):
     # Import only after explicit collection. Do not initialize the production DB.
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
+    from jx_alert.config import get_settings
     from jx_alert.lingxing.client import LingxingClient
     from jx_alert.lingxing.sp_validation import collect_sp_validation
     from jx_alert.storage.models import RawSnapshot
+    from jx_alert.store_controls import collection_enabled
+
+    if not collection_enabled(get_settings(), args.sid):
+        print(json.dumps({"status": "SKIPPED_COLLECTION_DISABLED", "sid": args.sid}))
+        return 0
 
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)

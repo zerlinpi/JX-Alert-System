@@ -13,6 +13,7 @@ from jx_alert.notifications.routing import (
     _database_entity_open_ids as _routing_database_ids,
 )
 from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.notifications.store_policy import paused_delivery
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import NotificationLog
 
@@ -119,13 +120,13 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                          attempts=attempts))
                 if not claimed.rowcount:
                     continue
-                jobs.append((row.id, row.idempotency_key, dict(row.payload), attempts, row.chat_id))
+                jobs.append((row.id, row.idempotency_key, dict(row.payload), attempts, row.chat_id, row.created_at))
             db.flush()
         db.commit()
 
     sent = 0
     failed = 0
-    for row_id, dedupe_key, payload, attempts, existing_chat_id in jobs:
+    for row_id, dedupe_key, payload, attempts, existing_chat_id, created_at in jobs:
         channel = "feishu_app" if payload.get("transport") == "app" else "feishu_webhook"
         message_id = None
         chat_id = (
@@ -134,6 +135,17 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             else existing_chat_id
         )
         try:
+            if paused_delivery(settings, payload, created_at):
+                with SessionLocal() as db:
+                    skipped = db.execute(update(NotificationOutbox).where(
+                        NotificationOutbox.id == row_id, NotificationOutbox.status == "SENDING",
+                        NotificationOutbox.claimed_at == claim_time, NotificationOutbox.attempts == attempts,
+                    ).values(status="SKIPPED", claimed_at=None, last_error="店铺通知已停用，旧消息保留记录"))
+                    if skipped.rowcount == 1:
+                        db.add(NotificationLog(dedupe_key=dedupe_key, channel=channel, status="SKIPPED",
+                                               error="店铺通知已停用"))
+                    db.commit()
+                continue
             if _scheduled_window(dedupe_key, payload, datetime.now(timezone.utc).replace(tzinfo=None))[0] != "READY":
                 with SessionLocal() as db:
                     db.execute(update(NotificationOutbox).where(

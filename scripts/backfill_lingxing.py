@@ -10,6 +10,7 @@ from jx_alert.lingxing.pipeline import collect_daily_snapshot
 from jx_alert.storage.db import SessionLocal, init_db
 from jx_alert.storage.store_config import build_store_report_dates, sync_store_config
 from jx_alert.reporting.excel import export_daily_reports
+from jx_alert.store_controls import collection_states
 
 
 def main():
@@ -35,6 +36,15 @@ def main():
     init_db()
     client = LingxingClient.from_settings()
     stores_response = client.get_stores()
+    switches = collection_states(settings, (str(row.get("sid")) for row in stores_response["data"]))
+    paused = sorted(sid for sid, enabled in switches.items() if not enabled)
+    if paused:
+        stores_response = {**stores_response, "data": [
+            row for row in stores_response["data"] if switches[str(row.get("sid"))]
+        ]}
+        if not stores_response["data"]:
+            print(json.dumps({"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": paused}))
+            return
     base_dates = build_store_report_dates(
         stores_response, settings.store_timezones_file
     )
@@ -75,6 +85,7 @@ def main():
         "days_requested": args.days,
         "daily_jobs": len(collected),
         "analysis_report_dates": base_dates,
+        "collection_disabled_store_ids": paused,
         "analysis_days": 1,
         "analysis_note": "Historical dates populate baselines; only each store's latest completed date is evaluated.",
         "analyses": analyses,

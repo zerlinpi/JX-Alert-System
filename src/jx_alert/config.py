@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     store_timezones_file: str = "/app/data/store-timezones.json"
     runtime_settings_file: str = "/app/data/runtime-settings.json"
     collection_scope_file: str = "/app/data/collection-scope.json"
+    store_controls_file: str = "/app/data/store-controls.json"
     # Opt-in historical collection without inventing a store's report timezone.
     # Uses a globally completed calendar day; intraday interpretation stays blocked.
     allow_unconfigured_timezone_history: bool = False
@@ -179,7 +180,7 @@ def get_settings() -> Settings:
             "excel_daily_snapshot_enabled", "excel_daily_snapshot_cron",
             "alert_kpi_change_ratio", "alert_kpi_min_impressions",
             "allow_unconfigured_timezone_history",
-            "collection_scope_file", "sp_collection_enabled", "sp_validation_targets_file",
+            "collection_scope_file", "store_controls_file", "sp_collection_enabled", "sp_validation_targets_file",
             "store_timezones_file", "feishu_routing_file",
             "sp_refresh_days", "mcp_operations_enabled", "mcp_notifications_enabled", "feishu_enabled", "feishu_transport",
             "feishu_group_fallback_enabled",

@@ -20,7 +20,7 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from jx_alert import admin_data, admin_mapping
+from jx_alert import admin_data, admin_mapping, store_controls
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import Store
@@ -194,7 +194,20 @@ class OwnerConsole:
 
     def _stores_data(self):
         with self.session_factory() as db:
-            return admin_data.store_overview(db, self.settings, admin_data.scoped_ids(self.settings))
+            data = admin_data.store_overview(db, self.settings, admin_data.scoped_ids(self.settings))
+        ids = [s["sid"] for s in data["stores"]]
+        try:
+            controls = store_controls.store_control_snapshots(self.settings, ids)
+        except store_controls.StoreControlError as exc:
+            controls = {sid: self._unknown_controls(exc) for sid in ids}
+        for row in data["stores"]:
+            row["controls"] = controls[row["sid"]]
+        return data
+
+    @staticmethod
+    def _unknown_controls(exc):
+        return {"collection_enabled": None, "notifications_enabled": None,
+                "revision": None, "updated_at": None, "error": exc.detail}
 
     def _selected(self, sid):
         if not _SID.fullmatch(sid) or sid not in admin_data.scoped_ids(self.settings):
@@ -224,8 +237,19 @@ class OwnerConsole:
                 data = admin_data.store_detail(db, self.settings, store, requested=date_value)
             except ValueError:
                 raise ConsoleError("所选日期尚未结束，或店铺报表时区待确认。", 400) from None
+            try:
+                controls = store_controls.get_store_controls(self.settings, sid)
+            except store_controls.StoreControlError as exc:
+                controls = self._unknown_controls(exc)
             return {"store": admin_data.store_row(sid, store, {"owner_count": owner_count,
-                     "group": mapping["group"]}), **data, "routing": mapping}
+                     "group": mapping["group"]}), **data, "routing": mapping, "controls": controls}
+
+    def _save_controls(self, sid, payload):
+        self._selected(sid)
+        with self.session_factory() as db:
+            if db.get(Store, sid) is None:
+                raise ConsoleError("该店铺尚未完成同步。", 404)
+        return store_controls.save_store_controls(self.settings, sid, **payload)
 
     def _mapping(self, sid, operation, payload=None):
         self._selected(sid)
@@ -263,11 +287,18 @@ class OwnerConsole:
                     _cookie(response, SESSION, "", 0)
                     return response
                 payload = await _body(request, "application/json")
-                if set(payload) != {"open_ids", "revision"}:
-                    raise ConsoleError("提交内容无效。", 400)
-                if not self._rate_allowed(request, "mapping", per_ip=12, total=24):
-                    raise ConsoleError("操作太频繁，请稍后重试。", 429)
-                data = await asyncio.to_thread(self._mapping, sid, "owners", payload)
+                if path.endswith("/controls"):
+                    if set(payload) != {"collection_enabled", "notifications_enabled", "revision"}:
+                        raise ConsoleError("提交内容无效。", 400)
+                    if not self._rate_allowed(request, "controls", per_ip=12, total=24):
+                        raise ConsoleError("操作太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(self._save_controls, sid, payload)
+                else:
+                    if set(payload) != {"open_ids", "revision"}:
+                        raise ConsoleError("提交内容无效。", 400)
+                    if not self._rate_allowed(request, "mapping", per_ip=12, total=24):
+                        raise ConsoleError("操作太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(self._mapping, sid, "owners", payload)
             elif path.endswith("/members"):
                 if not self._rate_allowed(request, "members", per_ip=24, total=48):
                     raise ConsoleError("成员加载太频繁，请稍后重试。", 429)
@@ -282,6 +313,8 @@ class OwnerConsole:
             return _error(exc.detail, exc.status)
         except admin_mapping.MappingError as exc:
             return _error(exc.detail, exc.status_code)
+        except store_controls.StoreControlError as exc:
+            return _error(exc.detail, exc.status_code)
         except Exception as exc:
             _LOG.warning("Console request failed (%s)", type(exc).__name__)
             return _error("暂时无法读取或保存，请稍后重试。", 503)
@@ -292,6 +325,7 @@ class OwnerConsole:
                 Route("/console/assets/{asset}", self.asset), Route("/console/api/stores", self.api),
                 Route("/console/api/stores/{sid}", self.api), Route("/console/api/stores/{sid}/members", self.api),
                 Route("/console/api/stores/{sid}/owners", self.api, methods=["POST"]),
+                Route("/console/api/stores/{sid}/controls", self.api, methods=["POST"]),
                 Route("/console/logout", self.api, methods=["POST"])]
 
 

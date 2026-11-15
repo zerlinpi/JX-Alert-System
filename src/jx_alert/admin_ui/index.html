@@ -45,7 +45,7 @@
             <label for="store-search" class="sr-only">搜索店铺</label>
             <div class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg><input id="store-search" type="search" placeholder="店铺名称、编号或站点" autocomplete="off"></div>
             <label for="store-filter" class="sr-only">筛选店铺</label>
-            <select id="store-filter"><option value="all">所有店铺</option><option value="unmapped">未映射负责人</option><option value="mapped">已映射负责人</option><option value="unauthorized">广告授权待核实</option></select>
+            <select id="store-filter"><option value="all">所有店铺</option><option value="unmapped">未映射负责人</option><option value="mapped">已映射负责人</option><option value="unauthorized">广告授权待核实</option><option value="collection_paused">采集已关闭</option><option value="notifications_paused">通知已关闭</option></select>
           </div>
           <ul class="stores" id="stores" aria-label="选择店铺" aria-busy="true"></ul>
           <p id="stores-empty" class="empty" hidden></p>
@@ -54,9 +54,29 @@
           <div class="panel empty-detail" id="detail-placeholder" role="status">正在读取店铺数据…</div>
           <div id="detail-content" hidden>
             <header class="panel store-heading">
-              <div><p id="store-eyebrow" class="eyebrow"></p><h2 id="store-name"></h2><p id="store-meta" class="muted"></p></div>
+              <div><p id="store-eyebrow" class="eyebrow"></p><h2 id="store-name"></h2><p id="store-meta" class="muted"></p><div id="store-control-badges" class="control-badges" aria-label="当前店铺开关"></div></div>
               <button id="edit-owners" type="button" class="button secondary">设置负责人</button>
             </header>
+            <section class="panel store-controls" aria-labelledby="controls-title">
+              <div class="section-heading"><div><h3 id="controls-title">店铺开关</h3><p class="muted">采集与通知独立设置，历史数据仍可查看。</p></div></div>
+              <div class="controls-body">
+                <fieldset id="controls-field" disabled>
+                  <legend class="sr-only">店铺采集与通知设置</legend>
+                  <label class="control-row" for="control-collection">
+                    <span class="control-copy"><strong>数据采集</strong><span>关闭后暂停该店铺的新数据采集。</span></span>
+                    <span class="switch"><input id="control-collection" type="checkbox" role="switch" aria-describedby="collection-state"><span class="switch-track" aria-hidden="true"></span></span>
+                    <span id="collection-state" class="control-state"></span>
+                  </label>
+                  <label class="control-row" for="control-notifications">
+                    <span class="control-copy"><strong>飞书通知</strong><span>关闭后暂停该店铺的日报、告警和 Chat 通知。</span></span>
+                    <span class="switch"><input id="control-notifications" type="checkbox" role="switch" aria-describedby="notifications-state"><span class="switch-track" aria-hidden="true"></span></span>
+                    <span id="notifications-state" class="control-state"></span>
+                  </label>
+                </fieldset>
+                <div id="controls-status" class="notice" role="status" hidden></div>
+                <div class="save-bar"><span id="controls-save-note" class="muted">正在读取开关状态…</span><div class="control-actions"><button id="reload-controls" class="link-button" type="button">刷新开关</button><button id="save-controls" class="button primary" type="button" disabled>保存开关</button></div></div>
+              </div>
+            </section>
             <div id="overview" class="detail-content">
               <section class="panel report" aria-labelledby="report-title">
                 <div class="section-heading">
