@@ -42,7 +42,7 @@ def daily_job(*, now=None):
         # A fixed Beijing delivery day identifies the plan, while each store's
         # completed local report date is still resolved by the dispatcher. Two
         # sales dates cover a missed previous collection without inventing facts.
-        with database_job_lock(engine, "scheduled_collection"), SessionLocal() as db:
+        with database_job_lock(engine, "collection_enqueue"), SessionLocal() as db:
             result = enqueue_collection(db, report_date=None, backfill_days=2,
                                         idempotency_key="scheduled-collection:" + day)
             db.commit()

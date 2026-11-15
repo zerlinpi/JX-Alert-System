@@ -1127,10 +1127,11 @@ def get_configuration_status() -> dict:
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
           meta=_tool_security("jx:read", "jx:collect"))
 def request_collection(report_date: str | None = None, backfill_days: int = 1,
-                       idempotency_key: str | None = None) -> dict:
+                       idempotency_key: str | None = None, store_ids: list[str] | None = None) -> dict:
     """Explicitly request collection/analysis of the configured store scope.
 
     Requires enabled operations and a running scheduler. Returns a persisted job ID.
+    Pass store_ids to refresh specific stores. Omit it for the configured scope.
     Never changes advertisements, budgets, bids, listings, or shop settings.
     """
     settings = get_settings()
@@ -1141,13 +1142,19 @@ def request_collection(report_date: str | None = None, backfill_days: int = 1,
             return _scope_challenge("jx:collect", settings, current_scopes=token.scopes if token else ())
     if not settings.mcp_operations_enabled or settings.app_dry_run:
         return {"status": "DISABLED"}
-    from jx_alert.operations import enqueue_collection
+    from jx_alert.operations import CollectionBlocked, enqueue_collection
+    from jx_alert.storage.job_lock import database_job_lock, JobAlreadyRunning
     init_db()
-    with SessionLocal() as db:
-        result = enqueue_collection(db, report_date=report_date, backfill_days=backfill_days,
-                                    idempotency_key=idempotency_key)
-        db.commit()
-        return result
+    try:
+        with SessionLocal() as db, database_job_lock(db.get_bind(), "collection_enqueue"):
+            result = enqueue_collection(db, report_date=report_date, backfill_days=backfill_days,
+                                        idempotency_key=idempotency_key, store_ids=store_ids)
+            db.commit()
+            return result
+    except CollectionBlocked as exc:
+        return {"status": "BLOCKED", "reason": exc.status}
+    except JobAlreadyRunning:
+        return {"status": "BUSY"}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),

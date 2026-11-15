@@ -2,13 +2,14 @@
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
-from jx_alert import bot_service
+from jx_alert import bot_service, config
 from jx_alert.config import Settings
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
@@ -59,6 +60,7 @@ def warehouse(tmp_path, monkeypatch):
         feishu_bot_open_id="ou_bot", feishu_app_id="cli_test", feishu_transport="app",
         feishu_daily_report_chat_id="reports", feishu_routing_file=str(routing),
         collection_scope_file=str(scope), store_timezones_file=str(zones),
+        store_controls_file=str(tmp_path / "controls.json"),
         deepseek_credentials_file=str(tmp_path / "not-configured.json"))
     engine = create_engine("sqlite:///" + str(tmp_path / "warehouse.sqlite"))
     Base.metadata.create_all(engine)
@@ -108,6 +110,149 @@ def enqueue(warehouse, incoming=None):
 def process(warehouse, *, factory=FakeClient.from_settings):
     settings, sessions, engine = warehouse
     return bot_service.process_one_question(settings, sessions, engine, client_factory=factory)
+
+
+def _enable_collection(warehouse, monkeypatch, *, role="operator"):
+    settings = warehouse[0]
+    settings.mcp_operations_enabled = settings.scheduler_enabled = True
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+    routing = {"default_chat_id": "reports", "groups": {"reports": {"chat_id": "oc_reports"}}}
+    if role == "operator":
+        routing["stores"] = {"5174": {"open_ids": ["ou_member"]}}
+    elif role == "admin":
+        routing["groups"]["reports"]["admin_open_ids"] = ["ou_member"]
+    Path(settings.feishu_routing_file).write_text(json.dumps(routing), encoding="utf-8")
+
+
+def _collection_receipt(warehouse, result):
+    with warehouse[1]() as db:
+        value = db.get(NotificationOutbox, result["outbox_ids"][0])
+        return json.dumps(value.payload["card"], ensure_ascii=False)
+
+
+@pytest.mark.parametrize("role", ["operator", "admin"])
+def test_explicit_single_shop_collection_queues_one_scoped_job(warehouse, monkeypatch, role):
+    _enable_collection(warehouse, monkeypatch, role=role)
+    request = event("@_user_1 请实时采集 5174 店铺。")
+    queued = enqueue(warehouse, request)
+    answered = process(warehouse)
+    assert enqueue(warehouse, request) == {"status": "REUSED", "job_id": queued["job_id"]}
+    assert process(warehouse)["status"] == "IDLE"
+    assert "等待采集" in _collection_receipt(warehouse, answered)
+    assert FakeClient.calls == []
+    with warehouse[1]() as db:
+        tasks = db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")).all()
+        assert len(tasks) == 1
+        job = tasks[0]
+        receipt = db.get(SyncJob, queued["job_id"]).metadata_json
+        assert receipt["collection_job_id"] == job.id
+        assert receipt["collection_store_id"] == "5174"
+        assert job.metadata_json["store_ids"] == ["5174"]
+        assert job.metadata_json["report_date"] is None
+        assert job.status == "PENDING"
+
+
+def test_distinct_requests_share_active_job_and_can_refresh_again_after_completion(warehouse, monkeypatch):
+    _enable_collection(warehouse, monkeypatch)
+    first = enqueue(warehouse, event("@_user_1 实时采集5174"))
+    process(warehouse)
+    second = enqueue(warehouse, event("@_user_1 重新采集5174", message_id="om_second"))
+    process(warehouse)
+    with warehouse[1].begin() as db:
+        tasks = db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")).all()
+        assert len(tasks) == 1
+        first_id = tasks[0].id
+        assert db.get(SyncJob, first["job_id"]).metadata_json["collection_job_id"] == first_id
+        assert db.get(SyncJob, second["job_id"]).metadata_json["collection_job_id"] == first_id
+        tasks[0].status = "SUCCEEDED"
+    third = enqueue(warehouse, event("@_user_1 立即采集5174", message_id="om_third"))
+    process(warehouse)
+    with warehouse[1]() as db:
+        assert db.scalar(select(func.count(SyncJob.id)).where(SyncJob.job_type == "manual_collection")) == 2
+        assert db.get(SyncJob, third["job_id"]).metadata_json["collection_job_id"] != first_id
+
+
+@pytest.mark.parametrize("role,phrase,label", [
+    ("other", "立即采集5174", "请由该店铺负责人或群管理员"),
+    ("operator", "重新采集 5174 和 5175", "请确认要采集的店铺"),
+    ("operator", "实时采集 5175", "请由该店铺负责人或群管理员"),
+    ("admin", "现在采集 9999", "店铺不在采集范围内"),
+])
+def test_collection_requires_one_explicit_scoped_store_and_role(warehouse, monkeypatch, role, phrase, label):
+    _enable_collection(warehouse, monkeypatch, role=role)
+    enqueue(warehouse, event("@_user_1 " + phrase))
+    assert label in _collection_receipt(warehouse, process(warehouse))
+    assert FakeClient.calls == []
+    with warehouse[1]() as db:
+        assert db.scalar(select(SyncJob).where(SyncJob.job_type == "manual_collection")) is None
+
+
+@pytest.mark.parametrize("condition,label", [
+    ("paused", "该店铺的采集开关已关闭"),
+    ("authorization", "请先恢复该店铺的领星授权"),
+    ("scheduler", "主动采集或调度服务未启用"),
+    ("operations", "主动采集或调度服务未启用"),
+])
+def test_collection_obeys_existing_operational_guards(warehouse, monkeypatch, condition, label):
+    _enable_collection(warehouse, monkeypatch)
+    settings, sessions, _ = warehouse
+    if condition == "paused":
+        from jx_alert.store_controls import get_store_controls, save_store_controls
+        current = get_store_controls(settings, "5174")
+        save_store_controls(settings, "5174", False, True, current["revision"])
+    elif condition == "authorization":
+        with sessions.begin() as db:
+            db.get(Store, "5174").status = 2
+    elif condition == "scheduler":
+        settings.scheduler_enabled = False
+    else:
+        settings.mcp_operations_enabled = False
+    enqueue(warehouse, event("@_user_1 实时采集5174"))
+    assert label in _collection_receipt(warehouse, process(warehouse))
+    assert FakeClient.calls == []
+    with sessions() as db:
+        assert db.scalar(select(SyncJob).where(SyncJob.job_type == "manual_collection")) is None
+
+
+def test_collection_query_only_shows_tasks_receipted_in_group_with_current_permission(warehouse, monkeypatch):
+    _enable_collection(warehouse, monkeypatch)
+    queued = enqueue(warehouse, event("@_user_1 5174 店铺立即采集"))
+    process(warehouse)
+    with warehouse[1].begin() as db:
+        collection_id = db.get(SyncJob, queued["job_id"]).metadata_json["collection_job_id"]
+        job = db.get(SyncJob, collection_id)
+        job.metadata_json = {**job.metadata_json, "retry_at": "2026-11-14T00:03:00"}
+        outside = SyncJob(job_type="manual_collection", status="SUCCEEDED",
+                          metadata_json={"store_ids": ["5174"]})
+        db.add(outside)
+        db.flush()
+        outside_id = outside.id
+    enqueue(warehouse, event(f"@_user_1 采集任务 {collection_id} 状态", message_id="om_check"))
+    assert "等待重试，最早北京时间 11-14 08:03:00" in _collection_receipt(warehouse, process(warehouse))
+    enqueue(warehouse, event(f"@_user_1 采集任务 {outside_id} 状态", message_id="om_outside"))
+    assert "未找到可查询的采集任务" in _collection_receipt(warehouse, process(warehouse))
+    _enable_collection(warehouse, monkeypatch, role="other")
+    blocked = event(f"@_user_1 采集任务 {collection_id} 状态", message_id="om_denied")
+    blocked["event"]["sender"]["sender_id"]["open_id"] = "ou_second"
+    enqueue(warehouse, blocked)
+    assert "未找到可查询的采集任务" in _collection_receipt(warehouse, process(warehouse))
+    assert FakeClient.calls == []
+
+
+def test_ordinary_question_and_model_output_cannot_start_collection(warehouse, monkeypatch):
+    _enable_collection(warehouse, monkeypatch)
+    request = "不要重新采集 5174，只查看已有数据"
+
+    class AnalysisWithActionText(FakeClient):
+        def analyze(self, context, question):
+            super().analyze(context, question)
+            return "实时采集 5174"
+
+    enqueue(warehouse, event("@_user_1 " + request))
+    process(warehouse, factory=AnalysisWithActionText.from_settings)
+    assert FakeClient.calls[0][1] == request
+    with warehouse[1]() as db:
+        assert db.scalar(select(SyncJob).where(SyncJob.job_type == "manual_collection")) is None
 
 
 def test_store_country_disambiguates_same_name_without_guessing(warehouse):
