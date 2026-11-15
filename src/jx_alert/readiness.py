@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
+from jx_alert.storage.collection_attempts import collection_issue_for_date
+from jx_alert.storage.coverage import SALES_DATA_LABELS, store_sales_data_status
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, SyncJob
 
 
@@ -118,17 +120,28 @@ def analysis_plan(db, settings, *, now=None):
         item["currency_confirmed"] = bool(item["currency_code"])
         item["analysis_ready"] = False
         item["amount_analysis_ready"] = False
+        sales_status = None
         if store is None:
             item["state"] = "WAITING_STORE_SYNC"
+        elif store.status != 1:
+            sales_status = store_sales_data_status(store.status, None, [])
         elif item["state"] == "READY":
             last = datetime.fromisoformat(item["report_date"]).date()
             dates = [last - timedelta(days=i) for i in range(8)]
-            coverage = {r.metric_date for r in db.scalars(select(DataCoverage).where(
-                DataCoverage.store_id == store.sid, DataCoverage.dimension == "store",
-                DataCoverage.metric_date.in_(dates), DataCoverage.status == "COMPLETE"))}
+            coverage_rows = {(r.dimension, r.metric_date): r for r in db.scalars(select(DataCoverage).where(
+                DataCoverage.store_id == store.sid, DataCoverage.metric_date.in_(dates),
+                DataCoverage.dimension.in_(["store", "sku_asin", "sku_msku"])))}
+            coverage = {day for (dim, day), row in coverage_rows.items()
+                        if dim == "store" and row.status == "COMPLETE"}
             rows = db.scalars(select(DailyMetric).where(DailyMetric.store_id == store.sid,
                 DailyMetric.dimension == "store", DailyMetric.entity_id == store.sid,
                 DailyMetric.metric_date.in_(dates), DailyMetric.metric_name.in_(METRICS))).all()
+            current = [row for row in rows if row.metric_date == last]
+            issue = collection_issue_for_date(db, store.sid, last)
+            sales_status = store_sales_data_status(store.status, coverage_rows.get(("store", last)), current,
+                coverage_rows.get(("sku_asin", last)), coverage_rows.get(("sku_msku", last)), issue=issue)
+            if sales_status == "COLLECTION_FAILED":
+                coverage.discard(last)
             facts = [{"entity_id": r.entity_id, "metric": r.metric_name, "date": r.metric_date.isoformat(),
                       "value": r.value, "currency": r.currency, "complete": r.metric_date in coverage} for r in rows]
             comparisons = snapshot_comparisons(facts, last, "store", confirmed_currency=store.currency_code,
@@ -136,12 +149,14 @@ def analysis_plan(db, settings, *, now=None):
             comparison = comparison_summary(comparisons)
             item.update(comparison)
             item["missing_baseline_dates"] = [d.isoformat() for d in dates if d not in coverage]
-            item["state"] = ("NO_DATA" if not any(r.metric_date == last for r in rows) else
+            item["state"] = ("NO_DATA" if not current or sales_status == "COLLECTION_FAILED" else
                 "READY" if comparison["comparison_coverage"] == "COMPLETE" else
                 "READY_WITH_GAPS" if comparison["data_sufficient"] else "INSUFFICIENT_DATA")
             item["analysis_ready"] = comparison["data_sufficient"]
             item["amount_analysis_ready"] = any(r["metric"] in {"sales", "spend"}
                 for r in comparison["eligible_comparisons"])
+        item["sales_data_status"] = sales_status
+        item["sales_data_label"] = SALES_DATA_LABELS.get(sales_status)
     return {"checked_at_utc": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
             "enabled_store_count": len(plan), "collection_ready_count": sum(x["collection_ready"] for x in plan),
             "analysis_ready_count": sum(x["analysis_ready"] for x in plan), "stores": plan}

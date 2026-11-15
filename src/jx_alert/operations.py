@@ -315,7 +315,7 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
 def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
     """Queue the 08:00 Beijing report from stored facts, independently of collection.
 
-    Explicit store scope and confirmed marketplace timezones are prerequisites.
+    Require explicit store scope and use the configured date policy for each store.
     No provider calls, collector lock, migrations or historical refresh are used.
     Missing/stale store mappings produce temporary unknown-data report records;
     they never create or update business Store rows.
@@ -374,7 +374,7 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
             for sid in selected_ids], settings.store_timezones_file, now=delivery_now,
             allow_unknown_timezone_history=getattr(settings, "allow_unconfigured_timezone_history", False),
             include_inactive=True)
-        report_dates, store_records, warnings = {}, [], {}
+        report_dates, store_records, warnings, history_fallback = {}, [], {}, set()
         for item in plan:
             if item["state"] != "READY":
                 continue
@@ -395,6 +395,8 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
             if existing is not None and existing.status != 1:
                 note = "店铺当前非正常同步状态，数据待核实"
                 warnings[sid] = warnings.get(sid, "") + ("；" if sid in warnings else "") + note
+            if not item["timezone_confirmed"] and sid not in warnings:
+                history_fallback.add(sid)
             report_dates[sid] = item["report_date"]
             store_records.append(store)
         if not report_dates:
@@ -402,6 +404,7 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
         notifications = enqueue_daily_snapshots(
             db, settings, store_dates=report_dates, delivery_date=delivery_now.date(),
             store_records=store_records, store_warnings=warnings, now=delivery_now,
+            history_fallback_store_ids=history_fallback,
         )
         db.commit()
     return {"status": "SKIPPED" if notifications.get("skipped") else "QUEUED",

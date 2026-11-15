@@ -18,6 +18,8 @@ from sqlalchemy import func, or_, select, text
 
 from jx_alert.config import get_settings
 from jx_alert.analysis.comparison import metric_comparison
+from jx_alert.storage.collection_attempts import collection_issue_for_date
+from jx_alert.storage.coverage import SALES_DATA_LABELS, store_sales_data_status
 from jx_alert.storage.db import SessionLocal, engine, init_db
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.models import (
@@ -416,8 +418,17 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
         (row.dimension, row.metric_date): row.status == "COMPLETE"
         for row in coverage_rows
     }
+    target_records = {row.dimension: row for row in coverage_rows if row.metric_date == target_date}
+    current_sales = [row for row in metric_rows if row.metric_date == target_date
+                     and row.dimension == "store" and row.entity_id == str(store_id)]
+    issue = collection_issue_for_date(db, str(store_id), target_date) if store.status == 1 else None
+    sales_status = store_sales_data_status(store.status, target_records.get("store"), current_sales,
+        target_records.get("sku_asin"), target_records.get("sku_msku"), issue=issue)
+    unavailable = sales_status in {"AUTHORIZATION_FAILED", "STORE_UNAVAILABLE", "COLLECTION_FAILED"}
 
     def is_complete(dimension: str, day: date) -> bool:
+        if day == target_date and unavailable:
+            return False
         return coverage.get((dimension, day), False)
 
     def value(dimension: str, entity_id: str, metric: str, day: date):
@@ -527,6 +538,8 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
         },
         "report_date": target_date.isoformat(),
         "sales": sales,
+        "sales_data_status": sales_status,
+        "sales_data_label": SALES_DATA_LABELS[sales_status],
         "campaign_ads": {
             "complete": all_campaign_types_complete,
             "by_type": campaign_by_type,
@@ -542,7 +555,7 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
             "note": "Product-ad metrics are a separate grain; do not add them to campaign totals.",
         },
         "coverage": target_coverage,
-        "data_complete": all(target_coverage.values()),
+        "data_complete": all(target_coverage.values()) and sales_status in {"AVAILABLE", "ZERO"},
     }
 
 
@@ -590,6 +603,8 @@ def get_daily_summary(store_id: str, report_date: str) -> dict:
     report_date must be the marketplace-local date for this store. Missing data is
     returned as null when coverage is incomplete or facts are absent. Prefer a
     complete seven-day baseline; otherwise use exact previous-day facts, never invented zeros.
+    sales_data_status distinguishes empty provider data, real zero, missing collection,
+    collection failure, and failed authorization.
     """
     try:
         target_date = date.fromisoformat(report_date)

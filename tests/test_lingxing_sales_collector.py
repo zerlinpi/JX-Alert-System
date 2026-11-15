@@ -94,6 +94,30 @@ def test_sales_collector_does_not_synthesize_missing_metrics_as_zero():
         assert orders == []
 
 
+def test_sales_coverage_represents_an_empty_partition_and_keeps_observed_zero():
+    class EmptyThenZeroClient(FakeSalesClient):
+        def sales_daily(self, payload):
+            if payload["event_date"] == "2026-11-10":
+                return {"code": 0, "total": 0, "data": []}
+            result = super().sales_daily(payload)
+            result["data"][0]["map_value"] = 0
+            return result
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine)() as db:
+        client = EmptyThenZeroClient()
+        collect_sales_for_day(client, db, "2026-11-10")
+        collect_sales_for_day(client, db, "2026-11-11")
+        coverage = {r.metric_date: r.row_count for r in db.scalars(
+            select(DataCoverage).where(DataCoverage.dimension == "store")
+        )}
+        assert coverage == {date(2026, 11, 10): 0, date(2026, 11, 11): 1}
+        totals = db.scalars(select(DailyMetric).where(DailyMetric.dimension == "store")).all()
+        assert {r.metric_date for r in totals} == {date(2026, 11, 11)}
+        assert {r.metric_name: r.value for r in totals} == {"orders": 0, "units": 0, "sales": 0}
+
+
 def test_sales_pagination_uses_offset_and_length():
     calls = []
     pages = [

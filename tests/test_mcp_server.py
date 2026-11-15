@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -17,6 +18,42 @@ from jx_alert.storage.models import (
     SyncJob,
 )
 import jx_alert.mcp_server as mcp_server
+
+
+@pytest.mark.parametrize(("status", "store_count", "asin_count", "msku_count", "values", "failed", "expected"), [
+    (1, 1, 0, 0, None, False, "EMPTY"),
+    (1, 0, 0, 0, None, False, "EMPTY"),
+    (1, 0, 0, 1, None, False, "PARTIAL"),
+    (1, 1, 0, None, None, False, "PARTIAL"),
+    (1, 1, 1, 1, [0, 0, 0], False, "ZERO"),
+    (1, None, None, None, None, False, "NOT_COLLECTED"),
+    (1, 1, 1, 1, [0, 0, 0], True, "COLLECTION_FAILED"),
+    (2, 1, 1, 1, [0, 0, 0], False, "AUTHORIZATION_FAILED"),
+])
+def test_daily_summary_distinguishes_source_empty_from_other_data_states(
+    status, store_count, asin_count, msku_count, values, failed, expected
+):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine)() as db:
+        day = date(2026, 11, 13)
+        db.add(Store(sid="101", name="Store", status=status))
+        for dim, count in (("store", store_count), ("sku_asin", asin_count), ("sku_msku", msku_count)):
+            if count is not None:
+                db.add(DataCoverage(store_id="101", metric_date=day, dimension=dim, status="COMPLETE",
+                                    row_count=count))
+        if values is not None:
+            for metric, value in zip(("orders", "units", "sales"), values):
+                db.add(DailyMetric(store_id="101", metric_date=day, dimension="store", entity_id="101",
+                                   metric_name=metric, value=value, currency="USD"))
+        if failed:
+            db.add(SyncJob(job_type="daily_collection", status="FAILED",
+                           metadata_json={"report_dates": {"101": day.isoformat()}}))
+        db.commit()
+        summary = mcp_server._daily_summary(db, "101", day)
+        assert summary["sales_data_status"] == expected
+        assert summary["data_complete"] is (expected == "ZERO")
+        assert summary["sales"]["orders"]["current"] == (0 if expected == "ZERO" else None)
 
 
 def test_mcp_tools_query_only_persisted_records(monkeypatch):
@@ -179,7 +216,8 @@ def test_mcp_tools_query_only_persisted_records(monkeypatch):
     assert orders_metric["value"] == 5
 
     summary = mcp_server.get_daily_summary("101", "2026-11-10")
-    assert summary["data_complete"] is True
+    assert all(summary["coverage"].values())
+    assert summary["data_complete"] is False and summary["sales_data_status"] == "PARTIAL"
     assert summary["sales"]["orders"]["current"] == 5
     assert summary["sales"]["orders"]["previous_day"] == 10
     assert summary["sales"]["orders"]["average_7d"] == 10

@@ -147,7 +147,7 @@ def test_model_context_cannot_confuse_previous_day_values_with_missing_current_d
         assert orders["current_display"] == "未知（无记录）"
         assert orders["previous_date"] == DAY.isoformat()
         assert orders["previous_display"] == "10"
-        assert context["coverage"][0] == {"dataset": "店铺销量", "status_label": "未知"}
+        assert context["coverage"][0] == {"dataset": "店铺销量", "status_label": "尚未采集"}
 
 
 def test_default_question_uses_one_recent_complete_report_date_with_explicit_target_notice(warehouse):

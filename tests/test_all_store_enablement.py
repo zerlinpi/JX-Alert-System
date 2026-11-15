@@ -86,6 +86,21 @@ def test_inventory_sync_keeps_all_stores_visible_and_never_invents_timezone_or_c
         assert plan["enabled_store_count"] == 3 and plan["collection_ready_count"] == 2
         assert {r["store_id"]: r["state"] for r in plan["stores"]} == {
             "1": "NO_DATA", "2": "NO_DATA", "3": "AUTHORIZATION_FAILED"}
+        assert {r["store_id"]: r["sales_data_status"] for r in plan["stores"]} == {
+            "1": "NOT_COLLECTED", "2": "NOT_COLLECTED", "3": "AUTHORIZATION_FAILED"}
+
+
+def test_analysis_plan_exposes_legacy_empty_without_changing_readiness_state(setup):
+    settings, sessions, _ = setup
+    sync(settings, sessions)
+    with sessions.begin() as db:
+        for dim, count in (("store", 1), ("sku_asin", 0), ("sku_msku", 0)):
+            db.add(DataCoverage(store_id="2", metric_date=date(2026, 11, 11), dimension=dim,
+                                row_count=count, status="COMPLETE"))
+    with sessions() as db:
+        row = next(r for r in analysis_plan(db, settings, now=CLOCK)["stores"] if r["store_id"] == "2")
+        assert row["state"] == "NO_DATA" and not row["analysis_ready"]
+        assert row["sales_data_status"] == "EMPTY" and row["sales_data_label"] == "接口无记录"
 
 
 def test_unknown_timezone_history_supports_count_analysis_but_empty_data_is_not_normal(setup):

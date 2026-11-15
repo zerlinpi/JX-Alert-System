@@ -121,7 +121,7 @@ def test_successful_empty_report_is_distinct_from_missing_failed_and_explicit_ze
     assert metrics["品牌推广花费"]["c3"] == "接口无记录，无法比较"
     assert metrics["展示推广花费"]["c1"] == "未知（无记录）"
     assert quality["商品推广"] == "采集完成" and quality["品牌推广"] == "接口无记录"
-    assert quality["展示推广"] == "采集失败" and quality["店铺销量"] == "未知"
+    assert quality["展示推广"] == "采集失败" and quality["店铺销量"] == "尚未采集"
     warned = build_daily_card(db, store, DAY, settings=settings, data_warning="最新采集失败")
     warned_tables = [e for e in warned["body"]["elements"] if e["tag"] == "table"]
     assert all(r["c1"] != "接口无记录" for r in warned_tables[0]["rows"])
@@ -140,4 +140,21 @@ def test_empty_coverage_requires_no_actual_rows_and_failed_partition_masks_stale
     assert tables[0]["rows"][5]["c1"] == "未知（无记录）"
     assert tables[1]["rows"][3]["c1"] == "采集失败"
     assert "99" not in json.dumps(tables[0]["rows"])
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_empty_store_sales_keeps_report_quality_separate_from_true_zero(setup, legacy):
+    db, settings, store = setup
+    db.add(DataCoverage(store_id=store.sid, metric_date=DAY, dimension="store",
+                        status="COMPLETE", row_count=int(legacy)))
+    if legacy:
+        db.add_all([DataCoverage(store_id=store.sid, metric_date=DAY, dimension=dimension,
+                                 status="COMPLETE", row_count=0) for dimension in ("sku_asin", "sku_msku")])
+    db.flush()
+    result = enqueue(db, settings)
+    payload = db.get(NotificationOutbox, result["outbox_ids"][0]).payload
+    tables = [e for e in payload["card"]["body"]["elements"] if e["tag"] == "table"]
+    assert all(row["c1"] == "接口无记录" for row in tables[0]["rows"][:3])
+    assert tables[1]["rows"][0]["c1"] == "接口无记录"
+    assert "订单 接口无记录" in payload["text"]
 
