@@ -254,7 +254,7 @@ def _collection_command(question):
     question = unicodedata.normalize("NFKC", question).strip()
     if re.search(_COLLECTION_VERB, question) and re.search(
             r"不要|不用|不必|禁止|取消|停止|别|只看|仅查看|不采集|是否|能否|可以吗|"
-            r"如何|怎么|说明|例如|示例|演示|假设|引用|写出|输出|解释", question):
+            r"如何|怎么|说明|例如|示例|演示|假设|引用|写出|输出|解释|什么|意思|吗|为何|是不是|能不能|可不可以", question):
         return None
     status = _COLLECTION_STATUS.fullmatch(question)
     if status:

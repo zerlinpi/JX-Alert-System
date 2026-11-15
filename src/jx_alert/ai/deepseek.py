@@ -147,7 +147,7 @@ def compact_context(context):
     keys = ("store_id", "store_name", "country", "report_date", "requested_report_date",
             "timezone_confirmed", "date_basis", "date_selection", "report_date_warning",
             "authorization_warning", "data_warning", "sales_and_spend", "coverage",
-            "advertising_totals", "ad_detail_coverage", "notification_policy", "campaign_selection")
+            "advertising_totals", "ad_detail_coverage", "notification_policy", "campaign_selection", "campaign_count")
     result = {k: context[k] for k in keys if k in context}
     kpi_keys = ("current", "baseline", "current_date", "currency", "status", "change_ratio",
                 "comparison_basis", "notification_note", "attribution_maturity_required", "attribution_mature")
@@ -182,7 +182,7 @@ def _actionable_text(text, context, question):
         if not line.strip():
             continue
         if (not re.search(r"覆盖|全量|所有活动|全部活动|巡检范围", question)
-                and re.match(r"\s*-\s*(?:活动)?样本(?:仅|只|范围)", line)):
+                and re.match(r"\s*-\s*(?:广告)?(?:活动)?样本(?:仅|只|范围)", line)):
             continue
         objects = [row for row in context.get("campaigns", []) if row.get("name") and row["name"] in line]
         groups = [row.get("kpis", {}) for row in objects] if objects else [context.get("advertising_kpis", {}),
