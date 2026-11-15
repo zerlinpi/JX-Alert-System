@@ -92,6 +92,7 @@ def analysis_plan(db, settings, *, now=None):
     """Enumerate the complete enabled scope and distinguish blocked/missing data."""
     from jx_alert.operations import scoped_stores, store_report_plan
     from jx_alert.chat_analysis import snapshot_comparisons, comparison_summary, METRICS
+    from jx_alert.store_controls import collection_states, notification_states, StoreControlError
     raw = _json_file(settings.collection_scope_file)
     ids = raw.get("store_ids", [])
     if not isinstance(ids, list):
@@ -101,10 +102,18 @@ def analysis_plan(db, settings, *, now=None):
     records = [{"sid": sid, "status": getattr(store, "status", 1)} for sid, store in existing.items()]
     plan = store_report_plan(records, settings.store_timezones_file, now=now,
         allow_unknown_timezone_history=getattr(settings, "allow_unconfigured_timezone_history", False))
+    try:
+        collection = collection_states(settings, existing)
+        notifications = {sid: state[0] for sid, state in notification_states(settings, existing).items()}
+    except StoreControlError:
+        collection = notifications = dict.fromkeys(existing)
     for item in plan:
-        store = existing[item["store_id"]]
+        sid = item["store_id"]
+        store = existing[sid]
         item["store_name"] = store.name if store else None
-        item["collection_ready"] = item["state"] == "READY"
+        item["collection_enabled"] = collection[sid]
+        item["notifications_enabled"] = notifications[sid]
+        item["collection_ready"] = item["state"] == "READY" and collection[sid] is True
         item["currency_code"] = getattr(store, "currency_code", None) or item["currency_code"] or None
         item["currency_confirmed"] = bool(item["currency_code"])
         item["analysis_ready"] = False

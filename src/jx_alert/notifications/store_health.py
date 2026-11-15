@@ -1,4 +1,5 @@
 """Read-only account-health briefs, scoped to the configured stores."""
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -125,7 +126,12 @@ def enqueue_store_health_brief(db, settings, *, now=None):
         return {"status": "REUSED", "outbox_ids": [r.id for r in existing],
                 "store_count": sum(len(r.payload["store_ids"]) for r in existing)}
     snapshots = health_brief_snapshots(db, settings, now=clock)
-    pages = build_health_brief_cards(snapshots["stores"], report_day=day)
+    from jx_alert.store_controls import notification_states
+    switches = notification_states(settings, (item["store_id"] for item in snapshots["stores"]))
+    selected = [item for item in snapshots["stores"] if switches[item["store_id"]][0]]
+    if snapshots["stores"] and not selected:
+        return {"status": "SKIPPED", "reason": "store_notifications_disabled", "outbox_ids": [], "store_count": 0}
+    pages = build_health_brief_cards(selected, report_day=day)
     ids = []
     # All pages commit together; a worker can never observe a partial brief.
     try:
@@ -145,5 +151,5 @@ def enqueue_store_health_brief(db, settings, *, now=None):
             raise
         return {"status": "REUSED", "outbox_ids": [r.id for r in existing],
                 "store_count": sum(len(r.payload["store_ids"]) for r in existing)}
-    return {"status": "QUEUED", "outbox_ids": ids, "store_count": snapshots["store_count"],
-            "status_counts": snapshots["status_counts"]}
+    return {"status": "QUEUED", "outbox_ids": ids, "store_count": len(selected),
+            "status_counts": dict(Counter(item["status"] for item in selected))}

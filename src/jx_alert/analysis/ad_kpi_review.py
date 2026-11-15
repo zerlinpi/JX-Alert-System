@@ -88,6 +88,9 @@ def submit_kpi_review(db, settings, review_id, findings, *, now=None):
     if clock > datetime.fromisoformat(meta["expires_at"]):
         raise ValueError("KPI review expired; fetch a fresh snapshot")
     context = meta["context"]
+    from jx_alert.store_controls import notifications_enabled
+    if findings and not notifications_enabled(settings, context["store_id"]):
+        return {"status": "SKIPPED", "reason": "该店铺已关闭飞书通知", "outbox_ids": []}
     store, zone = _ready_store(db, settings, context["store_id"], clock)
     if (context["policy"] != _policy(settings) or context["report_date"] != zone["report_date"]
             or context["timezone"] != zone["timezone"]):

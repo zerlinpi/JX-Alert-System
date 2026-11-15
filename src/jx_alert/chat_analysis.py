@@ -260,6 +260,9 @@ def submit_review(db, settings, review_id, findings, *, now=None):
     if clock > datetime.fromisoformat(meta["expires_at"]):
         raise ValueError("Analysis review expired; fetch a fresh snapshot")
     context = meta["context"]
+    from jx_alert.store_controls import notifications_enabled
+    if findings and not notifications_enabled(settings, context["store_id"]):
+        return {"status": "SKIPPED", "reason": "该店铺已关闭飞书通知", "outbox_ids": []}
     if context.get("comparison_policy_version") != COMPARISON_POLICY_VERSION:
         raise ValueError("Analysis comparison policy changed; fetch a fresh snapshot")
     policy = {"group_fallback_enabled": bool(getattr(settings, "feishu_group_fallback_enabled", False)),

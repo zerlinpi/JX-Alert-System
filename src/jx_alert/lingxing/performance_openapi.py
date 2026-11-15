@@ -590,6 +590,8 @@ def collect_store_performance(client, db, *, stores_response, settings):
     The notice request intentionally omits status/isRead/date filters so an
     incomplete filter can never hide a pending notice.
     """
+    from jx_alert.store_controls import collection_enabled
+
     store_rows = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(store_rows, list):
         raise RuntimeError("Lingxing seller-list response data must be an array")
@@ -608,6 +610,9 @@ def collect_store_performance(client, db, *, stores_response, settings):
             summary["errors"].append("seller-list row missing sid")
             continue
         store_id = str(sid)
+        if not collection_enabled(settings, store_id):
+            summary.setdefault("collection_disabled_store_ids", []).append(store_id)
+            continue
         try:
             result = _store_performance_for_sid(
                 client, db, sid, str(store.get("name") or sid), settings

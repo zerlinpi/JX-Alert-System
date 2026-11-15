@@ -15,6 +15,7 @@ from jx_alert.lingxing.report_dates import normalize_store_report_dates
 from jx_alert.lingxing.sales_collector import collect_sales_for_day
 from jx_alert.storage.models import RawSnapshot, SyncJob
 from jx_alert.storage.raw_archive import archive_raw_snapshots
+from jx_alert.store_controls import collection_states
 
 
 def ad_account_inventory(client):
@@ -50,6 +51,15 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
     store_rows = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(store_rows, list):
         raise RuntimeError("Lingxing seller-list response data must be an array")
+    switches = collection_states(settings, (str(row.get("sid")) for row in store_rows))
+    paused = {sid for sid, enabled in switches.items() if not enabled}
+    if paused:
+        store_rows = [row for row in store_rows if str(row.get("sid")) not in paused]
+        stores_response = {**stores_response, "data": store_rows}
+        if isinstance(report_dates, dict):
+            report_dates = {sid: day for sid, day in report_dates.items() if sid not in paused}
+        if not store_rows:
+            return {"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": sorted(paused)}
     ad_report_dates = {}
     for store in store_rows:
         if int(store.get("status") or 0) != 1 or int(store.get("has_ads_setting") or 0) != 1:
@@ -77,6 +87,8 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
     job_id = job.id
     completed_steps: list[str] = []
     results: dict = {}
+    if paused:
+        results["collection_disabled_store_ids"] = sorted(paused)
 
     def archive_excel(dates=report_dates):
         from jx_alert.reporting.archive import archive_partitions

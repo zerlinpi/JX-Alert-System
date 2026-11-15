@@ -14,6 +14,7 @@ from jx_alert.storage.db import SessionLocal, engine
 from jx_alert.storage.job_lock import database_job_lock
 from jx_alert.storage.models import RawSnapshot
 from jx_alert.storage.raw_archive import archive_raw_snapshots
+from jx_alert.store_controls import collection_states
 
 
 def main():
@@ -29,6 +30,12 @@ def main():
     settings = get_settings()
     if settings.app_dry_run or not settings.sb_sd_detail_reports_enabled:
         raise SystemExit("SB/SD detail collection is disabled")
+    switches = collection_states(settings, ids)
+    paused = sorted(sid for sid, enabled in switches.items() if not enabled)
+    ids.difference_update(paused)
+    if not ids:
+        print(json.dumps({"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": paused}))
+        return
     with database_job_lock(engine), SessionLocal() as db:
         client = LingxingClient.from_settings()
         scoped = scoped_stores(client.get_stores(), settings.collection_scope_file, allow_missing=True)
@@ -43,7 +50,7 @@ def main():
                                    stores_response={"data": stores},
                                    ad_currencies=account_currencies(client.seller_ad_accounts()))
         archive_raw_snapshots(db, settings.raw_dir, after_id=previous_snapshot_id)
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps({**result, "collection_disabled_store_ids": paused}, ensure_ascii=False))
     if result["failures"]:
         raise SystemExit(1)
 

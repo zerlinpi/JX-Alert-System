@@ -17,6 +17,7 @@ from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage import db as database
 from jx_alert.storage.db import Base
 from jx_alert.storage.models import DailyMetric, Store, SyncJob
+from jx_alert.store_controls import get_store_controls, save_store_controls
 
 
 DEADLINE = datetime(2026, 11, 13, 0, 0, tzinfo=timezone.utc)  # Beijing 08:00, LA previous-day 16:00
@@ -40,6 +41,7 @@ def setup(monkeypatch, tmp_path):
         feishu_daily_report_start_date="", feishu_daily_report_chat_id="reports",
         feishu_transport="app", feishu_routing_file=str(routing),
         collection_scope_file=str(scope), store_timezones_file=str(zones),
+        store_controls_file=str(tmp_path / "store-controls.json"),
         scheduler_enabled=True, app_timezone="UTC", daily_sync_cron="0 7 * * *",
         feishu_daily_report_cron="0 8 * * *", report_dir=str(tmp_path / "reports"),
         raw_dir=str(tmp_path / "raw"), sp_refresh_days=7, ad_attribution_refresh_days=22,
@@ -71,6 +73,20 @@ def capture_enqueues(monkeypatch):
 
     monkeypatch.setattr(daily_report, "enqueue_daily_snapshots", enqueue)
     return calls
+
+
+def test_scheduled_report_filters_notifications_independently_of_collection(setup):
+    settings, sessions, scope, _ = setup
+    scope.write_text('{"store_ids":[5174,5175]}', encoding="utf-8")
+    settings.feishu_daily_report_group_digest = True
+    save_store_controls(settings, "5174", True, False, get_store_controls(settings, "5174")["revision"])
+    save_store_controls(settings, "5175", False, True, get_store_controls(settings, "5175")["revision"])
+    result = operations.queue_scheduled_daily_reports(now=DEADLINE)
+    assert result["status"] == "QUEUED" and set(result["report_dates"]) == {"5175"}
+    assert result["notification_disabled_store_ids"] == ["5174"]
+    with sessions() as db:
+        row = db.get(NotificationOutbox, result["outbox_ids"][0])
+        assert row.payload["store_id"] == "5175"
 
 
 def test_before_beijing_deadline_never_reads_warehouse_or_calls_provider(setup, monkeypatch):

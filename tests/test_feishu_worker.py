@@ -9,6 +9,46 @@ from jx_alert.storage import models  # noqa: F401
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.models import NotificationLog, Product
 import jx_alert.notifications.worker as worker
+from jx_alert.store_controls import get_store_controls, save_store_controls
+
+
+def test_reenabled_notifications_skip_old_queued_pages_and_send_other_store(monkeypatch, tmp_path):
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(engine)
+    settings = SimpleNamespace(app_dry_run=False, feishu_enabled=True, feishu_transport="webhook",
+        feishu_timeout=10, feishu_routing_file=str(tmp_path / "none.json"),
+        feishu_webhook_url="https://example.test/webhook", feishu_sign_secret="", feishu_keyword="",
+        feishu_at_ids=lambda: [], store_controls_file=str(tmp_path / "store-controls.json"))
+    monkeypatch.setattr(worker, "SessionLocal", sessions)
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    sent = []
+
+    class FakeFeishu:
+        def __init__(self, **kwargs):
+            pass
+
+        def send_text(self, message, open_ids=None):
+            sent.append(message)
+            return {"code": 0}
+
+    monkeypatch.setattr(worker, "FeishuClient", FakeFeishu)
+    with sessions.begin() as db:
+        db.add_all([
+            NotificationOutbox(idempotency_key="old-page", payload={"text": "mixed", "store_ids": ["5174", "5175"]}),
+            NotificationOutbox(idempotency_key="unpaused", payload={"text": "other store", "store_id": "5175"}),
+        ])
+    original = get_store_controls(settings, "5174")
+    stopped = save_store_controls(settings, "5174", True, False, original["revision"])
+    save_store_controls(settings, "5174", True, True, stopped["revision"])
+    with sessions.begin() as db:
+        db.add(NotificationOutbox(idempotency_key="new-alert", payload={"text": "new alert", "store_id": "5174"}))
+    assert worker.process_outbox_batch()["sent"] == 2
+    assert sent == ["other store", "new alert"]
+    with sessions() as db:
+        states = {row.idempotency_key: row.status for row in db.scalars(select(NotificationOutbox))}
+        assert states == {"old-page": "SKIPPED", "unpaused": "DELIVERED", "new-alert": "DELIVERED"}
+        assert db.scalar(select(NotificationLog.status).where(NotificationLog.dedupe_key == "old-page")) == "SKIPPED"
 
 
 def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_path):

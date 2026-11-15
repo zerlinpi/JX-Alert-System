@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import or_, select, update
 
+from jx_alert.store_controls import collection_enabled, collection_states, notification_states
+
 
 def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -173,6 +175,8 @@ def collect_sp_targets(client, db, settings, report_dates, *, days=None, scope_s
         normalized.append((sid, campaign))
     runs = []
     for sid, campaign in normalized:
+        if not collection_enabled(settings, sid):
+            continue
         last = date.fromisoformat(report_dates[str(sid)])
         dates = [(last - timedelta(days=i)).isoformat()
                  for i in reversed(range(count))]
@@ -214,6 +218,11 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
             synced = sync_scoped_store_inventory(db, settings, inventory)
             db.commit()
         stores, plan = synced["stores_response"], synced["store_plan"]
+        switches = collection_states(settings, (x["store_id"] for x in plan))
+        paused = sorted(sid for sid, enabled in switches.items() if not enabled)
+        for item in plan:
+            if item["store_id"] in paused:
+                item.update(state="SKIPPED_COLLECTION_DISABLED", enabled=False)
         latest = {x["store_id"]: x["report_date"] for x in plan if x["state"] == "READY"}
         blocked = [x for x in plan if x["state"] != "READY"] + [
             {"store_id": sid, "enabled": True, "state": "SOURCE_STORE_MISSING"}
@@ -221,7 +230,9 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
         # Metadata is saved even for blocked stores, so the configured analysis
         # scope remains visible. No metric partition is fabricated for them.
         if not latest:
-            return {"status": "CONFIGURATION_BLOCKED", "store_plan": plan, "blocked_stores": blocked,
+            return {"status": ("SKIPPED_COLLECTION_DISABLED" if blocked and
+                    all(x["state"] == "SKIPPED_COLLECTION_DISABLED" for x in blocked)
+                    else "CONFIGURATION_BLOCKED"), "store_plan": plan, "blocked_stores": blocked,
                     "completed_store_ids": []}
         latest = _completed_dates(report_date, latest)
         scope_ids = {str(r["sid"]) for r in stores["data"]}
@@ -237,6 +248,11 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                 db.add(RawSnapshot(source="lingxing_seller_ad_accounts", payload={"rows": accounts}))
                 db.commit()
             for sid, day in latest.items():
+                if not collection_enabled(settings, sid):
+                    results[sid] = {"status": "SKIPPED_COLLECTION_DISABLED"}
+                    paused.append(sid)
+                    completed.discard(sid)
+                    continue
                 if sid in completed:
                     results[sid] = {"status": "REUSED_COMPLETED_CHECKPOINT"}
                     continue
@@ -250,11 +266,17 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                         if confirmed_timezone else {"status": "DISABLED_UNKNOWN_TIMEZONE", "runs": []})
                     sp_runs.extend(sp.get("runs", []))
                     for offset in range(backfill_days - 1, 0, -1):
+                        if not collection_enabled(settings, sid):
+                            break
                         older = (date.fromisoformat(day) - timedelta(days=offset)).isoformat()
                         collect_sales_for_day(client, db, {sid: older}, stores_response=one)
                     collected = collect_daily_snapshot(client, db, {sid: day}, stores_response=one,
                         settings=settings, ad_accounts=accounts,
                         ad_attribution_refresh_days=max(backfill_days, settings.ad_attribution_refresh_days))
+                    if collected["status"] == "SKIPPED_COLLECTION_DISABLED":
+                        results[sid] = collected
+                        paused.append(sid)
+                        continue
                     currency_state = _observed_sales_currency(db, sid)
                     db.commit()
                     analysis = evaluate_daily_anomalies(db, {sid: day})
@@ -277,9 +299,10 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                               "store_statuses": {s: r["status"] for s, r in results.items()}})
             archive = archive_raw_snapshots(db, settings.raw_dir)
         single = next(iter(results.values())) if len(results) == 1 else {}
-        return {"status": "PARTIAL" if failures else "COMPLETE_WITH_WARNINGS" if blocked or
+        return {"status": "PARTIAL" if failures else "COMPLETE_WITH_WARNINGS" if blocked or paused or
                 any(r["status"] == "COMPLETE_WITH_WARNINGS" for r in results.values()) else "COMPLETE",
                 "report_dates": latest, "store_plan": plan, "blocked_stores": blocked, "stores": results,
+                "collection_disabled_store_ids": sorted(set(paused)),
                 "completed_store_ids": sorted(completed), "failed_store_ids": failures,
                 "completed_store_dates": {sid: latest[sid] for sid in sorted(completed)},
                 "collection": single.get("collection", {"by_store": results}),
@@ -337,6 +360,12 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
     scope_ids = raw_scope.get("store_ids", []) if isinstance(raw_scope, dict) else []
     selected = scoped_stores({"data": [{"sid": str(sid)} for sid in scope_ids]}, scope_path)["data"]
     selected_ids = sorted({str(row["sid"]) for row in selected})
+    switches = notification_states(settings, selected_ids)
+    paused = [sid for sid in selected_ids if not switches[sid][0]]
+    selected_ids = [sid for sid in selected_ids if switches[sid][0]]
+    if paused and not selected_ids:
+        return {"status": "SKIPPED", "queued": 0, "outbox_ids": [],
+                "reason": "store_notifications_disabled", "notification_disabled_store_ids": paused}
     with SessionLocal() as db:
         stores = {store.sid: store for store in db.scalars(
             select(Store).where(Store.sid.in_(selected_ids)),
@@ -378,7 +407,8 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
     return {"status": "SKIPPED" if notifications.get("skipped") else "QUEUED",
             "delivery_date": delivery_now.date().isoformat(),
             "report_dates": report_dates, "store_plan": plan,
-            "blocked_stores": [x for x in plan if x["state"] != "READY"], **notifications}
+            "blocked_stores": [x for x in plan if x["state"] != "READY"],
+            "notification_disabled_store_ids": paused, **notifications}
 
 
 def enqueue_collection(db, *, report_date=None, backfill_days=1, idempotency_key=None):
@@ -402,8 +432,10 @@ def enqueue_collection(db, *, report_date=None, backfill_days=1, idempotency_key
         stores = scoped_stores({"data": candidates}, settings.collection_scope_file)
         plan = store_report_plan(stores["data"], settings.store_timezones_file,
             allow_unknown_timezone_history=getattr(settings, "allow_unconfigured_timezone_history", False))
-        latest = {x["store_id"]: x["report_date"] for x in plan if x["state"] == "READY"}
-        if not latest:
+        switches = collection_states(settings, (x["store_id"] for x in plan))
+        latest = {x["store_id"]: x["report_date"] for x in plan
+                  if x["state"] == "READY" and switches[x["store_id"]]}
+        if not latest and not any(not enabled for enabled in switches.values()):
             raise ValueError("No configured store dates are available")
         _completed_dates(report_date, latest)
     query = select(SyncJob).where(SyncJob.job_type == "manual_collection")
@@ -492,7 +524,7 @@ def process_pending_collection():
                 status = "SUCCEEDED_WITH_WARNINGS" if result["status"] == "COMPLETE_WITH_WARNINGS" else "SUCCEEDED"
                 args.pop("retry_at", None)
                 args.pop("error_type", None)
-            elif result["status"] == "DRY_RUN":
+            elif result["status"] in {"DRY_RUN", "SKIPPED_COLLECTION_DISABLED"}:
                 status = "SKIPPED"
             elif result["status"] == "CONFIGURATION_BLOCKED":
                 status = "BLOCKED"

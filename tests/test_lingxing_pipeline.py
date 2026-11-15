@@ -7,6 +7,20 @@ from jx_alert.storage.db import Base
 from jx_alert.storage import models  # noqa: F401
 from jx_alert.storage.models import DataCoverage, DailyMetric, SyncJob
 from jx_alert.lingxing.pipeline import collect_daily_snapshot
+from jx_alert.store_controls import get_store_controls, save_store_controls
+
+
+def test_pause_prevents_direct_daily_provider_calls_and_does_not_create_a_job(tmp_path):
+    settings = SimpleNamespace(store_controls_file=str(tmp_path / "store-controls.json"))
+    save_store_controls(settings, "101", False, True, get_store_controls(settings, "101")["revision"])
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine)() as db:
+        result = collect_daily_snapshot(object(), db, {"101": "2026-11-10"},
+            stores_response={"data": [{"sid": 101, "status": 1, "has_ads_setting": 1}]}, settings=settings)
+        assert result == {"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": ["101"]}
+        assert db.scalar(select(func.count()).select_from(SyncJob)) == 0
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) == 0
 
 
 class FakeDailyClient:

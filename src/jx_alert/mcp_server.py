@@ -1158,6 +1158,8 @@ def get_analysis_plan() -> dict:
     优先七日均值，七日不足且两日完整时使用前一日对比。
     未采集、授权异常或无可比证据单独标记。未确认时区只使用保守历史日期。
     小时任务先读此计划，逐店处理可用证据，分别记录未完整分析的店铺。
+    collection_enabled=false 表示暂停采集，已保存数据仍可分析。
+    notifications_enabled=false 时跳过该店铺的飞书推送。
     """
     from jx_alert.readiness import analysis_plan
     with SessionLocal() as db:
@@ -1243,13 +1245,14 @@ def _notification_guard(settings):
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
           meta=_tool_security("jx:read", "jx:notify"))
-def send_chat_report_to_feishu(title: str, markdown: str) -> dict:
+def send_chat_report_to_feishu(title: str, markdown: str, store_ids: list[str] | None = None) -> dict:
     """仅当用户明确要求发送时，将其指定的中文 Chat 报告原文发送到已配置的飞书日报群。
 
     使用原文 Markdown 保留标题、列表、粗体、表格，不添加额外说明或提及群成员。
     广告报告先用prepare_advertising_kpi_analysis取得七项指标及口径，保留未知状态。
     适用于经营日报或用户明确指定的报告。自动异常监控用submit_chat_analysis或submit_advertising_kpi_analysis，
     无异常时保持静默。发送前按用户指定范围检查内容，不把改善或持平列作异常。
+    store_ids 填写正文覆盖的所有店铺编号。报告不得包含已关闭通知的店铺，也不得省略其编号以绕过开关。
     返回通知编号和入队状态，实际送达用 get_notification_logs 核实。
     """
     settings = get_settings()
@@ -1258,7 +1261,7 @@ def send_chat_report_to_feishu(title: str, markdown: str) -> dict:
         return denied
     from jx_alert.notifications.chat_report import enqueue_chat_report
     with SessionLocal() as db:
-        result = enqueue_chat_report(db, settings, title=title, markdown=markdown)
+        result = enqueue_chat_report(db, settings, title=title, markdown=markdown, store_ids=store_ids)
         db.commit()
         return result
 
