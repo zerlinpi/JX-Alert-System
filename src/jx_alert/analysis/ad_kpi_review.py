@@ -6,6 +6,7 @@ import json
 from sqlalchemy import select
 
 from jx_alert.analysis.ad_kpis import advertising_kpis
+from jx_alert.analysis.materiality import materiality_enabled
 from jx_alert.chat_analysis import _chinese, _now, _scope
 from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card
 from jx_alert.notifications.outbox import enqueue_notification
@@ -21,7 +22,7 @@ def _policy(settings):
         "min_clicks": settings.alert_min_clicks, "min_spend": settings.alert_min_spend,
         "group": settings.feishu_daily_report_chat_id,
         "group_fallback": settings.feishu_group_fallback_enabled,
-        "materiality": getattr(settings, "alert_materiality_enabled", False), "version": 2,
+        "materiality": materiality_enabled(settings), "version": 2,
     }
 
 
@@ -143,7 +144,7 @@ def submit_kpi_review(db, settings, review_id, findings, *, now=None):
         key = "chat-ad-kpi:" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         row = enqueue_notification(db, idempotency_key=key, text=title + "：" + summary,
             store_id=store.sid, entity_id=entity_id, chat_id=delivery["receive_id"],
-            card=value, delivery=delivery, fixed_route=True)
+            card=value, delivery=delivery, fixed_route=True, material_ad_alert=materiality_enabled(settings))
         ids.append(row.id)
         titles.append(row.payload["card"]["header"]["title"]["content"])
     result = {"status": "QUEUED" if ids else "NO_ADVERSE_KPI",

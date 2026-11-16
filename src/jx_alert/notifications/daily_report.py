@@ -269,6 +269,9 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
     """
     if not getattr(settings, "feishu_daily_report_enabled", False):
         return {"queued": 0, "skipped": True, "outbox_ids": []}
+    from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_delivery
+    if delivery_date is None and quiet_delivery(settings):
+        return {"queued": 0, "skipped": True, "outbox_ids": [], "reason": QUIET_REASON}
     send_day = date.fromisoformat(delivery_date) if isinstance(delivery_date, str) else delivery_date
     due = local_now = None
     if send_day is not None:

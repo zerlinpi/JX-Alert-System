@@ -280,6 +280,7 @@ def _name_stores(warehouse, *, same_brand=False):
 
 @pytest.mark.parametrize("query", [
     "Geteen", "geteen 美国广告情况", "ＧＥＴＥＥＮ 美国", "梵界的情况", "Get 美国", "梵界 Geteen 主账号 US",
+    "Geteen美站SP花费", "Geteen PPC advertising spend",
 ])
 def test_store_name_and_brand_fragments_resolve_without_id(warehouse, query):
     _name_stores(warehouse)
@@ -347,6 +348,106 @@ def test_natural_inventory_uses_scoped_facts_without_model_or_provider(warehouse
         text = json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)
         assert 'Geteen' in text and '2026-11-12' in text and '有广告记录' in text
         assert 'Campx' not in text and '范围外店铺' not in text and '未匹配到店铺' not in text
+
+
+def _natural_reply(warehouse, question):
+    enqueue(warehouse, event('@_user_1 ' + question))
+    result = process(warehouse)
+    assert result['status'] == 'QUEUED' and FakeClient.calls == []
+    with warehouse[1]() as db:
+        assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == 'manual_collection')) is None
+        return json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)
+
+
+def test_natural_market_ad_spend_ranking_uses_the_saved_report_date(warehouse):
+    _name_stores(warehouse)
+    result = _natural_reply(warehouse, '美国店铺昨天广告花费排名')
+    assert '广告花费排名' in result and str(DAY) in result
+    assert '美元 300.00' in result and 'Geteen' in result
+    assert 'Campx' not in result and '范围外店铺' not in result
+
+
+def test_enabled_sp_query_answers_with_recently_observed_configuration(warehouse):
+    _name_stores(warehouse)
+    result = _natural_reply(warehouse, '查一下我有哪些店铺在投SP')
+    assert '已观测到启用广告的店铺' in result and '商品推广 1个' in result
+    assert 'Geteen' in result and '实际曝光请按报表日查询' in result
+    assert 'Campx' not in result and '范围外店铺' not in result and '品牌推广' not in result
+
+
+def test_sales_leader_excludes_missing_shops_without_treating_them_as_zero(warehouse):
+    _name_stores(warehouse)
+    result = _natural_reply(warehouse, '哪个店铺销售最高')
+    assert '店铺销售额排名' in result and '美元 2,000.00' in result
+    assert '已验证1/2家' in result and '尚未采集 1家' in result
+    assert 'Campx' not in result and '范围外店铺' not in result
+
+
+def test_foreign_currency_sales_have_separate_comparison_groups(warehouse):
+    _name_stores(warehouse)
+    with warehouse[1].begin() as db:
+        db.add(DataCoverage(store_id='5175', metric_date=DAY, dimension='store', status='COMPLETE', row_count=1))
+        db.add_all([DailyMetric(store_id='5175', metric_date=DAY, dimension='store', entity_id='5175',
+            metric_name=metric, value=value, currency=currency) for metric, value, currency in (
+                ('orders', 9, None), ('units', 9, None), ('sales', 3000, 'CAD'))])
+    result = _natural_reply(warehouse, '哪个店铺销售最高')
+    assert 'CAD' in result and 'USD' in result and result.count('店铺销售额排名') >= 2
+    assert '加元 3,000.00' in result and '美元 2,000.00' in result
+
+
+def test_unfinished_market_ad_question_avoids_a_historical_substitution(warehouse):
+    _name_stores(warehouse)
+    result = _natural_reply(warehouse, '美国店铺今天SP花费排行')
+    assert '报表日期尚未结束' in result and '美元 100.00' not in result
+
+
+@pytest.mark.parametrize('question,title', [
+    ('店铺今天健康怎么样', '店铺绩效与违规快报'),
+    ('店铺绩效', '店铺绩效与违规快报'),
+    ('广告有什么异常', '广告判断待补齐数据'),
+])
+def test_unspecified_health_or_ad_review_uses_operating_store_scope(warehouse, question, title):
+    _name_stores(warehouse)
+    result = _natural_reply(warehouse, question)
+    assert title in result and '未匹配到店铺' not in result and '范围外店铺' not in result
+
+
+def test_explicit_paused_market_can_answer_from_saved_data(warehouse):
+    from jx_alert.store_controls import get_store_controls, save_store_controls
+    _name_stores(warehouse)
+    settings = warehouse[0]
+    save_store_controls(settings, '5175', False, False, get_store_controls(settings, '5175')['revision'])
+    result = _natural_reply(warehouse, '加拿大店铺广告花费')
+    assert '尚未采集 1家' in result and 'Geteen' not in result
+
+
+@pytest.mark.parametrize('question,title,value', [
+    ('美国店铺最近7天SP广告花费', '商品推广花费', '美元 700.00'),
+    ('Geteen美国近七日销量趋势', '店铺销量', '11-06 12'),
+])
+def test_complete_period_query_returns_exact_dates_and_values(warehouse, question, title, value):
+    _name_stores(warehouse)
+    result = _natural_reply(warehouse, question)
+    assert '2026-11-06 至 2026-11-12' in result and title in result and value in result
+    assert '期间合计仅包含每天均有完整证据' in result
+
+
+def test_period_query_does_not_sum_partially_collected_days(warehouse):
+    _name_stores(warehouse)
+    with warehouse[1].begin() as db:
+        row = db.scalar(select(DataCoverage).where(DataCoverage.store_id == '5174',
+            DataCoverage.metric_date == DAY - timedelta(days=2), DataCoverage.dimension == 'campaign_sp'))
+        db.delete(row)
+    result = _natural_reply(warehouse, 'Geteen美国最近7天SP广告花费')
+    assert '广告报表尚未采集' in result and '美元 600.00' not in result
+
+
+def test_named_store_enabled_ads_list_contains_real_campaign_names(warehouse):
+    _name_stores(warehouse)
+    with warehouse[1].begin() as db:
+        db.add(Campaign(store_id='5174', campaign_type='sp', campaign_id='off', name='已暂停活动', state='paused'))
+    result = _natural_reply(warehouse, 'Geteen美国有哪些在投SP广告活动')
+    assert '测试活动' in result and '已暂停活动' not in result and '共1个' in result
 
 
 def test_historical_inventory_can_include_closed_stores_but_empty_source_is_not_data(warehouse):

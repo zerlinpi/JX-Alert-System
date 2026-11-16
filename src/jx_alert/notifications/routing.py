@@ -489,7 +489,7 @@ def application_deliveries(db, settings, *, store_id: str, entity_id: str,
 
 def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
                                    context: dict, roles: set[str] | None = None,
-                                   card: dict | None = None) -> dict:
+                                   card: dict | None = None, material_ad_alert: bool = False) -> dict:
     """Persist each destination or unresolved role once, in the event transaction."""
     from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
     from jx_alert.storage.models import NotificationLog
@@ -516,7 +516,7 @@ def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
             db, idempotency_key=key, text=text,
             store_id=context["store_id"], entity_id=context["entity_id"] or None,
             chat_id=delivery.get("receive_id", f"routing:{delivery['role']}"), delivery=delivery,
-            card=card,
+            card=card, material_ad_alert=material_ad_alert,
         )
         if failure and existing is None:
             row.status = "ROUTING_FAILED"
@@ -542,6 +542,9 @@ def repair_application_notification(db, settings, outbox_id: int) -> dict:
     if row is None or row.status != "ROUTING_FAILED":
         raise ValueError("Only a failed application routing job can be repaired")
     payload = row.payload
+    from jx_alert.notifications.quiet_policy import quiet_delivery, quiet_skip
+    if quiet_delivery(settings) and payload.get("material_ad_alert") is not True:
+        return quiet_skip()
     from jx_alert.notifications.store_policy import paused_delivery
     if paused_delivery(settings, payload, row.created_at):
         return {"status": "SKIPPED", "reason": "store_notifications_disabled", "outbox_ids": []}
@@ -551,7 +554,7 @@ def repair_application_notification(db, settings, outbox_id: int) -> dict:
         raise ValueError("Failed routing job has no valid repair context")
     result = enqueue_application_deliveries(
         db, settings, event_key=event_key, text=payload["text"], context=context, roles={role},
-        card=payload.get("card"),
+        card=payload.get("card"), material_ad_alert=payload.get("material_ad_alert") is True,
     )
     if not result["routing_failed"]:
         row.status = "SUPERSEDED"

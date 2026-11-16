@@ -127,6 +127,9 @@ def build_health_brief_cards(snapshots, *, report_day):
 
 def enqueue_store_health_brief(db, settings, *, now=None):
     """Queue an explicitly requested brief once per Beijing day and destination."""
+    from jx_alert.notifications.quiet_policy import quiet_delivery, quiet_skip
+    if quiet_delivery(settings):
+        return {**quiet_skip(), "store_count": 0}
     clock = now or datetime.now(timezone.utc)
     if clock.tzinfo is None:
         raise ValueError("Health brief requires an aware clock")

@@ -1,4 +1,4 @@
-"""Apply the owner's confirmed US report timezone without changing health source time."""
+"""Apply the owner's confirmed report timezone without changing health source time."""
 import argparse
 from datetime import datetime, timezone
 import json
@@ -27,11 +27,11 @@ def _replace(path, raw, stat):
         temporary.unlink(missing_ok=True)
 
 
-def set_us_timezones(db, config_path, *, apply=False):
+def set_us_timezones(db, config_path, *, apply=False, scoped_ids=None):
     """Commit file and DB metadata together, restoring the file on DB failure.
 
-    The caller must hold the existing daily-pipeline lock. Historical facts,
-    non-US rows, currency, collection controls and source-health time are untouched.
+    The caller holds the daily pipeline lock. By default update US stores. An
+    explicit scope applies the same timezone to every configured store in it.
     """
     path = Path(config_path)
     if path.is_symlink():
@@ -41,9 +41,14 @@ def set_us_timezones(db, config_path, *, apply=False):
     if not isinstance(document, dict) or not isinstance(document.get('stores'), dict):
         raise ValueError('Timezone configuration requires a stores object')
     stores = list(db.scalars(select(Store).order_by(Store.sid)))
-    selected = [s for s in stores if (s.country or '').strip().casefold() in US_COUNTRIES]
+    if scoped_ids is None:
+        selected = [s for s in stores if (s.country or '').strip().casefold() in US_COUNTRIES]
+    else:
+        selected = [s for s in stores if s.sid in scoped_ids]
+        if {s.sid for s in selected} != set(scoped_ids):
+            raise ValueError('All configured stores must be synchronized before assigning their timezone')
     if not selected:
-        raise ValueError('No explicitly identified US stores were found')
+        raise ValueError('No selected stores were found')
     previous = {s.sid: s.timezone for s in selected}
     changed = 0
     for store in selected:
@@ -52,11 +57,13 @@ def set_us_timezones(db, config_path, *, apply=False):
             raise ValueError('Invalid store timezone entry')
         changed += item.get('timezone') != US_ZONE
         document['stores'][store.sid] = {**item, 'timezone': US_ZONE}
-    result = {'applied': apply, 'us_stores': len(selected), 'config_changes': changed,
+    count_key = 'us_stores' if scoped_ids is None else 'scoped_stores'
+    result = {'applied': apply, count_key: len(selected), 'config_changes': changed,
               'database_changes': sum(s.timezone != US_ZONE for s in selected), 'backup_directory': None}
     if not apply or not (changed or result['database_changes']):
         return result
-    backup = path.parent / 'backups' / ('us-timezones-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid4().hex[:8])
+    prefix = 'us-timezones-' if scoped_ids is None else 'all-store-timezones-'
+    backup = path.parent / 'backups' / (prefix + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid4().hex[:8])
     backup.mkdir(parents=True, mode=0o700)
     for name, raw in [('store-timezones.before.json', original),
                       ('store-metadata.before.json', json.dumps(previous).encode())]:
@@ -86,13 +93,16 @@ def set_us_timezones(db, config_path, *, apply=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--all-stores', action='store_true', help='Use the entire configured collection scope')
     args = parser.parse_args()
     from jx_alert.config import get_settings
+    from jx_alert.operations import _checked_scope
     from jx_alert.storage.db import SessionLocal, engine
     from jx_alert.storage.job_lock import database_job_lock
     settings = get_settings()
     with database_job_lock(engine), SessionLocal() as db:
-        print(json.dumps(set_us_timezones(db, settings.store_timezones_file, apply=args.apply)))
+        scope = _checked_scope(settings, None) if args.all_stores else None
+        print(json.dumps(set_us_timezones(db, settings.store_timezones_file, apply=args.apply, scoped_ids=scope)))
 
 
 if __name__ == '__main__':

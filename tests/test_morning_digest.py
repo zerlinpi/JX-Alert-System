@@ -66,6 +66,22 @@ def test_daily_health_is_sent_without_normal_advertising_or_empty_optional_types
     assert all(term not in text for term in ('广告无异常', '品牌推广', '展示推广', '商品推广活动待复核'))
 
 
+def test_quiet_morning_keeps_health_observations_and_omits_separate_data_gap_message(warehouse):
+    db, settings, store = warehouse
+    settings.feishu_quiet_delivery_enabled = True
+    missing = DAY + timedelta(days=1)
+    result = enqueue_daily_snapshots(db, settings, store_dates={store.sid: missing},
+        delivery_date=NOW.date(), now=NOW, focused_morning=True)
+    assert len(result['outbox_ids']) == 1
+    row = db.get(NotificationOutbox, result['outbox_ids'][0])
+    assert row.payload['morning_message_kind'] == 'health'
+    text = json.dumps(row.payload['card'], ensure_ascii=False)
+    assert '源时区待确认' not in text and '时效待确认' in text
+    assert '2026-11-14 06:56:17' in text and '当前判定：待确认' in text
+    assert any(chunk[0]['header']['title']['content']=='广告判断待补齐数据' for chunk in morning_cards(
+        db, settings, [store], {store.sid: missing}, send_day=NOW.date(), now=NOW))
+
+
 def test_only_mature_zero_conversion_generates_a_specific_campaign_problem_with_all_kpis(warehouse):
     db, settings, store = warehouse
     change(db, 'orders', 0)  # Yesterday's immature zero is not a no-conversion warning.

@@ -197,7 +197,7 @@ def enqueue_group_question(db, settings, event_dict):
 
 
 _COUNTRY_NAMES = {
-    "美国": ("美国", "us", "usa", "united states"),
+    "美国": ("美国", "美站", "美区", "us", "usa", "united states"),
     "加拿大": ("加拿大", "ca", "canada"),
     "墨西哥": ("墨西哥", "mx", "mexico"),
     "巴西": ("巴西", "br", "brazil"),
@@ -208,6 +208,8 @@ _NAME_NOISE = {
     "主账号", "子账号", "主账户", "子账户", "账号", "账户", "店铺", "站点", "亚马逊",
     "实时", "采集", "查询", "查看", "分析", "广告", "绩效", "健康", "数据", "情况",
     "订单", "销量", "销售", "进度", "状态", "amazon", "amz", "llc", "inc", "ltd",
+    "sp", "sb", "sd", "ads", "advertising", "campaign", "campaigns", "ppc", "spend", "sales", "orders",
+    "budget", "clicks", "impressions", "performance", "show", "check", "report", "data", "today", "yesterday",
     "ctr", "cpc", "cdr", "cvr", "cps", "roas", "cpa", "tcoas", "tacos", "acos", "sku", "asin", "msku",
     *(alias for aliases in _COUNTRY_NAMES.values() for alias in aliases),
 }
@@ -231,16 +233,18 @@ def _name_parts(value):
     return result
 
 
+def _requested_countries(question):
+    return {label for label, aliases in _COUNTRY_NAMES.items() if any(
+        re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", question)
+        if alias.isascii() else alias in question for alias in aliases)}
+
+
 def _country_matches(question, country):
     for label, aliases in _COUNTRY_NAMES.items():
         if _name_text(country) in aliases:
             country = label
             break
-    requested = set()
-    for label, aliases in _COUNTRY_NAMES.items():
-        if any(re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", question)
-               if alias.isascii() else alias in question for alias in aliases):
-            requested.add(label)
+    requested = _requested_countries(question)
     return not requested or country in requested
 
 

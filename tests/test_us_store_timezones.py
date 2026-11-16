@@ -90,3 +90,15 @@ def test_config_is_restored_even_when_database_rollback_itself_fails(configured,
     with pytest.raises(RuntimeError, match='rollback failed'):
         script.set_us_timezones(db, path, apply=True)
     assert path.read_bytes() == before
+
+
+def test_all_store_mode_requires_complete_scope_and_excludes_other_database_rows(configured):
+    db, path = configured
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='must be synchronized'):
+        script.set_us_timezones(db, path, apply=True, scoped_ids={'1', '3', '99'})
+    assert path.read_bytes() == before
+    result = script.set_us_timezones(db, path, apply=True, scoped_ids={'1', '2', '3'})
+    assert result['scoped_stores'] == 3
+    assert db.get(Store, '3').timezone == script.US_ZONE and db.get(Store, '3').currency_code == 'CAD'
+    assert db.get(Store, '4').timezone == 'Europe/London'

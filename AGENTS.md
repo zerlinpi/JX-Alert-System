@@ -16,9 +16,9 @@
 - Daily reports supply daily accounting/attribution values. Hourly Stream data
   supplies intraday observations and reconciliation. Keep revisions and observed
   differences; never manufacture balancing rows or convert missing data to zero.
-- On 2026-11-16 the owner confirmed all explicitly identified US stores use
-  `America/Los_Angeles`. Analyze completed local dates and mature attribution
-  windows. Do not apply this to non-US stores or offset-free health source time.
+- The owner set every configured store's report timezone to
+  `America/Los_Angeles`. Analyze completed report dates and mature attribution
+  windows. Apply the separate source-time policy to offset-free health data.
 - Test Feishu in the explicitly selected group. The owner authorized missing
   administrator/operator/manager mappings to fall back to the verified report
   group without unverified mentions when `feishu_group_fallback_enabled=true`.
@@ -32,5 +32,6 @@
   Code rollback retains new historical evidence and never removes Docker volumes.
 - The user approved automatic health observation archiving only. Keep
   `lingxing_performance_observation_only=true`; even a FRESH source cannot create,
-  update, escalate, or recover health business alerts in this mode. Data-quality
-  notices are allowed. Business evaluation requires separate authorization.
+  update, escalate, or recover health business alerts in this mode. Preserve
+  data-quality observations in the warehouse. Follow the current Feishu policy
+  for outgoing messages. Business evaluation requires separate authorization.

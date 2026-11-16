@@ -171,8 +171,8 @@ def advertising_kpis(db, settings, store_id, target, *, dimension="store", entit
         ratio=getattr(settings, "alert_kpi_change_ratio", 0.15), maturity_days=lag,
         min_impressions=getattr(settings, "alert_kpi_min_impressions", 1000),
         min_spend=getattr(settings, "alert_min_spend", 20), store_scope=dimension == "store")
-    if getattr(settings, "alert_materiality_enabled", False):
-        from jx_alert.analysis.materiality import material_change, POLICY_VERSION
+    from jx_alert.analysis.materiality import material_change, materiality_enabled, POLICY_VERSION
+    if materiality_enabled(settings):
         for code, entry in comparisons.items():
             entry["notification_policy_version"] = POLICY_VERSION
             if entry["status"] == "ADVERSE" and not material_change(observed, entry["current_date"], code):

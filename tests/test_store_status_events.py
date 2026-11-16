@@ -34,3 +34,20 @@ def test_store_status_event_is_queued_and_recovers_when_status_returns_to_normal
             "店铺授权异常 · 重要", "店铺授权异常 · 已恢复",
         ]
         assert "请检查" not in notifications[1].payload["text"]
+
+
+def test_quiet_collection_records_authorization_failure_without_enqueuing_feishu(tmp_path, monkeypatch):
+    from jx_alert.analysis import service
+    from jx_alert.config import Settings
+
+    settings = Settings(_env_file=None, feishu_quiet_delivery_enabled=True, business_alert_delivery_mode="chat",
+                        store_controls_file=str(tmp_path / "controls.json"))
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine)() as db:
+        summary = evaluate_store_status_events(db, {"data": [{"sid": 101, "status": 2, "has_ads_setting": 1}]})
+        assert summary["non_normal_stores"] == 1
+        assert db.scalar(select(AnomalyEvent)).rule == "store_status_not_normal"
+        assert db.scalars(select(NotificationOutbox)).all() == []
+    engine.dispose()

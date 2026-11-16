@@ -15,8 +15,10 @@ from sqlalchemy import select
 
 from jx_alert.analysis.comparison import metric_comparison
 from jx_alert.analysis.ad_kpis import advertising_kpis
+from jx_alert.analysis.materiality import materiality_enabled
 from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card, number
 from jx_alert.notifications.outbox import enqueue_notification
+from jx_alert.notifications.quiet_policy import quiet_delivery, quiet_skip
 from jx_alert.notifications.routing import (
     _load_routing, _routed_open_ids, group_member_mentions, report_group_delivery,
 )
@@ -193,7 +195,7 @@ def prepare_review(db, settings, store_id, *, dimension="store", entity_id=None,
                "intraday_enabled": zone["intraday_enabled"], **comparison,
                "comparison_policy_version": COMPARISON_POLICY_VERSION,
                "notification_policy": {
-                   "materiality_enabled": bool(getattr(settings, "alert_materiality_enabled", False)),
+                   "materiality_enabled": bool(materiality_enabled(settings)),
                    "group_fallback_enabled": bool(getattr(settings, "feishu_group_fallback_enabled", False)),
                    "report_group_alias": settings.feishu_daily_report_chat_id},
                "missing_baseline_dates": missing_dates,
@@ -256,19 +258,22 @@ def submit_review(db, settings, review_id, findings, *, now=None):
     if job is None:
         raise ValueError("Unknown analysis review")
     meta = job.metadata_json
+    context = meta["context"]
+    is_ad = context["dimension"].startswith(_AD_PREFIXES)
+    if findings and quiet_delivery(settings) and not is_ad:
+        return quiet_skip()
     if job.status in {"REVIEWED", "INSUFFICIENT_DATA", "PARTIAL_REVIEW"}:
         if findings != meta["findings"]:
             raise ValueError("A completed review cannot be changed")
         return meta["result"]
     if clock > datetime.fromisoformat(meta["expires_at"]):
         raise ValueError("Analysis review expired; fetch a fresh snapshot")
-    context = meta["context"]
     from jx_alert.store_controls import notifications_enabled
     if findings and not notifications_enabled(settings, context["store_id"]):
         return {"status": "SKIPPED", "reason": "该店铺已关闭飞书通知", "outbox_ids": []}
     if context.get("comparison_policy_version") != COMPARISON_POLICY_VERSION:
         raise ValueError("Analysis comparison policy changed; fetch a fresh snapshot")
-    policy = {"materiality_enabled": bool(getattr(settings, "alert_materiality_enabled", False)),
+    policy = {"materiality_enabled": bool(materiality_enabled(settings)),
               "group_fallback_enabled": bool(getattr(settings, "feishu_group_fallback_enabled", False)),
               "report_group_alias": settings.feishu_daily_report_chat_id}
     if context.get("notification_policy") != policy:
@@ -299,7 +304,6 @@ def submit_review(db, settings, review_id, findings, *, now=None):
         evidence = [facts[i] for i in sorted(set(ids))]
         if len({(r["dimension"], r["entity_id"]) for r in evidence}) != 1 or len({r["date"] for r in evidence}) < 2:
             raise ValueError("Evidence must compare one entity and dimension across at least two dates")
-        is_ad = context["dimension"].startswith(_AD_PREFIXES)
         monetary = {r.get("currency") for r in evidence if r["metric"] in _MONEY_METRICS}
         if monetary and (len(monetary) != 1 or any(not isinstance(code, str)
                 or not re.fullmatch(r"[A-Z]{3}", code) for code in monetary)
@@ -330,7 +334,7 @@ def submit_review(db, settings, review_id, findings, *, now=None):
             if comparison is None:
                 skipped_nonnegative += 1
                 continue
-            if getattr(settings, "alert_materiality_enabled", False):
+            if materiality_enabled(settings):
                 from jx_alert.analysis.materiality import material_finding
                 if comparison["comparison_label"] == "归因成熟的连续七日":
                     sufficient = (sum(r["value"] for r in evidence if r["metric"] == "spend") >= 50
@@ -429,11 +433,11 @@ def submit_review(db, settings, review_id, findings, *, now=None):
         value = card(title, subtitle=subtitle, sections=sections)
         row = enqueue_notification(db, idempotency_key=key, text=title + "：" + summary + "；" + action,
             store_id=context["store_id"], entity_id=evidence[0]["entity_id"], chat_id=chat_id, card=value,
-            fixed_route=True, delivery=delivery)
+            fixed_route=True, delivery=delivery, material_ad_alert=is_ad and materiality_enabled(settings))
         ids.append(row.id)
         titles.append(row.payload["card"]["header"]["title"]["content"])
     result = {"status": "QUEUED" if ids else ("NO_ACTIONABLE_ANOMALY"
-                if findings and getattr(settings, "alert_materiality_enabled", False) else "NO_ANOMALY") if context["comparison_coverage"] == "COMPLETE"
+                if findings and materiality_enabled(settings) else "NO_ANOMALY") if context["comparison_coverage"] == "COMPLETE"
               else "PARTIAL_REVIEW" if context.get("data_sufficient") else "INSUFFICIENT_DATA",
               "outbox_ids": ids, "review_id": review_id, "finding_count": len(validated),
               "notification_titles": titles,

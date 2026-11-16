@@ -13,6 +13,7 @@ from jx_alert.notifications.routing import (
     _database_entity_open_ids as _routing_database_ids,
 )
 from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks
 from jx_alert.notifications.store_policy import paused_delivery
 from jx_alert.notifications.destination_policy import superseded_group_delivery
 from jx_alert.storage.db import SessionLocal
@@ -136,14 +137,14 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             else existing_chat_id
         )
         try:
-            skip_reason = None
-            if payload.get("transport") == "app":
+            skip_reason = QUIET_REASON if quiet_blocks(settings, dedupe_key, payload) else None
+            if skip_reason is None and payload.get("transport") == "app":
                 destination = payload.get("delivery") or {}
                 if destination.get("role") in {"group_question", "private_question"}:
                     from jx_alert.bot_service import validate_question_delivery
                     if not validate_question_delivery(settings, destination):
                         skip_reason = "原会话权限或通知群已变更，旧回复保留记录"
-                if superseded_group_delivery(settings, payload, created_at):
+                if skip_reason is None and superseded_group_delivery(settings, payload, created_at):
                     skip_reason = "通知群已更换，旧消息保留记录，不迁移或补发"
             if skip_reason is None and paused_delivery(settings, payload, created_at):
                 skip_reason = "店铺通知已停用，旧消息保留记录"

@@ -29,7 +29,8 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
                          delivery: dict | None = None,
                          card: dict | None = None,
                          fixed_route: bool = False,
-                         store_ids: list[str] | None = None) -> NotificationOutbox:
+                         store_ids: list[str] | None = None,
+                         material_ad_alert: bool = False) -> NotificationOutbox:
     """Insert once per idempotency key, safely handling concurrent producers."""
     existing = db.scalar(
         select(NotificationOutbox).where(
@@ -52,6 +53,8 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
         row.payload = {**row.payload, "store_ids": store_ids}
     if card is not None:
         row.payload = {**row.payload, "card": card}
+    if material_ad_alert:
+        row.payload = {**row.payload, "material_ad_alert": True}
     if delivery is not None:
         row.payload = {**row.payload, "transport": "app", "delivery": delivery}
     try:

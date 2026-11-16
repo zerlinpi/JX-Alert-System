@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     feishu_daily_report_group_digest: bool = False
     # Requested daily health/violation brief plus material SP exceptions only.
     feishu_morning_focus_enabled: bool = False
+    feishu_quiet_delivery_enabled: bool = False
     # Refresh enough marketplace-local dates for the 14-day attribution window plus its 7-day baseline.
     ad_attribution_refresh_days: int = Field(default=22, ge=1, le=31)
     sb_sd_detail_reports_enabled: bool = True
@@ -189,7 +190,7 @@ def get_settings() -> Settings:
             "sp_refresh_days", "mcp_operations_enabled", "mcp_notifications_enabled", "feishu_enabled", "feishu_transport",
             "feishu_group_fallback_enabled",
             "feishu_manager_open_ids", "feishu_daily_report_enabled", "feishu_daily_report_chat_id",
-            "feishu_morning_focus_enabled",
+            "feishu_morning_focus_enabled", "feishu_quiet_delivery_enabled",
             "lingxing_performance_enabled", "lingxing_performance_source_timezone",
             "lingxing_performance_observation_only",
             "mcp_allowed_hosts", "mcp_allowed_origins",
