@@ -197,15 +197,19 @@ class FeishuAppClient:
         }
         return self._send_message_payload(payload, receive_id_type)
 
-    def reply_card(self, message_id: str, card: dict, *, idempotency_key: str) -> dict:
-        """Reply in the original question's thread with a stable retry UUID."""
+    def reply_card(self, message_id: str, card: dict, *, idempotency_key: str,
+                   reply_in_thread: bool = True) -> dict:
+        """Reply to the original question, keeping private replies in the main chat."""
         from jx_alert.notifications.cards import with_mentions
         if not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]+", message_id):
             raise ValueError("Feishu reply requires a valid original message ID")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("Feishu reply requires an idempotency key")
+        if type(reply_in_thread) is not bool:
+            raise ValueError("Feishu reply_in_thread must be a boolean")
         payload = {"msg_type": "interactive", "content": json.dumps(with_mentions(card, []), ensure_ascii=False),
-                   "uuid": hashlib.sha256(idempotency_key.encode()).hexdigest()[:40], "reply_in_thread": True}
+                   "uuid": hashlib.sha256(idempotency_key.encode()).hexdigest()[:40],
+                   "reply_in_thread": reply_in_thread}
         return self._send_message_payload(payload, None, path=f"{self._MESSAGE_PATH}/{message_id}/reply")
 
     def _send_message_payload(self, payload, receive_id_type, *, path=None):

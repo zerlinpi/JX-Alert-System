@@ -20,7 +20,7 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from jx_alert import admin_data, admin_mapping, store_controls
+from jx_alert import admin_data, admin_groups, admin_mapping, store_controls
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import Store
@@ -287,7 +287,16 @@ class OwnerConsole:
                     _cookie(response, SESSION, "", 0)
                     return response
                 payload = await _body(request, "application/json")
-                if path.endswith("/controls"):
+                if path in {"/console/api/notification-group", "/console/api/notification-group/preview"}:
+                    preview = path.endswith("/preview")
+                    expected_fields = {"chat_id", "revision"} if preview else {"chat_id", "revision", "confirmed"}
+                    if set(payload) != expected_fields:
+                        raise ConsoleError("提交内容无效。", 400)
+                    if not self._rate_allowed(request, "notification-group-write", per_ip=8, total=16):
+                        raise ConsoleError("群设置操作太频繁，请稍后重试。", 429)
+                    action = admin_groups.preview_notification_group if preview else admin_groups.save_notification_group
+                    data = await asyncio.to_thread(action, self.settings, **payload)
+                elif path.endswith("/controls"):
                     if set(payload) != {"collection_enabled", "notifications_enabled", "revision"}:
                         raise ConsoleError("提交内容无效。", 400)
                     if not self._rate_allowed(request, "controls", per_ip=12, total=24):
@@ -299,6 +308,13 @@ class OwnerConsole:
                     if not self._rate_allowed(request, "mapping", per_ip=12, total=24):
                         raise ConsoleError("操作太频繁，请稍后重试。", 429)
                     data = await asyncio.to_thread(self._mapping, sid, "owners", payload)
+            elif path.startswith("/console/api/notification-group"):
+                if path.endswith("/chats"):
+                    if not self._rate_allowed(request, "notification-group-list", per_ip=12, total=24):
+                        raise ConsoleError("群列表刷新太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(admin_groups.list_notification_groups, self.settings)
+                else:
+                    data = await asyncio.to_thread(admin_groups.current_notification_group, self.settings)
             elif path.endswith("/members"):
                 if not self._rate_allowed(request, "members", per_ip=24, total=48):
                     raise ConsoleError("成员加载太频繁，请稍后重试。", 429)
@@ -323,6 +339,9 @@ class OwnerConsole:
         return [Route("/console", self.home), Route("/console/", self.home),
                 Route("/console/login", self.login, methods=["GET", "POST"]),
                 Route("/console/assets/{asset}", self.asset), Route("/console/api/stores", self.api),
+                Route("/console/api/notification-group", self.api, methods=["GET", "POST"]),
+                Route("/console/api/notification-group/chats", self.api),
+                Route("/console/api/notification-group/preview", self.api, methods=["POST"]),
                 Route("/console/api/stores/{sid}", self.api), Route("/console/api/stores/{sid}/members", self.api),
                 Route("/console/api/stores/{sid}/owners", self.api, methods=["POST"]),
                 Route("/console/api/stores/{sid}/controls", self.api, methods=["POST"]),

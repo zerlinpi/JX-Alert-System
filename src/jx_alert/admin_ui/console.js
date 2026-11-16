@@ -15,6 +15,7 @@ const state = {
   storeSeq: 0, detailSeq: 0, memberSeq: 0, members: null, revision: null,
   selected: new Set(), saving: false, controlsDraft: null, controlsSaving: false, controlsLoading: false,
   controlsSeq: 0,
+  groups: { current: null, chats: [], preview: null, saving: false, loading: false, seq: 0 },
 };
 
 function node(tag, text, name) {
@@ -483,8 +484,12 @@ function renderRouting() {
 
 function renderView() {
   const owners = state.view === "owners";
-  $("page-title").textContent = owners ? "负责人映射" : "经营概览";
-  $("page-description").textContent = owners ? "按店铺管理接收异常提醒的飞书负责人。" : "查看各店铺的销售、广告与账户绩效。";
+  const groups = state.view === "notification-group";
+  $("page-title").textContent = groups ? "通知群设置" : owners ? "负责人映射" : "经营概览";
+  $("page-description").textContent = groups ? "管理接收日报和默认提醒的飞书群聊。" : owners ? "按店铺管理接收异常提醒的飞书负责人。" : "查看各店铺的销售、广告与账户绩效。";
+  $("notification-group-panel").hidden = !groups;
+  $("store-stats").hidden = groups;
+  $("store-board").hidden = groups;
   for (const tab of document.querySelectorAll("[data-view]")) {
     if (tab.dataset.view === state.view) tab.setAttribute("aria-current", "page");
     else tab.removeAttribute("aria-current");
@@ -498,6 +503,106 @@ async function setView(view) {
   state.view = view;
   renderView();
   if (view === "owners" && state.data && !state.members) await loadMembers();
+  if (view === "notification-group" && !state.groups.current) await loadGroups();
+}
+
+function updateGroupSelection() {
+  const group = state.groups;
+  const busy = group.loading || group.saving;
+  $("notification-group-panel").setAttribute("aria-busy", String(busy));
+  $("notification-group-select").disabled = busy || !group.chats.length;
+  $("reload-groups").disabled = busy;
+  $("preview-group").disabled = busy || !group.current || !$("notification-group-select").value;
+  $("confirm-group-change").disabled = busy || !group.preview;
+  $("save-notification-group").disabled = busy || !group.preview || !$("confirm-group-change").checked || !state.csrf;
+  $("current-notification-group").textContent = group.current?.name || (group.loading ? "正在读取…" : "暂时无法读取");
+}
+
+function clearGroupPreview() {
+  state.groups.preview = null;
+  $("confirm-group-change").checked = false;
+  $("group-impact").hidden = true;
+  updateGroupSelection();
+}
+
+async function loadGroups() {
+  const group = state.groups;
+  if (group.saving) return;
+  const seq = ++group.seq;
+  group.loading = true;
+  group.current = null;
+  group.chats = [];
+  clearGroupPreview();
+  notice("group-settings-status", "正在读取机器人已加入的群…");
+  try {
+    const current = await api("notification-group");
+    if (seq !== group.seq) return;
+    group.current = current;
+    updateGroupSelection();
+    const result = await api("notification-group/chats");
+    if (seq !== group.seq) return;
+    group.current = result;
+    group.chats = result.chats || [];
+    const options = group.chats.map((chat) => {
+      const duplicate = group.chats.filter((item) => item.name === chat.name).length > 1;
+      const option = node("option", `${chat.name}${duplicate ? ` · …${chat.id.slice(-6)}` : ""}${chat.id === result.chat_id ? "（当前）" : ""}`);
+      option.value = chat.id;
+      return option;
+    });
+    const placeholder = node("option", "请选择目标群");
+    placeholder.value = "";
+    $("notification-group-select").replaceChildren(placeholder, ...options);
+    $("notification-group-select").value = "";
+    notice("group-settings-status", group.chats.length ? "" : "未读取到机器人已加入的群，请添加机器人后刷新。");
+  } catch (error) {
+    if (seq === group.seq) notice("group-settings-status", error.message || "群列表读取失败。", "error");
+  } finally {
+    if (seq === group.seq) { group.loading = false; updateGroupSelection(); }
+  }
+}
+
+async function previewGroup() {
+  const group = state.groups;
+  if (!group.current || group.loading || group.saving || !state.csrf) return;
+  const chat = $("notification-group-select").value;
+  if (!chat) return;
+  group.loading = true;
+  clearGroupPreview();
+  notice("group-settings-status", "正在核对目标群和人员映射…");
+  try {
+    const result = await api("notification-group/preview", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf },
+      body: JSON.stringify({ chat_id: chat, revision: group.current.revision }),
+    });
+    group.preview = result;
+    $("group-impact-summary").textContent = `${result.previous_name} → ${result.name}；保留管理员 ${result.retained_administrators} 人，移除群外管理员 ${result.removed_administrators} 人，${result.outside_owner_count} 位已映射负责人不在目标群。`;
+    $("group-impact").hidden = false;
+    notice("group-settings-status");
+  } catch (error) {
+    notice("group-settings-status", error.message || "无法核对目标群。", "error");
+  } finally { group.loading = false; updateGroupSelection(); }
+}
+
+async function saveNotificationGroup() {
+  const group = state.groups;
+  if (!group.preview || group.loading || group.saving || $("save-notification-group").disabled) return;
+  group.saving = true;
+  updateGroupSelection();
+  notice("group-settings-status", "正在保存通知群…");
+  try {
+    const result = await api("notification-group", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf },
+      body: JSON.stringify({ chat_id: group.preview.chat_id, revision: group.preview.revision, confirmed: true }),
+    });
+    group.current = result;
+    clearGroupPreview();
+    $("notification-group-select").value = "";
+    notice("group-settings-status", `通知群已保存为「${result.name}」，后续通知使用新配置。`, "success");
+    await loadStores();
+  } catch (error) {
+    clearGroupPreview();
+    notice("group-settings-status", error.message || "通知群保存失败。", "error");
+  } finally { group.saving = false; updateGroupSelection(); }
 }
 
 function ownerIDs() {
@@ -628,7 +733,12 @@ $("stores").addEventListener("click", (event) => {
 });
 $("store-search").addEventListener("input", renderStoreList);
 $("store-filter").addEventListener("change", renderStoreList);
-$("refresh").addEventListener("click", loadStores);
+$("refresh").addEventListener("click", () => state.view === "notification-group" ? loadGroups() : loadStores());
+$("reload-groups").addEventListener("click", loadGroups);
+$("notification-group-select").addEventListener("change", () => { clearGroupPreview(); notice("group-settings-status"); });
+$("preview-group").addEventListener("click", previewGroup);
+$("confirm-group-change").addEventListener("change", updateGroupSelection);
+$("save-notification-group").addEventListener("click", saveNotificationGroup);
 for (const button of document.querySelectorAll("[data-view]")) {
   button.addEventListener("click", () => setView(button.dataset.view));
 }

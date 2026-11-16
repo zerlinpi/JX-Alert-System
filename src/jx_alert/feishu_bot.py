@@ -150,16 +150,53 @@ def is_mentioned_question(data, *, app_id, bot_open_id, chat_id, tenant_key=""):
             and bool(content["text"].strip()) and len(content["text"]) <= 4000)
 
 
+def is_private_question(data, *, app_id, bot_open_id, tenant_key=""):
+    """Accept a human private text envelope; the worker authorizes its reader."""
+    if not isinstance(data, dict) or data.get("schema") != "2.0":
+        return False
+    header, event = data.get("header"), data.get("event")
+    if not isinstance(header, dict) or not isinstance(event, dict):
+        return False
+    if header.get("app_id") != app_id or header.get("event_type") != "im.message.receive_v1":
+        return False
+    if tenant_key and header.get("tenant_key") != tenant_key:
+        return False
+    sender, message = event.get("sender"), event.get("message")
+    if not isinstance(sender, dict) or sender.get("sender_type") != "user" or not isinstance(message, dict):
+        return False
+    ids = sender.get("sender_id")
+    uid = ids.get("open_id") if isinstance(ids, dict) else None
+    if (not isinstance(uid, str) or not _OPEN_ID.fullmatch(uid) or uid == bot_open_id
+            or not isinstance(bot_open_id, str) or not _OPEN_ID.fullmatch(bot_open_id)
+            or message.get("chat_type") != "p2p" or message.get("message_type") != "text"
+            or not isinstance(message.get("chat_id"), str)
+            or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", message["chat_id"])
+            or not isinstance(message.get("message_id"), str)
+            or not re.fullmatch(r"om_[A-Za-z0-9_-]+", message["message_id"])):
+        return False
+    try:
+        content = json.loads(message.get("content", ""))
+    except (TypeError, ValueError):
+        return False
+    return (isinstance(content, dict) and isinstance(content.get("text"), str)
+            and bool(content["text"].strip()) and len(content["text"]) <= 1200)
+
+
 def build_event_callback(settings, *, app_id, bot_open_id, chat_id, sdk=None,
-                         sessions=None, enqueue=None):
+                         sessions=None, enqueue=None, route_resolver=None):
     """The SDK callback only commits the event; the separate worker analyzes it."""
     def receive(data):
         try:
             event = event_to_dict(data, sdk=sdk)
         except (TypeError, ValueError, OverflowError):
             return
-        if not is_mentioned_question(event, app_id=app_id, bot_open_id=bot_open_id,
-                chat_id=chat_id, tenant_key=getattr(settings, "feishu_bot_tenant_key", "")):
+        # Resolve the persisted destination for every event, so a console group
+        # switch does not leave intake pinned to the process's startup group.
+        current_chat = route_resolver() if route_resolver is not None else chat_id
+        tenant = getattr(settings, "feishu_bot_tenant_key", "")
+        if not (is_mentioned_question(event, app_id=app_id, bot_open_id=bot_open_id,
+                chat_id=current_chat, tenant_key=tenant) or is_private_question(
+                event, app_id=app_id, bot_open_id=bot_open_id, tenant_key=tenant)):
             return
         session_factory, enqueue_question = sessions, enqueue
         if session_factory is None:
@@ -207,7 +244,9 @@ def run_bot(settings):
     sdk = _load_sdk()
     _install_safe_sdk_logging()
     callback = build_event_callback(settings, app_id=credentials._app_id,
-        bot_open_id=identity, chat_id=route["receive_id"], sdk=sdk)
+        bot_open_id=identity, chat_id=route["receive_id"], sdk=sdk,
+        route_resolver=lambda: report_group_delivery(settings,
+            _load_routing(settings.feishu_routing_file), role="group_questions")["receive_id"])
     handler = sdk.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(callback).build()
     client = sdk.ws.Client(credentials._app_id, credentials._app_secret,

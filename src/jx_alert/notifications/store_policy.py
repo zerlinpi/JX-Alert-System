@@ -7,7 +7,7 @@ from jx_alert.store_controls import notification_states
 def paused_delivery(settings, payload, created_at):
     delivery = payload.get("delivery") or {}
     role = delivery.get("role")
-    if role == "group_question" and delivery.get("reply_to_message_id"):
+    if role in {"group_question", "private_question"} and delivery.get("reply_to_message_id"):
         return False
     ids = payload.get("store_ids") or []
     if payload.get("store_id"):
