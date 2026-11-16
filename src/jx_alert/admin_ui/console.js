@@ -15,6 +15,7 @@ const state = {
   storeSeq: 0, detailSeq: 0, memberSeq: 0, members: null, revision: null,
   selected: new Set(), saving: false, controlsDraft: null, controlsSaving: false, controlsLoading: false,
   controlsSeq: 0,
+  collectionSeq: 0, collectionBusy: false, collectionTimer: null,
   groups: { current: null, chats: [], preview: null, saving: false, loading: false, seq: 0 },
 };
 
@@ -184,6 +185,9 @@ async function selectStore(sid, date) {
   const seq = ++state.detailSeq;
   ++state.memberSeq;
   ++state.controlsSeq;
+  ++state.collectionSeq;
+  clearTimeout(state.collectionTimer);
+  state.collectionBusy = false;
   state.sid = sid;
   state.data = null;
   state.members = null;
@@ -277,6 +281,7 @@ function renderDetail() {
   renderTrend();
   renderRouting();
   renderControls();
+  renderCollection();
   $("detail-placeholder").hidden = true;
   $("detail-content").hidden = false;
   renderView();
@@ -285,6 +290,58 @@ function renderDetail() {
 function validControls(controls) {
   return controls && typeof controls.collection_enabled === "boolean"
     && typeof controls.notifications_enabled === "boolean" && /^[0-9a-f]{64}$/.test(controls.revision || "");
+}
+
+function renderCollection() {
+  const receipt = state.data?.collection;
+  const active = receipt && ["PENDING", "RUNNING"].includes(receipt.status);
+  const controls = state.data?.controls;
+  $("sync-latest").disabled = state.collectionBusy || active || !state.csrf
+    || !validControls(controls) || !controls.collection_enabled;
+  $("collection-refresh").disabled = state.collectionBusy || !state.data;
+  if (!receipt || receipt.status === "NONE") { notice("collection-status"); return; }
+  const parts = [receipt.status_label];
+  if (receipt.report_date) parts.push(`实际报表日 ${receipt.report_date}`);
+  if (receipt.retry_at) {
+    const stamp = new Date(`${receipt.retry_at}Z`);
+    if (!Number.isNaN(stamp.getTime())) parts.push(`最早重试 ${stamp.toLocaleTimeString("zh-CN")}`);
+  }
+  if (["SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"].includes(receipt.status)) parts.push("可点击回到最新查看数据");
+  notice("collection-status", parts.join(" · "), /FAILED|BLOCKED/.test(receipt.status) ? "error" : "info");
+}
+
+async function collectionStatus({ start = false, polls = 0 } = {}) {
+  if (!state.sid || !state.data || state.collectionBusy) return;
+  const sid = state.sid;
+  const seq = state.collectionSeq;
+  state.collectionBusy = true;
+  let failed = false;
+  clearTimeout(state.collectionTimer);
+  renderCollection();
+  try {
+    const options = start ? { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: "{}" } : undefined;
+    const receipt = await api(`stores/${encodeURIComponent(sid)}/collection`, options);
+    if (seq !== state.collectionSeq || sid !== state.sid) return;
+    state.data.collection = receipt;
+    if (["PENDING", "RUNNING"].includes(receipt.status) && polls < 30) {
+      state.collectionTimer = setTimeout(() => void collectionStatus({ polls: polls + 1 }), 10000);
+    }
+  } catch (error) {
+    failed = true;
+    if (seq === state.collectionSeq) notice("collection-status", error.message || "暂时无法同步，请稍后重试。", "error");
+  } finally {
+    if (seq === state.collectionSeq) {
+      state.collectionBusy = false;
+      // Preserve an explicit request error until the next successful status read.
+      const receipt = state.data?.collection;
+      if (!failed && receipt && receipt.status !== "NONE") renderCollection();
+      else {
+        $("sync-latest").disabled = !state.csrf || ["PENDING", "RUNNING"].includes(receipt?.status)
+          || !validControls(state.data?.controls) || !state.data.controls.collection_enabled;
+        $("collection-refresh").disabled = false;
+      }
+    }
+  }
 }
 
 function controlBadges(controls) {
@@ -325,6 +382,7 @@ function renderControls() {
   $("store-control-badges").replaceChildren(...controlBadges(controls));
   notice("controls-status", validControls(controls) ? "" : "开关状态暂时不可用，历史数据仍可查看。", "error");
   updateControls();
+  renderCollection();
 }
 
 function acceptControls(sid, controls) {
@@ -761,6 +819,8 @@ $("date-form").addEventListener("submit", (event) => {
   if (state.sid && $("report-date").value) void selectStore(state.sid, $("report-date").value);
 });
 $("latest-date").addEventListener("click", () => { if (state.sid) void selectStore(state.sid); });
+$("sync-latest").addEventListener("click", () => { if (!$("sync-latest").disabled) void collectionStatus({ start: true }); });
+$("collection-refresh").addEventListener("click", () => void collectionStatus());
 for (const button of document.querySelectorAll("[data-metric]")) {
   button.addEventListener("click", () => {
     state.metric = button.dataset.metric;

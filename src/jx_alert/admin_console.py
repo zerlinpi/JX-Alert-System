@@ -19,11 +19,12 @@ from urllib.parse import parse_qsl, urlsplit
 from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
+from sqlalchemy import select
 
 from jx_alert import admin_data, admin_groups, admin_mapping, store_controls
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
 from jx_alert.storage.db import SessionLocal
-from jx_alert.storage.models import Store
+from jx_alert.storage.models import Store, SyncJob
 
 
 SESSION = "__Host-jx-console-session"
@@ -242,7 +243,54 @@ class OwnerConsole:
             except store_controls.StoreControlError as exc:
                 controls = self._unknown_controls(exc)
             return {"store": admin_data.store_row(sid, store, {"owner_count": owner_count,
-                     "group": mapping["group"]}), **data, "routing": mapping, "controls": controls}
+                     "group": mapping["group"]}), **data, "routing": mapping, "controls": controls,
+                    "collection": self._collection_receipt(db, sid)}
+
+    @staticmethod
+    def _collection_receipt(db, sid):
+        """Return only the selected store's durable, bounded manual-job status."""
+        labels = {"PENDING": "等待采集", "RUNNING": "正在同步", "SUCCEEDED": "同步完成",
+                  "SUCCEEDED_WITH_WARNINGS": "同步完成，部分数据待核查", "PARTIAL_FAILED": "部分采集失败",
+                  "FAILED": "同步失败", "SKIPPED": "已停止同步", "BLOCKED": "同步条件待核实"}
+        candidates = db.scalars(select(SyncJob).where(SyncJob.job_type == 'manual_collection',
+            SyncJob.metadata_json['store_ids'][0].as_string() == sid).order_by(SyncJob.id.desc()).limit(100))
+        for job in candidates:
+            args = job.metadata_json or {}
+            if args.get('store_ids') != [sid]:
+                continue
+            result = args.get('result') if isinstance(args.get('result'), dict) else {}
+            dates = result.get('report_dates') or args.get('planned_store_dates') or {}
+            due = dates.get(sid) if isinstance(dates, dict) else None
+            retry = args.get('retry_at') if job.status == 'PENDING' else None
+            return {'job_id': job.id, 'status': job.status,
+                    'status_label': '等待重试' if retry else labels.get(job.status, '状态待确认'),
+                    'report_date': due, 'retry_at': retry}
+        return {'job_id': None, 'status': 'NONE', 'status_label': '尚未手动同步', 'report_date': None, 'retry_at': None}
+
+    def _collection(self, sid, *, enqueue=False):
+        self._selected(sid)
+        from jx_alert.operations import enqueue_collection, CollectionConfigurationError, CollectionBlocked
+        if enqueue and (self.settings.app_dry_run or not self.settings.scheduler_enabled
+                        or not self.settings.mcp_operations_enabled):
+            raise ConsoleError('手动同步服务尚未开启，请先核实调度和主动采集开关。', 409)
+        with self.session_factory() as db:
+            if db.get(Store, sid) is None:
+                raise ConsoleError('该店铺尚未完成同步。', 404)
+            if enqueue:
+                try:
+                    queued = enqueue_collection(db, store_ids=[sid], backfill_days=2)
+                except CollectionBlocked as exc:
+                    labels = {'SKIPPED_COLLECTION_DISABLED': '该店铺采集已关闭，请先开启数据采集。',
+                              'AUTHORIZATION_FAILED': '该店铺授权失败，请先恢复领星授权。',
+                              'STORE_UNAVAILABLE': '该店铺未启用，无法开始同步。',
+                              'WAITING_TIMEZONE': '店铺报表时区待确认，尚不能同步最新完整日报。'}
+                    raise ConsoleError(labels.get(exc.status, '该店铺采集条件未满足，请核实授权、范围和时区。'), 409) from None
+                except CollectionConfigurationError:
+                    raise ConsoleError('采集范围或报表日期配置待核实，暂未开始同步。', 409) from None
+                db.commit()
+                receipt = self._collection_receipt(db, sid)
+                return {**receipt, 'reused': queued['reused']}
+            return self._collection_receipt(db, sid)
 
     def _save_controls(self, sid, payload):
         self._selected(sid)
@@ -296,6 +344,12 @@ class OwnerConsole:
                         raise ConsoleError("群设置操作太频繁，请稍后重试。", 429)
                     action = admin_groups.preview_notification_group if preview else admin_groups.save_notification_group
                     data = await asyncio.to_thread(action, self.settings, **payload)
+                elif path.endswith('/collection'):
+                    if payload:
+                        raise ConsoleError('同步最新日报不接受额外日期或店铺参数。', 400)
+                    if not self._rate_allowed(request, 'collection', per_ip=4, total=12):
+                        raise ConsoleError('同步操作太频繁，请稍后查看已有任务。', 429)
+                    data = await asyncio.to_thread(self._collection, sid, enqueue=True)
                 elif path.endswith("/controls"):
                     if set(payload) != {"collection_enabled", "notifications_enabled", "revision"}:
                         raise ConsoleError("提交内容无效。", 400)
@@ -315,6 +369,8 @@ class OwnerConsole:
                     data = await asyncio.to_thread(admin_groups.list_notification_groups, self.settings)
                 else:
                     data = await asyncio.to_thread(admin_groups.current_notification_group, self.settings)
+            elif path.endswith('/collection'):
+                data = await asyncio.to_thread(self._collection, sid)
             elif path.endswith("/members"):
                 if not self._rate_allowed(request, "members", per_ip=24, total=48):
                     raise ConsoleError("成员加载太频繁，请稍后重试。", 429)
@@ -345,6 +401,7 @@ class OwnerConsole:
                 Route("/console/api/stores/{sid}", self.api), Route("/console/api/stores/{sid}/members", self.api),
                 Route("/console/api/stores/{sid}/owners", self.api, methods=["POST"]),
                 Route("/console/api/stores/{sid}/controls", self.api, methods=["POST"]),
+                Route("/console/api/stores/{sid}/collection", self.api, methods=["GET", "POST"]),
                 Route("/console/logout", self.api, methods=["POST"])]
 
 

@@ -89,6 +89,18 @@ def test_fixed_official_request_freezes_data_and_never_exposes_tools_or_key_in_b
     assert CONTEXT == before and len(calls) == 1
 
 
+def test_custom_question_can_return_a_short_paragraph_without_an_anomaly_template(monkeypatch):
+    answer = 'CPC是广告花费除以点击次数。当前问题没有指定店铺，不能据此判断某家店是否异常。'
+    def handler(request):
+        body = json.loads(request.content)
+        assert '不套用固定异常报告' in body['messages'][0]['content']
+        assert body['tool_choice'] == 'none' and 'tools' not in body
+        return response(text=answer)
+    mock_http(monkeypatch, handler)
+    context = {**CONTEXT, 'reply_mode': 'answer', 'notification_policy': {'version': 1}}
+    assert DeepSeekClient(KEY).analyze(context, 'CPC是什么意思') == answer
+
+
 def test_loads_private_credentials_file_and_explicit_model(tmp_path, monkeypatch):
     path = tmp_path / "private.json"
     path.write_text(json.dumps({"api_key": KEY}))

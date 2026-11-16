@@ -59,6 +59,19 @@ CTR、CPC、TCOAS不依赖广告转化归因等待，成熟状态不适用不等
 不重复完整数据表，不加开场白、实现细节或大段解释，不输出内部英文状态码、字段名、JSON或null。
 正常/改善和按设计采用不同日期均不列为问题；不能完整回答时只说明具体缺少的证据。"""
 
+ANSWER_PROMPT = SYSTEM_PROMPT.split('服务端会附完整中文数据表')[0] + """
+本次按用户的实际问题回答，不套用固定异常报告，不要求用户先使用标准句式。
+可以用一至三段简短中文或少量条目，不强制表格或异常清单，总计500字以内。
+直接给结论和必要数值；与问题无关的指标、采集开关、内部实现、重复缺失和建议不展示。
+若问概念或操作方法，解释相关口径和允许的使用方式；现有证据不能回答时说明具体缺口。
+不把未知说成正常，不猜授权失败或数据缺失原因，不宣称已实时同步、已发送或已执行动作。
+正常或改善可以在用户明确询问该指标时回答，但不标为异常。
+"""
+
+
+def _prompt(context):
+    return ANSWER_PROMPT if isinstance(context, dict) and context.get('reply_mode') == 'answer' else SYSTEM_PROMPT
+
 _DISPLAY_TERMS = {
     "WATCH": "观察，未达到通知门槛",
     "CURRENCY_UNCONFIRMED": "币种待确认或不一致", "INSUFFICIENT_DATA": "数据不足",
@@ -147,7 +160,7 @@ def compact_context(context):
     keys = ("store_id", "store_name", "country", "report_date", "requested_report_date",
             "timezone_confirmed", "date_basis", "date_selection", "report_date_warning",
             "authorization_warning", "data_warning", "sales_and_spend", "coverage",
-            "advertising_totals", "ad_detail_coverage", "notification_policy", "campaign_selection", "campaign_count", "question_topic")
+            "advertising_totals", "ad_detail_coverage", "notification_policy", "campaign_selection", "campaign_count", "question_topic", "reply_mode")
     result = {k: context[k] for k in keys if k in context}
     kpi_keys = ("current", "baseline", "current_date", "currency", "status", "change_ratio",
                 "comparison_basis", "notification_note", "attribution_maturity_required", "attribution_mature")
@@ -168,12 +181,12 @@ def compact_context(context):
 
 def analysis_cache_key(context, question, model):
     packet = _input_json(context, question)
-    return hashlib.sha256((SYSTEM_PROMPT + model + packet).encode()).hexdigest()
+    return hashlib.sha256((_prompt(context) + model + packet).encode()).hexdigest()
 
 
 def _actionable_text(text, context, question):
     """Do not publish model-written watch/positive KPI bullets as findings."""
-    if not context.get("notification_policy"):
+    if context.get('reply_mode') == 'answer' or not context.get("notification_policy"):
         return text
     labels = {"CTR": "点击率", "CPC": "点击花费", "CDR": "点击转化率", "CPS": "单件转化花费",
               "ROAS": "广告投入产出", "CPA": "单均花费", "TCOAS": "总销售广告费占比"}
@@ -265,10 +278,11 @@ class DeepSeekClient:
                    timeout=getattr(settings, "deepseek_request_timeout", 45.0))
 
     def analyze(self, context, question):
+        frozen = _input_json(context, question)
         payload = {
             "model": self.model,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                         {"role": "user", "content": _input_json(context, question)}],
+            "messages": [{"role": "system", "content": _prompt(context)},
+                         {"role": "user", "content": frozen}],
             "stream": False, "thinking": {"type": "disabled"}, "temperature": 0.2,
             "max_tokens": 1536, "tool_choice": "none",
         }
