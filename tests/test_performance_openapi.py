@@ -63,6 +63,26 @@ def test_freshness_requires_configured_timezone_and_real_source_timestamp():
     ) == "FRESH"
 
 
+@pytest.mark.parametrize("configured", ["", "invalid/timezone", "UTC", "America/Los_Angeles"])
+def test_explicit_source_offset_is_used_without_relabeling(configured):
+    clock = datetime(2026, 11, 10, 2, 0, tzinfo=timezone.utc)
+    raw = "2026-11-10T10:00:00+08:00"
+    assert _freshness_status(raw, _settings(configured), now=clock) == "FRESH"
+
+
+@pytest.mark.parametrize("timestamp,expected", [
+    ("2026-11-10T02:00:00Z", "FRESH"),
+    ("2026-11-09T17:00:00-08:00", "FRESH"),
+    ("2026-11-10T10:06:00+08:00", "FUTURE"),
+    ("2026-11-10T01:00:00+08:00", "STALE"),
+    (None, "MISSING"), ("not-a-timestamp", "MISSING"),
+    ("2026-11-10 10:00:00", "NOT_CONFIGURED"),
+])
+def test_source_time_policy_keeps_freshness_protections(timestamp, expected):
+    assert _freshness_status(timestamp, _settings(""),
+        now=datetime(2026, 11, 10, 2, 0, tzinfo=timezone.utc)) == expected
+
+
 def test_notice_status_zero_is_not_treated_as_handled():
     assert _notice_status(0) == (0, "UNKNOWN")
     assert _notice_status(1) == (1, "PENDING")
@@ -225,6 +245,8 @@ def _unfresh_source(state, monkeypatch):
         "MISSING": None,
     }.get(state, _NOW)
     if isinstance(timestamp, datetime):
+        if state == "NOT_CONFIGURED":
+            timestamp = timestamp.replace(tzinfo=None)
         timestamp = timestamp.isoformat()
     if state == "UNKNOWN":
         # Gate unexpected/unknown states too, without assigning a timezone or
@@ -284,7 +306,7 @@ def test_confirmed_source_timezone_does_not_exit_observation_only(freshness_db):
     db = freshness_db
     settings = _settings("")
     settings.lingxing_performance_observation_only = True
-    first = _collect_source(db, SourceTimeClient(_NOW.isoformat()), settings)
+    first = _collect_source(db, SourceTimeClient(_NOW.replace(tzinfo=None).isoformat()), settings)
     assert first["status"] == "SUCCEEDED_WITH_WARNINGS"
     settings.lingxing_performance_source_timezone = "UTC"
     second = _collect_source(db, SourceTimeClient(_NOW.isoformat()), settings)
@@ -293,6 +315,17 @@ def test_confirmed_source_timezone_does_not_exit_observation_only(freshness_db):
     assert _business_events(db) == []
     quality = db.scalars(select(AnomalyEvent)).all()
     assert len(quality) == 2 and all(e.status == "RECOVERED" for e in quality)
+
+
+def test_explicit_offset_preserves_source_text_and_observation_only(freshness_db):
+    db = freshness_db
+    settings = _settings("")
+    settings.lingxing_performance_observation_only = True
+    raw = _NOW.isoformat().replace("+00:00", "Z")
+    result = _collect_source(db, SourceTimeClient(raw), settings)
+    assert result["freshness"][0]["performance_freshness"] == "FRESH"
+    assert result["observation_only"] is True and _business_events(db) == []
+    assert db.scalar(select(StorePerformance)).source_updated_at == raw
 
 
 @pytest.mark.parametrize("state", _NON_FRESH)

@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     lingxing_refresh_method: str = "POST"
     lingxing_timeout: int = 30
 
-    # Performance source timestamps have no UTC offset; configure their real IANA timezone.
+    # Offset-free performance timestamps need a separately verified IANA zone.
     lingxing_performance_enabled: bool = False
     lingxing_performance_observation_only: bool = True
     lingxing_performance_source_timezone: str = ""

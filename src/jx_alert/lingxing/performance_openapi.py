@@ -140,17 +140,19 @@ def _parse_source_datetime(value):
 
 
 def _freshness_status(source_timestamp, settings, *, now=None):
-    timezone_name = str(getattr(settings, "lingxing_performance_source_timezone", "") or "").strip()
-    if not timezone_name:
-        return "NOT_CONFIGURED"
-    try:
-        source_zone = ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        return "NOT_CONFIGURED"
     parsed = _parse_source_datetime(source_timestamp)
     if parsed is None:
         return "MISSING"
-    if parsed.tzinfo is None:
+    # An explicit source offset is authoritative. Only offset-free source
+    # values need a separately verified timezone; never use the host timezone.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        timezone_name = str(getattr(settings, "lingxing_performance_source_timezone", "") or "").strip()
+        if not timezone_name:
+            return "NOT_CONFIGURED"
+        try:
+            source_zone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            return "NOT_CONFIGURED"
         parsed = parsed.replace(tzinfo=source_zone)
     now = now or _utcnow()
     age = now.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)

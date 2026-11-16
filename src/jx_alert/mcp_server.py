@@ -1223,7 +1223,8 @@ def prepare_advertising_kpi_analysis(store_id: str, dimension: str = "store",
     dimension选store（全部广告汇总）、campaign_sp/sb/sd、product_ad_sp/sd。
     活动或广告商品必须传一个entity_id。CDR=归因订单/点击，CPS=花费/归因销量，
     TCOAS=全部广告花费/店铺总销售额，仅store适用。转化指标等待SP7日、SB/SD14日成熟。
-    当前默认恶化幅度15%，CTR至少1000曝光，其余广告指标至少10点击，TCOAS使用花费门槛。
+    默认初筛15%，CTR初筛1000曝光，其余使用点击或花费门槛。
+    实质通知门槛开启时，还需恶化幅度、绝对影响、样本与持续确认；未通过转为WATCH，不通知。
     七日分子分母各自汇总再相除；基线不足用前一日。逐店逐对象复核ADVERSE，
     使用submit_advertising_kpi_analysis发送具体问题，其他状态保留记录。
     """

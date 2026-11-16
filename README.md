@@ -1,24 +1,27 @@
 # JX Alert System
 
-领星 ERP（Lingxing OpenAPI）只读数据监控、销量/广告异常检测、飞书群自定义机器人通知与 MCP 查询服务。
+领星 ERP（Lingxing OpenAPI）只读数据监控、经营/广告异常分析、飞书自建应用通知与群问答、Chat MCP和Excel归档服务。
 
-> 当前阶段：第二轮基础集成。默认 `APP_DRY_RUN=true`、`FEISHU_ENABLED=false`、`SCHEDULER_ENABLED=false`。不提交真实密钥、不自动读取真实店铺、不自动向飞书群发消息。
+> **完整系统逻辑与所有提醒规则：[阅读总文档](docs/SYSTEM_RULES_AND_LOGIC.md)。** 其中区分线上实际开关、代码默认、初筛、最终通知、数据未知和真实送达。
+>
+> 源码默认 `APP_DRY_RUN=true`、`FEISHU_ENABLED=false`、`SCHEDULER_ENABLED=false`；现有服务器通过私有运行配置启用服务。以下新环境安装步骤不用于覆盖现有`.env`、私有配置或重建生产数据库。
 
 ## 当前架构
 
 - **领星：** access-token 获取接口已按官方文档配置为 POST `/api/auth-server/oauth/access-token` + `multipart/form-data`（`appId`、`appSecret`）；响应映射为 `data.access_token`、`data.refresh_token`、`data.expires_in`。Refresh-token 续约接口仍待用户提供官方契约，不猜测路径或字段。业务 API 使用 Bearer Token + URL Query 签名。
-- **飞书：** 使用群自定义机器人 Webhook 单向推送；支持按店铺和 SKU/ASIN 路由到不同群，并分别 @ 群管理员与负责人；不使用飞书应用机器人或 tenant_access_token。
+- **飞书：** 当前线上使用自建应用，支持群通知、定向@及独立长连接问答，不需要Webhook；旧Webhook仅为兼容通道。配置正常与入队不等于真实送达。
 - **数据库：** MariaDB 11；本地测试支持 SQLite。保留原始快照、日指标、异常事件、通知日志和 outbox。
 - **销售采集：** 已接入领星 ASIN/MSKU 日销量接口，分别采集销售额、销量、订单量，并保存店铺汇总和原始响应。
 - **广告采集：** 已接入 SP/SB/SD 活动日报、活动基础资料、SP/SD 商品广告日报，以及 SP/SD 商品广告基础状态（enabled/paused/archived）。SB 商品级报表接口尚未确认，不猜测接口路径。
-- **数据完整性：** 按店铺、日期、数据维度写入 coverage 标记；只有完整采集日才能把未返回的指标解释为零。
-- **时区：** 每个 sid 单独配置 IANA 时区和币种，日报按站点本地前一完整自然日计算。
-- **异常：** 店铺状态异常事件；店铺、ASIN、MSKU 订单量、销量和销售额相对前七个完整自然日均值变化默认 ±15%。广告花费/预算按最新完整日和前七日计算；广告订单/无转化规则延后到对应归因窗成熟后，再与前七个成熟日比较（SP 7 天，SB/SD 14 天）。
-- **可靠通知：** 幂等 outbox、worker claim、失败退避重试和投递日志。Webhook 本身不支持外部幂等键，因此进程在“飞书已接收、数据库尚未标记成功”之间崩溃时，重试可能产生重复消息（at-least-once）。
-- **Excel：** 已生成真实数据的七工作表日报，支持全店汇总和按店铺分别导出。
-- **调度/回补：** 每日调度已连接采集、异常分析和店铺 Excel 导出；广告归因成熟告警需要至少 22 天历史回补（覆盖 14 天归因窗口及其前七日基准）。提供 22–30 天显式历史回补 CLI。默认调度关闭。
-- **MCP：** JX Alert 自身提供只读店铺、产品/MSKU/ASIN负责人映射、SKU/ASIN、广告活动及 SP/SD 商品广告的前一日与七日表现、日报汇总、异常历史、飞书投递日志、coverage 和同步任务查询；支持本地 stdio 与可选的 Streamable HTTP 远程服务。远程服务使用 Bearer Token，并默认只绑定宿主机回环地址；不开放广告修改工具。
-- **店铺绩效：** 已接入领星 OpenAPI 的绩效列表、详情和业绩通知采集，保存评分、状态、指标标准、违规、通知状态及数据库和文件系统双份原始 JSON 快照；数据源更新时间缺失、过期或时区未配置时不会判为正常。功能默认关闭，服务器确认源时区并设置配置后启用。
+- **数据完整性：** 按店铺、日期、数据维度记录coverage。完整请求仍可能无记录；必须有明确有效事实才显示真实0，缺失字段不补0。
+- **时间：** 保留领星源时间，明确偏移才换算；无偏移不套服务器时区。已核实店铺按本地完整日规划，未知时区可用保守历史模式；调度仍为北京时间。
+- **异常：** 保留15%初筛与SP7日/SB、SD14日归因成熟保护。线上启用实质通知门槛：相对变化、绝对影响、样本和普通两日期确认；正向增长、单纯高花费及小波动不直接通知。线上业务告警采用Chat提交模式，授权/数据质量提醒独立保留。
+- **可靠通知：** 持久outbox、并发领取、失败退避和投递日志；应用通道复用UUID降低重复。接口接收后而数据库提交前崩溃仍可能重投，交付语义为at-least-once。
+- **Excel：** 单店报表日归档、内容版本及独立SP版本并存，每天北京23:30另存已保存全部业务历史的多维度快照；原JSON私有归档，不把版本相加。
+- **调度/回补：** 每日调度连接采集、分析和Excel，默认回刷22日以覆盖14日归因及七日基准；不足时按指标证据回退精确前日或保持未知，不强凑完整性。提供显式历史回补；源码默认调度关闭，现有线上配置已开启。
+- **MCP：** 提供查询、冻结证据分析、显式采集及受控通知；按read/collect/notify作用域与服务开关分别校验。线上远程HTTPS使用OAuth，保留Bearer兼容模式；没有广告修改工具。
+- **店铺绩效：** 已自动观测归档绩效、详情和业绩通知，保留源标准和源时间；健康业务告警保持仅观测保护，不因接受源时间展示而自动启用。
+- **群问答：** 真实@后按店铺全名、品牌或片段解析，多店歧义先确认站点；服务端生成完整表格，DeepSeek解释冻结证据。普通提问不采集，明确采集需负责人/管理员权限，原Chat MCP独立运行。
 
 ## 已核验的领星业务 API
 
@@ -37,7 +40,7 @@
 | SP 商品广告日报 | POST `/pb/openapi/newad/spProductAdReports` |
 | SD 商品广告日报 | POST `/pb/openapi/newad/sdProductAdReports` |
 
-广告接口使用 `X-API-VERSION: 2`。SP/SD 报表按 `next_token` 游标分页，SB 活动报表按 `offset/length` 分页；分页缺失或不完整时客户端会报错，不把部分结果当成完整日报。领星签名按 ASCII 排序，将业务参数、原始 `access_token`、`app_key`、`timestamp` 拼接后 MD5 大写，再使用 AppID 作为 AES 密钥执行 AES/ECB/PKCS5Padding。Bearer Token 通过 `Authorization` 头发送，但仍须参与签名；POST JSON 中的标量业务字段也须参与签名。当前客户端对嵌套对象/数组签名会 fail closed，不会猜测序列化规则。
+广告接口使用 `X-API-VERSION: 2`。SP/SD 报表按 `next_token` 游标分页，SB 活动报表按 `offset/length` 分页；分页缺失或不完整时客户端会报错，不把部分结果当成完整日报。领星签名按 ASCII 排序，将业务参数、原始 `access_token`、`app_key`、`timestamp` 拼接后 MD5 大写，再使用 AppID 作为 AES 密钥执行 AES/ECB/PKCS5Padding。Bearer Token 通过 `Authorization` 头发送，但仍须参与签名；POST JSON 中的标量业务字段也须参与签名。仅SP广告/投放小时接口的campaign_ids数组已有端点专用签名规范化，实际请求体保留数组；其他未核实嵌套参数仍拒绝猜测。
 
 官方资料：
 - [领星 OpenAPI 接入指南](https://apidoc.lingxing.com/new/guides/new-instructions/)
@@ -55,7 +58,7 @@
 - [SP 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/spProductAdReports/)
 - [SD 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/sdProductAdReports/)
 
-## 飞书自定义机器人
+## 旧Webhook兼容通道（当前线上不需要）
 
 自定义机器人只向创建它的群发送消息。Webhook 地址和签名密钥都属于敏感凭据，必须只保存在 Linux 服务器的 `.env` 中。
 
