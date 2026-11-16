@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 
 from jx_alert.analysis.ad_kpis import advertising_kpis
 from jx_alert.notifications.outbox import enqueue_notification, NotificationOutbox
-from jx_alert.notifications.routing import _load_routing
+from jx_alert.notifications.routing import _load_routing, report_group_delivery
 from jx_alert.storage.coverage import SALES_DATA_LABELS, is_empty_store_partition, store_sales_data_status
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerformance
 from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card, number, change, status_label
@@ -298,10 +298,7 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
         chat_id = group.get("chat_id", chat_alias)
         if not isinstance(chat_id, str) or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat_id):
             raise ValueError("Daily app snapshots require a configured group chat ID")
-        delivery = {
-            "role": "daily_snapshot", "receive_id": chat_id,
-            "receive_id_type": "chat_id", "open_ids": [],
-        }
+        delivery = report_group_delivery(settings, routing, role="daily_snapshot")
     else:
         if chat_alias not in groups and chat_alias != "default":
             raise ValueError("Daily webhook snapshots require a configured group alias")

@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
-from jx_alert import admin_mapping
+from jx_alert import admin_groups, admin_mapping
 from jx_alert import admin_data
 from jx_alert.admin_console import OwnerConsole, SESSION
 from jx_alert.config import Settings
@@ -230,3 +230,48 @@ def test_invalid_controls_keep_history_visible_but_never_allow_saving(console):
     headers = {"Origin": ORIGIN, "X-CSRF-Token": overview["csrf"]}
     assert client.post("/console/api/stores/5174/controls", headers=headers, json={
         "collection_enabled": True, "notifications_enabled": True, "revision": "0" * 64}).status_code == 503
+
+
+def test_notification_group_is_owner_only_and_requires_preview_confirmation_and_csrf(console, monkeypatch):
+    client, routing, _, _ = console
+    endpoint = "/console/api/notification-group"
+    monkeypatch.setattr(admin_groups, "_joined_chats", lambda *_, **kw: {"oc_new_group": "新通知群"})
+    assert client.get(endpoint).status_code == 401
+    assert client.post(endpoint, json={}).status_code == 401
+    assert login(client).is_redirect
+    current = client.get(endpoint).json()
+    assert current["chat_id"] == "oc_test" and current["name"] == "测试群"
+    assert client.get(endpoint + "/chats").json()["chats"] == [{"id": "oc_new_group", "name": "新通知群"}]
+    original = json.loads(routing.read_text(encoding="utf-8"))
+    csrf = client.get("/console/api/stores").json()["csrf"]
+    headers = {"Origin": ORIGIN, "X-CSRF-Token": csrf}
+    selected = {"chat_id": "oc_new_group", "revision": current["revision"]}
+    assert client.post(endpoint + "/preview", json=selected, headers={"Origin": ORIGIN}).status_code == 403
+    assert client.post(endpoint, json={**selected, "confirmed": True}, headers={
+        **headers, "Origin": "https://other.example"}).status_code == 403
+    assert client.post(endpoint + "/preview", json=selected, headers=headers).json()["changed"] is True
+    assert client.post(endpoint, json={**selected, "confirmed": False}, headers=headers).status_code == 400
+    assert json.loads(routing.read_text(encoding="utf-8")) == original
+    result = client.post(endpoint, json={**selected, "confirmed": True}, headers=headers)
+    assert result.status_code == 200 and result.json()["name"] == "新通知群"
+    changed = json.loads(routing.read_text(encoding="utf-8"))
+    assert changed["stores"] == original["stores"] and changed["groups"]["ops"]["chat_id"] == "oc_new_group"
+    assert client.post(endpoint, json={**selected, "confirmed": True}, headers=headers).status_code == 409
+    page = client.get("/console/").text
+    assert 'data-view="notification-group"' in page and 'id="confirm-group-change"' in page
+
+
+def test_notification_group_preview_has_separate_bounded_network_budget(console, monkeypatch):
+    client, _, _, _ = console
+    monkeypatch.setattr(admin_groups, "_joined_chats", lambda *_, **kw: {"oc_new_group": "新通知群"})
+    assert login(client).is_redirect
+    csrf = client.get("/console/api/stores").json()["csrf"]
+    current = client.get("/console/api/notification-group").json()
+    for _ in range(8):
+        result = client.post("/console/api/notification-group/preview", json={
+            "chat_id": "oc_new_group", "revision": current["revision"]},
+            headers={"Origin": ORIGIN, "X-CSRF-Token": csrf})
+        assert result.status_code == 200
+    assert client.post("/console/api/notification-group/preview", json={
+        "chat_id": "oc_new_group", "revision": current["revision"]},
+        headers={"Origin": ORIGIN, "X-CSRF-Token": csrf}).status_code == 429

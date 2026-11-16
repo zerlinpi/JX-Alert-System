@@ -264,12 +264,16 @@ def save_store_mapping(settings, sid, open_ids, revision):
     if not route.get("chat_id") and alias != routing["default_chat_id"]:
         updated["chat_id"] = alias
     routing.setdefault("stores", {})[sid] = updated
+    group_changed = False
+    if "verified_member_open_ids" in routing["groups"][alias] and ids:
+        group_changed = routing["groups"][alias]["verified_member_open_ids"] != sorted(roster)
+        routing["groups"][alias]["verified_member_open_ids"] = sorted(roster)
     payload = (json.dumps(routing, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     try:
         with _mapping_lock(path):
             if path.is_symlink() or path.read_bytes() != raw:
                 raise MappingError(409, _CONFLICT)
-            if updated == route:
+            if updated == route and not group_changed:
                 return _mapping(settings, routing, sid, revision)
             now = datetime.now(timezone.utc)
             _replace_mapping(path, raw, payload, sid, now.strftime("%Y%m%dT%H%M%SZ"))

@@ -72,6 +72,29 @@ def test_optional_tenant_match_and_verified_self_mention():
     assert not bot.is_mentioned_question(data, **{**kwargs, "bot_open_id": ""})
 
 
+def test_private_envelope_needs_no_mention_but_keeps_identity_and_tenant_checks():
+    data = incoming()
+    message = data["event"]["message"]
+    message.update(chat_type="p2p", chat_id="oc_private", content=json.dumps({"text": "分析Geteen美国"}))
+    message.pop("mentions")
+    kwargs = {"app_id": "cli_bot", "bot_open_id": "ou_this_bot", "tenant_key": "tenant"}
+    assert bot.is_private_question(data, **kwargs)
+    assert not bot.is_private_question(data, **{**kwargs, "tenant_key": "other"})
+    assert not bot.is_private_question(data, **{**kwargs, "app_id": "cli_other"})
+    assert not bot.is_private_question(data, **{**kwargs, "bot_open_id": ""})
+    message["chat_type"] = "group"
+    assert not bot.is_private_question(data, **kwargs)
+
+
+@pytest.mark.parametrize("field,value", [("chat_id", "ou_person"), ("message_id", "oc_private"),
+                                         ("message_type", "image"), ("content", "[]")])
+def test_private_intake_ignores_invalid_envelope(field, value):
+    data = incoming()
+    data["event"]["message"].update(chat_type="p2p", chat_id="oc_private", mentions=[])
+    data["event"]["message"][field] = value
+    assert not bot.is_private_question(data, app_id="cli_bot", bot_open_id="ou_this_bot")
+
+
 def mock_http(monkeypatch, handler):
     original = httpx.Client
     monkeypatch.setattr(httpx, "Client", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
@@ -157,6 +180,26 @@ def test_sdk_callback_only_commits_queue_and_ignores_unrelated_messages():
     wrong["event"]["message"]["chat_id"] = "oc_other"
     callback(wrong)
     assert len(calls) == 1 and session.commits == 1
+
+
+def test_sdk_callback_adapts_to_saved_group_and_persists_private_envelope_without_network():
+    current = ["oc_reports"]
+    calls = []
+    session = Session()
+    callback = bot.build_event_callback(SimpleNamespace(), app_id="cli_bot", bot_open_id="ou_this_bot",
+        chat_id="oc_reports", route_resolver=lambda: current[0], sessions=lambda: session,
+        enqueue=lambda db, s, event: calls.append(deepcopy(event)))
+    callback(incoming())
+    current[0] = "oc_new"
+    callback(incoming())
+    new = incoming()
+    new["event"]["message"]["chat_id"] = "oc_new"
+    callback(new)
+    private = incoming()
+    private["event"]["message"].update(chat_type="p2p", chat_id="oc_private", mentions=[])
+    callback(private)
+    assert [item["event"]["message"]["chat_id"] for item in calls] == ["oc_reports", "oc_new", "oc_private"]
+    assert session.commits == 3
 
 
 def test_queue_error_is_not_acknowledged_and_does_not_leak_payload(caplog):

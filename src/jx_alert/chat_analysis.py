@@ -17,7 +17,9 @@ from jx_alert.analysis.comparison import metric_comparison
 from jx_alert.analysis.ad_kpis import advertising_kpis
 from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card, number
 from jx_alert.notifications.outbox import enqueue_notification
-from jx_alert.notifications.routing import _load_routing, _routed_open_ids, report_group_delivery
+from jx_alert.notifications.routing import (
+    _load_routing, _routed_open_ids, group_member_mentions, report_group_delivery,
+)
 from jx_alert.storage.models import Campaign, DailyMetric, DataCoverage, Store, SyncJob
 
 
@@ -367,13 +369,13 @@ def submit_review(db, settings, review_id, findings, *, now=None):
     chat_id = group.get("chat_id", "")
     if validated and (settings.feishu_transport != "app" or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat_id)):
         raise ValueError("A configured application-bot report group is required")
-    admins = group.get("admin_open_ids", [])
+    admins = group_member_mentions(group, group.get("admin_open_ids", []))
     ids, titles = [], []
     for topic, summary, action, evidence, comparison in validated:
         entity_id = evidence[0]["entity_id"]
-        owners = _routed_open_ids(routing, context["store_id"], entity_id)
-        delivery = {"role": "chat_analysis", "receive_id": chat_id, "receive_id_type": "chat_id",
-                    "open_ids": list(dict.fromkeys(admins + owners))}
+        owners = group_member_mentions(group, _routed_open_ids(routing, context["store_id"], entity_id))
+        delivery = report_group_delivery(settings, routing, role="chat_analysis")
+        delivery["open_ids"] = list(dict.fromkeys(admins + owners))
         if not owners and not policy["group_fallback_enabled"]:
             raise ValueError("Verified operator mapping is required before analyst notifications")
         if policy["group_fallback_enabled"] and (not owners or not admins):

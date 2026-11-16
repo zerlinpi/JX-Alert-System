@@ -3,6 +3,7 @@ import json
 import hashlib
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import or_, select
@@ -48,6 +49,18 @@ def _validate_routing_data(data: dict) -> dict:
             ):
                 raise RuntimeError(f"Feishu group {group_id} has an invalid {env_key}")
         _validate_open_ids(group.get("admin_open_ids", []), f"groups.{group_id}.admin_open_ids")
+        if "verified_member_open_ids" in group:
+            _validate_open_ids(group["verified_member_open_ids"], "verified_group_members")
+        if "notifications_changed_at" in group:
+            _routing_timestamp(group["notifications_changed_at"])
+        if "retired_chat_ids" in group:
+            retired = group["retired_chat_ids"]
+            if not isinstance(retired, dict):
+                raise RuntimeError("Invalid retired Feishu destinations")
+            for chat, stamp in retired.items():
+                if not isinstance(chat, str) or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat):
+                    raise RuntimeError("Invalid retired Feishu destination")
+                _routing_timestamp(stamp)
 
     default_chat_id = data.get("default_chat_id", "default")
     if not isinstance(default_chat_id, str) or not default_chat_id:
@@ -203,6 +216,32 @@ def _app_open_ids(value) -> list[str]:
     return list(dict.fromkeys(value))
 
 
+def _routing_timestamp(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError
+        return parsed.astimezone(timezone.utc)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise RuntimeError("Invalid Feishu routing change timestamp") from None
+
+
+def group_member_mentions(group, open_ids):
+    """Keep ownership mappings, but never mention a known nonmember of the new group."""
+    ids = _app_open_ids(open_ids)
+    if "verified_member_open_ids" not in group:
+        return ids
+    members = set(_app_open_ids(group["verified_member_open_ids"]))
+    return [uid for uid in ids if uid in members]
+
+
+def bind_group_delivery(routing, alias, delivery):
+    """Freeze the destination generation; a later switch must not move old content."""
+    group = routing["groups"][alias]
+    return {**delivery, "routing_alias": alias,
+            "routing_changed_at": group.get("notifications_changed_at")}
+
+
 def report_group_delivery(settings, routing, *, role="group", reason=None):
     """Resolve only the explicitly configured report group; never invent recipients."""
     if getattr(settings, "feishu_transport", "webhook") != "app":
@@ -223,7 +262,7 @@ def report_group_delivery(settings, routing, *, role="group", reason=None):
     delivery = {"role": role, "receive_id": chat_id, "receive_id_type": "chat_id", "open_ids": []}
     if reason is not None:
         delivery.update(group_fallback=True, fallback_reasons=[reason])
-    return delivery
+    return bind_group_delivery(routing, alias, delivery)
 
 
 def _application_route_entry(mapping, key, groups):
@@ -312,12 +351,15 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
         for product in selected.values():
             owner_ids.extend(_app_open_ids(product.owner_open_ids or []))
     owner_ids = list(dict.fromkeys(owner_ids))
+    admin_ids = group_member_mentions(group, admin_ids)
+    owner_ids = group_member_mentions(group, owner_ids)
     if not owner_ids:
         raise ApplicationRoutingError("missing_operations_owner")
     if not admin_ids:
         raise ApplicationRoutingError("missing_group_administrator")
     mentions = list(dict.fromkeys(admin_ids + owner_ids))
-    return {"role": "group", "receive_id": chat_id, "receive_id_type": "chat_id", "open_ids": mentions}
+    return bind_group_delivery(routing, chat_alias, {
+        "role": "group", "receive_id": chat_id, "receive_id_type": "chat_id", "open_ids": mentions})
 
 
 def _application_management_deliveries(settings, routing, *, store_id, severity, status):

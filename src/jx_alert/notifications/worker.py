@@ -14,6 +14,7 @@ from jx_alert.notifications.routing import (
 )
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.notifications.store_policy import paused_delivery
+from jx_alert.notifications.destination_policy import superseded_group_delivery
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import NotificationLog
 
@@ -135,15 +136,26 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             else existing_chat_id
         )
         try:
-            if paused_delivery(settings, payload, created_at):
+            skip_reason = None
+            if payload.get("transport") == "app":
+                destination = payload.get("delivery") or {}
+                if destination.get("role") in {"group_question", "private_question"}:
+                    from jx_alert.bot_service import validate_question_delivery
+                    if not validate_question_delivery(settings, destination):
+                        skip_reason = "原会话权限或通知群已变更，旧回复保留记录"
+                if superseded_group_delivery(settings, payload, created_at):
+                    skip_reason = "通知群已更换，旧消息保留记录，不迁移或补发"
+            if skip_reason is None and paused_delivery(settings, payload, created_at):
+                skip_reason = "店铺通知已停用，旧消息保留记录"
+            if skip_reason is not None:
                 with SessionLocal() as db:
                     skipped = db.execute(update(NotificationOutbox).where(
                         NotificationOutbox.id == row_id, NotificationOutbox.status == "SENDING",
                         NotificationOutbox.claimed_at == claim_time, NotificationOutbox.attempts == attempts,
-                    ).values(status="SKIPPED", claimed_at=None, last_error="店铺通知已停用，旧消息保留记录"))
+                    ).values(status="SKIPPED", claimed_at=None, last_error=skip_reason))
                     if skipped.rowcount == 1:
                         db.add(NotificationLog(dedupe_key=dedupe_key, channel=channel, status="SKIPPED",
-                                               error="店铺通知已停用"))
+                                               error=skip_reason))
                     db.commit()
                 continue
             if _scheduled_window(dedupe_key, payload, datetime.now(timezone.utc).replace(tzinfo=None))[0] != "READY":
@@ -167,10 +179,12 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                 chat_id = destination["receive_id"]
                 card = payload.get("card")
                 if destination.get("reply_to_message_id"):
-                    if destination.get("role") != "group_question" or card is None:
-                        raise ValueError("Only verified group question cards can reply in a thread")
-                    response = client_cache["app"].reply_card(destination["reply_to_message_id"], card,
-                                                            idempotency_key=dedupe_key)
+                    if destination.get("role") not in {"group_question", "private_question"} or card is None:
+                        raise ValueError("Only verified question cards can reply to their original message")
+                    reply_args = {"idempotency_key": dedupe_key}
+                    if destination["role"] == "private_question":
+                        reply_args["reply_in_thread"] = False
+                    response = client_cache["app"].reply_card(destination["reply_to_message_id"], card, **reply_args)
                 else:
                     send_message = client_cache["app"].send_card if card is not None else client_cache["app"].send_text
                     response = send_message(

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine, select
@@ -14,7 +15,11 @@ def test_expired_report_backlog_does_not_block_today_or_send_before_eight(tmp_pa
     engine = create_engine("sqlite:///" + str(tmp_path / "outbox.db"))
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
-    settings = SimpleNamespace(app_dry_run=False, feishu_enabled=True, feishu_transport="app", feishu_timeout=1)
+    routing = tmp_path / "routing.json"
+    routing.write_text(json.dumps({"default_chat_id": "report", "groups": {
+        "report": {"chat_id": "oc_test"}}}), encoding="utf-8")
+    settings = SimpleNamespace(app_dry_run=False, feishu_enabled=True, feishu_transport="app", feishu_timeout=1,
+        feishu_routing_file=str(routing), feishu_daily_report_chat_id="report")
     monkeypatch.setattr(worker, "SessionLocal", sessions)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
     sent = []

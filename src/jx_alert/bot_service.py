@@ -1,4 +1,4 @@
-"""Durable group questions. No model request runs in MCP or event callbacks."""
+"""Durable group and private questions, with no model request in event callbacks."""
 from datetime import date, datetime, timedelta, timezone
 import html
 import json
@@ -32,11 +32,77 @@ def _route(settings):
     return report_group_delivery(settings, _load_routing(settings.feishu_routing_file), role="group_question")
 
 
-def _reply(db, settings, message_id, chat_id, cards):
-    delivery = _route(settings)
-    if delivery["receive_id"] != chat_id:
-        raise ValueError("Original question is outside the current allowed group")
-    delivery = {**delivery, "reply_to_message_id": message_id}
+def _explicit_private_readers(settings, routing):
+    """Only configured roles confer read access without a membership lookup."""
+    groups = routing.get("groups", {})
+    configured = [groups.get(settings.feishu_daily_report_chat_id, {}).get("admin_open_ids", [])]
+    for section in ("stores", "entities"):
+        for key in routing.get(section, {}):
+            entry = _route_entry(routing[section], key)
+            configured.extend((entry.get("open_ids", []), entry.get("manager_open_ids", [])))
+    management = routing.get("management", {})
+    if isinstance(management, dict):
+        configured.append(management.get("open_ids", []))
+    configured.append([item.strip() for item in getattr(settings, "feishu_manager_open_ids", "").split(",")
+                       if item.strip()])
+    return {uid for items in configured if isinstance(items, list) for uid in items
+            if isinstance(uid, str) and re.fullmatch(r"ou_[A-Za-z0-9_-]+", uid)}
+
+
+def validate_question_delivery(settings, delivery):
+    """Fail closed on removed access; propagate sanitized lookup failures for retry."""
+    if (not getattr(settings, "feishu_bot_enabled", False) or settings.app_dry_run
+            or not settings.feishu_enabled or settings.feishu_transport != "app"
+            or not isinstance(delivery, dict) or delivery.get("receive_id_type") != "chat_id"):
+        return False
+    routing = _load_routing(settings.feishu_routing_file)
+    current = report_group_delivery(settings, routing, role="group_question")
+    if delivery.get("role") == "group_question":
+        return (delivery.get("receive_id") == current["receive_id"]
+                and delivery.get("routing_alias", current.get("routing_alias")) == current.get("routing_alias")
+                and delivery.get("routing_changed_at") == current.get("routing_changed_at"))
+    if delivery.get("role") != "private_question":
+        return False
+    chat, sender = delivery.get("receive_id"), delivery.get("sender_open_id")
+    if (not isinstance(chat, str) or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat)
+            or any(group.get("chat_id") == chat for group in routing.get("groups", {}).values())
+            or not isinstance(sender, str) or not re.fullmatch(r"ou_[A-Za-z0-9_-]+", sender)
+            or sender == getattr(settings, "feishu_bot_open_id", "")):
+        return False
+    if sender in _explicit_private_readers(settings, routing):
+        return True
+    from jx_alert.admin_mapping import _members
+    # A changed group is checked against its new roster. No forever-trusted
+    # membership snapshot or permissive fallback is used on an API failure.
+    return sender in _members(settings, current["receive_id"])
+
+
+def _question_delivery(settings, meta):
+    kind = meta.get("chat_type", "group")
+    if kind == "p2p":
+        return {"role": "private_question", "receive_id_type": "chat_id", "open_ids": [],
+                "receive_id": meta["chat_id"], "sender_open_id": meta["sender_id"],
+                "reply_to_message_id": meta["message_id"]}
+    if kind != "group":
+        raise ValueError("Question conversation type is invalid")
+    saved = meta.get("question_route")
+    if not isinstance(saved, dict):
+        # Questions already queued before generation tracking belong to the
+        # original route, not to a newer group that happens to reuse its ID.
+        saved = {**_route(settings), "routing_changed_at": None}
+    return {**saved, "role": "group_question", "receive_id": meta["chat_id"],
+            "reply_to_message_id": meta["message_id"]}
+
+
+class QuestionAccessChanged(ValueError):
+    """An earlier authorized conversation no longer permits this reply."""
+
+
+def _reply(db, settings, message_id, chat_id, cards, *, question_meta=None):
+    delivery = _question_delivery(settings, question_meta or {
+        "chat_id": chat_id, "message_id": message_id, "chat_type": "group"})
+    if not validate_question_delivery(settings, delivery):
+        raise QuestionAccessChanged("Original question is outside the current allowed conversation")
     ids = []
     for index, value in enumerate(cards):
         row = enqueue_notification(db, idempotency_key=f"group-question:{message_id}:{index}",
@@ -47,31 +113,42 @@ def _reply(db, settings, message_id, chat_id, cards):
 
 
 def enqueue_group_question(db, settings, event_dict):
-    """Validate the group and real bot identity again; persist only needed fields."""
+    """Persist only validated envelopes; authorize private readers in the worker."""
     if not getattr(settings, "feishu_bot_enabled", False) or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
-    if not isinstance(event_dict, dict):
+    if not isinstance(event_dict, dict) or event_dict.get("schema") != "2.0":
         return {"status": "IGNORED"}
     header, event = event_dict.get("header", {}), event_dict.get("event", {})
     if not isinstance(header, dict) or not isinstance(event, dict):
         return {"status": "IGNORED"}
     sender, message = event.get("sender", {}), event.get("message", {})
+    tenant = getattr(settings, "feishu_bot_tenant_key", "")
     if (header.get("event_type") != "im.message.receive_v1" or header.get("app_id") != settings.feishu_app_id
+            or (tenant and header.get("tenant_key") != tenant)
             or not isinstance(sender, dict) or not isinstance(message, dict)
-            or sender.get("sender_type") != "user" or message.get("chat_type") != "group"
-            or message.get("message_type") != "text" or message.get("chat_id") != _route(settings)["receive_id"]):
+            or sender.get("sender_type") != "user" or message.get("chat_type") not in {"group", "p2p"}
+            or message.get("message_type") != "text"):
+        return {"status": "IGNORED"}
+    kind, chat = message["chat_type"], message.get("chat_id")
+    intake_route = _route(settings)
+    current_chat = intake_route["receive_id"]
+    if (not isinstance(chat, str) or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat)
+            or (kind == "group" and chat != current_chat) or (kind == "p2p" and chat == current_chat)):
         return {"status": "IGNORED"}
     mentions = message.get("mentions", [])
+    if kind == "p2p" and mentions is None:
+        mentions = []
     own_id = getattr(settings, "feishu_bot_open_id", "")
-    if not own_id or not isinstance(mentions, list) or not any(
+    if not own_id or not isinstance(mentions, list) or (kind == "group" and not any(
             isinstance(m, dict) and isinstance(m.get("id"), dict) and m["id"].get("open_id") == own_id
-            for m in mentions):
+            for m in mentions)):
         return {"status": "IGNORED"}
     message_id = message.get("message_id")
     sender_id = sender.get("sender_id", {}).get("open_id") if isinstance(sender.get("sender_id"), dict) else None
     if not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]+", message_id):
         return {"status": "IGNORED"}
-    if not isinstance(sender_id, str) or not re.fullmatch(r"ou_[A-Za-z0-9_-]+", sender_id):
+    if (not isinstance(sender_id, str) or not re.fullmatch(r"ou_[A-Za-z0-9_-]+", sender_id)
+            or sender_id == own_id):
         return {"status": "IGNORED"}
     try:
         content = json.loads(message.get("content", ""))
@@ -102,12 +179,17 @@ def enqueue_group_question(db, settings, event_dict):
         busy = pending >= getattr(settings, "feishu_bot_max_pending", 50) or recent >= 3
         job = SyncJob(job_type="feishu_question", status="SUCCEEDED" if busy else "PENDING",
             started_at=clock, metadata_json={"message_id": message_id, "sender_id": sender_id,
-                "chat_id": message["chat_id"], "question": question, "attempts": 0})
+                "chat_id": chat, "chat_type": kind, "question": question, "attempts": 0})
+        if kind == "group":
+            job.metadata_json = {**job.metadata_json, "question_route": intake_route}
         db.add(job)
         db.flush()
         if busy:
             value = card("提问较多", subtitle="请稍后重试", sections=[])
-            ids = _reply(db, settings, message_id, message["chat_id"], [value])
+            # Do not perform a roster API call or disclose data from the SDK
+            # intake callback. Private excess questions remain silent.
+            ids = (_reply(db, settings, message_id, chat, [value], question_meta=job.metadata_json)
+                   if kind == "group" else [])
             job.metadata_json = {**job.metadata_json, "outbox_ids": ids}
             job.finished_at = clock
         db.commit()  # Publish deduplication while the ingestion lock is held.
@@ -276,7 +358,9 @@ def _collection_command(question):
 def _collection_permission(settings, meta, sid):
     routing = _load_routing(settings.feishu_routing_file)
     group = report_group_delivery(settings, routing, role="group_question")
-    if meta["chat_id"] != group["receive_id"]:
+    if meta.get("chat_type", "group") == "group" and meta["chat_id"] != group["receive_id"]:
+        return False
+    if meta.get("chat_type", "group") not in {"group", "p2p"}:
         return False
     admins = routing["groups"][settings.feishu_daily_report_chat_id].get("admin_open_ids", [])
     operators = _route_entry(routing.get("stores", {}), sid).get("open_ids", [])
@@ -313,6 +397,9 @@ def _lookup_collection(db, settings, meta, collection_id):
         SyncJob.metadata_json["collection_job_id"].as_integer() == collection_id,
         SyncJob.metadata_json["analysis_provider"].as_string() == "collection_request",
     ).order_by(SyncJob.id.desc()).limit(1))
+    if (receipt is not None and meta.get("chat_type") == "p2p"
+            and (receipt.metadata_json or {}).get("sender_id") != meta["sender_id"]):
+        receipt = None
     if receipt is not None:
         sid = receipt.metadata_json.get("collection_store_id")
         job = db.get(SyncJob, collection_id)
@@ -325,7 +412,7 @@ def _lookup_collection(db, settings, meta, collection_id):
                 pass
             else:
                 return _collection_status_card(db, job, sid)
-    return card("未找到可查询的采集任务", subtitle="请由店铺负责人或管理员查询本群发起的采集任务。", sections=[])
+    return card("未找到可查询的采集任务", subtitle="请由店铺负责人或管理员查询当前会话发起的采集任务。", sections=[])
 
 
 def _lookup_store_collection(db, settings, meta, sid):
@@ -337,11 +424,18 @@ def _lookup_store_collection(db, settings, meta, sid):
     ).order_by(SyncJob.id.desc()).limit(1))
     if receipt is not None and type(receipt.metadata_json.get("collection_job_id")) is int:
         return _lookup_collection(db, settings, meta, receipt.metadata_json["collection_job_id"])
-    return card("未找到可查询的采集任务", subtitle="本群尚未发起该店铺的采集，可发送：实时采集 店铺名。", sections=[])
+    return card("未找到可查询的采集任务", subtitle="当前会话尚未发起该店铺的采集，可发送：实时采集 店铺名。", sections=[])
 
 
 def _complete_question(db, settings, job_id, meta, cards, provider):
-    response_ids = _reply(db, settings, meta["message_id"], meta["chat_id"], cards)
+    try:
+        response_ids = _reply(db, settings, meta["message_id"], meta["chat_id"], cards, question_meta=meta)
+    except QuestionAccessChanged:
+        job = db.get(SyncJob, job_id)
+        job.status, job.finished_at = "SKIPPED", _utcnow().replace(tzinfo=None)
+        job.error_message = "会话或读取权限已变更，本次未回复。"
+        db.commit()
+        return {"status": "SKIPPED", "job_id": job_id}
     job = db.get(SyncJob, job_id)
     job.status, job.finished_at = "SUCCEEDED", _utcnow().replace(tzinfo=None)
     job.metadata_json = {**meta, "outbox_ids": response_ids, "analysis_provider": provider}
@@ -646,6 +740,11 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
             meta["attempts"] = meta.get("attempts", 0) + 1
             job.metadata_json = meta
             db.commit()
+            if not validate_question_delivery(settings, _question_delivery(settings, meta)):
+                job.status, job.finished_at = "SKIPPED", _utcnow().replace(tzinfo=None)
+                job.error_message = "会话或读取权限已变更，本次未回复。"
+                db.commit()
+                return {"status": "SKIPPED", "job_id": job_id}
             collection = _collection_command(meta["question"])
             if collection is not None:
                 return _process_collection_command(db, settings, job_id, meta, collection)
@@ -670,6 +769,7 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                     cached = db.scalar(select(SyncJob).where(SyncJob.job_type == "feishu_question",
                         SyncJob.status == "SUCCEEDED", SyncJob.finished_at >= _utcnow().replace(tzinfo=None) - timedelta(minutes=10),
                         SyncJob.metadata_json["chat_id"].as_string() == meta["chat_id"],
+                        SyncJob.metadata_json["sender_id"].as_string() == meta["sender_id"],
                         SyncJob.metadata_json["analysis_cache_key"].as_string() == cache_key,
                         SyncJob.metadata_json["analysis_provider"].as_string().in_(["deepseek", "deepseek_cache"]))
                         .order_by(SyncJob.id.desc()).limit(1)) if cache_key else None

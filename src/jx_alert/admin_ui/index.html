@@ -20,6 +20,7 @@
       <nav class="navigation" aria-label="工作区">
         <button type="button" data-view="overview" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg>经营概览</button>
         <button type="button" data-view="owners"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2M16 5a3 3 0 0 1 0 6m4 9v-2a4 4 0 0 0-3-4"/></svg>负责人映射</button>
+        <button type="button" data-view="notification-group"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 5h14v11H9l-4 4z"/><path d="M8 9h8M8 12h5"/></svg>通知群设置</button>
       </nav>
       <div class="sidebar-bottom">
         <span class="owner-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4-3 7-7 10-4-3-7-6-7-10V6z"/><path d="m9 12 2 2 4-4"/></svg></span>
@@ -33,12 +34,27 @@
         <button type="button" id="refresh" class="button secondary"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6M20 4v7h-7"/></svg>刷新数据</button>
       </header>
       <div id="global-status" class="notice" role="status" hidden></div>
-      <section class="stats" aria-label="店铺统计">
+      <section class="panel notification-group" id="notification-group-panel" aria-labelledby="notification-group-title" hidden>
+        <div class="section-heading"><div><h2 id="notification-group-title">通知群</h2><p class="muted">选择机器人已加入的群，保存后用于后续日报、默认通知和群内问答。</p></div><button id="reload-groups" class="button secondary" type="button">刷新群列表</button></div>
+        <div class="group-settings-body">
+          <div class="current-group"><span class="muted">当前通知群</span><strong id="current-notification-group">正在读取…</strong></div>
+          <p class="muted">另有独立群配置的店铺或商品仍使用原路由；管理层私信和店铺开关不变。</p>
+          <div class="group-picker"><label for="notification-group-select">替换为</label><select id="notification-group-select" disabled><option value="">请先读取群列表</option></select><button id="preview-group" class="button secondary" type="button" disabled>查看替换范围</button></div>
+          <div id="group-settings-status" class="notice" role="status" hidden></div>
+          <div id="group-impact" class="group-impact" hidden>
+            <h3>确认替换范围</h3><p id="group-impact-summary"></p>
+            <ul><li>负责人映射保留；群外人员不会被 @，缺少人员时按已启用的群兜底通知。</li><li>不在新群的原管理员会从本群管理员映射移除，不会自动指定新管理员。</li><li>旧群待发消息停止发送，不自动补发到新群；已经发送或发送中的消息无法撤回。</li></ul>
+            <label class="group-confirm"><input id="confirm-group-change" type="checkbox">我已核对目标群及上述范围</label>
+          </div>
+          <div class="save-bar"><span class="muted">目标群未出现时，请先在飞书中将机器人加入该群。</span><button id="save-notification-group" class="button primary" type="button" disabled>保存通知群</button></div>
+        </div>
+      </section>
+      <section class="stats" id="store-stats" aria-label="店铺统计">
         <article class="stat"><span>店铺总数</span><strong id="total-stores">—</strong></article>
         <article class="stat"><span>广告已授权</span><strong id="total-authorized">—</strong></article>
         <article class="stat"><span>已映射负责人</span><strong id="total-mapped">—</strong></article>
       </section>
-      <div class="board">
+      <div class="board" id="store-board">
         <section class="panel store-list" aria-labelledby="list-title">
           <div class="list-head"><h2 id="list-title">店铺</h2><span id="list-count" class="count">—</span></div>
           <div class="list-inputs">

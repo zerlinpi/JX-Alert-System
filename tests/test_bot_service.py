@@ -36,6 +36,7 @@ class FakeClient:
 
 def event(question="@_user_1 5174 店铺广告和绩效情况", *, message_id="om_question"):
     return {
+        "schema": "2.0",
         "header": {"event_type": "im.message.receive_v1", "app_id": "cli_test", "token": HEADER_TOKEN},
         "event": {
             "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_member", "union_id": "private-union"}},
@@ -885,3 +886,234 @@ def test_unexpected_processing_failure_has_bounded_recovery_and_no_replies(wareh
         assert db.get(SyncJob, queued["job_id"]).status == "FAILED"
         assert db.scalar(select(NotificationOutbox)) is None
     assert len(failures) == 2 and FakeClient.calls == []
+
+
+def private_event(question="5174 店铺广告和绩效情况", *, message_id="om_private", sender="ou_member", chat="oc_private"):
+    value = event(question, message_id=message_id)
+    value["event"]["sender"]["sender_id"]["open_id"] = sender
+    value["event"]["message"].update(chat_type="p2p", chat_id=chat)
+    value["event"]["message"].pop("mentions")
+    return value
+
+
+def test_mapped_owner_private_question_needs_no_mention_and_replies_only_in_private_chat(warehouse, monkeypatch):
+    _enable_collection(warehouse, monkeypatch)
+    queued = enqueue(warehouse, private_event())
+    assert queued["status"] == "QUEUED"
+    assert enqueue(warehouse, private_event())["status"] == "REUSED"
+    result = process(warehouse)
+    assert result["status"] == "QUEUED" and len(FakeClient.calls) == 1
+    with warehouse[1]() as db:
+        meta = db.get(SyncJob, queued["job_id"]).metadata_json
+        assert meta["chat_type"] == "p2p" and meta["sender_id"] == "ou_member"
+        deliveries = [db.get(NotificationOutbox, row).payload["delivery"] for row in result["outbox_ids"]]
+    assert deliveries and all(d["role"] == "private_question" and d["receive_id"] == "oc_private"
+        and d["sender_open_id"] == "ou_member" and d["reply_to_message_id"] == "om_private"
+        and d["open_ids"] == [] for d in deliveries)
+
+
+@pytest.mark.parametrize("is_member", [True, False])
+def test_private_read_checks_current_group_members_before_any_data_or_model_work(warehouse, monkeypatch, is_member):
+    from jx_alert import admin_mapping
+    lookups = []
+    def members(settings, chat):
+        lookups.append(chat)
+        return {"ou_member": "测试成员"} if is_member else {}
+    monkeypatch.setattr(admin_mapping, "_members", members)
+    enqueue(warehouse, private_event())
+    assert lookups == []  # SDK intake stays a durable, network-free operation.
+    result = process(warehouse)
+    assert result["status"] == ("QUEUED" if is_member else "SKIPPED")
+    assert lookups and set(lookups) == {"oc_reports"}
+    assert len(FakeClient.calls) == int(is_member)
+    if not is_member:
+        with warehouse[1]() as db:
+            assert db.scalar(select(NotificationOutbox)) is None
+
+
+def test_private_membership_api_failure_is_not_a_read_permission_fallback(warehouse, monkeypatch):
+    from jx_alert import admin_mapping
+    def unavailable(*args):
+        raise admin_mapping.MappingError(502, "无法读取飞书群成员。")
+    monkeypatch.setattr(admin_mapping, "_members", unavailable)
+    queued = enqueue(warehouse, private_event())
+    with pytest.raises(admin_mapping.MappingError):
+        process(warehouse)
+    assert FakeClient.calls == []
+    with warehouse[1]() as db:
+        assert db.scalar(select(NotificationOutbox)) is None
+        assert db.get(SyncJob, queued["job_id"]).status == "RUNNING"
+    monkeypatch.setattr(admin_mapping, "_members", lambda *a: {"ou_member": "已核实成员"})
+    assert process(warehouse)["status"] == "QUEUED"
+
+
+@pytest.mark.parametrize("role", ["operator", "admin", "other"])
+def test_private_realtime_collection_keeps_existing_store_role_requirement(warehouse, monkeypatch, role):
+    from jx_alert import admin_mapping
+    _enable_collection(warehouse, monkeypatch, role=role)
+    monkeypatch.setattr(admin_mapping, "_members", lambda *a: {"ou_member": "普通群成员"})
+    enqueue(warehouse, private_event("实时采集 Geteen 美国"))
+    # Select an unambiguous persisted name, not a model-resolved store.
+    with warehouse[1].begin() as db:
+        db.get(Store, "5174").name = "Geteen-US"
+        db.get(Store, "5174").country = "美国"
+    result = process(warehouse)
+    assert result["status"] == "QUEUED" and FakeClient.calls == []
+    with warehouse[1]() as db:
+        jobs = list(db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")))
+        assert len(jobs) == int(role != "other")
+    if role == "other":
+        assert "请由该店铺负责人或群管理员" in _collection_receipt(warehouse, result)
+
+
+def test_private_cache_is_not_shared_between_different_senders_even_with_same_chat(warehouse, monkeypatch):
+    _enable_collection(warehouse, monkeypatch)
+    settings = warehouse[0]
+    routing = json.loads(Path(settings.feishu_routing_file).read_text())
+    routing["stores"]["5174"]["open_ids"].append("ou_second")
+    Path(settings.feishu_routing_file).write_text(json.dumps(routing))
+    enqueue(warehouse, private_event())
+    process(warehouse)
+    enqueue(warehouse, private_event(message_id="om_second_private", sender="ou_second"))
+    process(warehouse)
+    assert len(FakeClient.calls) == 2
+
+
+def test_group_switch_skips_old_question_before_model_and_accepts_new_group(warehouse):
+    queued = enqueue(warehouse)
+    path = Path(warehouse[0].feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing["groups"]["reports"]["chat_id"] = "oc_new_group"
+    path.write_text(json.dumps(routing))
+    assert process(warehouse) == {"status": "SKIPPED", "job_id": queued["job_id"]}
+    assert FakeClient.calls == []
+    assert enqueue(warehouse, event(message_id="om_old_again"))["status"] == "IGNORED"
+    new = event(message_id="om_new_group")
+    new["event"]["message"]["chat_id"] = "oc_new_group"
+    assert enqueue(warehouse, new)["status"] == "QUEUED"
+    result = process(warehouse)
+    with warehouse[1]() as db:
+        assert all(db.get(NotificationOutbox, oid).payload["delivery"]["receive_id"] == "oc_new_group"
+                   for oid in result["outbox_ids"])
+
+
+def test_group_switch_during_model_analysis_does_not_redirect_old_private_content(warehouse):
+    enqueue(warehouse)
+    class SwitchingClient(FakeClient):
+        def analyze(self, context, question):
+            path = Path(warehouse[0].feishu_routing_file)
+            routing = json.loads(path.read_text())
+            routing["groups"]["reports"]["chat_id"] = "oc_new_group"
+            path.write_text(json.dumps(routing))
+            return super().analyze(context, question)
+    assert process(warehouse, factory=lambda _: SwitchingClient())["status"] == "SKIPPED"
+    with warehouse[1]() as db:
+        assert db.scalar(select(NotificationOutbox)) is None
+
+
+def test_private_queue_limit_does_not_call_membership_or_model_from_intake(warehouse):
+    warehouse[0].feishu_bot_max_pending = 1
+    enqueue(warehouse)
+    incoming = private_event()
+    busy = enqueue(warehouse, incoming)
+    assert busy["status"] == "BUSY" and enqueue(warehouse, incoming)["status"] == "REUSED"
+    with warehouse[1]() as db:
+        assert db.get(SyncJob, busy["job_id"]).metadata_json["outbox_ids"] == []
+        assert db.scalar(select(NotificationOutbox)) is None
+    assert FakeClient.calls == []
+
+
+def test_private_read_does_not_keep_membership_after_notification_group_switch(warehouse, monkeypatch):
+    from jx_alert import admin_mapping
+    checked = []
+    def members(settings, chat):
+        checked.append(chat)
+        return {"ou_member": "旧群成员"} if chat == "oc_reports" else {}
+    monkeypatch.setattr(admin_mapping, "_members", members)
+    enqueue(warehouse, private_event())
+    path = Path(warehouse[0].feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing["groups"]["reports"]["chat_id"] = "oc_new_group"
+    path.write_text(json.dumps(routing))
+    assert process(warehouse)["status"] == "SKIPPED"
+    assert checked == ["oc_new_group"] and FakeClient.calls == []
+
+
+def test_private_role_revoked_during_analysis_prevents_reply(warehouse, monkeypatch):
+    from jx_alert import admin_mapping
+    _enable_collection(warehouse, monkeypatch)
+    monkeypatch.setattr(admin_mapping, "_members", lambda *a: {})
+    enqueue(warehouse, private_event())
+    class RevokedClient(FakeClient):
+        def analyze(self, context, question):
+            path = Path(warehouse[0].feishu_routing_file)
+            routing = json.loads(path.read_text())
+            routing["stores"]["5174"]["open_ids"] = []
+            path.write_text(json.dumps(routing))
+            return super().analyze(context, question)
+    assert process(warehouse, factory=lambda _: RevokedClient())["status"] == "SKIPPED"
+    with warehouse[1]() as db:
+        assert db.scalar(select(NotificationOutbox)) is None
+
+
+def test_private_collection_receipt_is_bound_to_original_sender(warehouse, monkeypatch):
+    _enable_collection(warehouse, monkeypatch)
+    enqueue(warehouse, private_event("实时采集5174"))
+    first = process(warehouse)
+    with warehouse[1]() as db:
+        receipt = db.get(SyncJob, first["job_id"])
+        collection_id = receipt.metadata_json["collection_job_id"]
+    # Even a currently configured operator cannot borrow another sender's
+    # private receipt, if a corrupted/replayed envelope reuses that chat ID.
+    path = Path(warehouse[0].feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing["stores"]["5174"]["open_ids"].append("ou_second")
+    path.write_text(json.dumps(routing))
+    enqueue(warehouse, private_event(f"采集任务{collection_id}状态", message_id="om_other_sender", sender="ou_second"))
+    assert "未找到可查询的采集任务" in _collection_receipt(warehouse, process(warehouse))
+
+
+@pytest.mark.parametrize("missing_field", ["schema", "tenant"])
+def test_queue_validation_keeps_schema_and_configured_tenant_checks(warehouse, missing_field):
+    data = private_event()
+    settings = warehouse[0]
+    if missing_field == "schema":
+        data.pop("schema")
+    else:
+        settings = settings.model_copy(update={"feishu_bot_tenant_key": "confirmed-tenant"})
+    with warehouse[1]() as db:
+        assert bot_service.enqueue_group_question(db, settings, data)["status"] == "IGNORED"
+        assert db.scalar(select(SyncJob)) is None
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_switch_back_to_same_group_never_revives_an_old_queued_question(warehouse, legacy):
+    queued = enqueue(warehouse)
+    if legacy:
+        with warehouse[1].begin() as db:
+            job = db.get(SyncJob, queued["job_id"])
+            job.metadata_json = {key: value for key, value in job.metadata_json.items() if key != "question_route"}
+    path = Path(warehouse[0].feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing["groups"]["reports"]["notifications_changed_at"] = "2026-11-14T00:00:00+00:00"
+    # Same chat ID, different route generation, as in A->B->A.
+    path.write_text(json.dumps(routing))
+    assert process(warehouse)["status"] == "SKIPPED" and FakeClient.calls == []
+    new = event(message_id="om_new_generation")
+    assert enqueue(warehouse, new)["status"] == "QUEUED"
+    assert process(warehouse)["status"] == "QUEUED"
+
+
+def test_busy_reply_uses_current_route_generation(warehouse):
+    path = Path(warehouse[0].feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing["groups"]["reports"]["notifications_changed_at"] = "2026-11-14T00:00:00+00:00"
+    path.write_text(json.dumps(routing))
+    warehouse[0].feishu_bot_max_pending = 1
+    enqueue(warehouse)
+    result = enqueue(warehouse, event(message_id="om_busy_current"))
+    assert result["status"] == "BUSY"
+    with warehouse[1]() as db:
+        outbox_id = db.get(SyncJob, result["job_id"]).metadata_json["outbox_ids"][0]
+        route = db.get(NotificationOutbox, outbox_id).payload["delivery"]
+        assert route["routing_changed_at"] == "2026-11-14T00:00:00+00:00"

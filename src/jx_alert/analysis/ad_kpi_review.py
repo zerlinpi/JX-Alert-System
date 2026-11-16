@@ -9,7 +9,9 @@ from jx_alert.analysis.ad_kpis import advertising_kpis
 from jx_alert.chat_analysis import _chinese, _now, _scope
 from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card
 from jx_alert.notifications.outbox import enqueue_notification
-from jx_alert.notifications.routing import _load_routing, _routed_open_ids, report_group_delivery
+from jx_alert.notifications.routing import (
+    _load_routing, _routed_open_ids, group_member_mentions, report_group_delivery,
+)
 from jx_alert.storage.models import AdProduct, Campaign, Store, SyncJob
 
 
@@ -123,8 +125,8 @@ def submit_kpi_review(db, settings, review_id, findings, *, now=None):
         delivery = report_group_delivery(settings, routing, role="chat_ad_kpi")
         entity_id = context["entity_id"] or store.sid
         group = routing["groups"][settings.feishu_daily_report_chat_id]
-        owners = _routed_open_ids(routing, store.sid, entity_id)
-        admins = group.get("admin_open_ids", [])
+        owners = group_member_mentions(group, _routed_open_ids(routing, store.sid, entity_id))
+        admins = group_member_mentions(group, group.get("admin_open_ids", []))
         if not owners and not settings.feishu_group_fallback_enabled:
             raise ValueError("Verified operator mapping is required")
         if owners and admins:
