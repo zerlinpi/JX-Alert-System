@@ -66,6 +66,7 @@ ANSWER_PROMPT = SYSTEM_PROMPT.split('服务端会附完整中文数据表')[0] +
 若问概念或操作方法，解释相关口径和允许的使用方式；现有证据不能回答时说明具体缺口。
 不把未知说成正常，不猜授权失败或数据缺失原因，不宣称已实时同步、已发送或已执行动作。
 正常或改善可以在用户明确询问该指标时回答，但不标为异常。
+用户只要异常或待确认项时，不写正常/无异常条目，不加异常、建议等分组标题。
 """
 
 
@@ -186,6 +187,24 @@ def analysis_cache_key(context, question, model):
 
 def _actionable_text(text, context, question):
     """Do not publish model-written watch/positive KPI bullets as findings."""
+    findings_only = bool(re.search(r'(?:只|仅).{0,8}(?:异常|待确认|风险|违规)', question))
+    if context.get('reply_mode') == 'answer' and findings_only:
+        retained = []
+        for line in text.splitlines():
+            line = line.strip()
+            if (not line or re.match(r'^#{1,6}\s|^\*\*[^*]+\*\*\s*$', line)
+                    or re.match(r'^(?:\*\*)?(?:复核建议|建议|说明)[:：]', line.replace('**', ''))):
+                continue
+            qualified = re.search(r'不能|无法|不代表|待确认|未确认|数据不足|未知|未采集|缺失', line)
+            normal = re.search(r'(?:无|没有|未发现|不存在|未见).{0,8}(?:异常|超标|违规)', line)
+            if normal and not qualified:
+                continue
+            retained.append(line)
+        text = '\n'.join(retained)
+        if not text and context.get('health', {}).get('status') != 'HEALTHY':
+            reason = context.get('health', {}).get('confirmation_reason')
+            if reason:
+                text = '- 待确认：' + reason + '。'
     if context.get('reply_mode') == 'answer' or not context.get("notification_policy"):
         return text
     labels = {"CTR": "点击率", "CPC": "点击花费", "CDR": "点击转化率", "CPS": "单件转化花费",
