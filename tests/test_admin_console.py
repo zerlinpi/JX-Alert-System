@@ -167,6 +167,26 @@ def test_manual_sync_preserves_pause_authorization_and_service_gates(console, mo
     assert unauthorized.status_code == 409 and '授权失败' in unauthorized.json()['error']
 
 
+def test_bulk_collection_is_owner_only_and_requires_same_origin_csrf_and_empty_body(console, monkeypatch):
+    client, _, _, _ = console
+    _enable_console_collection(console, monkeypatch)
+    path = '/console/api/collection/all'
+    assert client.get(path).status_code == 401 and client.post(path, json={}).status_code == 401
+    assert login(client).is_redirect
+    headers = {'Origin': ORIGIN, 'X-CSRF-Token': client.get('/console/api/stores').json()['csrf']}
+    assert client.post(path, json={}, headers={'Origin': ORIGIN}).status_code == 403
+    assert client.post(path, json={}, headers={**headers, 'Origin': 'https://wrong.example'}).status_code == 403
+    assert client.post(path, json={'store_ids': ['999']}, headers=headers).status_code == 400
+    result = client.post(path, json={}, headers=headers)
+    assert result.status_code == 200 and result.json()['selected_store_count'] == 1
+    assert result.json()['skipped_reason_counts'] == {'授权失败': 1}
+    reused = client.post(path, json={}, headers=headers)
+    assert reused.json()['job_id'] == result.json()['job_id'] and reused.json()['reused']
+    assert client.post(path, json={}, headers=headers).status_code == 429
+    assert client.get(path).json()['job_id'] == result.json()['job_id']
+    assert 'id="sync-all"' in client.get('/console/').text
+
+
 def test_manual_sync_status_is_scoped_and_never_exposes_raw_job_metadata(console):
     client, routing, _, _ = console
     engine = create_engine(f"sqlite:///{routing.parent / 'warehouse.sqlite'}")
