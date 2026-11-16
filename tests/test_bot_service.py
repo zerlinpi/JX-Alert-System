@@ -488,6 +488,10 @@ def test_all_store_analysis_respects_an_explicit_date_and_blocks_unfinished_date
 @pytest.mark.parametrize('question, expected', [
     ('帮我更新Geteen美国的数据再分析', ('name_request', 'Geteen美国')),
     ('请刷新一下Geteen美国最新数据', ('name_request', 'Geteen美国')),
+    ('请同步Geteen美国最新数据', ('name_request', 'Geteen美国')),
+    ('手动同步Geteen美国今日数据', ('name_request', 'Geteen美国')),
+    ('不要同步Geteen美国最新数据', None),
+    ('如何同步Geteen美国今日数据', None),
     ('不要更新Geteen美国数据', None), ('如何更新Geteen美国数据', None),
     ('Geteen美国能否实时采集', None), ('Geteen美国广告情况', None),
 ])
