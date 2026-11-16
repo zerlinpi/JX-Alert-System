@@ -692,7 +692,6 @@ def question_context(db, settings, store_id, *, now=None, question=None):
 
 def _answer_cards(context, data_card, analysis):
     if context.get('operator_compact'):
-        import html
         from jx_alert.bot_presentation import operator_card
         cards = [] if context.get('reply_mode') == 'answer' else [operator_card(context)]
         if analysis:
