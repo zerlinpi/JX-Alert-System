@@ -10,7 +10,7 @@ The list is queried one store at a time with sids, offset and length. Detail use
 
 ## Freshness
 
-The performance list update_date and notice data.lastUpdateDate are source timestamps, not request timestamps. They have no explicit UTC offset. Set LINGXING_PERFORMANCE_SOURCE_TIMEZONE only after confirming the source timezone. Until then freshness is NOT_CONFIGURED, not healthy. Missing timestamps are MISSING; old data is STALE; future data is FUTURE. Default maximum age is 8 hours.
+The performance list update_date and notice data.lastUpdateDate are source timestamps, not request timestamps. Preserve their original values. Parse an explicit source offset (including Z) before considering configuration; it takes precedence over a separately configured zone. Offset-free values need a verified LINGXING_PERFORMANCE_SOURCE_TIMEZONE; without it freshness is NOT_CONFIGURED, never inferred from the host timezone. Missing or invalid timestamps are MISSING; old data is STALE; future data is FUTURE. Default maximum age is 8 hours. The production source values checked on 2026-11-16 had no offset, so their interpretation remains unconfirmed. Observation-only mode stays enabled. See the [current system/time policy](SYSTEM_RULES_AND_LOGIC.md#3-四种时间与报表日期).
 
 ## Notice status
 

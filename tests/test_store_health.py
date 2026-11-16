@@ -88,6 +88,7 @@ def test_missing_or_future_source_time_never_becomes_healthy(warehouse, source, 
 def test_unconfirmed_source_timezone_preserves_risk_as_observation_only(warehouse):
     db, _, settings, row = warehouse
     settings.lingxing_performance_source_timezone = ""
+    row.source_updated_at = (NOW - timedelta(minutes=10)).replace(tzinfo=None).isoformat()
     row.ahr_status = "AtRisk"
     row.indicators = {**VALUES, "order_with_defect": 2.5}
     db.flush()

@@ -56,4 +56,4 @@ sudo docker compose -p jx-alert exec -T scheduler python /app/scripts/export_dai
 
 脚本只读取已有数据，不请求领星、不重建环境。同日完成时返回`ALREADY_COMPLETE`；未完成返回失败退出码，不把尝试成功当作归档完成。
 
-运行配置支持`excel_daily_snapshot_enabled`和`excel_daily_snapshot_cron`；还需原有`excel_archive_enabled=true`。默认快照计划为北京时间`30 23 * * *`。调度代码来自镜像，因此部署此改动要构建并更新scheduler服务；只拉取Git或重启旧镜像不会加载新任务。可以保持原MCP服务运行。
+运行配置支持`excel_daily_snapshot_enabled`和`excel_daily_snapshot_cron`；还需原有`excel_archive_enabled=true`。默认快照计划为北京时间`30 23 * * *`。部署方式取决于实际运行配置：当前服务器的调度服务使用只读源码挂载与`PYTHONPATH`，拉取已验收版本后重启对应进程可加载；没有源码挂载而使用镜像内打包代码的部署才需要构建并更新镜像。不要因此重建数据库或更换数据卷，MCP可独立运行。完整运行口径见[系统总文档](SYSTEM_RULES_AND_LOGIC.md)。

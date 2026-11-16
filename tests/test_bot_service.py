@@ -84,7 +84,7 @@ def warehouse(tmp_path, monkeypatch):
                     db.add(DailyMetric(store_id="5174", metric_date=on, dimension=dimension, entity_id=entity_id,
                         metric_name=metric, value=value, currency="USD" if metric in {"sales", "spend"} else None))
         db.add(StorePerformance(store_id="5174", pull_date=DAY, ahr_status="Healthy", ahr_score=220,
-            captured_at=NOW.replace(tzinfo=None), source_updated_at=NOW.isoformat(),
+            captured_at=NOW.replace(tzinfo=None), source_updated_at=NOW.replace(tzinfo=None).isoformat(),
             freshness_status="NOT_CONFIGURED", indicators={"order_with_defect": "0.00"},
             standards={"orderWithDefect": "1"}))
         db.commit()
