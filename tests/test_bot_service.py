@@ -334,6 +334,79 @@ def test_partial_name_question_uses_correct_store_without_starting_collection(wa
         assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == "manual_collection")) is None
 
 
+@pytest.mark.parametrize('question', ['现在有哪些店铺数据', '目前有哪些数据', '查看店铺列表'])
+def test_natural_inventory_uses_scoped_facts_without_model_or_provider(warehouse, question):
+    from jx_alert.store_controls import get_store_controls, save_store_controls
+    _name_stores(warehouse)
+    settings = warehouse[0]
+    save_store_controls(settings, '5175', False, False, get_store_controls(settings, '5175')['revision'])
+    enqueue(warehouse, event('@_user_1 ' + question))
+    result = process(warehouse)
+    assert result['status'] == 'QUEUED' and FakeClient.calls == []
+    with warehouse[1]() as db:
+        text = json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)
+        assert 'Geteen' in text and '2026-11-12' in text and '有广告记录' in text
+        assert 'Campx' not in text and '范围外店铺' not in text and '未匹配到店铺' not in text
+
+
+def test_historical_inventory_can_include_closed_stores_but_empty_source_is_not_data(warehouse):
+    from jx_alert.bot_intents import global_question_cards
+    from jx_alert.store_controls import get_store_controls, save_store_controls
+    _name_stores(warehouse)
+    settings = warehouse[0]
+    save_store_controls(settings, '5175', False, False, get_store_controls(settings, '5175')['revision'])
+    with warehouse[1].begin() as db:
+        # Legacy coverage counted a summary row even though both source grains were empty.
+        db.add(DataCoverage(store_id='5175', dimension='store', metric_date=DAY, status='COMPLETE', row_count=1))
+        for dim in ('sku_asin', 'sku_msku', 'campaign_sp'):
+            db.add(DataCoverage(store_id='5175', dimension=dim, metric_date=DAY, status='COMPLETE', row_count=0))
+    with warehouse[1]() as db:
+        snapshots, ids = bot_service._resolve_store(db, settings, '包含已关闭的店铺列表')
+        cards = global_question_cards(db, settings, '包含已关闭的店铺列表', snapshots, ids, now=NOW)
+        rows = next(e['rows'] for e in cards[0]['body']['elements'] if e['tag'] == 'table')
+        paused = next(r for r in rows if 'Campx' in r['c0'])
+        assert paused['c2'] == '暂无可用记录' and paused['c3'] == '接口无记录' and paused['c4'] == '接口无记录'
+        assert '采集关' in paused['c5']
+
+
+def test_health_only_question_keeps_health_evidence_without_irrelevant_ad_tables(warehouse):
+    enqueue(warehouse, event('@_user_1 5174店铺绩效是否有违规'))
+    assert process(warehouse)['status'] == 'QUEUED'
+    context = FakeClient.calls[0][0]
+    assert context['question_topic'] == 'health' and 'health' in context
+    assert 'advertising_kpis' not in context and 'campaigns' not in context
+    with warehouse[1]() as db:
+        text = json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)
+        assert '店铺绩效快报' in text and '广告归因数据' not in text and '经营与广告' not in text
+
+
+def test_ad_only_question_omits_empty_sb_sd_and_health_but_retains_all_kpis(warehouse):
+    from jx_alert.bot_intents import focus_question
+    with warehouse[1].begin() as db:
+        for dim in ('campaign_sb', 'campaign_sd'):
+            for row in list(db.scalars(select(DailyMetric).where(DailyMetric.dimension == dim))):
+                db.delete(row)
+            for row in db.scalars(select(DataCoverage).where(DataCoverage.dimension == dim)):
+                row.row_count = 0
+    with warehouse[1]() as db:
+        context, value = bot_service.question_context(db, warehouse[0], '5174', now=NOW)
+        context, value = focus_question(context, value, '5174广告订单转化情况')
+    assert context['question_topic'] == 'ads' and 'health' not in context
+    assert [r['ad_type'] for r in context['advertising_totals']] == ['商品推广']
+    assert len(context['advertising_kpis']) == 7
+    assert '店铺绩效快报' not in json.dumps(value, ensure_ascii=False)
+
+
+@pytest.mark.parametrize('question, expected', [
+    ('帮我更新Geteen美国的数据再分析', ('name_request', 'Geteen美国')),
+    ('请刷新一下Geteen美国最新数据', ('name_request', 'Geteen美国')),
+    ('不要更新Geteen美国数据', None), ('如何更新Geteen美国数据', None),
+    ('Geteen美国能否实时采集', None), ('Geteen美国广告情况', None),
+])
+def test_natural_refresh_is_an_explicit_request_and_never_inferred_from_capability_questions(question, expected):
+    assert bot_service._collection_command(question) == expected
+
+
 def test_unknown_full_brand_cannot_fall_back_to_shared_chinese_prefix(warehouse):
     _name_stores(warehouse)
     with warehouse[1]() as db:

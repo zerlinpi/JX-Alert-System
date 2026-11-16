@@ -3,6 +3,8 @@
 领星 ERP（Lingxing OpenAPI）只读数据监控、经营/广告异常分析、飞书自建应用通知与群内/私聊问答、Chat MCP和Excel归档服务。
 
 > **完整系统逻辑与所有提醒规则：[阅读总文档](docs/SYSTEM_RULES_AND_LOGIC.md)。** 其中区分线上实际开关、代码默认、初筛、最终通知、数据未知和真实送达。
+
+早间08:00按「每天绩效/违规快报，广告只列有意义的SP活动问题」发送；自然提问、数据清单、两项独立开关生效边界及回滚见[早间快报与自然提问](docs/MORNING_BRIEF_AND_QUESTIONS.md)。
 >
 > 源码默认 `APP_DRY_RUN=true`、`FEISHU_ENABLED=false`、`SCHEDULER_ENABLED=false`；现有服务器通过私有运行配置启用服务。以下新环境安装步骤不用于覆盖现有`.env`、私有配置或重建生产数据库。
 

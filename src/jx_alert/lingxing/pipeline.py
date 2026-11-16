@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from jx_alert.analysis.evaluator import evaluate_store_status_events
 from jx_alert.lingxing.ad_currency import account_currencies
 from jx_alert.lingxing.campaign_collector import collect_campaigns
-from jx_alert.lingxing.client import LingxingError, LingxingTransientError
+from jx_alert.lingxing.client import LingxingError, LingxingTransientError, LingxingCollectionPaused
 from jx_alert.lingxing.collector import collect_ads_for_day
 from jx_alert.lingxing.product_ads_collector import collect_product_ads_for_day
 from jx_alert.lingxing.performance_openapi import collect_store_performance
@@ -207,6 +207,15 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             "record_count": record_count,
             "steps": results,
         }
+    except LingxingCollectionPaused:
+        db.rollback()
+        results['raw_archive'] = archive_raw_snapshots(db, settings.raw_dir, after_id=snapshot_start_id)
+        job = db.get(SyncJob, job_id)
+        job.status, job.finished_at = 'SKIPPED', _utcnow()
+        job.metadata_json = {'report_dates': report_dates, 'completed_steps': completed_steps,
+            'results': results, 'reason': 'SKIPPED_COLLECTION_DISABLED'}
+        db.commit()
+        return {'job_id': job_id, 'status': 'SKIPPED_COLLECTION_DISABLED', 'steps': results}
     except Exception as exc:
         db.rollback()
         # A later provider failure must not hide already committed partitions.

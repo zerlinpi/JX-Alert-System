@@ -5,6 +5,7 @@ from threading import Event
 from types import SimpleNamespace
 
 from apscheduler.executors.pool import ThreadPoolExecutor as SchedulerExecutor
+from apscheduler.events import EVENT_JOB_REMOVED
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytest
 from sqlalchemy import create_engine, func, inspect, select
@@ -159,6 +160,13 @@ def test_deadline_uses_latest_complete_marketplace_date_only_for_explicit_scope(
     assert calls[0]["now"] == DEADLINE
     assert [row.sid for row in calls[0]["store_records"]] == ["5174"]
     assert calls[0]["store_warnings"] == {}
+
+
+def test_focused_morning_setting_reaches_the_scheduled_enqueue_without_collecting(setup, monkeypatch):
+    setup[0].feishu_morning_focus_enabled = True
+    calls = capture_enqueues(monkeypatch)
+    operations.queue_scheduled_daily_reports(now=DEADLINE)
+    assert calls[0]['focused_morning'] is True
 
 
 def test_multiple_scoped_stores_keep_each_marketplace_date(setup, monkeypatch):
@@ -341,6 +349,7 @@ def test_predeadline_report_job_does_not_drain_other_outbox_messages(monkeypatch
 
 def test_separate_scheduler_executor_runs_deadline_report_during_long_collection(monkeypatch):
     entered, release, reported = Event(), Event(), Event()
+    removed = Event()
 
     def long_collection():
         entered.set()
@@ -358,12 +367,17 @@ def test_separate_scheduler_executor_runs_deadline_report_during_long_collection
         "default": SchedulerExecutor(max_workers=1),
         "daily_reports": SchedulerExecutor(max_workers=1),
     })
+    running.add_listener(lambda event: removed.set() if event.job_id == 'deadline_report' else None,
+                         EVENT_JOB_REMOVED)
     try:
         running.start()
         running.add_job(scheduler.manual_collection_job, "date", executor="default")
         assert entered.wait(3)
-        running.add_job(scheduler.daily_report_job, "date", executor="daily_reports")
+        running.add_job(scheduler.daily_report_job, "date", executor="daily_reports", id='deadline_report')
         assert reported.wait(3), "The deadline report must not wait for the collection executor"
+        # The callback can finish before APScheduler removes this one-shot job.
+        # Do not close its job store concurrently with that removal.
+        assert removed.wait(3)
         assert not release.is_set()
     finally:
         release.set()
