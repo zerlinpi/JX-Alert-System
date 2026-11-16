@@ -12,7 +12,7 @@ from jx_alert.analysis.evaluator import _ad_entity_events, _comparison_evidence
 from jx_alert.analysis.materiality import material_change
 from jx_alert.analysis.rules import RuleConfig
 from jx_alert.analysis.store_health import store_health_snapshot
-from jx_alert.notifications.cards import ad_kpi_rows, card, number, plain
+from jx_alert.notifications.cards import card, compact_ad_kpi_rows, number, plain
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.notifications.store_health import card_fits
 from jx_alert.storage.collection_attempts import collection_issue_for_date
@@ -144,9 +144,15 @@ def health_notice_summary(db, store, snapshot):
 def morning_health_row(db, settings, store, *, now=None):
     health = store_health_snapshot(db, store, settings, now=now)
     observed = health['source_status_label'] + '（源观测）'
-    return (store.name, number(health['ahr_score']), observed, health['status_label'],
-        health_notice_summary(db, store, health), health['indicator_summary'],
-        health['source_updated_at'] or '未提供', health['confirmation_reason'])
+    summary = f"健康评分：{number(health['ahr_score'])}\n{observed}\n当前判定：{health['status_label']}"
+    attention = [health_notice_summary(db, store, health)]
+    for indicator in health['indicators']:
+        if indicator['status'] in {'BREACHED', 'AT_THRESHOLD'}:
+            attention.append(f"{indicator['label']} {indicator['value']:g}%（标准 {indicator['standard']:g}%）")
+    if any(item['status'] == 'INSUFFICIENT_DATA' for item in health['indicators']):
+        attention.append('部分绩效指标待补齐')
+    freshness = (health['source_updated_at'] or '未提供源更新时间') + '\n' + health['confirmation_reason']
+    return store.name, summary, '\n'.join(attention), freshness
 
 
 def _health_chunks(db, settings, stores, send_day, now):
@@ -156,8 +162,8 @@ def _health_chunks(db, settings, stores, send_day, now):
         size = min(10, len(rows) - offset)
         while size:
             value = card(f'店铺绩效与违规快报 · {send_day}', subtitle='账户观测与待处理事项',
-                sections=[('店铺绩效', ['店铺', '健康评分', '源评级', '当前判定', '违规/通知', '绩效关注项',
-                    '源更新时间', '数据依据'], [r[1] for r in rows[offset:offset + size]])])
+                sections=[('店铺绩效', ['店铺', '健康概况', '违规与绩效关注', '源时间与依据'],
+                    [r[1] for r in rows[offset:offset + size]])])
             if card_fits(value):
                 break
             size -= 1
@@ -168,26 +174,49 @@ def _health_chunks(db, settings, stores, send_day, now):
     return result
 
 
-def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=None):
+def select_morning_dates(db, stores, dates, warnings=None, history_allowed=None):
+    """Reuse the existing exact-date/failure/history policy before freezing pages."""
+    from jx_alert.notifications.daily_report import _report_selection
+    actual, warnings = {}, dict(warnings or {})
+    for store in stores:
+        day, warning, _, _ = _report_selection(db, store, _date(dates[store.sid]), warnings.get(store.sid),
+            scheduled=True, allow_history=store.sid in (history_allowed or set()))
+        actual[store.sid] = day
+        if warning:
+            warnings[store.sid] = warning
+    return actual, warnings
+
+
+def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=None, target_dates=None):
     """Return full requested health coverage, plus SP exception pages only."""
     chunks = _health_chunks(db, settings, stores, send_day, now)
     pending = []
     for store in stores:
+        target = _date((target_dates or dates)[store.sid])
+        actual = _date(dates[store.sid])
         findings, quality = sp_campaign_exceptions(db, settings, store, dates[store.sid])
         if (warnings or {}).get(store.sid):
             quality = (warnings or {})[store.sid]
             findings = []
+        if actual != target:
+            note = f'目标日尚未采集，仅复核历史报表日{actual}，不代表目标日数据'
+            quality = note + ('；' + quality if quality else '')
         if quality:
-            pending.append((store.sid, (store.name, str(dates[store.sid]), quality)))
+            pending.append((store.sid, (store.name, str(target), quality)))
         for finding in findings:
             topics = '；'.join(title + '（' + day + '）' for title, day in finding['topics'])
+            dates_and_values = [('实际复核日', finding['report_date']),
+                ('花费', number(finding['spend'], money=True, currency=finding['currency'] or '币种待确认')),
+                ('成熟归因日', finding['mature_date']),
+                ('成熟花费', number(finding['mature_spend'], money=True,
+                    currency=finding['mature_currency'] or '币种待确认')),
+                ('成熟归因订单', number(finding['mature_orders']))]
+            if actual != target:
+                dates_and_values.insert(0, ('目标报表日', target.isoformat()))
             value = card('商品推广活动待复核', subtitle=store.name + ' · ' + finding['campaign_name'],
                 sections=[('异常内容', ['活动状态', '问题'], [(finding['state'], topics)]),
-                    ('关键数据', ['花费报表日', '花费', '成熟归因日', '成熟花费', '成熟归因订单'], [(
-                        finding['report_date'], number(finding['spend'], money=True, currency=finding['currency'] or '币种待确认'),
-                        finding['mature_date'], number(finding['mature_spend'], money=True,
-                            currency=finding['mature_currency'] or '币种待确认'), number(finding['mature_orders']))]),
-                    ('广告指标', ['指标', '本期', '参考', '变化', '判断', '本期日期'], ad_kpi_rows(finding['kpis']))])
+                    ('关键数据', ['指标', '数值'], dates_and_values),
+                    ('广告指标', ['指标', '本期/日期', '参考/变化', '判断'], compact_ad_kpi_rows(finding['kpis']))])
             if not card_fits(value):
                 raise ValueError('Morning exception exceeds the card limit')
             chunks.append((value, [store.sid]))
@@ -201,7 +230,7 @@ def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=N
     return chunks
 
 
-def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, due, delivery, now):
+def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, due, delivery, now, history_allowed=None):
     chat_id = delivery['receive_id']
     # Reuse ANY format already frozen for this delivery day; never resend on upgrade.
     existing = list(db.scalars(select(NotificationOutbox).where(
@@ -210,7 +239,9 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
     if existing:
         return {'queued': len(existing), 'skipped': False, 'outbox_ids': [r.id for r in existing]}
     prefix = 'scheduled-daily:morning:' + hashlib.sha256(f'{send_day}:{chat_id}'.encode()).hexdigest() + ':'
-    chunks = morning_cards(db, settings, stores, dates, send_day=send_day, now=now, warnings=warnings)
+    actual, warnings = select_morning_dates(db, stores, dates, warnings, history_allowed)
+    chunks = morning_cards(db, settings, stores, actual, send_day=send_day, now=now,
+        warnings=warnings, target_dates=dates)
     ids = []
     try:
         with db.begin_nested():
@@ -219,7 +250,7 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
                     next_attempt_at=due.astimezone(timezone.utc).replace(tzinfo=None), payload={
                         'text': plain(value['header']['title']['content']), 'store_ids': store_ids,
                         'store_id': store_ids[0] if len(store_ids) == 1 else None,
-                        'store_report_dates': {sid: {'target': str(dates[sid]), 'actual': str(dates[sid])} for sid in store_ids},
+                        'store_report_dates': {sid: {'target': str(dates[sid]), 'actual': str(actual[sid])} for sid in store_ids},
                         'open_ids': [], 'fixed_route': True, 'transport': 'app', 'delivery': delivery, 'card': value,
                         'scheduled_delivery_date': send_day.isoformat(), 'scheduled_timezone': 'Asia/Shanghai',
                         'scheduled_not_before': due.isoformat(), 'morning_focus': True})

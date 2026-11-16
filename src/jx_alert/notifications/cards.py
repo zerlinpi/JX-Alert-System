@@ -73,6 +73,23 @@ def ad_kpi_rows(comparisons):
     return rows
 
 
+def compact_ad_kpi_rows(comparisons, *, omit_empty=True):
+    """Keep dates, references and judgments in four operator-facing columns.
+
+    Missing values stay missing. A real zero is retained, while completely
+    unavailable or inapplicable ratios need not occupy an empty message row.
+    The original comparisons remain untouched for detailed queries/exports.
+    """
+    rows = []
+    for entry in comparisons.values():
+        if omit_empty and entry.get('current') is None and entry.get('baseline') is None:
+            continue
+        label, current, reference, change, status, day = ad_kpi_rows({'entry': entry})[0]
+        rows.append((label, current + ('\n' + day if day else ''),
+            reference + ('\n' + change if change != '—' else ''), status))
+    return rows
+
+
 def table(headers, rows):
     return {
         "tag": "table", "page_size": min(10, max(1, len(rows))),

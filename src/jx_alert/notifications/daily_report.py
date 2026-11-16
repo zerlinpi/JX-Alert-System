@@ -329,7 +329,7 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
             raise ValueError("Morning brief store is outside the explicit report scope")
         from jx_alert.notifications.morning_digest import enqueue_morning_digest
         return enqueue_morning_digest(db, settings, stores, dates, store_warnings or {},
-            send_day=send_day, due=due, delivery=delivery, now=local_now)
+            send_day=send_day, due=due, delivery=delivery, now=local_now, history_allowed=history_fallback_store_ids)
     if (send_day is not None and app_transport and len(stores) > 1
             and getattr(settings, "feishu_daily_report_group_digest", False)):
         dates = store_dates if store_dates is not None else {s.sid: target for s in stores}

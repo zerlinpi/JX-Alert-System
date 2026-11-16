@@ -75,7 +75,8 @@ def test_only_mature_zero_conversion_generates_a_specific_campaign_problem_with_
     assert len(chunks) == 2
     text = json.dumps(chunks[1], ensure_ascii=False)
     assert '成熟广告有花费但无归因订单' in text and '2026-11-05' in text and '普通活动' in text
-    assert all(code in text for code in ('CTR', 'CPC', 'CDR', 'CPS', 'ROAS', 'CPA', 'TCOAS'))
+    assert all(code in text for code in ('CTR', 'CPC', 'CDR', 'CPS', 'ROAS'))
+    assert len(sp_campaign_exceptions(db, settings, store, DAY)[0][0]['kpis']) == 7
 
 
 def test_improvements_and_small_changes_do_not_generate_campaign_messages(warehouse):
@@ -168,3 +169,28 @@ def test_upgrade_does_not_resend_old_format_for_the_same_delivery_day(warehouse)
     result = enqueue_daily_snapshots(db, settings, store_dates={store.sid: DAY}, delivery_date=NOW.date(),
         now=NOW, focused_morning=True)
     assert result['outbox_ids'] == [old_id]
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_unknown_timezone_history_fallback_keeps_actual_date_and_never_masks_target_failure(warehouse, failed):
+    db, settings, store = warehouse
+    for dimension, count in [('store', 1), ('campaign_sb', 0), ('campaign_sd', 0)]:
+        db.add(DataCoverage(store_id=store.sid, dimension=dimension, metric_date=DAY, status='COMPLETE', row_count=count))
+    for metric, value in {'orders': 10, 'units': 12, 'sales': 500}.items():
+        db.add(DailyMetric(store_id=store.sid, dimension='store', entity_id=store.sid, metric_date=DAY,
+            metric_name=metric, value=value, currency='USD' if metric == 'sales' else None))
+    target = DAY + timedelta(days=1)
+    if failed:
+        db.add(SyncJob(job_type='daily_collection', status='FAILED', metadata_json={'report_dates': {store.sid: target.isoformat()}}))
+    db.commit()
+    change(db, 'orders', 0, DAY - timedelta(days=7))
+    result = enqueue_daily_snapshots(db, settings, store_dates={store.sid: target}, delivery_date=NOW.date(),
+        now=NOW, focused_morning=True, history_fallback_store_ids={store.sid})
+    payloads = [db.get(NotificationOutbox, i).payload for i in result['outbox_ids']]
+    assert all(p['store_report_dates'][store.sid] == {'target': str(target), 'actual': str(target if failed else DAY)} for p in payloads)
+    text = json.dumps(payloads, ensure_ascii=False)
+    if failed:
+        assert '采集失败' in text and '商品推广活动待复核' not in text and '仅复核历史' not in text
+    else:
+        assert '商品推广活动待复核' in text and '仅复核历史报表日2026-11-12' in text
+        assert '目标报表日' in text and '实际复核日' in text

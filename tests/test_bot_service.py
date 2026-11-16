@@ -365,8 +365,8 @@ def test_historical_inventory_can_include_closed_stores_but_empty_source_is_not_
         cards = global_question_cards(db, settings, '包含已关闭的店铺列表', snapshots, ids, now=NOW)
         rows = next(e['rows'] for e in cards[0]['body']['elements'] if e['tag'] == 'table')
         paused = next(r for r in rows if 'Campx' in r['c0'])
-        assert paused['c2'] == '暂无可用记录' and paused['c3'] == '接口无记录' and paused['c4'] == '接口无记录'
-        assert '采集关' in paused['c5']
+        assert paused['c1'] == '暂无可用记录' and paused['c2'] == '接口无记录' and paused['c3'] == '接口无记录'
+        assert '采集关' not in json.dumps(rows, ensure_ascii=False)
 
 
 def test_health_only_question_keeps_health_evidence_without_irrelevant_ad_tables(warehouse):
@@ -377,7 +377,73 @@ def test_health_only_question_keeps_health_evidence_without_irrelevant_ad_tables
     assert 'advertising_kpis' not in context and 'campaigns' not in context
     with warehouse[1]() as db:
         text = json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)
-        assert '店铺绩效快报' in text and '广告归因数据' not in text and '经营与广告' not in text
+        assert ANALYSIS in text and '广告归因数据' not in text and '经营与广告' not in text
+        assert not any(e['tag'] == 'table' for r in db.scalars(select(NotificationOutbox)) for e in r.payload['card']['body']['elements'])
+
+
+def test_all_store_health_question_replies_with_cards_without_model_or_advertising(warehouse):
+    enqueue(warehouse, event('@_user_1 所有店铺绩效和违规情况'))
+    assert process(warehouse)['status'] == 'QUEUED' and not FakeClient.calls
+    with warehouse[1]() as db:
+        text = json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)
+    assert '店铺绩效与违规快报' in text and '广告判断' not in text and '未匹配到店铺' not in text
+
+
+def test_today_daily_brief_means_delivery_today_but_intraday_query_stays_unfinished(warehouse):
+    with warehouse[1]() as db:
+        context, _ = bot_service.question_context(db, warehouse[0], '5174', now=NOW,
+            question='使用最新的日报格式发送今日日报的内容Geteen美国')
+        intraday, _ = bot_service.question_context(db, warehouse[0], '5174', now=NOW,
+            question='5174今天实时广告数据')
+    assert context['report_date'] == str(DAY) and context['data_warning'] is None
+    assert context['sales_and_spend'][0]['current_display'] == '10'
+    assert not intraday['report_date_is_complete'] and '尚未结束' in intraday['data_warning']
+
+
+@pytest.mark.parametrize('question', ['CPC是什么意思', '你能根据哪些资料回答问题', '为什么不能把空记录当成零'])
+def test_custom_business_question_does_not_require_a_standard_store_template(warehouse, question):
+    enqueue(warehouse, event('@_user_1 ' + question))
+    result = process(warehouse)
+    assert result['status'] == 'QUEUED' and len(FakeClient.calls) == 1
+    assert FakeClient.calls[0][0]['reply_mode'] == 'answer'
+    assert '范围外店铺' not in json.dumps(FakeClient.calls[0], ensure_ascii=False)
+    with warehouse[1]() as db:
+        payload = db.get(NotificationOutbox, result['outbox_ids'][0]).payload
+        assert '未匹配到店铺' not in json.dumps(payload, ensure_ascii=False)
+        assert all(e['tag'] != 'table' for e in payload['card']['body']['elements'])
+
+
+def test_greeting_returns_usage_without_a_model_or_store_clarification(warehouse):
+    enqueue(warehouse, event('@_user_1 你好'))
+    result = process(warehouse)
+    assert result['status'] == 'QUEUED' and FakeClient.calls == []
+    with warehouse[1]() as db:
+        assert db.get(SyncJob, result['job_id']).metadata_json['analysis_provider'] == 'question_help'
+
+
+def test_targeted_amount_question_keeps_numeric_evidence_without_a_full_data_dump(warehouse):
+    enqueue(warehouse, event('@_user_1 只告诉我5174店铺广告花费多少'))
+    result = process(warehouse)
+    assert result['status'] == 'QUEUED'
+    context = FakeClient.calls[0][0]
+    assert context['reply_mode'] == 'answer' and context['advertising_totals'][0]['spend'] == 100
+    with warehouse[1]() as db:
+        assert all(e['tag'] != 'table' for i in result['outbox_ids']
+            for e in db.get(NotificationOutbox, i).payload['card']['body']['elements'])
+
+
+def test_operator_daily_tables_are_narrow_health_first_and_omit_internal_capture_metadata(warehouse):
+    from jx_alert.bot_intents import focus_question
+    with warehouse[1]() as db:
+        context, source = bot_service.question_context(db, warehouse[0], '5174', now=NOW)
+    context, source = focus_question(context, source, '5174店铺最新日报')
+    values = bot_service._answer_cards(context, source, ANALYSIS)
+    tables = [e for v in values for e in v['body']['elements'] if e['tag'] == 'table']
+    assert tables[0]['rows'][0]['c0'] == '健康评分'
+    assert all(len(t['columns']) <= 4 for t in tables)
+    text = json.dumps(values, ensure_ascii=False)
+    assert '采集时间（UTC）' not in text and '采集开关' not in text
+    assert all(code in text for code in ('CTR', 'CPC', 'CDR', 'CPS', 'ROAS', 'CPA', 'TCOAS'))
 
 
 def test_ad_only_question_omits_empty_sb_sd_and_health_but_retains_all_kpis(warehouse):
@@ -395,6 +461,28 @@ def test_ad_only_question_omits_empty_sb_sd_and_health_but_retains_all_kpis(ware
     assert [r['ad_type'] for r in context['advertising_totals']] == ['商品推广']
     assert len(context['advertising_kpis']) == 7
     assert '店铺绩效快报' not in json.dumps(value, ensure_ascii=False)
+
+
+@pytest.mark.parametrize('future', [False, True])
+def test_all_store_analysis_respects_an_explicit_date_and_blocks_unfinished_dates(warehouse, future):
+    from jx_alert.bot_intents import global_question_cards
+    requested = DAY + timedelta(days=1) if future else DAY - timedelta(days=2)
+    on = requested - timedelta(days=7)
+    with warehouse[1].begin() as db:
+        for metric, value in [('orders', 0), ('clicks', 40)]:
+            row = db.scalar(select(DailyMetric).where(DailyMetric.store_id == '5174', DailyMetric.dimension == 'campaign_sp',
+                DailyMetric.metric_date == on, DailyMetric.metric_name == metric))
+            row.value = value
+    with warehouse[1]() as db:
+        q = f'所有店铺{requested}广告异常'
+        snapshots, ids = bot_service._resolve_store(db, warehouse[0], q)
+        values = global_question_cards(db, warehouse[0], q, snapshots, ids, now=NOW)
+    text = json.dumps(values, ensure_ascii=False)
+    assert str(requested) in text
+    if future:
+        assert '尚未结束' in text and '商品推广活动待复核' not in text
+    else:
+        assert '成熟广告有花费但无归因订单' in text and '2026-11-03' in text
 
 
 @pytest.mark.parametrize('question, expected', [
@@ -853,7 +941,7 @@ def test_single_sid_reply_has_actual_sales_advertising_ratios_health_and_chinese
         assert all(row.status == "PENDING" for row in rows)  # Queueing is not confirmed delivery.
 
 
-@pytest.mark.parametrize("question", ["同创美国的情况", "你好", "9999 店铺情况", "151740 店铺情况"])
+@pytest.mark.parametrize("question", ["同创美国的情况", "9999 店铺情况", "151740 店铺情况"])
 def test_ambiguous_or_outside_scope_store_gets_clarification_without_model_call(warehouse, question):
     enqueue(warehouse, event("@_user_1 " + question))
     result = process(warehouse)

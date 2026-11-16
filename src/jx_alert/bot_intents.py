@@ -9,7 +9,7 @@ import unicodedata
 from sqlalchemy import select
 
 from jx_alert.notifications.cards import card
-from jx_alert.notifications.morning_digest import morning_cards
+from jx_alert.notifications.morning_digest import morning_cards, select_morning_dates
 from jx_alert.notifications.store_health import card_fits
 from jx_alert.operations import store_report_plan
 from jx_alert.storage.collection_attempts import collection_issue_for_date
@@ -79,7 +79,6 @@ def _data_state(db, store, day):
 
 def inventory_cards(db, settings, stores, *, historical=False):
     rows = []
-    controls = store_control_snapshots(settings, [s.sid for s in stores])
     for store in stores:
         days = list(db.scalars(select(DataCoverage.metric_date).where(DataCoverage.store_id == store.sid,
             DataCoverage.dimension.in_(['store', 'campaign_sp'])).distinct().order_by(DataCoverage.metric_date.desc()).limit(22)))
@@ -92,18 +91,14 @@ def inventory_cards(db, settings, stores, *, historical=False):
             if sales in {'AVAILABLE', 'ZERO'} or sp:
                 actual = day.isoformat()
                 break
-        state = controls[store.sid]
-        switches = ('采集开' if state['collection_enabled'] else '采集关') + ' / ' + (
-            '通知开' if state['notifications_enabled'] else '通知关')
-        rows.append((store.name, store.country or '站点待确认', actual or '暂无可用记录',
-                     labels[0], labels[1], switches))
+        rows.append((store.name, actual or '暂无可用记录', labels[0], labels[1]))
     title = '店铺历史数据清单' if historical else '当前运营店铺数据'
     if not rows:
         return [card(title, subtitle='当前范围没有开启采集或通知的店铺。', sections=[])]
     cards = []
     for offset in range(0, len(rows), 10):
         value = card(title, subtitle=f'共{len(rows)}家 · 第{offset // 10 + 1}页', sections=[
-            ('已保存数据', ['店铺', '站点', '最近可用报表日', '最新销量状态', '最新商品推广状态', '开关'], rows[offset:offset + 10])])
+            ('已保存数据', ['店铺', '最近可用报表日', '销量', '商品推广'], rows[offset:offset + 10])])
         if not card_fits(value):
             raise ValueError('Store inventory page exceeds the card limit')
         cards.append(value)
@@ -129,11 +124,29 @@ def global_question_cards(db, settings, question, snapshots, matched_ids, *, now
     plan = store_report_plan([{'sid': s.sid, 'status': s.status} for s in stores], settings.store_timezones_file,
         now=clock, include_inactive=True,
         allow_unknown_timezone_history=getattr(settings, 'allow_unconfigured_timezone_history', False))
-    dates = {r['store_id']: r['report_date'] for r in plan if r['state'] == 'READY'}
+    from jx_alert.bot_service import _question_date, QuestionDateError
+    targets, history_allowed, warnings = {}, set(), {}
+    for item in plan:
+        if item['state'] != 'READY':
+            continue
+        completed = datetime.fromisoformat(item['report_date']).date()
+        try:
+            explicit = _question_date(q, completed, timezone_confirmed=item['timezone_confirmed'])
+        except QuestionDateError as exc:
+            return [card('请确认报表日期', subtitle=str(exc), sections=[])]
+        sid = item['store_id']
+        targets[sid] = explicit or completed
+        if targets[sid] > completed:
+            warnings[sid] = '查询报表日期尚未结束，不能作为完整日报分析'
+        elif explicit is None:
+            history_allowed.add(sid)
+    dates, warnings = select_morning_dates(db, [s for s in stores if s.sid in targets],
+        targets, warnings, history_allowed)
     ready = [s for s in stores if s.sid in dates]
     topic = question_topic(q)
-    cards = morning_cards(db, settings, ready, dates,
-        send_day=clock.astimezone(ZoneInfo('Asia/Shanghai')).date(), now=clock) if ready else []
+    cards = [value for value, _ in morning_cards(db, settings, ready, dates,
+        send_day=clock.astimezone(ZoneInfo('Asia/Shanghai')).date(), now=clock,
+        target_dates=targets, warnings=warnings)] if ready else []
     if topic == 'health':
         cards = [v for v in cards if v['header']['title']['content'].startswith('店铺绩效')]
     elif topic == 'ads':
@@ -149,6 +162,9 @@ def focus_question(context, data_card, question):
     context, value = deepcopy(context), deepcopy(data_card)
     topic = question_topic(question)
     context['question_topic'] = topic
+    from jx_alert.bot_presentation import reply_mode
+    context['operator_compact'] = True
+    context['reply_mode'] = reply_mode(question)
     show_optional = bool(re.search(r'品牌推广|展示推广|\bSB\b|\bSD\b', question, re.I))
     absent = {r['ad_type'] for r in context.get('advertising_totals', []) if r['ad_type'] != '商品推广'
               and (r.get('no_records') or all(r.get(m) is None for m in ('spend', 'orders', 'sales', 'clicks', 'impressions')))}

@@ -115,6 +115,80 @@ def test_dashboard_keeps_zero_and_empty_separate_from_missing(console):
     assert client.get("/console/api/stores/5174?date=9999-01-01").status_code == 400
 
 
+def _enable_console_collection(console, monkeypatch):
+    import jx_alert.config as config
+    settings = console[3]
+    settings.app_dry_run = False
+    settings.scheduler_enabled = True
+    settings.mcp_operations_enabled = True
+    monkeypatch.setattr(config, 'get_settings', lambda: settings)
+    return settings
+
+
+def test_manual_latest_collection_requires_owner_csrf_and_exact_scoped_store(console, monkeypatch):
+    client, routing, _, _ = console
+    _enable_console_collection(console, monkeypatch)
+    path = '/console/api/stores/5174/collection'
+    assert client.get(path).status_code == 401 and client.post(path, json={}).status_code == 401
+    assert login(client).is_redirect
+    csrf = client.get('/console/api/stores').json()['csrf']
+    headers = {'Origin': ORIGIN, 'X-CSRF-Token': csrf}
+    assert client.post(path, json={}, headers={'Origin': ORIGIN}).status_code == 403
+    assert client.post(path, json={}, headers={**headers, 'Origin': 'https://wrong.example'}).status_code == 403
+    assert client.post(path, json={'report_date': '9999-01-01'}, headers=headers).status_code == 400
+    assert client.post('/console/api/stores/999/collection', json={}, headers=headers).status_code == 404
+    first = client.post(path, json={}, headers=headers)
+    assert first.status_code == 200 and first.json()['status'] == 'PENDING' and not first.json()['reused']
+    again = client.post(path, json={}, headers=headers)
+    assert again.json()['job_id'] == first.json()['job_id'] and again.json()['reused']
+    engine = create_engine(f"sqlite:///{routing.parent / 'warehouse.sqlite'}")
+    try:
+        with sessionmaker(engine)() as db:
+            jobs = list(db.scalars(select(SyncJob).where(SyncJob.job_type == 'manual_collection')))
+            assert len(jobs) == 1
+            assert jobs[0].metadata_json['store_ids'] == ['5174']
+            assert jobs[0].metadata_json['report_date'] is None and jobs[0].metadata_json['backfill_days'] == 2
+    finally:
+        engine.dispose()
+
+
+def test_manual_sync_preserves_pause_authorization_and_service_gates(console, monkeypatch):
+    from jx_alert.store_controls import get_store_controls, save_store_controls
+    client, _, _, settings = console
+    assert login(client).is_redirect
+    headers = {'Origin': ORIGIN, 'X-CSRF-Token': client.get('/console/api/stores').json()['csrf']}
+    path = '/console/api/stores/5174/collection'
+    assert client.post(path, json={}, headers=headers).status_code == 409
+    _enable_console_collection(console, monkeypatch)
+    save_store_controls(settings, '5174', False, True, get_store_controls(settings, '5174')['revision'])
+    paused = client.post(path, json={}, headers=headers)
+    assert paused.status_code == 409 and '采集已关闭' in paused.json()['error']
+    unauthorized = client.post('/console/api/stores/5175/collection', json={}, headers=headers)
+    assert unauthorized.status_code == 409 and '授权失败' in unauthorized.json()['error']
+
+
+def test_manual_sync_status_is_scoped_and_never_exposes_raw_job_metadata(console):
+    client, routing, _, _ = console
+    engine = create_engine(f"sqlite:///{routing.parent / 'warehouse.sqlite'}")
+    try:
+        with sessionmaker(engine).begin() as db:
+            db.add(SyncJob(job_type='manual_collection', status='PENDING', metadata_json={
+                'store_ids': ['5174'], 'retry_at': '2026-11-16T09:00:00', 'private_marker': 'must-not-leak',
+                'planned_store_dates': {'5174': '2026-11-14'}, 'result': {'raw_payload': 'must-not-leak'}}))
+            db.add(SyncJob(job_type='manual_collection', status='FAILED', metadata_json={
+                'store_ids': ['5175'], 'error': 'outside-selected-store'}))
+        assert login(client).is_redirect
+        response = client.get('/console/api/stores/5174/collection')
+        data = response.json()
+        assert response.status_code == 200 and data['status_label'] == '等待重试'
+        assert data['report_date'] == '2026-11-14' and data['retry_at'] == '2026-11-16T09:00:00'
+        assert set(data) == {'job_id', 'status', 'status_label', 'report_date', 'retry_at'}
+        assert 'must-not-leak' not in response.text and 'outside-selected-store' not in response.text
+        assert client.get('/console/api/stores/999/collection').status_code == 404
+    finally:
+        engine.dispose()
+
+
 def test_dashboard_reads_legacy_empty_sales_from_partition_evidence(console):
     client, routing, _, _ = console
     empty_day = date(2024, 10, 11)
