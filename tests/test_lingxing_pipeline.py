@@ -80,6 +80,7 @@ class FakeDailyClient:
             "serving_status": "AD_STATUS_LIVE",
         }])
 
+
     def iter_advertising_product_report(self, report_type, payload, **kwargs):
         if self.fail_product_sd and report_type == "sd":
             raise RuntimeError("simulated SD product report failure")
@@ -97,6 +98,28 @@ class FakeDailyClient:
             "clicks": 2,
             "impressions": 100,
         }])
+
+
+def test_pause_after_sales_preserves_committed_facts_and_archives_without_failure_retry(tmp_path):
+    from jx_alert.lingxing.client import LingxingCollectionPaused
+    from jx_alert.storage.models import RawSnapshot
+
+    class PausedClient(FakeDailyClient):
+        def iter_advertising_campaigns(self, *args, **kwargs):
+            raise LingxingCollectionPaused('Store collection was paused; request not sent')
+
+    engine = create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine)() as db:
+        result = collect_daily_snapshot(PausedClient(), db, '2026-11-10', ad_attribution_refresh_days=1,
+            settings=SimpleNamespace(lingxing_performance_enabled=False, raw_dir=str(tmp_path / 'raw')))
+        assert result['status'] == 'SKIPPED_COLLECTION_DISABLED'
+        job = db.get(SyncJob, result['job_id'])
+        assert job.status == 'SKIPPED' and job.metadata_json['completed_steps'] == ['store_status', 'sales']
+        assert db.scalar(select(func.count()).select_from(DailyMetric)) > 0
+        assert db.scalar(select(func.count()).select_from(RawSnapshot)) > 0
+        assert list((tmp_path / 'raw').rglob('*.json'))
+
 
 
 def test_daily_pipeline_records_successful_job_and_all_steps(tmp_path):

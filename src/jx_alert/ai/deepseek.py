@@ -147,7 +147,7 @@ def compact_context(context):
     keys = ("store_id", "store_name", "country", "report_date", "requested_report_date",
             "timezone_confirmed", "date_basis", "date_selection", "report_date_warning",
             "authorization_warning", "data_warning", "sales_and_spend", "coverage",
-            "advertising_totals", "ad_detail_coverage", "notification_policy", "campaign_selection", "campaign_count")
+            "advertising_totals", "ad_detail_coverage", "notification_policy", "campaign_selection", "campaign_count", "question_topic")
     result = {k: context[k] for k in keys if k in context}
     kpi_keys = ("current", "baseline", "current_date", "currency", "status", "change_ratio",
                 "comparison_basis", "notification_note", "attribution_maturity_required", "attribution_mature")

@@ -45,6 +45,44 @@ def test_signature_source_sorts_and_omits_empty_values():
     )
 
 
+def test_pause_during_retry_prevents_the_next_http_request(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from jx_alert.lingxing.client import LingxingCollectionPaused
+    from jx_alert.store_controls import get_store_controls, save_store_controls
+    settings = SimpleNamespace(store_controls_file=str(tmp_path / 'controls.json'))
+    original_client, calls = httpx.Client, []
+
+    def handle(request):
+        calls.append(request)
+        return httpx.Response(429)
+
+    def pause(_):
+        save_store_controls(settings, '5174', False, True, get_store_controls(settings, '5174')['revision'])
+
+    monkeypatch.setattr(lingxing_module.httpx, 'Client', lambda timeout: original_client(
+        timeout=timeout, transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(lingxing_module.time, 'sleep', pause)
+    client = LingxingClient(base_url='https://example.test', app_id='0123456789abcdef', app_key='test', access_token='test')
+    client._collection_settings = settings
+    with pytest.raises(LingxingCollectionPaused):
+        client._request('POST', '/read-only', json_body={'sid': 5174})
+    assert len(calls) == 1
+
+
+def test_pause_after_a_page_stops_next_page_and_retains_the_completed_response(mock_api, tmp_path):
+    from types import SimpleNamespace
+    from jx_alert.lingxing.client import LingxingCollectionPaused
+    from jx_alert.store_controls import get_store_controls, save_store_controls
+    client, requests = mock_api
+    settings = SimpleNamespace(store_controls_file=str(tmp_path / 'controls.json'))
+    client._collection_settings = settings
+    assert client._request('POST', '/read-only', json_body={'sids': '5174'})['code'] == 0
+    save_store_controls(settings, '5174', False, True, get_store_controls(settings, '5174')['revision'])
+    with pytest.raises(LingxingCollectionPaused):
+        client._request('POST', '/read-only', json_body={'sids': '5174', 'offset': 100})
+    assert len(requests) == 1
+
+
 def test_post_body_business_parameters_are_part_of_signature():
     first = build_signature({"offset": 0, "length": 100, "timestamp": 1700000000},
                             access_token="token", app_key="app", app_id="0123456789abcdef")

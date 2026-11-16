@@ -260,7 +260,8 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
                             now: datetime | None = None,
                             store_records: list[Store] | None = None,
                             store_warnings: dict[str, str] | None = None,
-                            history_fallback_store_ids: set[str] | None = None) -> dict:
+                            history_fallback_store_ids: set[str] | None = None,
+                            focused_morning: bool = False) -> dict:
     """Persist one snapshot per store/date/destination; never send from this function.
 
     Missing records stay unknown. The caller supplies marketplace-local report
@@ -320,6 +321,15 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
         stores = [store for store in stores if switches[store.sid][0]]
         if not stores:
             return {"queued": 0, "skipped": True, "outbox_ids": [], "reason": "store_notifications_disabled"}
+    if send_day is not None and focused_morning:
+        if not app_transport:
+            raise ValueError("Focused morning briefs require the configured application bot")
+        dates = store_dates if store_dates is not None else {s.sid: target for s in stores}
+        if any(s.sid not in dates for s in stores):
+            raise ValueError("Morning brief store is outside the explicit report scope")
+        from jx_alert.notifications.morning_digest import enqueue_morning_digest
+        return enqueue_morning_digest(db, settings, stores, dates, store_warnings or {},
+            send_day=send_day, due=due, delivery=delivery, now=local_now)
     if (send_day is not None and app_transport and len(stores) > 1
             and getattr(settings, "feishu_daily_report_group_digest", False)):
         dates = store_dates if store_dates is not None else {s.sid: target for s in stores}

@@ -161,6 +161,13 @@ def test_deadline_uses_latest_complete_marketplace_date_only_for_explicit_scope(
     assert calls[0]["store_warnings"] == {}
 
 
+def test_focused_morning_setting_reaches_the_scheduled_enqueue_without_collecting(setup, monkeypatch):
+    setup[0].feishu_morning_focus_enabled = True
+    calls = capture_enqueues(monkeypatch)
+    operations.queue_scheduled_daily_reports(now=DEADLINE)
+    assert calls[0]['focused_morning'] is True
+
+
 def test_multiple_scoped_stores_keep_each_marketplace_date(setup, monkeypatch):
     _, _, scope, _ = setup
     scope.write_text(json.dumps({"store_ids": [5174, 5175]}), encoding="utf-8")

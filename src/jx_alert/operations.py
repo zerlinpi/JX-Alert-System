@@ -483,6 +483,7 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
             db, settings, store_dates=report_dates, delivery_date=delivery_now.date(),
             store_records=store_records, store_warnings=warnings, now=delivery_now,
             history_fallback_store_ids=history_fallback,
+            focused_morning=getattr(settings, "feishu_morning_focus_enabled", False),
         )
         db.commit()
     return {"status": "SKIPPED" if notifications.get("skipped") else "QUEUED",

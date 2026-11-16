@@ -26,6 +26,10 @@ class LingxingTransientError(LingxingError):
     """A network or provider rate-limit condition safe to retry."""
 
 
+class LingxingCollectionPaused(LingxingError):
+    """An owner paused this store before the next business request was sent."""
+
+
 _SP_HOUR_ARRAY_PATHS = frozenset({
     "/pb/openapi/newad/spAdvertiseHourData",
     "/pb/openapi/newad/spTargetHourData",
@@ -126,6 +130,7 @@ class LingxingClient:
         self.app_key = app_key or app_id
         self.access_token = access_token
         self.timeout = timeout
+        self._collection_settings = None
 
     @classmethod
     def from_settings(cls):
@@ -133,13 +138,33 @@ class LingxingClient:
         from jx_alert.lingxing.token import LingxingTokenProvider
         settings = get_settings()
         token = LingxingTokenProvider(settings).get_access_token()
-        return cls(
+        client = cls(
             base_url=settings.lingxing_base_url,
             app_id=settings.lingxing_app_id,
             app_key=settings.lingxing_app_key,
             access_token=token,
             timeout=settings.lingxing_timeout,
         )
+        client._collection_settings = settings
+        return client
+
+    def _check_collection_controls(self, business):
+        if self._collection_settings is None:
+            return
+        selected = []
+        for key in ('sid', 'sids'):
+            if key not in business:
+                continue
+            value = business[key]
+            values = value if isinstance(value, list) else str(value).split(',')
+            for sid in values:
+                if not str(sid).strip().isdigit() or int(str(sid).strip()) <= 0:
+                    raise LingxingError('Invalid store identity for collection controls')
+                selected.append(str(int(str(sid).strip())))
+        if selected:
+            from jx_alert.store_controls import collection_states
+            if not all(collection_states(self._collection_settings, selected).values()):
+                raise LingxingCollectionPaused('Store collection was paused; request not sent')
 
     def _request(self, method: str, path: str, params: dict | None = None,
                  json_body: dict | None = None, *, advertising: bool = False):
@@ -150,10 +175,14 @@ class LingxingClient:
 
         query_business = dict(params or {})
         body_business = dict(json_body or {})
+        self._check_collection_controls({**query_business, **body_business})
         business_sign_params = _endpoint_signature_params(
             path, {**query_business, **body_business}
         )
         for attempt in range(5):
+            # Re-read the shared file on every page/retry, including after a
+            # backoff. A request already accepted by the provider may finish.
+            self._check_collection_controls({**query_business, **body_business})
             timestamp = int(time.time())
             sign_params = {**business_sign_params, "timestamp": timestamp}
             signature = build_signature(

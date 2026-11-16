@@ -289,7 +289,14 @@ def _resolve_store(db, settings, question):
             matched = matched and all(p in _name_text(name) for p in literal_parts)
             if matched and _country_matches(question, snapshot["country"]):
                 ids.append(snapshot["store_id"])
-    return snapshots, list(dict.fromkeys(ids))
+    ids = list(dict.fromkeys(ids))
+    if len(ids) > 1:
+        from jx_alert.bot_intents import operating_snapshots
+        operating = {s['store_id'] for s in operating_snapshots(settings, snapshots, question)}
+        preferred = [sid for sid in ids if sid in operating]
+        if preferred:
+            ids = preferred
+    return snapshots, ids
 
 
 def _store_clarification(snapshots, ids, *, collection=False):
@@ -334,10 +341,14 @@ _COLLECTION_STATES = {
 
 def _collection_command(question):
     question = unicodedata.normalize("NFKC", question).strip()
-    if re.search(_COLLECTION_VERB, question) and re.search(
+    if re.search(_COLLECTION_VERB + r'|更新|刷新|拉取|重新获取', question) and re.search(
             r"不要|不用|不必|禁止|取消|停止|别|只看|仅查看|不采集|是否|能否|可以吗|"
             r"如何|怎么|说明|例如|示例|演示|假设|引用|写出|输出|解释|什么|意思|吗|为何|是不是|能不能|可不可以", question):
         return None
+    natural = re.fullmatch(r'(?:请(?:帮我)?|麻烦(?:帮我)?|帮我)?\s*(?:更新|刷新|拉取|重新获取)'
+        r'(?:一下)?\s*(.+?)(?:的)?(?:最新)?数据(?:\s*(?:再|并|然后)(?:做)?(?:分析|看看))?[。！!]?\s*', question)
+    if natural:
+        return 'name_request', natural[1].strip(' 的')
     status = _COLLECTION_STATUS.fullmatch(question)
     if status:
         return "status", int(status[1])
@@ -429,6 +440,10 @@ def _lookup_store_collection(db, settings, meta, sid):
 
 def _complete_question(db, settings, job_id, meta, cards, provider):
     try:
+        if meta.get('reply_store_ids'):
+            allowed = {s['store_id'] for s in health_brief_snapshots(db, settings)['stores']}
+            if not set(meta['reply_store_ids']) <= allowed:
+                raise QuestionAccessChanged('Question stores left the allowed scope')
         response_ids = _reply(db, settings, meta["message_id"], meta["chat_id"], cards, question_meta=meta)
     except QuestionAccessChanged:
         job = db.get(SyncJob, job_id)
@@ -677,13 +692,14 @@ def _answer_cards(context, data_card, analysis):
         if row.get("no_records"):
             return "接口无记录"
         return number(row[metric], money=metric in {"spend", "sales"}, currency=row.get(metric + "_currency") or "")
-    totals = [(r["ad_type"], *[display(r, metric) for metric in
-               ("spend", "orders", "units", "sales", "clicks", "impressions")]) for r in context["advertising_totals"]]
-    raw = card("广告归因数据", subtitle=context["store_name"] + " · " + context["report_date"],
-        sections=[("广告明细", ["广告类型", "花费", "归因订单", "归因销量", "归因销售额", "点击", "曝光"], totals)])
-    # Combine all required data when it fits. Preserve separate dates in KPI rows.
-    combined = {**data_card, "body": {"elements": data_card["body"]["elements"] + raw["body"]["elements"][1:]}}
-    cards = [combined] if card_fits(combined) else [data_card, raw]
+    cards = [data_card]
+    if context.get('question_topic') != 'health':
+        totals = [(r["ad_type"], *[display(r, metric) for metric in
+                   ("spend", "orders", "units", "sales", "clicks", "impressions")]) for r in context["advertising_totals"]]
+        raw = card("广告归因数据", subtitle=context["store_name"] + " · " + context["report_date"],
+            sections=[("广告明细", ["广告类型", "花费", "归因订单", "归因销量", "归因销售额", "点击", "曝光"], totals)])
+        combined = {**data_card, "body": {"elements": data_card["body"]["elements"] + raw["body"]["elements"][1:]}}
+        cards = [combined] if card_fits(combined) else [data_card, raw]
     detail_rows = [(r["dataset"], r["status"], r["rows"] if r["rows"] is not None else "—")
                    for r in context.get("ad_detail_coverage", [])]
     if detail_rows:
@@ -749,12 +765,18 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
             if collection is not None:
                 return _process_collection_command(db, settings, job_id, meta, collection)
             snapshots, ids = _resolve_store(db, settings, meta["question"])
+            from jx_alert.bot_intents import global_question_cards, focus_question
+            global_cards = global_question_cards(db, settings, meta['question'], snapshots, ids, now=_utcnow())
+            if global_cards is not None:
+                meta['reply_store_ids'] = [s['store_id'] for s in snapshots]
+                return _complete_question(db, settings, job_id, meta, global_cards, 'scoped_store_query')
             if len(ids) != 1:
                 value = _store_clarification(snapshots, ids)
                 cards, provider = [value], "store_clarification"
             else:
                 try:
                     context, data_card = question_context(db, settings, ids[0], question=meta["question"])
+                    context, data_card = focus_question(context, data_card, meta['question'])
                 except QuestionDateError as exc:
                     cards = [card("请确认报表日期", subtitle=str(exc), sections=[])]
                     provider = "date_clarification"
