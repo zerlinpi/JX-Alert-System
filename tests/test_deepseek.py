@@ -101,6 +101,19 @@ def test_custom_question_can_return_a_short_paragraph_without_an_anomaly_templat
     assert DeepSeekClient(KEY).analyze(context, 'CPC是什么意思') == answer
 
 
+def test_findings_only_answer_drops_normal_items_under_an_abnormal_heading():
+    from jx_alert.ai.deepseek import _actionable_text
+    text = '## 店铺绩效\n**待确认**\n- 源时区未确认，当前健康待确认。\n**异常**\n- 无已确认异常；订单缺陷率均未见超标。\n**复核建议**：补齐资料。'
+    result = _actionable_text(text, {'reply_mode': 'answer'}, '只回答异常或待确认项')
+    assert result == '- 源时区未确认，当前健康待确认。'
+
+
+def test_findings_filter_preserves_a_risk_that_cannot_be_ruled_out_and_unknown_evidence():
+    from jx_alert.ai.deepseek import _actionable_text
+    text = '- 源时区未知，不能确认当前无违规。\n- 投放花费高且没有订单，成熟数据待复核。'
+    assert _actionable_text(text, {'reply_mode': 'answer'}, '仅列风险和待确认') == text
+
+
 def test_loads_private_credentials_file_and_explicit_model(tmp_path, monkeypatch):
     path = tmp_path / "private.json"
     path.write_text(json.dumps({"api_key": KEY}))
