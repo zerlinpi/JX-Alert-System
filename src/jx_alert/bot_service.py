@@ -341,12 +341,12 @@ _COLLECTION_STATES = {
 
 def _collection_command(question):
     question = unicodedata.normalize("NFKC", question).strip()
-    if re.search(_COLLECTION_VERB + r'|更新|刷新|拉取|重新获取', question) and re.search(
+    if re.search(_COLLECTION_VERB + r'|更新|刷新|拉取|重新获取|同步', question) and re.search(
             r"不要|不用|不必|禁止|取消|停止|别|只看|仅查看|不采集|是否|能否|可以吗|"
             r"如何|怎么|说明|例如|示例|演示|假设|引用|写出|输出|解释|什么|意思|吗|为何|是不是|能不能|可不可以", question):
         return None
-    natural = re.fullmatch(r'(?:请(?:帮我)?|麻烦(?:帮我)?|帮我)?\s*(?:更新|刷新|拉取|重新获取)'
-        r'(?:一下)?\s*(.+?)(?:的)?(?:最新)?数据(?:\s*(?:再|并|然后)(?:做)?(?:分析|看看))?[。！!]?\s*', question)
+    natural = re.fullmatch(r'(?:请(?:帮我)?|麻烦(?:帮我)?|帮我)?\s*(?:更新|刷新|拉取|重新获取|手动同步|同步)'
+        r'(?:一下)?\s*(.+?)(?:的)?(?:最新|今日|今天的?)?数据(?:\s*(?:再|并|然后)(?:做)?(?:分析|看看))?[。！!]?\s*', question)
     if natural:
         return 'name_request', natural[1].strip(' 的')
     status = _COLLECTION_STATUS.fullmatch(question)
