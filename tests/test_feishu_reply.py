@@ -87,7 +87,11 @@ def warehouse(monkeypatch, tmp_path):
     engine = create_engine("sqlite:///" + str(tmp_path / "delivery.sqlite"))
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
-    settings = SimpleNamespace(app_dry_run=False, feishu_enabled=True, feishu_transport="app", feishu_timeout=5)
+    routing = tmp_path / "routing.json"
+    routing.write_text(json.dumps({"default_chat_id": "report", "groups": {
+        "report": {"chat_id": "oc_reports"}}}), encoding="utf-8")
+    settings = SimpleNamespace(app_dry_run=False, feishu_enabled=True, feishu_transport="app", feishu_timeout=5,
+        feishu_bot_enabled=True, feishu_routing_file=str(routing), feishu_daily_report_chat_id="report")
     monkeypatch.setattr(worker, "SessionLocal", sessions)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
     yield sessions
