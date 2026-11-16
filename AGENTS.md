@@ -16,9 +16,9 @@
 - Daily reports supply daily accounting/attribution values. Hourly Stream data
   supplies intraday observations and reconciliation. Keep revisions and observed
   differences; never manufacture balancing rows or convert missing data to zero.
-- The user confirmed SID 5174 uses `America/Los_Angeles`. Analyze completed local
-  dates and mature attribution windows. Do not assume this timezone applies to
-  other stores or to offset-free store-health source timestamps.
+- On 2026-11-16 the owner confirmed all explicitly identified US stores use
+  `America/Los_Angeles`. Analyze completed local dates and mature attribution
+  windows. Do not apply this to non-US stores or offset-free health source time.
 - Test Feishu in the explicitly selected group. The owner authorized missing
   administrator/operator/manager mappings to fall back to the verified report
   group without unverified mentions when `feishu_group_fallback_enabled=true`.

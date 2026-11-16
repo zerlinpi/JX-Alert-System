@@ -20,6 +20,7 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 from sqlalchemy import select
+from sqlalchemy.orm import aliased
 
 from jx_alert import admin_data, admin_groups, admin_mapping, store_controls
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
@@ -292,6 +293,110 @@ class OwnerConsole:
                 return {**receipt, 'reused': queued['reused']}
             return self._collection_receipt(db, sid)
 
+    def _bulk_selection(self, db):
+        """Choose only currently collectable scoped stores, preserving both switches."""
+        from jx_alert.operations import store_report_plan
+        ids = sorted(admin_data.scoped_ids(self.settings), key=int)
+        stores = {s.sid: s for s in db.scalars(select(Store).where(Store.sid.in_(ids)))}
+        switches = store_controls.collection_states(self.settings, ids)
+        try:
+            plan = store_report_plan([{'sid': sid, 'status': stores[sid].status} for sid in ids if sid in stores],
+                self.settings.store_timezones_file,
+                allow_unknown_timezone_history=getattr(self.settings, 'allow_unconfigured_timezone_history', False))
+        except (OSError, ValueError, RuntimeError):
+            raise ConsoleError('采集范围或报表日期配置待核实，暂未开始同步。', 409) from None
+        states = {row['store_id']: row['state'] for row in plan}
+        selected, skipped = [], []
+        for sid in ids:
+            reason = ('采集已关闭' if not switches[sid] else '尚未同步店铺' if sid not in stores else
+                      '授权失败' if stores[sid].status == 2 else '店铺未启用' if stores[sid].status != 1 else
+                      '报表日期或时区待确认' if states.get(sid) != 'READY' else None)
+            if reason:
+                skipped.append({'store_id': sid, 'reason': reason})
+            else:
+                selected.append(sid)
+        return selected, skipped
+
+    def _bulk_receipt(self, db, job=None, *, skipped=None):
+        """Expose bounded per-store progress, never raw task results or provider text."""
+        scope = set(admin_data.scoped_ids(self.settings))
+        labels = {'PENDING': '等待采集', 'RUNNING': '正在同步', 'SUCCEEDED': '同步完成',
+                  'SUCCEEDED_WITH_WARNINGS': '同步完成，部分数据待核查', 'PARTIAL_FAILED': '部分采集失败',
+                  'FAILED': '同步失败', 'SKIPPED': '已停止同步', 'BLOCKED': '同步条件待核实',
+                  'COMPLETE': '同步完成', 'COMPLETE_WITH_WARNINGS': '同步完成，部分数据待核查',
+                  'REUSED_COMPLETED_CHECKPOINT': '已完成，沿用检查点', 'PARTIAL': '部分数据待重试',
+                  'AWAITING_RESULT': '等待逐店结果',
+                  'SKIPPED_COLLECTION_DISABLED': '采集已关闭'}
+        args = (job.metadata_json or {}) if job else {}
+        result = args.get('result') if isinstance(args.get('result'), dict) else {}
+        selected = [sid for sid in args.get('store_ids', []) if sid in scope]
+        omitted = skipped or []
+        omitted = [row for row in omitted if row.get('store_id') in scope]
+        dates = result.get('report_dates') or args.get('planned_store_dates') or {}
+        completed = args.get('completed_store_dates') or result.get('completed_store_dates') or {}
+        statuses = args.get('store_statuses') or {}
+        observations = result.get('stores') or {}
+        stores = {s.sid: s.name for s in db.scalars(select(Store).where(Store.sid.in_(selected)))}
+        switches = store_controls.collection_states(self.settings, selected)
+        rows = []
+        for sid in selected:
+            prior = observations.get(sid) if isinstance(observations.get(sid), dict) else {}
+            status = ('SKIPPED_COLLECTION_DISABLED' if not switches[sid] else
+                      'COMPLETE' if sid in completed else statuses.get(sid) or prior.get('status') or
+                      ('AWAITING_RESULT' if job.status == 'RUNNING' else job.status))
+            rows.append({'store_id': sid, 'store_name': stores.get(sid, '尚未同步店铺'),
+                         'status': status, 'status_label': labels.get(status, '状态待确认'),
+                         'report_date': dates.get(sid) if isinstance(dates, dict) else None})
+        done = sum(row['status'] in {'COMPLETE', 'COMPLETE_WITH_WARNINGS', 'REUSED_COMPLETED_CHECKPOINT',
+                                    'SUCCEEDED', 'SUCCEEDED_WITH_WARNINGS'} for row in rows)
+        paused = sum(row['status'] == 'SKIPPED_COLLECTION_DISABLED' for row in rows)
+        counts = {}
+        for row in omitted:
+            counts[row['reason']] = counts.get(row['reason'], 0) + 1
+        retry = args.get('retry_at') if job is not None and job.status == 'PENDING' else None
+        return {'job_id': job.id if job else None, 'status': job.status if job else 'NONE',
+                'status_label': '等待重试' if retry else labels.get(job.status, '尚未批量同步') if job else '尚未批量同步',
+                'selected_store_count': len(selected), 'completed_store_count': done,
+                'remaining_store_count': len(rows) - done - paused,
+                'paused_store_count': paused, 'skipped_store_count': len(omitted),
+                'skipped_reason_counts': counts, 'stores': rows, 'retry_at': retry}
+
+    def _bulk_collection(self, *, enqueue=False):
+        from jx_alert.operations import enqueue_collection, CollectionConfigurationError
+        from jx_alert.storage.job_lock import database_job_lock, JobAlreadyRunning
+        if enqueue and (self.settings.app_dry_run or not self.settings.scheduler_enabled
+                        or not self.settings.mcp_operations_enabled):
+            raise ConsoleError('手动同步服务尚未开启，请先核实调度和主动采集开关。', 409)
+        with self.session_factory() as db:
+            request = aliased(SyncJob)
+            query = select(SyncJob, request.metadata_json).join(request,
+                request.metadata_json['collection_job_id'].as_integer() == SyncJob.id).where(
+                request.job_type == 'console_bulk_collection', SyncJob.job_type == 'manual_collection'
+            ).order_by(request.id.desc()).limit(1)
+            if not enqueue:
+                latest = db.execute(query).first()
+                return self._bulk_receipt(db, latest[0], skipped=latest[1]['skipped']) if latest else self._bulk_receipt(db)
+            try:
+                with database_job_lock(db.get_bind(), 'console_bulk_submit'):
+                    active = db.execute(query.where(SyncJob.status.in_(['PENDING', 'RUNNING']))).first()
+                    if active is not None:
+                        return {**self._bulk_receipt(db, active[0], skipped=active[1]['skipped']), 'reused': True}
+                    selected, skipped = self._bulk_selection(db)
+                    if not selected:
+                        return {**self._bulk_receipt(db, skipped=skipped), 'status': 'NO_ELIGIBLE',
+                                'status_label': '没有可同步店铺', 'reused': False}
+                    queued = enqueue_collection(db, store_ids=selected, backfill_days=2)
+                    job = db.get(SyncJob, queued['job_id'])
+                    # Keep the receipt independent of worker-owned progress, including reused jobs.
+                    db.add(SyncJob(job_type='console_bulk_collection', status='SUCCEEDED',
+                        metadata_json={'collection_job_id': job.id, 'skipped': skipped}))
+                    db.commit()
+                    return {**self._bulk_receipt(db, job, skipped=skipped), 'reused': queued['reused']}
+            except CollectionConfigurationError:
+                raise ConsoleError('店铺采集条件已变化，请刷新店铺列表后重试。', 409) from None
+            except JobAlreadyRunning:
+                raise ConsoleError('全店同步正在提交，请刷新进度。', 409) from None
+
     def _save_controls(self, sid, payload):
         self._selected(sid)
         with self.session_factory() as db:
@@ -344,6 +449,12 @@ class OwnerConsole:
                         raise ConsoleError("群设置操作太频繁，请稍后重试。", 429)
                     action = admin_groups.preview_notification_group if preview else admin_groups.save_notification_group
                     data = await asyncio.to_thread(action, self.settings, **payload)
+                elif path == '/console/api/collection/all':
+                    if payload:
+                        raise ConsoleError('批量同步不接受额外日期或店铺参数。', 400)
+                    if not self._rate_allowed(request, 'bulk-collection', per_ip=2, total=4):
+                        raise ConsoleError('批量同步操作太频繁，请稍后查看已有任务。', 429)
+                    data = await asyncio.to_thread(self._bulk_collection, enqueue=True)
                 elif path.endswith('/collection'):
                     if payload:
                         raise ConsoleError('同步最新日报不接受额外日期或店铺参数。', 400)
@@ -369,6 +480,8 @@ class OwnerConsole:
                     data = await asyncio.to_thread(admin_groups.list_notification_groups, self.settings)
                 else:
                     data = await asyncio.to_thread(admin_groups.current_notification_group, self.settings)
+            elif path == '/console/api/collection/all':
+                data = await asyncio.to_thread(self._bulk_collection)
             elif path.endswith('/collection'):
                 data = await asyncio.to_thread(self._collection, sid)
             elif path.endswith("/members"):
@@ -402,6 +515,7 @@ class OwnerConsole:
                 Route("/console/api/stores/{sid}/owners", self.api, methods=["POST"]),
                 Route("/console/api/stores/{sid}/controls", self.api, methods=["POST"]),
                 Route("/console/api/stores/{sid}/collection", self.api, methods=["GET", "POST"]),
+                Route("/console/api/collection/all", self.api, methods=["GET", "POST"]),
                 Route("/console/logout", self.api, methods=["POST"])]
 
 

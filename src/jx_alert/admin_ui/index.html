@@ -34,6 +34,12 @@
         <button type="button" id="refresh" class="button secondary"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6M20 4v7h-7"/></svg>刷新数据</button>
       </header>
       <div id="global-status" class="notice" role="status" hidden></div>
+      <section class="panel report bulk-sync" id="bulk-sync-panel" aria-labelledby="bulk-sync-title">
+        <div class="section-heading"><div><h2 id="bulk-sync-title">全店数据同步</h2><p class="muted">按各店最新已结束日报同步；关闭采集、授权失败的店铺自动跳过。</p></div><button id="sync-all" class="button primary" type="button" disabled>一键同步所有店铺数据</button></div>
+        <div id="bulk-collection-status" class="notice" role="status" hidden></div>
+        <details id="bulk-collection-details" hidden><summary>查看同步进度</summary><div class="table-scroll"><table><thead><tr><th scope="col">店铺</th><th scope="col">实际报表日</th><th scope="col">状态</th></tr></thead><tbody id="bulk-collection-rows"></tbody></table></div></details>
+        <div class="save-bar"><span class="muted">重复点击复用在途任务；不会额外发送群消息。</span><button id="bulk-collection-refresh" class="link-button" type="button">刷新全店进度</button></div>
+      </section>
       <section class="panel notification-group" id="notification-group-panel" aria-labelledby="notification-group-title" hidden>
         <div class="section-heading"><div><h2 id="notification-group-title">通知群</h2><p class="muted">选择机器人已加入的群，保存后用于后续日报、默认通知和群内问答。</p></div><button id="reload-groups" class="button secondary" type="button">刷新群列表</button></div>
         <div class="group-settings-body">

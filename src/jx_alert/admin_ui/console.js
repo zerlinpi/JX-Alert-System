@@ -16,6 +16,7 @@ const state = {
   selected: new Set(), saving: false, controlsDraft: null, controlsSaving: false, controlsLoading: false,
   controlsSeq: 0,
   collectionSeq: 0, collectionBusy: false, collectionTimer: null,
+  bulkCollection: null, bulkBusy: false, bulkTimer: null,
   groups: { current: null, chats: [], preview: null, saving: false, loading: false, seq: 0 },
 };
 
@@ -156,6 +157,7 @@ async function loadStores() {
     if (seq !== state.storeSeq) return;
     state.stores = response.stores || [];
     state.csrf = response.csrf;
+    renderBulkCollection();
     for (const [field, id] of [["stores", "total-stores"], ["authorized", "total-authorized"], ["mapped", "total-mapped"]]) {
       $(id).textContent = scalar(response.totals?.[field]);
     }
@@ -179,6 +181,51 @@ function detailPlaceholder(text) {
   $("detail-content").hidden = true;
   $("detail-placeholder").hidden = false;
   $("detail-placeholder").textContent = text;
+}
+
+function renderBulkCollection() {
+  const receipt = state.bulkCollection;
+  $("sync-all").disabled = !state.csrf || state.bulkBusy || ["PENDING", "RUNNING"].includes(receipt?.status);
+  $("bulk-collection-refresh").disabled = !state.csrf || state.bulkBusy;
+  $("bulk-collection-details").hidden = !receipt?.stores?.length;
+  if (!receipt || receipt.status === "NONE") { notice("bulk-collection-status"); return; }
+  const outstanding = ["PENDING", "RUNNING"].includes(receipt.status) ? "待处理" : "未完成";
+  const parts = [receipt.status_label, `本次 ${receipt.selected_store_count} 家`, `已完成 ${receipt.completed_store_count} 家`,
+    `${outstanding} ${receipt.remaining_store_count} 家`];
+  if (receipt.paused_store_count) parts.push(`途中关闭 ${receipt.paused_store_count} 家`);
+  if (receipt.skipped_store_count) parts.push(`跳过 ${receipt.skipped_store_count} 家（${Object.entries(receipt.skipped_reason_counts || {}).map(([key, n]) => `${key} ${n}`).join("，")}）`);
+  if (receipt.retry_at) {
+    const retry = new Date(`${receipt.retry_at}Z`);
+    if (!Number.isNaN(retry.getTime())) parts.push(`最早重试 ${retry.toLocaleTimeString("zh-CN")}`);
+  }
+  notice("bulk-collection-status", parts.join(" · "), /FAILED|BLOCKED/.test(receipt.status) ? "error" : "info");
+  tableRows("bulk-collection-rows", (receipt.stores || []).map((r) => [r.store_name, r.report_date, badge(r.status_label)]), 3, "本次没有可同步店铺。");
+}
+
+async function bulkCollectionStatus({ start = false, polls = 0 } = {}) {
+  if (!state.csrf || state.bulkBusy) return;
+  state.bulkBusy = true;
+  clearTimeout(state.bulkTimer);
+  renderBulkCollection();
+  let failed = false;
+  try {
+    const options = start ? { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: "{}" } : undefined;
+    state.bulkCollection = await api("collection/all", options);
+    renderBulkCollection();
+    if (["PENDING", "RUNNING"].includes(state.bulkCollection.status) && polls < 60) {
+      state.bulkTimer = setTimeout(() => void bulkCollectionStatus({ polls: polls + 1 }), 15000);
+    }
+  } catch (error) {
+    failed = true;
+    notice("bulk-collection-status", error.message || "暂时无法同步所有店铺，请稍后重试。", "error");
+  } finally {
+    state.bulkBusy = false;
+    if (!failed) renderBulkCollection();
+    else {
+      $("sync-all").disabled = !state.csrf || ["PENDING", "RUNNING"].includes(state.bulkCollection?.status);
+      $("bulk-collection-refresh").disabled = !state.csrf;
+    }
+  }
 }
 
 async function selectStore(sid, date) {
@@ -548,6 +595,7 @@ function renderView() {
   $("notification-group-panel").hidden = !groups;
   $("store-stats").hidden = groups;
   $("store-board").hidden = groups;
+  $("bulk-sync-panel").hidden = groups;
   for (const tab of document.querySelectorAll("[data-view]")) {
     if (tab.dataset.view === state.view) tab.setAttribute("aria-current", "page");
     else tab.removeAttribute("aria-current");
@@ -821,6 +869,8 @@ $("date-form").addEventListener("submit", (event) => {
 $("latest-date").addEventListener("click", () => { if (state.sid) void selectStore(state.sid); });
 $("sync-latest").addEventListener("click", () => { if (!$("sync-latest").disabled) void collectionStatus({ start: true }); });
 $("collection-refresh").addEventListener("click", () => void collectionStatus());
+$("sync-all").addEventListener("click", () => { if (!$("sync-all").disabled) void bulkCollectionStatus({ start: true }); });
+$("bulk-collection-refresh").addEventListener("click", () => void bulkCollectionStatus());
 for (const button of document.querySelectorAll("[data-metric]")) {
   button.addEventListener("click", () => {
     state.metric = button.dataset.metric;
@@ -843,4 +893,4 @@ $("logout").addEventListener("click", async () => {
     $("logout").disabled = false;
   }
 });
-void loadStores();
+void loadStores().then(() => bulkCollectionStatus());
