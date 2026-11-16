@@ -9,7 +9,7 @@ import unicodedata
 from sqlalchemy import select
 
 from jx_alert.notifications.cards import card
-from jx_alert.notifications.morning_digest import morning_cards, select_morning_dates
+from jx_alert.notifications.morning_digest import _health_chunks, morning_cards, select_morning_dates
 from jx_alert.notifications.store_health import card_fits
 from jx_alert.operations import store_report_plan
 from jx_alert.storage.collection_attempts import collection_issue_for_date
@@ -33,7 +33,7 @@ def operating_snapshots(settings, snapshots, question):
 def question_topic(question):
     q = unicodedata.normalize('NFKC', question or '').lower()
     health = bool(re.search(r'绩效|健康|违规|侵权|通知', q))
-    ads = bool(re.search(r'广告|推广|投放|ctr|cpc|cdr|cvr|cps|roas|cpa|tcoas|tacos', q))
+    ads = bool(re.search(r'广告|推广|投放|ctr|cpc|cdr|cvr|cps|roas|cpa|tcoas|tacos|(?<![a-z0-9])(?:sp|sb|sd|ppc)(?![a-z0-9])', q))
     sales = bool(re.search(r'店铺.{0,4}(?:销量|销售额|订单)|经营|总销售|总订单', q))
     if health and not ads and not sales:
         return 'health'
@@ -106,21 +106,51 @@ def inventory_cards(db, settings, stores, *, historical=False):
 
 
 def global_question_cards(db, settings, question, snapshots, matched_ids, *, now=None):
+    from jx_alert.bot_portfolio import campaign_cards, is_ranking, metric_cards, period_length, portfolio_query
+    from jx_alert.bot_service import _country_matches, _name_parts, _requested_countries
+
     q = unicodedata.normalize('NFKC', question).strip()
-    broad = bool(re.search(r'所有店铺|全部店铺|各个?店铺|每个店铺|全店|哪些店铺|店铺列表|店铺清单|几家店|多少家店', q))
+    whole_scope = bool(re.search(r'所有.{0,4}店铺|全部.{0,4}店铺|各个?店铺|每个店铺|全店|所有站点|全部站点', q))
+    broad = whole_scope or bool(re.search(r'哪些店铺|哪[几一]?家店|哪个店铺|店铺列表|店铺清单|几家店|多少家店', q))
     inventory = bool(re.search(r'有哪些店铺|哪些店铺.{0,12}(?:数据|记录)|店铺列表|店铺清单|几家店|多少家店|目前.{0,8}店铺.{0,8}数据|现在.{0,8}店铺.{0,8}数据|(?:现在|目前).{0,4}有哪些数据', q))
-    # A named-shop question stays named-shop, including its ordinary phrasing.
-    if len(matched_ids) == 1 and not re.search(r'所有店铺|全部店铺|全店|各个?店铺|每个店铺', q):
+    market = _requested_countries(q.casefold())
+    topic = question_topic(q)
+    query = portfolio_query(q)
+    period = period_length(q)
+    activity_query = bool(query and query[0] == 'campaigns')
+    single_portfolio = len(matched_ids) == 1 and bool(activity_query or (query and period != 1)) and not whole_scope
+    if matched_ids and not whole_scope and not single_portfolio:
         return None
-    if not broad and not inventory:
+    # Failed concrete ID or brand matches must never silently become an all-store query.
+    name_query = re.sub(r'\d{4}[-年/]\d{1,2}[-月/]\d{1,2}日?|\d{1,2}月\d{1,2}日|(?:top|前)\s*\d+', '', q, flags=re.I)
+    if not matched_ids and any(part.isascii() and len(part) >= 3 for part in _name_parts(name_query)):
         return None
-    chosen = {s['store_id'] for s in operating_snapshots(settings, snapshots, q)}
+    conceptual = not (broad or inventory or market or is_ranking(q)) and bool(re.search(r'什么意思|是什么|如何计算|怎么算|怎么计算|如何理解|意味着什么', q))
+    subject = bool(re.search(r'店铺|站点|订单|销量|销售|广告|推广|投放|绩效|健康|经营|日报|数据|异常', q))
+    requested_review = topic == 'health' or (topic == 'ads' and bool(re.search(r'异常|风险|正常', q)))
+    if conceptual or not (broad or inventory or query or requested_review or (market and subject)):
+        return None
+    if single_portfolio:
+        chosen = set(matched_ids)
+    else:
+        candidates = snapshots if market else operating_snapshots(settings, snapshots, q)
+        chosen = {s['store_id'] for s in candidates if _country_matches(q.casefold(), s.get('country') or '待确认')}
     stores = list(db.scalars(select(Store).where(Store.sid.in_(chosen)).order_by(Store.name, Store.sid)))
-    if inventory and not re.search(r'异常|风险|违规|健康|绩效|广告.*(?:问题|分析|情况)', q):
-        return inventory_cards(db, settings, stores, historical=include_paused(q))
+    historical = include_paused(q) or bool(market and chosen - {
+        r['store_id'] for r in operating_snapshots(settings, snapshots, q)
+    })
+    if inventory and query is None and not re.search(r'异常|风险|违规|健康|绩效|广告.*(?:问题|分析|情况)', q):
+        return inventory_cards(db, settings, stores, historical=historical)
     if not stores:
-        return inventory_cards(db, settings, stores, historical=include_paused(q))
+        return [card('查询店铺数据', subtitle='所问范围暂无可读取的店铺记录。', sections=[])]
+    if activity_query:
+        return campaign_cards(db, stores, q, detail=single_portfolio)
     clock = now or datetime.now(timezone.utc)
+    send_day = clock.astimezone(ZoneInfo('Asia/Shanghai')).date()
+    if topic == 'health':
+        return [value for value, _ in _health_chunks(db, settings, stores, send_day, clock)]
+    if not period or period > 14 or (period > 1 and query is None):
+        return [card('请指定报表日', subtitle='请选择具体报表日，或查询最近2至14天的花费、销量、订单等数值。', sections=[])]
     plan = store_report_plan([{'sid': s.sid, 'status': s.status} for s in stores], settings.store_timezones_file,
         now=clock, include_inactive=True,
         allow_unknown_timezone_history=getattr(settings, 'allow_unconfigured_timezone_history', False))
@@ -140,16 +170,18 @@ def global_question_cards(db, settings, question, snapshots, matched_ids, *, now
             warnings[sid] = '查询报表日期尚未结束，不能作为完整日报分析'
         elif explicit is None:
             history_allowed.add(sid)
+    if query:
+        # Compare the exact target day. A historical fallback from different dates
+        # cannot replace it in a portfolio comparison or ranking.
+        return metric_cards(db, settings, stores, q, query, targets, warnings, period=period)
     dates, warnings = select_morning_dates(db, [s for s in stores if s.sid in targets],
         targets, warnings, history_allowed)
     ready = [s for s in stores if s.sid in dates]
     topic = question_topic(q)
     cards = [value for value, _ in morning_cards(db, settings, ready, dates,
-        send_day=clock.astimezone(ZoneInfo('Asia/Shanghai')).date(), now=clock,
+        send_day=send_day, now=clock,
         target_dates=targets, warnings=warnings)] if ready else []
-    if topic == 'health':
-        cards = [v for v in cards if v['header']['title']['content'].startswith('店铺绩效')]
-    elif topic == 'ads':
+    if topic == 'ads':
         cards = [v for v in cards if not v['header']['title']['content'].startswith('店铺绩效')]
     if len(ready) < len(stores):
         waiting = [(s.name, '报表日期或时区配置待确认') for s in stores if s.sid not in dates]

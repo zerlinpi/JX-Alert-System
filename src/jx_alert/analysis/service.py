@@ -4,11 +4,14 @@ from sqlalchemy import or_, select
 
 from jx_alert.config import get_settings
 from jx_alert.notifications.outbox import enqueue_notification
+from jx_alert.notifications.quiet_policy import quiet_delivery
 from jx_alert.storage.models import AnomalyEvent, Campaign, Product, Store
 
 
 _POSITIVE_RULES = frozenset({"orders_increase", "units_increase", "sales_increase"})
 NON_ALERT_RULES = _POSITIVE_RULES | {"high_ad_spend"}
+_AD_ALERT_RULES = frozenset({"orders_decrease", "units_decrease", "sales_decrease", "spend_no_conversion",
+                             "low_spend_no_conversion", "campaign_over_budget"})
 _SEVERITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 _ESCALATED_SEVERITY = {"P3": "P2", "P2": "P1", "P1": "P1", "P0": "P0"}
 
@@ -188,7 +191,13 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         if anomaly.rule in NON_ALERT_RULES:
             continue
         settings = get_settings()
-        from jx_alert.analysis.materiality import material_rule_notification
+        from jx_alert.analysis.materiality import material_rule_notification, materiality_enabled
+        scope = (anomaly.evaluation_scope or "").split(":")
+        material_ad_alert = (materiality_enabled(settings) and anomaly.rule in _AD_ALERT_RULES
+            and anomaly.status != "RECOVERED" and len(scope) == 3 and scope[0] == anomaly.store_id
+            and scope[1] in {"campaign", "product_ad"} and scope[2] in {"sp", "sb", "sd"})
+        if quiet_delivery(settings) and not material_ad_alert:
+            continue
         if not material_rule_notification(db, settings, anomaly):
             continue
         from jx_alert.store_controls import notifications_enabled, StoreControlError
@@ -203,7 +212,7 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         ):
             continue
         if anomaly.status not in {"NEW", "ESCALATED", "RECOVERED"}:
-            if anomaly.status != "ONGOING" or not getattr(settings, "alert_materiality_enabled", False):
+            if anomaly.status != "ONGOING" or not materiality_enabled(settings):
                 continue
             from jx_alert.notifications.outbox import NotificationOutbox
             # A broad screening incident may first become material later.
@@ -251,7 +260,7 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
             from jx_alert.notifications.cards import anomaly_card
             store = db.get(Store, anomaly.store_id)
             result = enqueue_application_deliveries(
-                db, settings, event_key=event_key, text=message,
+                db, settings, event_key=event_key, text=message, material_ad_alert=material_ad_alert,
                 card=anomaly_card(state=state_label, severity=anomaly.severity,
                                   store=store_label, campaign=campaign_label,
                                   product=product_label, rule=anomaly.rule,
@@ -268,7 +277,7 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         else:
             enqueue_notification(
                 db, idempotency_key=event_key, text=message,
-                store_id=anomaly.store_id, entity_id=anomaly.entity_id or None,
+                store_id=anomaly.store_id, entity_id=anomaly.entity_id or None, material_ad_alert=material_ad_alert,
             )
             queued += 1
     return queued

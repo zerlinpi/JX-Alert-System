@@ -143,15 +143,19 @@ def health_notice_summary(db, store, snapshot):
 
 def morning_health_row(db, settings, store, *, now=None):
     health = store_health_snapshot(db, store, settings, now=now)
+    quiet = getattr(settings, 'feishu_quiet_delivery_enabled', False)
     observed = health['source_status_label'] + '（源观测）'
     summary = f"健康评分：{number(health['ahr_score'])}\n{observed}\n当前判定：{health['status_label']}"
     attention = [health_notice_summary(db, store, health)]
     for indicator in health['indicators']:
         if indicator['status'] in {'BREACHED', 'AT_THRESHOLD'}:
             attention.append(f"{indicator['label']} {indicator['value']:g}%（标准 {indicator['standard']:g}%）")
-    if any(item['status'] == 'INSUFFICIENT_DATA' for item in health['indicators']):
+    if not quiet and any(item['status'] == 'INSUFFICIENT_DATA' for item in health['indicators']):
         attention.append('部分绩效指标待补齐')
-    freshness = (health['source_updated_at'] or '未提供源更新时间') + '\n' + health['confirmation_reason']
+    reason = health['confirmation_reason']
+    if quiet and health['freshness_status'] == 'NOT_CONFIGURED' and health['status'] == 'UNCONFIRMED':
+        reason = '时效待确认'
+    freshness = (health['source_updated_at'] or '未提供源更新时间') + '\n' + reason
     return store.name, summary, '\n'.join(attention), freshness
 
 
@@ -187,7 +191,8 @@ def select_morning_dates(db, stores, dates, warnings=None, history_allowed=None)
     return actual, warnings
 
 
-def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=None, target_dates=None):
+def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=None, target_dates=None,
+                  include_quality=True):
     """Return full requested health coverage, plus SP exception pages only."""
     chunks = _health_chunks(db, settings, stores, send_day, now)
     pending = []
@@ -201,7 +206,7 @@ def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=N
         if actual != target:
             note = f'目标日尚未采集，仅复核历史报表日{actual}，不代表目标日数据'
             quality = note + ('；' + quality if quality else '')
-        if quality:
+        if quality and include_quality:
             pending.append((store.sid, (store.name, str(target), quality)))
         for finding in findings:
             topics = '；'.join(title + '（' + day + '）' for title, day in finding['topics'])
@@ -240,20 +245,24 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
         return {'queued': len(existing), 'skipped': False, 'outbox_ids': [r.id for r in existing]}
     prefix = 'scheduled-daily:morning:' + hashlib.sha256(f'{send_day}:{chat_id}'.encode()).hexdigest() + ':'
     actual, warnings = select_morning_dates(db, stores, dates, warnings, history_allowed)
+    quiet = getattr(settings, 'feishu_quiet_delivery_enabled', False)
     chunks = morning_cards(db, settings, stores, actual, send_day=send_day, now=now,
-        warnings=warnings, target_dates=dates)
+        warnings=warnings, target_dates=dates, include_quality=not quiet)
     ids = []
     try:
         with db.begin_nested():
             for index, (value, store_ids) in enumerate(chunks):
+                title = plain(value['header']['title']['content'])
+                kind = ('health' if title.startswith('店铺绩效与违规快报') else
+                        'ad_exception' if title == '商品推广活动待复核' else 'data_quality')
                 row = NotificationOutbox(idempotency_key=prefix + str(index), chat_id=chat_id,
                     next_attempt_at=due.astimezone(timezone.utc).replace(tzinfo=None), payload={
-                        'text': plain(value['header']['title']['content']), 'store_ids': store_ids,
+                        'text': title, 'store_ids': store_ids,
                         'store_id': store_ids[0] if len(store_ids) == 1 else None,
                         'store_report_dates': {sid: {'target': str(dates[sid]), 'actual': str(actual[sid])} for sid in store_ids},
                         'open_ids': [], 'fixed_route': True, 'transport': 'app', 'delivery': delivery, 'card': value,
                         'scheduled_delivery_date': send_day.isoformat(), 'scheduled_timezone': 'Asia/Shanghai',
-                        'scheduled_not_before': due.isoformat(), 'morning_focus': True})
+                        'scheduled_not_before': due.isoformat(), 'morning_focus': True, 'morning_message_kind': kind})
                 db.add(row)
                 db.flush()
                 ids.append(row.id)

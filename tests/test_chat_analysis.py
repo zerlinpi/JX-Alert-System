@@ -74,9 +74,10 @@ def test_materiality_blocks_small_or_unconfirmed_declines_before_outbox(setup, c
     assert len(db.scalars(select(NotificationOutbox)).all()) == expected
 
 
-@pytest.mark.parametrize("orders,expected", [(0, 1), (4, 0)])
-def test_mature_ad_spend_with_usd_is_independent_of_store_currency(setup, orders, expected):
+@pytest.mark.parametrize("orders,expected,quiet", [(0, 1, False), (4, 0, False), (0, 1, True), (4, 0, True)])
+def test_mature_ad_spend_with_usd_is_independent_of_store_currency(setup, orders, expected, quiet):
     db, settings = setup
+    settings.feishu_quiet_delivery_enabled = quiet
     db.get(Store, "5174").currency_code = "CAD"
     for offset in range(7):
         day = date(2026, 11, 4) - timedelta(days=offset)
@@ -95,6 +96,24 @@ def test_mature_ad_spend_with_usd_is_independent_of_store_currency(setup, orders
         assert "美元" in json.dumps(row.payload, ensure_ascii=False)
         assert result["notification_titles"] == ["广告有花费但无归因订单"]
         assert row.payload["text"].startswith("广告有花费但无归因订单")
+        assert bool(row.payload.get("material_ad_alert")) == quiet
+
+
+def test_quiet_mode_rejects_ad_hoc_reports_and_non_advertising_analyst_alerts(setup):
+    from jx_alert.notifications.chat_report import enqueue_chat_report
+    from jx_alert.notifications.daily_report import enqueue_daily_snapshots
+    from jx_alert.notifications.store_health import enqueue_store_health_brief
+
+    db, settings = setup
+    settings.feishu_quiet_delivery_enabled = True
+    settings.feishu_daily_report_enabled = True
+    review = prepare_review(db, settings, "5174", now=CLOCK)
+    result = submit_review(db, settings, review["review_id"], finding(review), now=CLOCK)
+    assert result["status"] == "SKIPPED" and result["outbox_ids"] == []
+    assert enqueue_chat_report(db, settings, title="同步完成", markdown="已完成同步")["status"] == "SKIPPED"
+    assert enqueue_daily_snapshots(db, settings, report_date="2026-11-11")["skipped"]
+    assert enqueue_store_health_brief(db, settings, now=CLOCK)["status"] == "SKIPPED"
+    assert db.scalars(select(NotificationOutbox)).all() == []
 
 
 def test_ad_cost_increase_uses_cost_title_and_shows_cost_comparison(setup):

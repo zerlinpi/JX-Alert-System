@@ -138,3 +138,46 @@ def test_new_group_mentions_preserve_only_verified_members_without_mutating_owne
     assert group_member_mentions({"verified_member_open_ids": ["ou_present"]}, owners) == ["ou_present"]
     assert owners == ["ou_absent", "ou_present", "ou_present"]
     assert group_member_mentions({}, owners) == ["ou_absent", "ou_present"]
+
+
+def test_quiet_mode_skips_queued_noise_without_sending_or_retrying(delivery_runtime, monkeypatch):
+    from zoneinfo import ZoneInfo
+    sessions, settings, routing, _, sent, now = delivery_runtime
+    settings.feishu_quiet_delivery_enabled = True
+    monkeypatch.setattr(bot_service, "validate_question_delivery", lambda s, d: True)
+    group = report_group_delivery(settings, routing, role="daily_snapshot")
+    reply = {**group, "role": "group_question", "reply_to_message_id": "om_question"}
+    day = now.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    due = {"scheduled_delivery_date": day, "scheduled_timezone": "Asia/Shanghai",
+           "scheduled_not_before": day + "T00:00:00+08:00"}
+    scheduled = {
+        "scheduled-daily:morning:a": {"morning_message_kind": "health"},
+        "scheduled-daily:morning:b": {"morning_message_kind": "ad_exception"},
+        "scheduled-daily:morning:c": {"card": card("广告判断待补齐数据", subtitle="", sections=[])},
+    }
+    other = {
+        "app:old-freshness": {},
+        "chat-analysis:old-unsupported": {},
+        "chat-report:manual": {},
+        "store-health-brief:duplicate": {},
+        "chat-ad-kpi:verified": {"material_ad_alert": True},
+    }
+    with sessions.begin() as db:
+        for key, extra in {**scheduled, **other}.items():
+            row = _row(key, group, now)
+            row.payload = {**row.payload, **(due if key in scheduled else {}), **extra}
+            db.add(row)
+        db.add(_row("group-question:om_question:0", reply, now))
+        db.add(_row("group-question:om_other:0", reply, now))
+    for _ in range(2):
+        worker.process_outbox_batch()
+    assert len(sent) == 4 and [operation for operation, _ in sent].count("reply") == 1
+    pending = {*scheduled, *other, "group-question:om_question:0", "group-question:om_other:0"}
+    expected = {"scheduled-daily:morning:a", "scheduled-daily:morning:b",
+                "chat-ad-kpi:verified", "group-question:om_question:0"}
+    with sessions() as db:
+        rows = {row.idempotency_key: row for row in db.scalars(select(NotificationOutbox))}
+        assert {key for key, row in rows.items() if row.status == "DELIVERED"} == expected
+        assert {key for key, row in rows.items() if row.status == "SKIPPED"} == pending - expected
+        logs = list(db.scalars(select(NotificationLog).where(NotificationLog.status == "SKIPPED")))
+        assert len(logs) == 6 and all(row.message_id is None for row in logs)

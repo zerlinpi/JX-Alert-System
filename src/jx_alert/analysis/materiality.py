@@ -8,6 +8,7 @@ import math
 
 from sqlalchemy import select
 
+from jx_alert.notifications.quiet_policy import quiet_delivery
 from jx_alert.storage.models import DailyMetric, DataCoverage
 
 
@@ -127,8 +128,12 @@ def notification_evidence(db, store_id, dimension, entity_id, target):
     return result
 
 
+def materiality_enabled(settings):
+    return getattr(settings, "alert_materiality_enabled", False) or quiet_delivery(settings)
+
+
 def material_finding(db, settings, store_id, dimension, entity_id, target, metric):
-    if not getattr(settings, "alert_materiality_enabled", False):
+    if not materiality_enabled(settings):
         return True
     if not target:
         return False
@@ -136,7 +141,7 @@ def material_finding(db, settings, store_id, dimension, entity_id, target, metri
 
 
 def material_rule_notification(db, settings, anomaly):
-    if not getattr(settings, "alert_materiality_enabled", False):
+    if not materiality_enabled(settings):
         return True
     if anomaly.rule == "store_status_not_normal" or anomaly.rule.endswith("_freshness"):
         return True

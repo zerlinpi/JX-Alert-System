@@ -330,6 +330,7 @@ def get_store_health_brief(store_id: str | None = None, offset: int = 0, limit: 
 def send_store_health_brief() -> dict:
     """仅在用户要求发送绩效快报时，将全部已配置店铺的中文表格发送到既定飞书日报群。
 
+    精简通知开启时，手动快报返回 SKIPPED。可用 get_store_health_brief 直接查询。
     包含源评级、评分、七项绩效指标、关注项、归档待处理通知与数据质量。
     同一北京时间日期和目标群只生成一次，重复调用复用原卡片，不重发。
     此工具为快报，不用于自动异常巡检；未知数据不标正常，不触发或恢复健康业务告警。
@@ -1271,6 +1272,7 @@ def _notification_guard(settings):
 def send_chat_report_to_feishu(title: str, markdown: str, store_ids: list[str] | None = None) -> dict:
     """仅当用户明确要求发送时，将其指定的中文 Chat 报告原文发送到已配置的飞书日报群。
 
+    精简通知开启时，普通报告返回 SKIPPED。有实质异常的广告用广告分析提交接口。
     使用原文 Markdown 保留标题、列表、粗体、表格，不添加额外说明或提及群成员。
     广告报告先用prepare_advertising_kpi_analysis取得七项指标及口径，保留未知状态。
     适用于经营日报或用户明确指定的报告。自动异常监控用submit_chat_analysis或submit_advertising_kpi_analysis，

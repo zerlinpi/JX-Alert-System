@@ -5,11 +5,14 @@ import re
 from pathlib import Path
 
 from jx_alert.notifications.outbox import enqueue_notification
+from jx_alert.notifications.quiet_policy import quiet_delivery, quiet_skip
 from jx_alert.notifications.routing import _load_routing, report_group_delivery
 from jx_alert.store_controls import notification_states
 
 
 def enqueue_chat_report(db, settings, *, title: str, markdown: str, store_ids: list[str] | None = None) -> dict:
+    if quiet_delivery(settings):
+        return quiet_skip()
     if store_ids is not None:
         raw_scope = json.loads(Path(settings.collection_scope_file).read_text(encoding="utf-8"))
         scope = {str(int(sid)) for sid in raw_scope["store_ids"]}
