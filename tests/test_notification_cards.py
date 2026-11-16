@@ -16,14 +16,19 @@ from jx_alert.storage.db import Base
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, StorePerformance
 
 
-def test_card_preserves_explicit_zero_missing_and_incomplete_comparison():
+@pytest.mark.parametrize("source_updated_at,freshness_label", [
+    ("2026-11-11 08:00:00", "源时区待确认"),
+    (None, "缺少源数据或更新时间"),
+])
+def test_card_preserves_explicit_zero_missing_and_incomplete_comparison(source_updated_at, freshness_label):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         store = Store(sid="5174", name="Geteen-US", timezone="America/Los_Angeles", currency_code="USD")
         db.add(store)
         db.add(StorePerformance(store_id=store.sid, pull_date=date(2026, 11, 11), ahr_score=248,
-                                ahr_status="Healthy", freshness_status="NOT_CONFIGURED"))
+                                ahr_status="Healthy", freshness_status="NOT_CONFIGURED",
+                                source_updated_at=source_updated_at))
         for day, value in [(date(2026, 11, 10), 10), (date(2026, 11, 11), 0)]:
             db.add(DailyMetric(store_id=store.sid, entity_id=store.sid, metric_date=day,
                                dimension="store", metric_name="orders", value=value))
@@ -37,7 +42,7 @@ def test_card_preserves_explicit_zero_missing_and_incomplete_comparison():
         assert table["rows"][3]["c3"] == "待完整采集"
         assert "美国太平洋时间" in json.dumps(result, ensure_ascii=False)
         tables = [e for e in result["body"]["elements"] if e["tag"] == "table"]
-        assert tables[2]["rows"][0] == {"c0": "健康评分", "c1": "248", "c2": "源时区待确认"}
+        assert tables[2]["rows"][0] == {"c0": "健康评分", "c1": "248", "c2": freshness_label}
 
 
 def sample_card():
