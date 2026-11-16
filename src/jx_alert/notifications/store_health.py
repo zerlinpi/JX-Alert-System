@@ -88,7 +88,20 @@ def health_brief_snapshots(db, settings, *, store_id=None, now=None):
 
 
 def card_fits(value):
-    """Include JSON-in-JSON escaping in the application's 20 KB wire limit."""
+    """Bound both the five-table platform limit and JSON-in-JSON wire size.
+
+    https://open.feishu.cn/document/feishu-cards/feishu-card-cardkit/components/table
+    """
+    pending, tables = [value], 0
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            tables += item.get("tag") == "table"
+            if tables > 5:
+                return False
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
     payload = {"receive_id": "oc_" + "x" * 64, "msg_type": "interactive",
                "content": json.dumps(value, ensure_ascii=False), "uuid": "x" * 40}
     return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= 20 * 1024
