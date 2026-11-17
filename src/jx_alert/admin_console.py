@@ -22,7 +22,8 @@ from starlette.routing import Route
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
-from jx_alert import admin_data, admin_groups, admin_mapping, store_controls
+from jx_alert import admin_data, admin_groups, admin_mapping, admin_sources, store_controls
+from jx_alert.lingxing.source_credentials import SourceCredentialsError
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import Store, SyncJob
@@ -439,8 +440,12 @@ class OwnerConsole:
                     response = RedirectResponse("/console/login", 303, headers=_HEADERS)
                     _cookie(response, SESSION, "", 0)
                     return response
-                payload = await _body(request, "application/json")
-                if path in {"/console/api/notification-group", "/console/api/notification-group/preview"}:
+                payload = await _body(request, "application/json", limit=16384 if path == "/console/api/data-sources" else 8192)
+                if path == "/console/api/data-sources":
+                    if not self._rate_allowed(request, "data-sources-write", per_ip=6, total=12):
+                        raise ConsoleError("数据源更新太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(admin_sources.save_data_source, self.settings, payload)
+                elif path in {"/console/api/notification-group", "/console/api/notification-group/preview"}:
                     preview = path.endswith("/preview")
                     expected_fields = {"chat_id", "revision"} if preview else {"chat_id", "revision", "confirmed"}
                     if set(payload) != expected_fields:
@@ -473,6 +478,8 @@ class OwnerConsole:
                     if not self._rate_allowed(request, "mapping", per_ip=12, total=24):
                         raise ConsoleError("操作太频繁，请稍后重试。", 429)
                     data = await asyncio.to_thread(self._mapping, sid, "owners", payload)
+            elif path == "/console/api/data-sources":
+                data = await asyncio.to_thread(admin_sources.get_data_sources, self.settings)
             elif path.startswith("/console/api/notification-group"):
                 if path.endswith("/chats"):
                     if not self._rate_allowed(request, "notification-group-list", per_ip=12, total=24):
@@ -496,6 +503,8 @@ class OwnerConsole:
             return JSONResponse(data, headers=_HEADERS)
         except ConsoleError as exc:
             return _error(exc.detail, exc.status)
+        except SourceCredentialsError as exc:
+            return _error(exc.detail, exc.status_code)
         except admin_mapping.MappingError as exc:
             return _error(exc.detail, exc.status_code)
         except store_controls.StoreControlError as exc:
@@ -508,6 +517,7 @@ class OwnerConsole:
         return [Route("/console", self.home), Route("/console/", self.home),
                 Route("/console/login", self.login, methods=["GET", "POST"]),
                 Route("/console/assets/{asset}", self.asset), Route("/console/api/stores", self.api),
+                Route("/console/api/data-sources", self.api, methods=["GET", "POST"]),
                 Route("/console/api/notification-group", self.api, methods=["GET", "POST"]),
                 Route("/console/api/notification-group/chats", self.api),
                 Route("/console/api/notification-group/preview", self.api, methods=["POST"]),

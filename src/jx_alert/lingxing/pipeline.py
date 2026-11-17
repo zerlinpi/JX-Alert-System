@@ -47,6 +47,12 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
     if not 1 <= ad_attribution_refresh_days <= 31:
         raise ValueError("ad_attribution_refresh_days must be between 1 and 31")
     settings = settings or get_settings()
+    from jx_alert.lingxing.source_gateway import CollectionSources, create_collection_client
+    if not isinstance(client, CollectionSources):
+        client = create_collection_client(settings, api_client=client, db=db)
+    elif client.db is None:
+        client.db = db
+    dual = isinstance(client, CollectionSources)
     stores_response = stores_response or client.get_stores()
     store_rows = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(store_rows, list):
@@ -60,6 +66,9 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             report_dates = {sid: day for sid, day in report_dates.items() if sid not in paused}
         if not store_rows:
             return {"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": sorted(paused)}
+    if dual:
+        client.shadow_dates = {str(s["sid"]): set(normalize_store_report_dates(report_dates, str(s["sid"])))
+                               for s in store_rows}
     ad_report_dates = {}
     for store in store_rows:
         if int(store.get("status") or 0) != 1 or int(store.get("has_ads_setting") or 0) != 1:
@@ -87,6 +96,7 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
     job_id = job.id
     completed_steps: list[str] = []
     results: dict = {}
+    source_failures = []
     if paused:
         results["collection_disabled_store_ids"] = sorted(paused)
 
@@ -100,6 +110,40 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             selected[sid] = normalize_store_report_dates(dates, sid)
         results["excel_archive"] = archive_partitions(db, settings, selected)
 
+    def step(name, function, dimensions=(), dates=report_dates):
+        """The optional secondary source cannot erase a successful primary step."""
+        try:
+            value = function()
+            completed_steps.append(name)
+            return value
+        except LingxingCollectionPaused:
+            raise
+        except Exception as exc:
+            if not dual:
+                raise
+            db.rollback()
+            source_failures.append({"step": name, "error_type": type(exc).__name__})
+            # Keep previously valid records but hide failed exact-date primary
+            # partitions. MCP observations have their own independent coverage.
+            from jx_alert.storage.coverage import mark_coverage
+            last = client.last_request or {}
+            sid, day = last.get("store_id"), last.get("report_date")
+            allowed = (set(normalize_store_report_dates(dates, sid))
+                       if sid and (isinstance(dates, str) or sid in dates) else set())
+            if dimensions and sid in {str(s["sid"]) for s in store_rows} and day in allowed:
+                exact = dimensions
+                if str(last.get("dataset", "")).startswith("product_ad_"):
+                    exact = (last["dataset"],)
+                for dimension in exact:
+                    row = mark_coverage(db, store_id=sid, metric_date=date.fromisoformat(day),
+                                        dimension=dimension, row_count=0)
+                    row.status = "FAILED"
+            db.commit()
+            return {"status": "PARTIAL_FAILED", "rows": {}, "campaigns": {}}
+        finally:
+            if dual:
+                client.flush(db)
+
     try:
         results["stores"] = {
             "count": len(stores_response.get("data", []))
@@ -108,13 +152,16 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             else None
         }
 
-        results["store_status"] = evaluate_store_status_events(db, stores_response)
-        completed_steps.append("store_status")
+        if stores_response.get("_source") == "mcp_visible_cached_identity":
+            # MCP visibility and cached identity are not fresh Amazon
+            # authorization evidence and cannot recover or escalate events.
+            results["store_status"] = {"status": "SKIPPED", "reason": "NO_FRESH_AUTHORIZATION_EVIDENCE"}
+        else:
+            results["store_status"] = evaluate_store_status_events(db, stores_response)
+            completed_steps.append("store_status")
 
-        results["sales"] = collect_sales_for_day(
-            client, db, report_dates, stores_response=stores_response
-        )
-        completed_steps.append("sales")
+        results["sales"] = step("sales", lambda: collect_sales_for_day(
+            client, db, report_dates, stores_response=stores_response), ("store", "sku_asin", "sku_msku"))
         from jx_alert.lingxing.business_dashboard import collect_business_for_day
         results["business_dashboard"] = collect_business_for_day(
             db, settings, stores_response, report_dates)
@@ -122,10 +169,8 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             completed_steps.append("business_dashboard")
         archive_excel()
 
-        results["campaigns"] = collect_campaigns(
-            client, db, stores_response=stores_response
-        )
-        completed_steps.append("campaigns")
+        results["campaigns"] = step("campaigns", lambda: collect_campaigns(
+            client, db, stores_response=stores_response))
 
         results["ad_report_dates"] = ad_report_dates
         currencies = {}
@@ -137,10 +182,36 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
                     db.add(RawSnapshot(source="lingxing_seller_ad_accounts", payload={"rows": accounts}))
             results["ad_currency"] = {"status": "COMPLETE" if currencies else "LOOKUP_UNAVAILABLE",
                                       "accounts_matched": len(currencies)}
-        results["campaign_reports"] = collect_ads_for_day(
-            client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies,
-        )
-        completed_steps.append("campaign_reports")
+        if dual:
+            # Only the explicit target dates need the supplementary UI report;
+            # the 22-day attribution refresh remains the authoritative API.
+            # Collect these even if the API's earliest historical page fails.
+            for sid, days in client.shadow_dates.items():
+                if not any(str(s["sid"]) == sid and int(s.get("has_ads_setting") or 0) == 1
+                           for s in store_rows):
+                    continue
+                for day in days:
+                    for kind in ("sp", "sb", "sd"):
+                        try:
+                            client.observe_campaign(sid, day, kind)
+                        except LingxingCollectionPaused:
+                            raise
+                        except Exception:
+                            pass  # Separate MCP failed coverage is persisted below.
+            client.flush(db)
+            by_type = {}
+            for kind in ("sp", "sb", "sd"):
+                by_type[kind] = step("campaign_report_" + kind, lambda kind=kind: collect_ads_for_day(
+                    client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies,
+                    report_types=(kind,)), ("campaign_" + kind,), ad_report_dates)
+            results["campaign_reports"] = {"rows": {kind: result.get("rows", {}).get(kind, 0)
+                for kind, result in by_type.items()}, "by_type": by_type}
+            if all(value.get("status") != "PARTIAL_FAILED" for value in by_type.values()):
+                completed_steps.append("campaign_reports")
+        else:
+            results["campaign_reports"] = collect_ads_for_day(
+                client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies)
+            completed_steps.append("campaign_reports")
         archive_excel(ad_report_dates)
 
         if getattr(settings, "sb_sd_detail_reports_enabled", False):
@@ -150,10 +221,9 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
                 ad_currencies=currencies)
             completed_steps.append("sb_sd_detail_reports")
 
-        results["product_ad_reports"] = collect_product_ads_for_day(
-            client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies,
-        )
-        completed_steps.append("product_ad_reports")
+        results["product_ad_reports"] = step("product_ad_reports", lambda: collect_product_ads_for_day(
+            client, db, ad_report_dates, stores_response=stores_response, ad_currencies=currencies),
+            ("product_ad_sp", "product_ad_sd"), ad_report_dates)
         archive_excel(ad_report_dates)
 
         if settings.lingxing_performance_enabled:
@@ -180,9 +250,10 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         detail_reports = results.get("sb_sd_detail_reports", {})
         transient_detail_failure = any(item["error_type"] == LingxingTransientError.__name__
                                        for item in detail_reports.get("failures", []))
-        job.status = ("PARTIAL_FAILED" if performance_status == "PARTIAL_FAILED" or transient_detail_failure
-                      or results.get("business_dashboard", {}).get("status") == "PARTIAL_FAILED" else
+        job.status = ("PARTIAL_FAILED" if source_failures or performance_status == "PARTIAL_FAILED" or transient_detail_failure else
                       "SUCCEEDED_WITH_WARNINGS" if performance_status == "SUCCEEDED_WITH_WARNINGS"
+                      or results.get("business_dashboard", {}).get("status") == "PARTIAL_FAILED"
+                      or dual and any(x.get("mcp") == "FAILED" for x in client.outcomes)
                       or detail_reports.get("status") == "PARTIAL_FAILED"
                       or results.get("ad_currency", {}).get("status") == "LOOKUP_UNAVAILABLE" else "SUCCEEDED")
         job.finished_at = _utcnow()
@@ -195,6 +266,9 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             "completed_steps": completed_steps,
             "results": results,
         }
+        if dual:
+            results["sources"] = client.source_summary()
+            results["source_failures"] = source_failures
         db.commit()
         results["raw_archive"] = archive_raw_snapshots(
             db, settings.raw_dir, after_id=snapshot_start_id

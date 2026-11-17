@@ -18,6 +18,7 @@ const state = {
   collectionSeq: 0, collectionBusy: false, collectionTimer: null,
   bulkCollection: null, bulkBusy: false, bulkTimer: null,
   groups: { current: null, chats: [], preview: null, saving: false, loading: false, seq: 0 },
+  sources: { data: null, loading: false, saving: false },
 };
 
 function node(tag, text, name) {
@@ -295,7 +296,8 @@ function businessComparison(item, warning) {
 
 function renderBusinessDaily(data) {
   const business = data.business_daily;
-  const items = (business?.metrics || []).filter((item) => Number.isFinite(item.current) || Number.isFinite(item.previous));
+  const items = (business?.metrics || []).filter((item) => Number.isFinite(item.current) &&
+    (item.unit !== "money" || /^[A-Z]{3}$/.test(item.currency || "")));
   $("business-daily").hidden = !business && typeof data.business_source_configured !== "boolean";
   $("business-daily-table").hidden = !items.length;
   $("business-daily-period").textContent = items.length ? [
@@ -311,11 +313,38 @@ function renderBusinessDaily(data) {
   else if (!items.length) notes.push(data.business_source_configured ? "经营看板暂无该日报数据。" : "经营看板数据尚未接入。");
   else {
     if (items.some((item) => item.unit === "expense_rate")) notes.push("¹ 领星经营看板口径，费用与退款占比按扣款绝对值展示。");
-    if (business.missing_metrics?.length) notes.push(`未取得：${business.missing_metrics.join("、")}`);
   }
   $("business-daily-note").textContent = notes.join(" ");
   // The source sales summary remains visible until the distinct business dashboard is available.
   $("metric-summary").hidden = items.length > 0;
+}
+
+function renderSourceObservations(data) {
+  const observations = data.source_observations || {};
+  const sales = observations.store_sales;
+  const rows = [], bases = new Set();
+  if (sales && sales.metrics) {
+    for (const [key, label] of [["sales", "销售额"], ["units", "销量"], ["orders", "订单"]]) {
+      const value = sales.metrics[key];
+      if (!Number.isFinite(value) || Number.isFinite(data.metrics?.[key])) continue;
+      if (key === "sales" && !/^[A-Z]{3}$/.test(sales.currency || "")) continue;
+      rows.push([label + "（下单口径）", key === "sales" ? money(value, sales.currency) : scalar(value)]);
+      if (sales.basis) bases.add(sales.basis);
+    }
+  }
+  for (const ad of observations.campaign_ads || []) {
+    const original = (data.ad_breakdown || []).find((item) => item.type === String(ad.ad_type).toUpperCase());
+    for (const [key, label] of [["spend", "花费"], ["clicks", "点击"], ["impressions", "曝光"]]) {
+      const value = ad.metrics?.[key];
+      if (!Number.isFinite(value) || Number.isFinite(original?.[key])) continue;
+      if (key === "spend" && !/^[A-Z]{3}$/.test(ad.currency || "")) continue;
+      rows.push([String(ad.ad_type).toUpperCase() + " · " + label, key === "spend" ? money(value, ad.currency) : scalar(value)]);
+      if (ad.basis) bases.add(ad.basis);
+    }
+  }
+  $("source-observations").hidden = !rows.length;
+  $("source-observations-basis").textContent = [observations.report_date, ...bases].filter(Boolean).join(" · ");
+  tableRows("source-observation-rows", rows, 2, "");
 }
 
 function renderDetail() {
@@ -336,7 +365,8 @@ function renderDetail() {
   if (data.latest_completed_date) reportNotes.push(`最近已结束报表日 ${data.latest_completed_date}`);
   if (data.data_warning) reportNotes.push(data.data_warning);
   $("report-note").textContent = reportNotes.join(" · ");
-  $("metric-summary").replaceChildren(...figures.map(([key, label]) => {
+  $("metric-summary").replaceChildren(...figures.filter(([key]) => Number.isFinite(data.metrics?.[key]) &&
+    (!["sales", "spend"].includes(key) || /^[A-Z]{3}$/.test(data.currency_codes?.[key] || ""))).map(([key, label]) => {
     const tile = node("div", undefined, "metric");
     const value = metricValue(key, data);
     const dd = node("dd", value);
@@ -345,13 +375,20 @@ function renderDetail() {
     return tile;
   }));
   renderBusinessDaily(data);
-  tableRows("kpi-rows", (data.kpis || []).map((r) => [r.label || r.code, kpiValue(r), r.date, badge(r.status)]), 4, "暂无可用广告指标。");
+  renderSourceObservations(data);
+  tableRows("kpi-rows", (data.kpis || []).filter((r) => Number.isFinite(r.value) &&
+    (!["CPC", "CPS", "CPA"].includes(r.code) || /^[A-Z]{3}$/.test(r.currency || ""))).map((r) => [r.label || r.code, kpiValue(r), r.date,
+    /数据不足|待确认|待核实|缺少|币种/.test(r.status || "") ? node("span", "") : badge(r.status)]), 4, "尚无可展示的广告指标。");
   tableRows("coverage-rows", (data.coverage || []).map((r) => [r.name, badge(r.status), scalar(r.rows)]), 3, "暂无采集记录。");
   const health = data.health || {};
-  const healthItems = [["当前状态", badge(health.status)], ["健康评分", scalar(health.score)], ["源评级", health.source_rating], ["源更新时间", health.updated_at]];
-  if (health.reason) healthItems.push(["状态依据", health.reason]);
+  const healthItems = [];
+  if (health.status && !/待确认|待核实|未知/.test(health.status)) healthItems.push(["当前状态", badge(health.status)]);
+  if (Number.isFinite(health.score)) healthItems.push(["健康评分（观测）", scalar(health.score)]);
+  if (health.source_rating && !/未知|未提供|未识别/.test(health.source_rating)) healthItems.push(["源评级（观测）", health.source_rating]);
+  if (health.updated_at) healthItems.push(["源更新时间（原值）", health.updated_at]);
   for (const evidence of health.indicators || []) {
-    const observed = Number.isFinite(evidence.value) ? `${scalar(evidence.value)}%` : "—";
+    if (!Number.isFinite(evidence.value)) continue;
+    const observed = `${scalar(evidence.value)}%`;
     const standard = Number.isFinite(evidence.standard) ? `平台标准 ${scalar(evidence.standard)}%` : "";
     const value = [observed, standard, evidence.status_label || evidence.judgment].filter(Boolean).join(" · ");
     if (evidence.label || evidence.name) healthItems.push([evidence.label || evidence.name, value]);
@@ -364,8 +401,10 @@ function renderDetail() {
     div.append(node("dt", label), dd);
     return div;
   }));
-  $("ad-breakdown").hidden = !Array.isArray(data.ad_breakdown);
-  tableRows("ad-breakdown-rows", (data.ad_breakdown || []).map((r) => [r.name || r.type, money(r.spend, r.currency),
+  $("health-panel").hidden = !healthItems.length;
+  const adRows = (data.ad_breakdown || []).filter((r) => Number.isFinite(r.spend) && /^[A-Z]{3}$/.test(r.currency || ""));
+  $("ad-breakdown").hidden = !adRows.length;
+  tableRows("ad-breakdown-rows", adRows.map((r) => [r.name || r.type, money(r.spend, r.currency),
     scalar(r.orders), scalar(r.clicks), scalar(r.impressions), badge(r.status)]), 6, "暂无广告类型数据。");
   $("recent-alerts").hidden = !Array.isArray(data.recent_alerts);
   tableRows("alert-rows", (data.recent_alerts || []).map((r) => [r.title, badge(r.status), r.date]), 3, "暂无近期异常记录。");
@@ -636,12 +675,14 @@ function renderRouting() {
 function renderView() {
   const owners = state.view === "owners";
   const groups = state.view === "notification-group";
-  $("page-title").textContent = groups ? "通知群设置" : owners ? "负责人映射" : "经营概览";
-  $("page-description").textContent = groups ? "管理接收日报和默认提醒的飞书群聊。" : owners ? "按店铺管理接收异常提醒的飞书负责人。" : "查看各店铺的销售、广告与账户绩效。";
+  const sources = state.view === "data-sources";
+  $("page-title").textContent = sources ? "领星数据源" : groups ? "通知群设置" : owners ? "负责人映射" : "经营概览";
+  $("page-description").textContent = sources ? "管理接口与 MCP 凭据、更换日期及操作记录。" : groups ? "管理接收日报和默认提醒的飞书群聊。" : owners ? "按店铺管理接收异常提醒的飞书负责人。" : "查看各店铺的销售、广告与账户绩效。";
   $("notification-group-panel").hidden = !groups;
-  $("store-stats").hidden = groups;
-  $("store-board").hidden = groups;
-  $("bulk-sync-panel").hidden = groups;
+  $("data-sources-panel").hidden = !sources;
+  $("store-stats").hidden = groups || sources;
+  $("store-board").hidden = groups || sources;
+  $("bulk-sync-panel").hidden = groups || sources;
   for (const tab of document.querySelectorAll("[data-view]")) {
     if (tab.dataset.view === state.view) tab.setAttribute("aria-current", "page");
     else tab.removeAttribute("aria-current");
@@ -656,6 +697,99 @@ async function setView(view) {
   renderView();
   if (view === "owners" && state.data && !state.members) await loadMembers();
   if (view === "notification-group" && !state.groups.current) await loadGroups();
+  if (view === "data-sources" && !state.sources.data) await loadSources();
+}
+
+function sourceTime(value) {
+  if (typeof value !== "string") return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return "";
+  const instant = new Date(value);
+  return Number.isFinite(instant.getTime()) ? new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(instant) : "";
+}
+
+function nextSourceMonth(today) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(today || "");
+  if (!match) return "";
+  const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+  const last = new Date(Date.UTC(year, month + 1, 0));
+  const result = new Date(Date.UTC(year, month, Math.min(day, last.getUTCDate())));
+  return result.toISOString().slice(0, 10);
+}
+
+function renderSources(data) {
+  const busy = state.sources.loading || state.sources.saving;
+  const dateParts = new Intl.DateTimeFormat("en", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const parts = Object.fromEntries(dateParts.map((part) => [part.type, part.value]));
+  const today = `${parts.year}-${parts.month}-${parts.day}`;
+  for (const kind of ["api", "mcp"]) {
+    const info = data?.[kind] || {};
+    $("source-" + kind + "-fields").disabled = busy || !state.csrf || !data?.revision;
+    const status = { CONFIGURED: "已配置", EXPIRING: "待更换（7日内）", EXPIRED: "已到更换日期", INVALID: "配置需更新", NOT_CONFIGURED: "未配置" }[info.status];
+    $("source-" + kind + "-state").replaceChildren(...(status ? [badge(status)] : []));
+    const rows = [["服务地址", info.origin], ["添加 / 更新", sourceTime(info.updated_at)],
+      ["计划更换", sourceTime(info.expires_on)]].filter(([, value]) => value);
+    $("source-" + kind + "-meta").replaceChildren(...rows.map(([label, value]) => {
+      const pair = node("div"); pair.append(node("dt", label), node("dd", value)); return pair;
+    }));
+    const expiry = $("source-" + kind + "-expiry");
+    if (!expiry.value) expiry.value = info.expires_on || nextSourceMonth(today);
+    if (kind === "api") $("source-api-app-id").required = !info.configured;
+  }
+  $("reload-sources").disabled = busy;
+  const actions = { ADD: "添加", ROTATE: "更新", added: "添加", rotated: "更新", updated: "更新", add: "添加", rotate: "更新", update: "更新" };
+  const events = (data?.events || []).filter((item) => ["api", "mcp"].includes(item.kind) && actions[item.action] && sourceTime(item.at));
+  tableRows("source-history-rows", events.map((item) => [item.kind === "api" ? "领星接口" : "领星 MCP",
+    actions[item.action], sourceTime(item.at), item.expires_on || ""]), 4, "尚无添加或更换记录。");
+}
+
+async function loadSources() {
+  if (state.sources.loading || state.sources.saving) return;
+  state.sources.loading = true;
+  renderSources(state.sources.data);
+  try {
+    state.sources.data = await api("data-sources");
+    for (const kind of ["api", "mcp"]) $("source-" + kind + "-expiry").value = "";
+    for (const id of ["source-api-app-id", "source-mcp-key", "source-api-secret", "source-api-app-key", "source-api-access-token"]) $(id).value = "";
+    notice("sources-status");
+  } catch (error) {
+    notice("sources-status", error.message, "error");
+  } finally {
+    state.sources.loading = false;
+    renderSources(state.sources.data);
+  }
+}
+
+async function saveSource(kind) {
+  if (state.sources.saving || !state.sources.data?.revision || !state.csrf) return;
+  const credentials = kind === "mcp" ? { url: $("source-mcp-url").value.trim(), key: $("source-mcp-key").value.trim() } : {
+    app_id: $("source-api-app-id").value.trim(), app_secret: $("source-api-secret").value.trim(),
+    app_key: $("source-api-app-key").value.trim(), access_token: $("source-api-access-token").value.trim(),
+  };
+  if (!state.sources.data[kind]?.configured && (kind === "mcp" ? !credentials.key :
+      !credentials.app_id || (!credentials.app_secret && !credentials.access_token))) {
+    notice("sources-status", "请填写该数据源的必要凭据。", "error"); return;
+  }
+  state.sources.saving = true;
+  renderSources(state.sources.data);
+  try {
+    state.sources.data = await api("data-sources", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf,
+    }, body: JSON.stringify({ revision: state.sources.data.revision, kind, credentials,
+      expires_on: $("source-" + kind + "-expiry").value || null }) });
+    $("source-" + kind + "-expiry").value = "";
+    notice("sources-status", "配置已保存，后续采集读取新凭据。", "success");
+  } catch (error) {
+    notice("sources-status", error.message, "error");
+    if (error.status === 409) state.sources.data = null;
+  } finally {
+    for (const id of ["source-mcp-key", "source-api-secret", "source-api-app-key", "source-api-access-token"]) $(id).value = "";
+    state.sources.saving = false;
+    renderSources(state.sources.data);
+  }
 }
 
 function updateGroupSelection() {
@@ -884,8 +1018,12 @@ $("stores").addEventListener("click", (event) => {
   if (btn) void selectStore(btn.dataset.sid);
 });
 $("store-search").addEventListener("input", renderStoreList);
+$("reload-sources").addEventListener("click", () => void loadSources());
+for (const kind of ["api", "mcp"]) {
+  $("source-" + kind + "-form").addEventListener("submit", (event) => { event.preventDefault(); void saveSource(kind); });
+}
 $("store-filter").addEventListener("change", renderStoreList);
-$("refresh").addEventListener("click", () => state.view === "notification-group" ? loadGroups() : loadStores());
+$("refresh").addEventListener("click", () => state.view === "data-sources" ? loadSources() : state.view === "notification-group" ? loadGroups() : loadStores());
 $("reload-groups").addEventListener("click", loadGroups);
 $("notification-group-select").addEventListener("change", () => { clearGroupPreview(); notice("group-settings-status"); });
 $("preview-group").addEventListener("click", previewGroup);

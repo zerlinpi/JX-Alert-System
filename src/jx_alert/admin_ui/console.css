@@ -98,6 +98,24 @@ svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width:
 .search svg { width: 16px; color: var(--muted); }
 .search input { border: 0; background: none; outline: 0; min-width: 0; width: 100%; color: var(--ink); min-height: 37px; }
 select, input[type="date"], input[type="password"] { border: 1px solid #bfceda; border-radius: 8px; color: var(--ink); background: #fff; min-height: 38px; padding: 5px 8px; }
+.data-sources { display: grid; gap: 16px; }
+.sources-intro { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 16px; }
+.source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.source-card { min-width: 0; }
+.source-meta { display: flex; flex-wrap: wrap; gap: 10px 24px; padding: 0 16px 12px; font-size: 12px; }
+.source-meta dt { color: var(--muted); }
+.source-meta > div { min-width: 0; }
+.source-meta dd { overflow-wrap: anywhere; }
+.source-form { padding: 0 16px 16px; }
+.source-form fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 8px; min-width: 0; }
+.source-form input { width: 100%; min-width: 0; border: 1px solid #bfceda; border-radius: 8px; min-height: 40px; padding: 7px 10px; background: #fff; color: var(--ink); }
+.source-form label { margin-top: 6px; font-weight: 600; }
+.source-form button { justify-self: start; margin-top: 12px; }
+.source-form details input { margin-block: 5px 10px; }
+.source-form details summary { color: var(--muted); cursor: pointer; padding-block: 6px; }
+.source-form details label { display: block; }
+.source-history .table-scroll { padding: 0 16px 16px; }
+@media (max-width: 1000px) { .source-grid { grid-template-columns: minmax(0, 1fr); } }
 .list-inputs select { min-width: 0; width: 100%; }
 .stores { max-height: min(64vh, 620px); overflow: auto; overscroll-behavior: contain; padding: 3px 7px 8px; scrollbar-color: #bbcdd9 transparent; }
 .store-option { background: transparent; display: block; border: 1px solid transparent; border-radius: 8px; padding: 9px 10px; color: var(--ink); width: 100%; text-align: left; }

@@ -21,6 +21,7 @@
         <button type="button" data-view="overview" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg>经营概览</button>
         <button type="button" data-view="owners"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2M16 5a3 3 0 0 1 0 6m4 9v-2a4 4 0 0 0-3-4"/></svg>负责人映射</button>
         <button type="button" data-view="notification-group"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 5h14v11H9l-4 4z"/><path d="M8 9h8M8 12h5"/></svg>通知群设置</button>
+        <button type="button" data-view="data-sources"><svg aria-hidden="true" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/></svg>领星数据源</button>
       </nav>
       <div class="sidebar-bottom">
         <span class="owner-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4-3 7-7 10-4-3-7-6-7-10V6z"/><path d="m9 12 2 2 4-4"/></svg></span>
@@ -54,6 +55,38 @@
           </div>
           <div class="save-bar"><span class="muted">目标群未出现时，请先在飞书中将机器人加入该群。</span><button id="save-notification-group" class="button primary" type="button" disabled>保存通知群</button></div>
         </div>
+      </section>
+      <section id="data-sources-panel" class="data-sources" aria-labelledby="sources-title" hidden>
+        <div class="panel sources-intro"><div><h2 id="sources-title">领星数据源</h2><p class="muted">添加或更换凭据后，后续采集自动读取新配置。超过所填日期将停止使用该凭据，并尝试其他可用数据源。</p></div><button id="reload-sources" class="button secondary" type="button">刷新配置记录</button></div>
+        <div id="sources-status" class="notice" role="status" hidden></div>
+        <div class="source-grid">
+          <section class="panel source-card" aria-labelledby="source-api-title">
+            <div class="section-heading"><div><h3 id="source-api-title">领星接口</h3><p class="muted">官方 OpenAPI</p></div><span id="source-api-state"></span></div>
+            <dl id="source-api-meta" class="source-meta"></dl>
+            <form id="source-api-form" class="source-form" autocomplete="off">
+              <fieldset id="source-api-fields" disabled>
+                <label for="source-api-app-id">App ID</label><input id="source-api-app-id" type="text" required maxlength="128" autocomplete="off" spellcheck="false">
+                <label for="source-api-secret">App Secret</label><input id="source-api-secret" type="password" maxlength="4096" autocomplete="new-password" placeholder="填写新值；同一 App ID 留空保留原凭据">
+                <details><summary>其他接口凭据</summary><label for="source-api-app-key">App Key（如与 App ID 不同）</label><input id="source-api-app-key" type="password" maxlength="128" autocomplete="new-password"><label for="source-api-access-token">Access Token（可选）</label><input id="source-api-access-token" type="password" maxlength="4096" autocomplete="new-password"></details>
+                <label for="source-api-expiry">计划更换日期（美国太平洋时间）</label><input id="source-api-expiry" type="date">
+                <button id="save-source-api" class="button primary" type="submit">保存接口凭据</button>
+              </fieldset>
+            </form>
+          </section>
+          <section class="panel source-card" aria-labelledby="source-mcp-title">
+            <div class="section-heading"><div><h3 id="source-mcp-title">领星 MCP</h3><p class="muted">官方只读数据源</p></div><span id="source-mcp-state"></span></div>
+            <dl id="source-mcp-meta" class="source-meta"></dl>
+            <form id="source-mcp-form" class="source-form" autocomplete="off">
+              <fieldset id="source-mcp-fields" disabled>
+                <label for="source-mcp-url">Server URL</label><input id="source-mcp-url" type="url" value="https://openmcp.lingxing.com/mcp-servers/lingxing-mcp" required maxlength="512" spellcheck="false" autocomplete="off">
+                <label for="source-mcp-key">X-Mcp-Key</label><input id="source-mcp-key" type="password" maxlength="4096" autocomplete="new-password" placeholder="填写新值；留空保留原凭据">
+                <label for="source-mcp-expiry">计划更换日期（美国太平洋时间）</label><input id="source-mcp-expiry" type="date">
+                <button id="save-source-mcp" class="button primary" type="submit">保存 MCP 凭据</button>
+              </fieldset>
+            </form>
+          </section>
+        </div>
+        <section class="panel source-history" aria-labelledby="source-history-title"><div class="section-heading"><div><h3 id="source-history-title">添加与更新记录</h3><p class="muted">只记录时间和操作，不展示密钥。日期为美国太平洋时间。</p></div></div><div class="table-scroll"><table><thead><tr><th scope="col">数据源</th><th scope="col">操作</th><th scope="col">添加 / 更新时间</th><th scope="col">计划更换日期</th></tr></thead><tbody id="source-history-rows"></tbody></table></div></section>
       </section>
       <section class="stats" id="store-stats" aria-label="店铺统计">
         <article class="stat"><span>店铺总数</span><strong id="total-stores">—</strong></article>
@@ -118,6 +151,7 @@
                 </div>
                 <dl id="metric-summary" class="metrics"></dl>
               </section>
+              <section id="source-observations" class="panel" aria-labelledby="source-observations-title" hidden><div class="section-heading"><div><h3 id="source-observations-title">领星 MCP 补充数据</h3><p id="source-observations-basis" class="muted"></p></div></div><div class="table-scroll"><table><thead><tr><th scope="col">指标</th><th scope="col">观测值</th></tr></thead><tbody id="source-observation-rows"></tbody></table></div></section>
               <section class="panel trends" aria-labelledby="trend-title">
                 <div class="section-heading"><div><h3 id="trend-title">近日报表趋势</h3><p class="muted" id="trend-note">使用已采集的店铺报表。</p></div>
                   <div class="segments" role="group" aria-label="趋势指标"><button type="button" data-metric="orders" aria-pressed="true">订单</button><button type="button" data-metric="sales" aria-pressed="false">销售额</button><button type="button" data-metric="spend" aria-pressed="false">广告花费</button></div>
@@ -132,7 +166,7 @@
               <section id="ad-breakdown" class="panel" aria-labelledby="ad-breakdown-title" hidden><div class="section-heading"><h3 id="ad-breakdown-title">广告类型明细</h3></div><div class="table-scroll"><table><thead><tr><th scope="col">类型</th><th scope="col">广告花费</th><th scope="col">归因订单</th><th scope="col">点击</th><th scope="col">曝光</th><th scope="col">采集状态</th></tr></thead><tbody id="ad-breakdown-rows"></tbody></table></div></section>
               <div class="lower-grid">
                 <section class="panel" aria-labelledby="coverage-title"><div class="section-heading"><h3 id="coverage-title">采集状态</h3></div><div class="table-scroll"><table><thead><tr><th scope="col">数据集</th><th scope="col">状态</th><th scope="col">源记录</th></tr></thead><tbody id="coverage-rows"></tbody></table></div></section>
-                <section class="panel" aria-labelledby="health-title"><div class="section-heading"><h3 id="health-title">店铺绩效</h3></div><dl id="health-data" class="health-data"></dl></section>
+                <section id="health-panel" class="panel" aria-labelledby="health-title"><div class="section-heading"><h3 id="health-title">店铺绩效</h3></div><dl id="health-data" class="health-data"></dl></section>
               </div>
               <section id="recent-alerts" class="panel" aria-labelledby="alerts-title" hidden><div class="section-heading"><h3 id="alerts-title">近期异常</h3></div><div class="table-scroll"><table><thead><tr><th scope="col">异常</th><th scope="col">状态</th><th scope="col">日期</th></tr></thead><tbody id="alert-rows"></tbody></table></div></section>
             </div>

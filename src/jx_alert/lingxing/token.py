@@ -109,7 +109,11 @@ def request_token(*, base_url: str, path: str, request_json: str,
 
 class LingxingTokenProvider:
     def __init__(self, settings):
-        self.settings = settings
+        from jx_alert.lingxing.source_credentials import effective_api_settings, SourceCredentialsError
+        try:
+            self.settings = effective_api_settings(settings)
+        except SourceCredentialsError as exc:
+            raise LingxingError(str(exc)) from None
 
     def _load(self) -> dict:
         path = Path(self.settings.lingxing_token_store_path)

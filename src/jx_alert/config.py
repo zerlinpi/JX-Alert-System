@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     lingxing_mcp_url: str = ""
     lingxing_mcp_key: SecretStr = SecretStr("")
     lingxing_business_credentials_file: str = "./data/secrets/lingxing-business-mcp.json"
+    lingxing_sources_file: str = "/app/data/secrets/lingxing-sources.json"
     lingxing_app_id: str = ""
     lingxing_app_key: str = ""
     lingxing_app_secret: str = ""
@@ -195,6 +196,7 @@ def get_settings() -> Settings:
             "lingxing_performance_enabled", "lingxing_performance_source_timezone",
             "lingxing_performance_observation_only",
             "lingxing_business_credentials_file",
+            "lingxing_sources_file",
             "mcp_allowed_hosts", "mcp_allowed_origins",
             "mcp_auth_mode", "mcp_public_url", "mcp_oauth_database_path", "mcp_owner_credentials_file",
             "mcp_forwarded_allow_ips",

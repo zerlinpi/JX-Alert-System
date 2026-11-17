@@ -84,7 +84,8 @@ SHEETS = {
 }
 
 _FACT_DIMENSIONS = {"store", "sku_msku", "sku_asin", "campaign_sp", "campaign_sb", "campaign_sd",
-                    "product_ad_sp", "product_ad_sd", "business_dashboard"}
+                    "product_ad_sp", "product_ad_sd", "business_dashboard", "mcp_sales_asin", "mcp_sales_msku",
+                    "mcp_campaign_sp", "mcp_campaign_sb", "mcp_campaign_sd"}
 _FACT_METRICS = {"orders", "units", "sales", "spend", "clicks", "impressions", "volume",
                  "netAmount", "platformIncome", "grossProfit", "grossRate", "totalAdsCostRate", "totalRefundsRate"}
 _MONEY = {"sales", "spend", "netAmount", "platformIncome", "grossProfit"}
