@@ -217,7 +217,8 @@ def test_missing_private_credentials_keeps_optional_collection_unconfigured(ware
 
 
 def fake_mcp(monkeypatch, tmp_path, *, help_kind='read', schema_kind='read', missing_schema=False,
-             action_response=None):
+             action_response=None, inventory_help_kind='read', inventory_schema_kind='read',
+             inventory_response=None, inventory_properties=None):
     calls = []
     credentials = tmp_path / 'business-test-private.json'
     credentials.write_text(json.dumps({'url': 'https://official.example.test/mcp',
@@ -257,15 +258,22 @@ def fake_mcp(monkeypatch, tmp_path, *, help_kind='read', schema_kind='read', mis
 
         async def call_tool(self, name, arguments):
             calls.append((name, arguments))
+            tool_id = arguments.get('toolId') or arguments.get('query')
+            inventory = tool_id == dashboard.STORE_TOOL
             if name == 'help':
-                value = {'code': 1, 'data': {'tools': [{'toolId': dashboard.TOOL, 'toolType': help_kind}]}}
+                kind = inventory_help_kind if inventory else help_kind
+                value = {'code': 1, 'data': {'tools': [{'toolId': tool_id, 'toolType': kind}]}}
             elif name == 'search':
-                properties = {key: {} for key in (
-                    'startDate', 'endDate', 'currencyCode', 'sids', 'aggregateType', 'indexName')}
-                if missing_schema:
+                properties = ({} if inventory_properties is None else inventory_properties) if inventory else {
+                    key: {} for key in ('startDate', 'endDate', 'currencyCode', 'sids', 'aggregateType', 'indexName')}
+                if missing_schema and not inventory:
                     del properties['sids']
-                value = {'code': 1, 'data': {'toolId': dashboard.TOOL, 'toolType': schema_kind,
-                                           'inputSchema': {'properties': properties}}}
+                kind = inventory_schema_kind if inventory else schema_kind
+                value = {'code': 1, 'data': {'toolId': tool_id, 'toolType': kind,
+                                           'inputSchema': {'type': 'object', 'properties': properties}}}
+            elif inventory:
+                value = inventory_response if inventory_response is not None else {
+                    'code': 1, 'data': {'code': 1, 'list': [{'id': 101}]}}
             else:
                 value = action_response if action_response is not None else payload()
                 if callable(value):
@@ -300,7 +308,8 @@ def test_discovery_and_schema_must_both_confirm_fixed_read_only_tool_before_acti
     settings, calls = fake_mcp(monkeypatch, tmp_path, help_kind=help_kind, schema_kind=schema_kind)
     result = dashboard.collect_business_for_day(db, settings,
         {'data': [{'sid': store.sid, 'status': 1}]}, DAY.isoformat())
-    assert result['status'] == 'PARTIAL_FAILED' and not any(name == 'action' for name, _ in calls)
+    assert result['status'] == 'PARTIAL_FAILED'
+    assert not any(name == 'action' and args['toolId'] == dashboard.TOOL for name, args in calls)
     assert facts(db) == []
 
 
@@ -309,7 +318,9 @@ def test_schema_drift_blocks_action_without_guessing_new_parameter_shapes(wareho
     settings, calls = fake_mcp(monkeypatch, tmp_path, missing_schema=True)
     result = dashboard.collect_business_for_day(db, settings,
         {'data': [{'sid': store.sid, 'status': 1}]}, DAY.isoformat())
-    assert result['status'] == 'PARTIAL_FAILED' and [name for name, _ in calls] == ['help', 'search']
+    assert result['status'] == 'PARTIAL_FAILED'
+    assert [name for name, _ in calls] == ['help', 'search', 'action', 'help', 'search']
+    assert not any(name == 'action' and args['toolId'] == dashboard.TOOL for name, args in calls)
 
 
 def test_collect_calls_only_the_confirmed_tool_with_exact_day_and_requested_fields(warehouse, tmp_path, monkeypatch):
@@ -318,7 +329,8 @@ def test_collect_calls_only_the_confirmed_tool_with_exact_day_and_requested_fiel
     result = dashboard.collect_business_for_day(db, settings,
         {'data': [{'sid': store.sid, 'status': 1}, {'sid': '999', 'status': 2}]}, DAY.isoformat())
     assert result['status'] == 'COMPLETE' and result['metrics'] == 14
-    assert [name for name, _ in calls] == ['help', 'search', 'action']
+    assert [name for name, _ in calls] == ['help', 'search', 'action', 'help', 'search', 'action']
+    assert calls[2][1] == {'toolId': dashboard.STORE_TOOL, 'params': {}}
     assert calls[-1][1] == {'toolId': dashboard.TOOL, 'params': {
         'startDate': DAY.isoformat(), 'endDate': DAY.isoformat(), 'currencyCode': 'USD',
         'sids': [101], 'aggregateType': '2', 'indexName': dashboard.FIELDS,
@@ -331,7 +343,8 @@ def test_store_collection_switch_is_rechecked_before_each_business_request(wareh
     states = iter([True, False])
     monkeypatch.setattr(dashboard, 'collection_states', lambda settings, sids: {store.sid: next(states)})
     result = asyncio.run(dashboard._collect(db, settings, [{'sid': store.sid}], {store.sid: [DAY.isoformat()]}))
-    assert result['metrics'] == 0 and not any(name == 'action' for name, _ in calls)
+    assert result['metrics'] == 0
+    assert not any(name == 'action' and args['toolId'] == dashboard.TOOL for name, args in calls)
 
 
 def test_action_failure_leaves_existing_partition_intact_and_reports_a_sanitized_type(warehouse, tmp_path, monkeypatch):
@@ -382,7 +395,8 @@ def test_discovery_failure_marks_all_requested_dates_failed_but_preserves_other_
     dates = [DAY.isoformat(), '2026-11-17']
     result = dashboard.collect_business_for_day(db, settings,
         {'data': [{'sid': store.sid, 'status': 1}]}, {store.sid: dates})
-    assert result['status'] == 'PARTIAL_FAILED' and [name for name, _ in calls] == ['help', 'search']
+    assert result['status'] == 'PARTIAL_FAILED'
+    assert [name for name, _ in calls] == ['help', 'search', 'action', 'help', 'search']
     assert len(facts(db)) == 14 and db.scalar(select(func.count(RawSnapshot.id))) == 1
     for day in dates:
         part = db.scalar(select(DataCoverage).where(DataCoverage.metric_date == date.fromisoformat(day),
@@ -405,7 +419,8 @@ def test_one_requested_day_failure_does_not_stop_other_days_and_only_hides_faile
     result = dashboard.collect_business_for_day(db, settings, {'data': [{'sid': store.sid, 'status': 1}]},
         {store.sid: [DAY.isoformat(), '2026-11-14']})
     assert result['status'] == 'PARTIAL_FAILED' and result['metrics'] == 7
-    assert [params['params']['startDate'] for name, params in calls if name == 'action'] == [
+    assert [params['params']['startDate'] for name, params in calls
+            if name == 'action' and params['toolId'] == dashboard.TOOL] == [
         DAY.isoformat(), '2026-11-14',
     ]
     assert result['failures'] == [{'store_id': store.sid, 'report_date': DAY.isoformat(),
@@ -439,3 +454,94 @@ def test_single_json_text_document_is_supported():
     result = SimpleNamespace(isError=False, structuredContent=None,
         content=[SimpleNamespace(type='text', text=json.dumps(response))])
     assert dashboard._document(result) == response
+
+
+@pytest.mark.parametrize('listing,error_type', [
+    ([], 'BusinessStoreNotVisibleError'),
+    ([{'id': 202}], 'BusinessStoreNotVisibleError'),
+    ([{'id': 101}, {'id': 101}], 'BusinessStoreInventoryError'),
+    ([{'id': 0}], 'BusinessStoreInventoryError'),
+    ([{'id': -1}], 'BusinessStoreInventoryError'),
+    ([{'id': True}], 'BusinessStoreInventoryError'),
+    ([{'id': '101'}], 'BusinessStoreInventoryError'),
+    ([{'sid': 101}], 'BusinessStoreInventoryError'),
+    ({'id': 101}, 'BusinessStoreInventoryError'),
+])
+def test_empty_invisible_or_malformed_inventory_never_requests_cards_or_erases_old_facts(
+        warehouse, tmp_path, monkeypatch, listing, error_type):
+    db, store = warehouse
+    dashboard.persist_business_cards(db, store.sid, DAY, payload())
+    inventory = {'code': 1, 'data': {'code': 1, 'list': listing}}
+    settings, calls = fake_mcp(monkeypatch, tmp_path, inventory_response=inventory)
+    dates = [DAY.isoformat(), '2026-11-17']
+    result = dashboard.collect_business_for_day(db, settings,
+        {'data': [{'sid': store.sid, 'status': 1}]}, {store.sid: dates})
+    assert result['status'] == 'PARTIAL_FAILED' and result['metrics'] == 0
+    assert result['failures'] == [{'store_id': store.sid, 'report_date': day, 'error_type': error_type} for day in dates]
+    assert [args['toolId'] for name, args in calls if name == 'action'] == [dashboard.STORE_TOOL]
+    assert len(facts(db)) == 14 and db.scalar(select(func.count(RawSnapshot.id))) == 1
+    assert all(business_daily_context(db, store.sid, day)['availability'] == 'FAILED' for day in dates)
+
+
+@pytest.mark.parametrize('help_kind,schema_kind', [('write', 'read'), ('read', 'write')])
+def test_store_inventory_tool_must_also_be_confirmed_read_only_before_any_action(
+        warehouse, tmp_path, monkeypatch, help_kind, schema_kind):
+    db, store = warehouse
+    settings, calls = fake_mcp(monkeypatch, tmp_path,
+        inventory_help_kind=help_kind, inventory_schema_kind=schema_kind)
+    result = dashboard.collect_business_for_day(db, settings,
+        {'data': [{'sid': store.sid, 'status': 1}]}, DAY.isoformat())
+    assert result['status'] == 'PARTIAL_FAILED' and not any(name == 'action' for name, _ in calls)
+    assert facts(db) == []
+
+
+def test_store_inventory_schema_cannot_gain_unverified_arguments(warehouse, tmp_path, monkeypatch):
+    db, store = warehouse
+    settings, calls = fake_mcp(monkeypatch, tmp_path, inventory_properties={'sids': {'type': 'array'}})
+    result = dashboard.collect_business_for_day(db, settings,
+        {'data': [{'sid': store.sid, 'status': 1}]}, DAY.isoformat())
+    assert result['status'] == 'PARTIAL_FAILED' and not any(name == 'action' for name, _ in calls)
+
+
+def test_only_inventory_visible_stores_reach_the_business_cards_tool(warehouse, tmp_path, monkeypatch):
+    db, store = warehouse
+    dashboard.persist_business_cards(db, store.sid, DAY, payload())
+    inventory = {'code': 1, 'success': True, 'data': {'code': 1, 'list': [
+        {'id': 202, 'name': '另一家可见店铺', 'country_code': 'US', 'is_concept': 0},
+    ]}}
+    settings, calls = fake_mcp(monkeypatch, tmp_path, inventory_response=inventory)
+    result = dashboard.collect_business_for_day(db, settings, {'data': [
+        {'sid': store.sid, 'status': 1}, {'sid': '202', 'status': 1},
+    ]}, DAY.isoformat())
+    assert result['status'] == 'PARTIAL_FAILED' and result['metrics'] == 14
+    assert result['failures'] == [{'store_id': '101', 'report_date': DAY.isoformat(),
+                                  'error_type': 'BusinessStoreNotVisibleError'}]
+    actions = [args for name, args in calls if name == 'action']
+    assert actions[0] == {'toolId': dashboard.STORE_TOOL, 'params': {}}
+    assert [args['params']['sids'] for args in actions if args['toolId'] == dashboard.TOOL] == [[202]]
+    assert business_daily_context(db, '101', DAY)['availability'] == 'FAILED'
+    assert business_daily_context(db, '202', DAY)['availability'] == 'AVAILABLE'
+    assert len([r for r in facts(db) if r.store_id == '101']) == 14
+
+
+@pytest.mark.parametrize('response', [
+    {'code': 0, 'data': {'code': 1, 'list': [{'id': 101}]}},
+    {'code': 1, 'success': False, 'data': {'code': 1, 'list': [{'id': 101}]}},
+    {'code': 1, 'data': [{'id': 101}]},
+    {'code': 1, 'data': {'list': [{'id': 101}]}},
+])
+def test_unconfirmed_store_inventory_response_does_not_reuse_arbitrary_record_shapes(
+        warehouse, tmp_path, monkeypatch, response):
+    db, store = warehouse
+    settings, calls = fake_mcp(monkeypatch, tmp_path, inventory_response=response)
+    result = dashboard.collect_business_for_day(db, settings,
+        {'data': [{'sid': store.sid, 'status': 1}]}, DAY.isoformat())
+    assert result['failures'][0]['error_type'] == 'BusinessStoreInventoryError'
+    assert [args['toolId'] for name, args in calls if name == 'action'] == [dashboard.STORE_TOOL]
+    assert facts(db) == []
+
+
+def test_source_reader_allowlist_rejects_any_other_tool_before_discovery(tmp_path, monkeypatch):
+    fake_mcp(monkeypatch, tmp_path)
+    with pytest.raises(dashboard.BusinessDashboardError, match='allowlist'):
+        asyncio.run(dashboard._read_schema(SimpleNamespace(), 'campaign_update'))

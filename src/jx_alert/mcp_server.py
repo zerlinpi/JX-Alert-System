@@ -2,12 +2,13 @@
 
 Collection requests only enqueue work; the scheduler performs the read-only APIs.
 """
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import argparse
 import hmac
 import json
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -619,6 +620,16 @@ def get_daily_summary(store_id: str, report_date: str) -> dict:
         result = _daily_summary(db, str(store_id), target_date)
         if "store" in result:
             result["business_daily"] = business_daily_context(db, str(store_id), target_date)
+            zone = result["store"].get("timezone")
+            try:
+                complete_day = target_date < datetime.now(timezone.utc).astimezone(ZoneInfo(zone)).date()
+            except (TypeError, ValueError, ZoneInfoNotFoundError):
+                complete_day = None
+            result["report_date_is_complete"] = complete_day
+            result["business_daily"]["observation_only"] = complete_day is not True
+            if complete_day is not True:
+                result["report_date_warning"] = ("报表日尚未结束，仅为观测，不能作为完整日报。" if complete_day is False
+                    else "报表时区未确认，仅为观测，不能作为完整日报。")
         return result
 
 
