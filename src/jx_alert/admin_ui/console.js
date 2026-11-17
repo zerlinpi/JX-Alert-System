@@ -301,7 +301,7 @@ function renderBusinessDaily(data) {
   $("business-daily").hidden = !business && typeof data.business_source_configured !== "boolean";
   $("business-daily-table").hidden = !items.length;
   $("business-daily-period").textContent = items.length ? [
-    business.report_date, `对比 ${business.previous_date}`, business.currency === "USD" ? "美元 USD" : business.currency,
+    `美国统计日：${business.report_date}`, `对比 ${business.previous_date}`, business.currency === "USD" ? "美元 USD" : business.currency,
   ].filter(Boolean).join(" · ") : "";
   tableRows("business-daily-rows", items.map((item) => [item.label,
     businessValue(item.current, item.unit, item.currency),
@@ -323,6 +323,23 @@ function renderSourceObservations(data) {
   const observations = data.source_observations || {};
   const sales = observations.store_sales;
   const rows = [], bases = new Set();
+  const api = data.api_business_observations || {};
+  if (data.business_daily?.availability !== "AVAILABLE") {
+    for (const [source, key, label, monetary] of [
+      ["product", "volume", "销量（接口下单）", false], ["product", "netAmount", "净销售额（接口下单）", true],
+      ["settlement", "platformIncome", "平台收入（接口结算）", true], ["settlement", "grossProfit", "毛利润（接口结算）", true],
+      ["settlement", "grossRate", "毛利率（接口结算）", false], ["settlement", "refundsRate", "退款率（结算销量）", false],
+    ]) {
+      const item = api[source] || {}, value = item.metrics?.[key];
+      if (!Number.isFinite(value) || monetary && !/^[A-Z]{3}$/.test(item.currency || "")) continue;
+      rows.push([label, monetary ? money(value, item.currency) : key.endsWith("Rate") ? `${(value * 100).toFixed(2)}%` : scalar(value)]);
+      if (item.basis) bases.add(item.basis);
+    }
+    const p = api.product || {};
+    if (Number.isFinite(p.metrics?.adSpend) && p.metrics?.netAmount > 0) {
+      rows.push(["广告费/净销售额（接口下单）", `${(Math.abs(p.metrics.adSpend) / p.metrics.netAmount * 100).toFixed(2)}%`]);
+    }
+  }
   if (sales && sales.metrics) {
     for (const [key, label] of [["sales", "销售额"], ["units", "销量"], ["orders", "订单"]]) {
       const value = sales.metrics[key];
@@ -343,7 +360,7 @@ function renderSourceObservations(data) {
     }
   }
   $("source-observations").hidden = !rows.length;
-  $("source-observations-basis").textContent = [observations.report_date, ...bases].filter(Boolean).join(" · ");
+  $("source-observations-basis").textContent = [observations.report_date || api.report_date, ...bases].filter(Boolean).join(" · ");
   tableRows("source-observation-rows", rows, 2, "");
 }
 
@@ -354,7 +371,7 @@ function renderDetail() {
   $("store-eyebrow").textContent = [store.country, `店铺 ${state.sid}`].filter(Boolean).join(" · ");
   const ads = store.ads_authorized === true ? "广告已授权" : "广告授权待核实";
   $("store-meta").textContent = [store.timezone || "报表时区待确认", ads].join(" · ");
-  $("report-title").textContent = data.report_date ? `${data.report_date} 日报` : "日报";
+  $("report-title").textContent = data.display_reporting_date ? `${data.display_reporting_date} 日报` : "日报";
   const reportDate = $("report-date");
   reportDate.value = data.report_date || "";
   reportDate.max = data.latest_completed_date || "";

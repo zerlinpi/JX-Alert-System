@@ -106,10 +106,9 @@ def card(title, *, subtitle, sections, notes=(), color="blue"):
     elements = [{"tag": "markdown", "content": html.escape(subtitle, quote=False)}]
     for heading, headers, rows in sections:
         if rows:
-            elements.extend([
-                {"tag": "markdown", "content": f"**{html.escape(heading, quote=False)}**"},
-                table(headers, rows),
-            ])
+            if heading:
+                elements.append({"tag": "markdown", "content": f"**{html.escape(heading, quote=False)}**"})
+            elements.append(table(headers, rows))
     if notes:
         elements.append({"tag": "hr"})
         elements.append({"tag": "markdown", "content": "\n".join(

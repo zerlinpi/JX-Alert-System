@@ -58,6 +58,8 @@ observed_pace_range是历史日花费上下界外推，不是概率或置信区�
 全月实际缺日时不得拼出全月预测总额；可以回答已验证的剩余天数情景金额并合并说明缺口。
 没有预算上限不能断言超预算；没有库存、交期或搜索词明细不能声称已定位断货或浪费词。
 经营净销售额、平台收入、毛利润、毛利率和退款率只使用已确认口径的经营证据，不能互相替代。
+api_business_observations中product按下单日，settlement按结算日，不能跨这两种口径计算占比或冒充同口径经营看板。仅用已有数值回答，缺失指标合并为一句具体缺口，不罗列七个空值或泛泛建议。
+该接口观测已提供数值时应据此回答，不能只因business_daily缺失就说经营指标全部无值。
 source_observations为独立领星MCP观测，保留其basis和日期。下单销售额不冒充已付款销售额或净销售额；不同口径不相加、不跨来源算环比。
 接口无可用事实时可按这些已确认MCP观测回答，明确一次其口径；有接口证据时综合复核，来源不一致只报告差异，不编造平衡值。
 intraday_observation仅为采集时刻的盘中广告观测，保留其日期和采集时间，不能作为完整日报。
@@ -178,8 +180,14 @@ def compact_context(context):
             "last_completed_report_date", "report_date_is_complete",
             "authorization_warning", "data_warning", "sales_and_spend", "coverage",
             "advertising_totals", "ad_detail_coverage", "notification_policy", "campaign_selection", "campaign_count", "question_topic", "reply_mode",
-            "analysis_evidence", "business_daily", "intraday_observation", "source_observations")
+            "analysis_evidence", "business_daily", "intraday_observation", "source_observations", "api_business_observations")
     result = {k: context[k] for k in keys if k in context}
+    business = result.get("business_daily")
+    if isinstance(business, dict):
+        result["business_daily"] = {key: value for key, value in business.items() if key != "missing_metrics"}
+        if "metrics" in business:
+            result["business_daily"]["metrics"] = [row for row in business["metrics"]
+                if row.get("current") is not None or row.get("previous") is not None]
     kpi_keys = ("current", "baseline", "current_date", "currency", "status", "change_ratio",
                 "comparison_basis", "notification_note", "attribution_maturity_required", "attribution_mature")
 

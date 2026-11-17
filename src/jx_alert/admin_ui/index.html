@@ -137,7 +137,7 @@
                 <div class="section-heading">
                   <div><h3 id="report-title">日报</h3><p id="report-note" class="muted"></p></div>
                   <form id="date-form" class="date-form">
-                    <label class="sr-only" for="report-date">报表日期</label><input id="report-date" type="date" required>
+                    <label for="report-date">美国统计日</label><input id="report-date" type="date" required>
                     <button class="button secondary" type="submit">查询</button>
                     <button class="link-button" id="latest-date" type="button">回到最新</button>
                   </form>
@@ -151,7 +151,7 @@
                 </div>
                 <dl id="metric-summary" class="metrics"></dl>
               </section>
-              <section id="source-observations" class="panel" aria-labelledby="source-observations-title" hidden><div class="section-heading"><div><h3 id="source-observations-title">领星 MCP 补充数据</h3><p id="source-observations-basis" class="muted"></p></div></div><div class="table-scroll"><table><thead><tr><th scope="col">指标</th><th scope="col">观测值</th></tr></thead><tbody id="source-observation-rows"></tbody></table></div></section>
+              <section id="source-observations" class="panel" aria-labelledby="source-observations-title" hidden><div class="section-heading"><div><h3 id="source-observations-title">领星补充数据</h3><p id="source-observations-basis" class="muted"></p></div></div><div class="table-scroll"><table><thead><tr><th scope="col">指标</th><th scope="col">观测值</th></tr></thead><tbody id="source-observation-rows"></tbody></table></div></section>
               <section class="panel trends" aria-labelledby="trend-title">
                 <div class="section-heading"><div><h3 id="trend-title">近日报表趋势</h3><p class="muted" id="trend-note">使用已采集的店铺报表。</p></div>
                   <div class="segments" role="group" aria-label="趋势指标"><button type="button" data-metric="orders" aria-pressed="true">订单</button><button type="button" data-metric="sales" aria-pressed="false">销售额</button><button type="button" data-metric="spend" aria-pressed="false">广告花费</button></div>

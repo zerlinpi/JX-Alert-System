@@ -18,7 +18,8 @@ def renderer(monkeypatch):
     calls = []
     stores = [SimpleNamespace(sid='one', name='CAMPX'), SimpleNamespace(sid='two', name='Geteen')]
 
-    def business(db, store, day, *, settings=None, data_warning=None):
+    def business(db, store, day, *, settings=None, data_warning=None, reporting_day=None):
+        assert reporting_day == date(2026, 11, 16)
         calls.append((store.sid, day, data_warning))
         # The business renderer owns field/currency/coverage verification. This
         # test isolates its None contract from morning routing and ordering.

@@ -162,6 +162,8 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
 
         results["sales"] = step("sales", lambda: collect_sales_for_day(
             client, db, report_dates, stores_response=stores_response), ("store", "sku_asin", "sku_msku"))
+        from jx_alert.lingxing.api_business import collect_api_business_for_day
+        results["api_business"] = collect_api_business_for_day(client, db, settings, stores_response, report_dates)
         from jx_alert.lingxing.business_dashboard import collect_business_for_day
         results["business_dashboard"] = collect_business_for_day(
             db, settings, stores_response, report_dates)
@@ -253,6 +255,7 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
         job.status = ("PARTIAL_FAILED" if source_failures or performance_status == "PARTIAL_FAILED" or transient_detail_failure else
                       "SUCCEEDED_WITH_WARNINGS" if performance_status == "SUCCEEDED_WITH_WARNINGS"
                       or results.get("business_dashboard", {}).get("status") == "PARTIAL_FAILED"
+                      or results.get("api_business", {}).get("status") == "PARTIAL_FAILED"
                       or dual and any(x.get("mcp") == "FAILED" for x in client.outcomes)
                       or detail_reports.get("status") == "PARTIAL_FAILED"
                       or results.get("ad_currency", {}).get("status") == "LOOKUP_UNAVAILABLE" else "SUCCEEDED")

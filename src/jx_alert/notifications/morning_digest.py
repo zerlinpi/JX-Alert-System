@@ -218,7 +218,7 @@ def select_morning_dates(db, stores, dates, warnings=None, history_allowed=None)
     return actual, warnings
 
 
-def _business_chunks(db, settings, stores, dates, warnings, target_dates):
+def _business_chunks(db, settings, stores, dates, warnings, target_dates, reporting_day):
     from jx_alert.notifications.business_daily import business_daily_card
 
     chunks = []
@@ -226,7 +226,7 @@ def _business_chunks(db, settings, stores, dates, warnings, target_dates):
         actual = _date(dates[store.sid])
         target = _date((target_dates or dates)[store.sid])
         value = business_daily_card(db, store, actual, settings=settings,
-                                    data_warning=(warnings or {}).get(store.sid))
+                                    data_warning=(warnings or {}).get(store.sid), reporting_day=reporting_day)
         if value is None:
             continue
         if actual != target:
@@ -243,7 +243,8 @@ def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=N
     """Return health, verified business reports, then material SP exceptions."""
     chunks = _health_chunks(db, settings, stores, send_day, now)
     if include_business:
-        chunks.extend(_business_chunks(db, settings, stores, dates, warnings, target_dates))
+        chunks.extend(_business_chunks(db, settings, stores, dates, warnings, target_dates,
+                                      _date(send_day) - timedelta(days=1)))
     pending = []
     for store in stores:
         target = _date((target_dates or dates)[store.sid])
@@ -312,6 +313,7 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
                         'store_report_dates': {sid: {'target': str(dates[sid]), 'actual': str(actual[sid])} for sid in store_ids},
                         'open_ids': [], 'fixed_route': True, 'transport': 'app', 'delivery': delivery, 'card': value,
                         'scheduled_delivery_date': send_day.isoformat(), 'scheduled_timezone': 'Asia/Shanghai',
+                        'display_reporting_date': (send_day - timedelta(days=1)).isoformat(),
                         'scheduled_not_before': due.isoformat(), 'morning_focus': True, 'morning_message_kind': kind})
                 db.add(row)
                 db.flush()
