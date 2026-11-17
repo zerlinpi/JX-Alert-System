@@ -2,8 +2,8 @@
 
 Signature rules follow the current official integration guide. Scalar POST JSON
 fields are included in the signature even though they are sent in the request body.
-Only campaign_ids arrays on spAdvertiseHourData and spTargetHourData have a
-verified canonicalizer; all other nested JSON values continue to fail closed.
+Only the explicitly verified SP hour and single-store finance arrays have a
+canonicalizer; other nested JSON values continue to fail closed.
 """
 import base64
 import hashlib
@@ -49,6 +49,16 @@ _AD_DETAIL_PATHS = {
 def _endpoint_signature_params(path: str, params: dict) -> dict:
     """Copy signature parameters, canonicalizing only verified SP campaign arrays."""
     values = dict(params)
+    if path == "/bd/profit/report/open/report/seller/list" and "sids" in values:
+        ids = values["sids"]
+        if not isinstance(ids, list) or len(ids) != 1 or type(ids[0]) is not int or ids[0] <= 0:
+            raise LingxingError("Daily profit collection requires one positive store ID")
+        # Official Python SDK SignBase.format_params serializes list values
+        # with compact JSON. The endpoint documents sids as a JSON array:
+        # https://apidoc.lingxing.com/new/api-docs/Finance/bdSeller/
+        # https://apidoc.lingxing.com/file/openapi-python3-sdk-20230419.zip
+        values["sids"] = json.dumps(ids, separators=(",", ":"))
+        return values
     if path not in _SP_HOUR_ARRAY_PATHS:
         return values
 
@@ -270,6 +280,29 @@ class LingxingClient:
             return data
 
         raise LingxingTransientError("Lingxing request exhausted retry attempts")
+
+    def product_performance_daily(self, sid, day, *, offset=0, length=1000):
+        """Official product performance, one marketplace-local day and store."""
+        sid, day = self._business_scope(sid, day)
+        return self._request("POST", "/bd/productPerformance/openApi/asinList", json_body={
+            "sid": str(sid), "start_date": day, "end_date": day, "offset": offset, "length": length,
+            "sort_field": "volume", "sort_type": "desc", "summary_field": "asin",
+            "currency_code": "USD", "is_recently_enum": False, "purchase_status": 0})
+
+    def profit_report_daily(self, sid, day, *, offset=0, length=1000):
+        """Settlement-date profit; never relabeled as product purchase data."""
+        sid, day = self._business_scope(sid, day)
+        return self._request("POST", "/bd/profit/report/open/report/seller/list", json_body={
+            "sids": [sid], "startDate": day, "endDate": day, "offset": offset, "length": length,
+            "currencyCode": "USD", "orderStatus": "Disbursed"})
+
+    @staticmethod
+    def _business_scope(sid, day):
+        if type(sid) not in (str, int) or not str(sid).isdigit() or int(sid) <= 0:
+            raise ValueError("Business collection requires a positive store ID")
+        if not isinstance(day, str) or date.fromisoformat(day).isoformat() != day:
+            raise ValueError("Business collection requires an exact date")
+        return int(sid), day
 
     def get_stores(self):
         return self._request("GET", "/erp/sc/data/seller/lists")

@@ -87,14 +87,16 @@ def business_display(value, unit, currency=None):
     return f"{value:,.0f}"
 
 
-def business_daily_card(db, store, day, *, settings=None, data_warning=None):
+def business_daily_card(db, store, day, *, settings=None, data_warning=None, reporting_day=None):
     context = business_daily_context(db, store.sid, day)
-    if store.status != 1 or context["availability"] != "AVAILABLE":
+    if store.status != 1:
         return None
+    if context["availability"] != "AVAILABLE":
+        return api_business_card(db, store, day, reporting_day=reporting_day, data_warning=data_warning)
     rows = []
     for item in context["metrics"]:
         # An unavailable metric is explained once below, not as seven empty rows.
-        if item["current"] is None and item["previous"] is None:
+        if item["current"] is None:
             continue
         delta = item["change"]
         if data_warning:
@@ -110,14 +112,63 @@ def business_daily_card(db, store, day, *, settings=None, data_warning=None):
     notes = []
     if any(r[0].endswith("¹") for r in rows):
         notes.append("¹ 领星经营看板口径，费用与退款占比按扣款绝对值展示。")
-    if context["missing_metrics"]:
-        notes.append("未取得：" + "、".join(context["missing_metrics"]))
     if data_warning:
         notes.append(data_warning)
     currency = context["currency"]
     title = store.name[:60] + " 经营日报"
     day = date.fromisoformat(context["report_date"])
-    return card(title, subtitle=f"{day.year}年{day.month}月{day.day}日｜" +
+    label = date.fromisoformat(reporting_day) if isinstance(reporting_day, str) else reporting_day or day
+    if reporting_day is not None:
+        notes.insert(0, f"美国统计日：{day}")
+    return card(title, subtitle=f"{label.year}年{label.month}月{label.day}日｜" +
         ("美元 USD" if currency == "USD" else currency or "币种按各行"),
         sections=[("", ["指标", "当日", "前一日", "日环比"], rows)],
         notes=[f"前一日：{context['previous_date']}", *notes])
+
+
+def api_business_card(db, store, day, *, reporting_day=None, data_warning=None):
+    """API evidence has its own labelled bases; it never fills dashboard facts."""
+    from jx_alert.lingxing.api_business import api_business_context
+    on = date.fromisoformat(day) if isinstance(day, str) else day
+    current = api_business_context(db, store.sid, on)
+    previous = api_business_context(db, store.sid, on - timedelta(days=1))
+    specifications = [
+        ("product", "volume", "销量（下单）", "count"),
+        ("product", "netAmount", "净销售额（下单）", "money"),
+        ("settlement", "platformIncome", "平台收入（结算）", "money"),
+        ("settlement", "grossProfit", "毛利润（结算）", "money"),
+        ("settlement", "grossRate", "毛利率（结算）", "rate"),
+        ("product", "adsNetRatio", "广告费/净销售额", "rate"),
+        ("settlement", "refundsRate", "退款率（结算销量）", "rate"),
+    ]
+    for packet in (current, previous):
+        values = packet["product"].get("metrics", {})
+        if values.get("netAmount", 0) > 0 and "adSpend" in values:
+            values["adsNetRatio"] = abs(values["adSpend"]) / values["netAmount"]
+    rows, has_prior = [], False
+    for source, key, label, unit in specifications:
+        a = current[source].get("metrics", {}).get(key)
+        if a is None:
+            continue
+        b = previous[source].get("metrics", {}).get(key)
+        currency = current[source].get("currency")
+        if previous[source].get("currency") != currency:
+            b = None
+        has_prior |= b is not None
+        change = "—"
+        if b is not None and not data_warning:
+            if unit == "rate":
+                change = f"{(a-b)*100:+.2f}个百分点"
+            elif b != 0:
+                change = f"{(a-b)/abs(b):+.2%}"
+            elif a == 0:
+                change = "持平"
+        rows.append((label, business_display(a, unit, currency), business_display(b, unit, currency), change))
+    if not rows:
+        return None
+    label = date.fromisoformat(reporting_day) if isinstance(reporting_day, str) else reporting_day or on
+    return card(store.name[:60] + " 接口经营日报", subtitle=f"{label.year}年{label.month}月{label.day}日｜美元 USD",
+        sections=[("", ["指标", "当日", "前一日", "日环比"] if has_prior else ["指标", "当日"],
+                   rows if has_prior else [row[:2] for row in rows])],
+        notes=[f"美国统计日：{on}。销量及净销售额按下单日，财务指标按结算日。",
+               *([data_warning] if data_warning else [])])

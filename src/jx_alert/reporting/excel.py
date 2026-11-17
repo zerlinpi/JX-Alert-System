@@ -85,10 +85,11 @@ SHEETS = {
 
 _FACT_DIMENSIONS = {"store", "sku_msku", "sku_asin", "campaign_sp", "campaign_sb", "campaign_sd",
                     "product_ad_sp", "product_ad_sd", "business_dashboard", "mcp_sales_asin", "mcp_sales_msku",
-                    "mcp_campaign_sp", "mcp_campaign_sb", "mcp_campaign_sd"}
+                    "mcp_campaign_sp", "mcp_campaign_sb", "mcp_campaign_sd", "api_business_product", "api_business_finance"}
 _FACT_METRICS = {"orders", "units", "sales", "spend", "clicks", "impressions", "volume",
-                 "netAmount", "platformIncome", "grossProfit", "grossRate", "totalAdsCostRate", "totalRefundsRate"}
-_MONEY = {"sales", "spend", "netAmount", "platformIncome", "grossProfit"}
+                 "netAmount", "platformIncome", "grossProfit", "grossRate", "totalAdsCostRate", "totalRefundsRate",
+                 "adSpend", "refundCount", "refundsRate"}
+_MONEY = {"sales", "spend", "netAmount", "platformIncome", "grossProfit", "adSpend"}
 _SP_FIELDS = ["版本ID", "记录ID", "店铺ID", "报表日期", "活动ID", "活动名称", "小时", "范围",
               "广告ID", "投放ID", "广告组ID", "ASIN", "MSKU", "花费", "点击", "曝光", "订单", "销售额",
               "币种", "采集时间（UTC）", "源快照ID", "行键"]

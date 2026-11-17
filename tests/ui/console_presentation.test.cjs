@@ -158,3 +158,17 @@ test("MCP unknown currency does not expose a guessed spend amount", () => {
   assert.equal(rows[0].children[1].textContent, "0");
   assert.equal(rows[1].children[1].textContent, "50");
 });
+
+test("API business observations show known values with their independent date bases", () => {
+  const scope = consoleScope();
+  scope.evaluate(`renderSourceObservations({business_daily:{availability:"MISSING"},api_business_observations:{report_date:"2026-11-16",
+    product:{basis:"产品表现，下单日",currency:"USD",metrics:{volume:0,netAmount:100,adSpend:20}},
+    settlement:{basis:"利润报表，结算日，已发放",currency:"USD",metrics:{grossProfit:-20,grossRate:-0.25}}}})`);
+  const rows = scope.elements.get("source-observation-rows").children[0].children;
+  assert.equal(rows.length, 5);
+  assert.equal(rows[0].children[1].textContent, "0");
+  assert.equal(rows[3].children[1].textContent, "-25.00%");
+  assert.equal(rows[4].children[1].textContent, "20.00%");
+  assert.ok(scope.elements.get("source-observations-basis").textContent.includes("下单日"));
+  assert.ok(scope.elements.get("source-observations-basis").textContent.includes("结算日"));
+});

@@ -427,6 +427,7 @@ def export_daily_snapshot(db, output_dir, snapshot_date, *, now=None, settings=N
             for dimension in reader.scalars(select(DailyMetric.dimension).distinct().order_by(DailyMetric.dimension)):
                 if dimension not in dimensions:
                     dimensions[dimension] = {"business_dashboard": "经营日报事实",
+                        "api_business_product": "接口产品经营事实", "api_business_finance": "接口结算财务事实",
                         "mcp_sales_asin": "MCP下单ASIN观测", "mcp_sales_msku": "MCP下单MSKU观测",
                         "mcp_campaign_sp": "MCP商品推广观测", "mcp_campaign_sb": "MCP品牌推广观测",
                         "mcp_campaign_sd": "MCP展示推广观测"}.get(dimension, "其他标准化经营事实")

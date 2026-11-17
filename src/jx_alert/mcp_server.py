@@ -625,10 +625,12 @@ def get_daily_summary(store_id: str, report_date: str) -> dict:
     with SessionLocal() as db:
         from jx_alert.notifications.business_daily import business_daily_context
         from jx_alert.lingxing.source_gateway import source_observations
+        from jx_alert.lingxing.api_business import api_business_context
         result = _daily_summary(db, str(store_id), target_date)
         if "store" in result:
             result["business_daily"] = business_daily_context(db, str(store_id), target_date)
             result["source_observations"] = source_observations(db, str(store_id), target_date)
+            result["api_business_observations"] = api_business_context(db, str(store_id), target_date)
             zone = result["store"].get("timezone")
             try:
                 complete_day = target_date < datetime.now(timezone.utc).astimezone(ZoneInfo(zone)).date()

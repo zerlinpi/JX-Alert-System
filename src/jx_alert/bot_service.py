@@ -770,10 +770,13 @@ def question_context(db, settings, store_id, *, now=None, question=None):
     business = business_daily_context(db, store_id, target) if business_allowed else {
         "report_date": target.isoformat(), "availability": "UNAVAILABLE", "metrics": [], "reason": warning}
     from jx_alert.bot_intents import question_topic
-    business_card = (business_daily_card(db, store, target, settings=settings)
+    business_card = (business_daily_card(db, store, target, settings=settings,
+        reporting_day=target + timedelta(days=1) if explicit is None else None)
         if business_allowed and question_topic(question or '') != 'health'
         and re.search(r'日报|经营快报|经营报告', question or '') else None)
+    from jx_alert.lingxing.api_business import api_business_context
     return {"analysis_evidence": evidence, "business_daily": business,
+        "api_business_observations": api_business_context(db, store_id, target),
         "source_observations": source_observations(db, store_id, target),
         "business_daily_report": business_card is not None,
         "notification_policy": POLICY if getattr(settings, "alert_materiality_enabled", False) else {},
