@@ -183,7 +183,11 @@ def store_detail(db, settings, store, *, requested=None, now=None):
                      "format": item["format"], "status": _KPI_LABELS.get(item["status"], "待核实"),
                      "baseline": item["baseline"], "change_ratio": item["change_ratio"]}
                     for code, item in advertising_kpis(db, settings, store.sid, target).items()]
+    from jx_alert.notifications.business_daily import business_daily_context
+    business = business_daily_context(db, store.sid, target) if target else None
     return {**report, "metrics": metrics, "currency_codes": currencies, "coverage": coverage, "data_warning": data_warning,
+            "business_daily": business,
+            "business_source_configured": Path(settings.lingxing_business_credentials_file).is_file(),
             "sales_data_status": sales_state, "sales_data_status_label": SALES_DATA_LABELS[sales_state],
             "trend": trend, "ad_breakdown": breakdown, "kpis": kpis,
             "health": {"status": health["status_label"], "score": health["ahr_score"],

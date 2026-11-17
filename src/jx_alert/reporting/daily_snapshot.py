@@ -426,7 +426,8 @@ def export_daily_snapshot(db, output_dir, snapshot_date, *, now=None, settings=N
             dimensions = dict(FACT_DIMENSIONS)
             for dimension in reader.scalars(select(DailyMetric.dimension).distinct().order_by(DailyMetric.dimension)):
                 if dimension not in dimensions:
-                    dimensions[dimension] = "其他标准化经营事实"
+                    dimensions[dimension] = ("经营日报事实" if dimension == "business_dashboard"
+                                             else "其他标准化经营事实")
             for dimension, title in dimensions.items():
                 key = "facts_" + hashlib.sha256(dimension.encode()).hexdigest()[:16]
                 result = _write_dataset(staging, key, title, [label for _, label in FACT_COLUMNS],

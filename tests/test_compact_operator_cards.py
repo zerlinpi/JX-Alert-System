@@ -80,8 +80,8 @@ def test_joint_brief_keeps_all_health_first_and_only_material_sp_then_quality_wi
     health = tables(chunks[0][0])[0]
     assert {r['c0'] for r in health['rows']} == {'Geteen美国', 'Campx美国'}
     health_text = json.dumps(health, ensure_ascii=False)
-    assert '健康评分：256' in health_text and '当前判定：待确认' in health_text
-    assert '源时区待确认' in health_text and '订单缺陷率 2%' in health_text
+    assert '评分 256 · 评级良好（观测）' in health_text and '当前判定' not in health_text
+    assert '源时区待确认' not in health_text and '订单缺陷率 2%' in health_text
     assert '未见违规' not in health_text and '采集时间（UTC）' not in health_text
     for value, _ in chunks:
         assert card_fits(value) and all(len(t['columns']) <= 4 for t in tables(value))
@@ -102,3 +102,32 @@ def test_inventory_omits_switches_and_empty_business_columns_without_claiming_so
     serialized = json.dumps(values, ensure_ascii=False)
     assert not any(term in serialized for term in ['采集开', '采集关', '通知开', '通知关'])
     assert all(card_fits(value) for value in values)
+
+
+def test_single_store_unauthorized_health_has_one_actionable_row_without_empty_boilerplate():
+    from jx_alert.bot_presentation import operator_card
+    context = {'store_name': 'CROSSLAND LLC-US', 'question_topic': 'health', 'health': {
+        'status': 'AUTHORIZATION_FAILED', 'confirmation_reason': '店铺授权异常',
+        'ahr_score': None, 'source_status_label': '未提供', 'source_updated_at': None,
+        'pending_notice_observations': 0, 'indicators': [], 'freshness_label': '无记录'}}
+    result = operator_card(context)
+    rows = tables(result)[0]['rows']
+    assert len(rows) == 1 and '恢复授权后同步' in rows[0]['c1']
+    text = json.dumps(result, ensure_ascii=False)
+    assert not any(label in text for label in ('未知', '未提供', '归档未见', '健康评分', '源时区'))
+
+
+def test_single_store_health_keeps_real_observation_and_risk_without_normal_metric_dump():
+    from jx_alert.bot_presentation import operator_card
+    context = {'store_name': 'Geteen-US', 'question_topic': 'health', 'health': {
+        'status': 'UNCONFIRMED', 'confirmation_reason': '源时区待确认',
+        'ahr_score': 256, 'source_status_label': '评级良好', 'source_updated_at': '2026-11-15 15:47:50',
+        'pending_notice_observations': 0, 'indicators': [
+            {'label': '订单缺陷率', 'value': 0, 'standard': 1, 'status': 'WITHIN_STANDARD', 'status_label': '未见超标'},
+            {'label': '迟发率', 'value': 6, 'standard': 4, 'status': 'BREACHED', 'status_label': '观测未达标'}]}}
+    before = deepcopy(context)
+    result = operator_card(context)
+    text = json.dumps(result, ensure_ascii=False)
+    assert '256' in text and '归档观测' in text and '迟发率' in text and '6%' in text
+    assert '当前健康' in text and '订单缺陷率' not in text and '待处理通知' not in text
+    assert '2026-11-15 15:47:50' in text and context == before

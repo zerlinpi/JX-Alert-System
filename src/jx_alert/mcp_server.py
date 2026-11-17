@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 import argparse
 import hmac
 import json
+from pathlib import Path
 import re
 
 from starlette.middleware.cors import CORSMiddleware
@@ -272,6 +273,7 @@ def system_health() -> dict:
         "lingxing_performance_mcp_configured": bool(
             settings.lingxing_mcp_url and settings.lingxing_mcp_key.get_secret_value()
         ),
+        "lingxing_business_dashboard_configured": Path(getattr(settings, "lingxing_business_credentials_file", "")).is_file(),
         "lingxing_token_mode": token_mode,
         "feishu_enabled": settings.feishu_enabled,
         "feishu_webhook_configured": bool(settings.feishu_webhook_url),
@@ -613,7 +615,11 @@ def get_daily_summary(store_id: str, report_date: str) -> dict:
         raise ValueError("report_date must be YYYY-MM-DD") from exc
     init_db()
     with SessionLocal() as db:
-        return _daily_summary(db, str(store_id), target_date)
+        from jx_alert.notifications.business_daily import business_daily_context
+        result = _daily_summary(db, str(store_id), target_date)
+        if "store" in result:
+            result["business_daily"] = business_daily_context(db, str(store_id), target_date)
+        return result
 
 
 

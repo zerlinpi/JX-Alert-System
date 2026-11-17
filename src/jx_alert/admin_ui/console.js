@@ -273,6 +273,51 @@ function kpiValue(kpi) {
   return scalar(kpi.value);
 }
 
+function businessValue(value, unit, currency) {
+  if (!Number.isFinite(value)) return "—";
+  if (unit === "rate" || unit === "expense_rate") return `${moneyNumber.format(value * 100)}%`;
+  if (unit === "money") {
+    if (!/^[A-Z]{3}$/.test(currency || "")) return "币种待确认";
+    return currency === "USD" ? `$${moneyNumber.format(value)}` : money(value, currency);
+  }
+  return scalar(value);
+}
+
+function businessComparison(item, warning) {
+  if (warning) return "待确认";
+  if (item.comparable === false) return "币种不同";
+  if (!Number.isFinite(item.change)) {
+    return item.previous === 0 && Number.isFinite(item.current) ? "前值为零" : "—";
+  }
+  const signed = `${item.change > 0 ? "+" : ""}${moneyNumber.format(item.change * 100)}`;
+  return signed + (item.unit === "rate" || item.unit === "expense_rate" ? " 个百分点" : "%");
+}
+
+function renderBusinessDaily(data) {
+  const business = data.business_daily;
+  const items = (business?.metrics || []).filter((item) => Number.isFinite(item.current) || Number.isFinite(item.previous));
+  $("business-daily").hidden = !business && typeof data.business_source_configured !== "boolean";
+  $("business-daily-table").hidden = !items.length;
+  $("business-daily-period").textContent = items.length ? [
+    business.report_date, `对比 ${business.previous_date}`, business.currency === "USD" ? "美元 USD" : business.currency,
+  ].filter(Boolean).join(" · ") : "";
+  tableRows("business-daily-rows", items.map((item) => [item.label,
+    businessValue(item.current, item.unit, item.currency),
+    businessValue(item.previous, item.unit, item.previous_currency),
+    businessComparison(item, data.data_warning),
+  ]), 4, "");
+  const notes = [];
+  if (business?.availability === "FAILED") notes.push("该日经营看板刷新失败，旧值不参与本次比较；请在后台重试同步。");
+  else if (!items.length) notes.push(data.business_source_configured ? "经营看板暂无该日报数据。" : "经营看板数据尚未接入。");
+  else {
+    if (items.some((item) => item.unit === "expense_rate")) notes.push("¹ 领星经营看板口径，费用与退款占比按扣款绝对值展示。");
+    if (business.missing_metrics?.length) notes.push(`未取得：${business.missing_metrics.join("、")}`);
+  }
+  $("business-daily-note").textContent = notes.join(" ");
+  // The source sales summary remains visible until the distinct business dashboard is available.
+  $("metric-summary").hidden = items.length > 0;
+}
+
 function renderDetail() {
   const data = state.data;
   const store = data.store || {};
@@ -299,6 +344,7 @@ function renderDetail() {
     tile.append(node("dt", label), dd);
     return tile;
   }));
+  renderBusinessDaily(data);
   tableRows("kpi-rows", (data.kpis || []).map((r) => [r.label || r.code, kpiValue(r), r.date, badge(r.status)]), 4, "暂无可用广告指标。");
   tableRows("coverage-rows", (data.coverage || []).map((r) => [r.name, badge(r.status), scalar(r.rows)]), 3, "暂无采集记录。");
   const health = data.health || {};

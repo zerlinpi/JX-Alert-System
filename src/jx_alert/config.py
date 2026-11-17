@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     # through the public OpenAPI contract used by the daily collector.
     lingxing_mcp_url: str = ""
     lingxing_mcp_key: SecretStr = SecretStr("")
+    lingxing_business_credentials_file: str = "./data/secrets/lingxing-business-mcp.json"
     lingxing_app_id: str = ""
     lingxing_app_key: str = ""
     lingxing_app_secret: str = ""
@@ -193,6 +194,7 @@ def get_settings() -> Settings:
             "feishu_morning_focus_enabled", "feishu_quiet_delivery_enabled",
             "lingxing_performance_enabled", "lingxing_performance_source_timezone",
             "lingxing_performance_observation_only",
+            "lingxing_business_credentials_file",
             "mcp_allowed_hosts", "mcp_allowed_origins",
             "mcp_auth_mode", "mcp_public_url", "mcp_oauth_database_path", "mcp_owner_credentials_file",
             "mcp_forwarded_allow_ips",
