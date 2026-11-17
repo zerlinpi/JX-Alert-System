@@ -223,7 +223,9 @@ def fake_mcp(monkeypatch, tmp_path, *, help_kind='read', schema_kind='read', mis
     credentials = tmp_path / 'business-test-private.json'
     credentials.write_text(json.dumps({'url': 'https://openmcp.lingxing.com/mcp-servers/lingxing-mcp',
                                       'key': 'synthetic-mcp-test-credential'}), encoding='utf-8')
-    settings = SimpleNamespace(lingxing_business_credentials_file=str(credentials))
+    credentials.chmod(0o600)
+    settings = SimpleNamespace(lingxing_business_credentials_file=str(credentials),
+                               lingxing_sources_file=str(tmp_path / 'sources-not-configured.json'))
 
     async def unpaced(session, tool, params):
         return await session.call_tool(tool, params)
