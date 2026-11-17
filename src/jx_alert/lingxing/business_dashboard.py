@@ -24,10 +24,20 @@ from jx_alert.store_controls import collection_states
 
 
 TOOL = "business_dashboard_performance_cards"
+STORE_TOOL = "get_my_sids"
+READ_TOOLS = frozenset({TOOL, STORE_TOOL})
 FIELDS = [key for key, _, _ in BUSINESS_METRICS]
 
 
 class BusinessDashboardError(RuntimeError):
+    pass
+
+
+class BusinessStoreNotVisibleError(BusinessDashboardError):
+    pass
+
+
+class BusinessStoreInventoryError(BusinessDashboardError):
     pass
 
 
@@ -140,6 +150,46 @@ def _failed_partition(db, sid, day):
     db.commit()
 
 
+def _visible_store_ids(response):
+    """Parse the verified get_my_sids code=1 -> data.list response only."""
+    value = response
+    for _ in range(3):
+        if (not isinstance(value, dict) or value.get("success") is False
+                or type(value.get("code")) is not int or value["code"] != 1):
+            break
+        if "list" in value:
+            rows = value["list"]
+            if not isinstance(rows, list):
+                break
+            result = set()
+            for row in rows:
+                sid = row.get("id") if isinstance(row, dict) else None
+                if type(sid) is not int or sid <= 0 or str(sid) in result:
+                    raise BusinessStoreInventoryError("Invalid official store inventory")
+                result.add(str(sid))
+            return result
+        value = value.get("data")
+    raise BusinessStoreInventoryError("Invalid official store inventory")
+
+
+async def _read_schema(session, tool_id):
+    # This source reader is deliberately limited to two fixed read-only tools.
+    # Neither model output nor a remote description can select another tool.
+    if tool_id not in READ_TOOLS:
+        raise BusinessDashboardError("Business tool is outside the read-only allowlist")
+    discovery = _document(await session.call_tool("help", {"query": tool_id, "limit": 10}))
+    if discovery.get("code") != 1 or discovery.get("success") is False:
+        raise BusinessDashboardError("Official business discovery failed")
+    listing = discovery.get("data", {}).get("tools", [])
+    if not any(isinstance(t, dict) and t.get("toolId") == tool_id
+               and t.get("toolType") == "read" for t in listing):
+        raise BusinessDashboardError("Business tool is not confirmed read-only")
+    schema = unwrap(_document(await session.call_tool("search", {"toolId": tool_id})))
+    if schema.get("toolId") != tool_id or schema.get("toolType") != "read":
+        raise BusinessDashboardError("Business tool is not confirmed read-only")
+    return schema.get("inputSchema", {})
+
+
 async def _collect(db, settings, stores, report_dates):
     url, key = _credentials(settings.lingxing_business_credentials_file)
     results, failures = [], []
@@ -151,17 +201,22 @@ async def _collect(db, settings, stores, report_dates):
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
                 if not {"help", "search", "action"}.issubset(tools):
                     raise BusinessDashboardError("Official MCP discovery tools are unavailable")
-                discovery = _document(await session.call_tool("help", {"query": TOOL, "limit": 10}))
-                listing = discovery.get("data", {}).get("tools", [])
-                if not any(t.get("toolId") == TOOL and t.get("toolType") == "read" for t in listing):
-                    raise BusinessDashboardError("Business tool is not confirmed read-only")
-                schema = unwrap(_document(await session.call_tool("search", {"toolId": TOOL})))
-                if schema.get("toolId") != TOOL or schema.get("toolType") != "read":
-                    raise BusinessDashboardError("Business tool is not confirmed read-only")
-                properties = schema.get("inputSchema", {}).get("properties", {})
-                required = {"startDate", "endDate", "currencyCode", "sids", "aggregateType", "indexName"}
-                if not required.issubset(properties):
-                    raise BusinessDashboardError("Official business schema changed")
+                inventory_schema = await _read_schema(session, STORE_TOOL)
+                if (inventory_schema.get("type") != "object" or inventory_schema.get("properties") != {}
+                        or inventory_schema.get("required", []) != []):
+                    raise BusinessStoreInventoryError("Official store inventory schema changed")
+                inventory_error = None
+                try:
+                    visible = _visible_store_ids(_document(await session.call_tool(
+                        "action", {"toolId": STORE_TOOL, "params": {}})))
+                except BusinessDashboardError:
+                    visible, inventory_error = set(), BusinessStoreInventoryError
+                if any(str(store["sid"]) in visible for store in stores):
+                    schema = await _read_schema(session, TOOL)
+                    properties = schema.get("properties", {})
+                    required = {"startDate", "endDate", "currencyCode", "sids", "aggregateType", "indexName"}
+                    if not required.issubset(properties):
+                        raise BusinessDashboardError("Official business schema changed")
                 for store in stores:
                     sid = str(store["sid"])
                     if not collection_states(settings, [sid]).get(sid, False):
@@ -170,6 +225,9 @@ async def _collect(db, settings, stores, report_dates):
                         if not collection_states(settings, [sid]).get(sid, False):
                             break
                         try:
+                            if sid not in visible:
+                                raise (inventory_error or BusinessStoreNotVisibleError)(
+                                    "Store is not confirmed visible to the official business source")
                             response = _document(await session.call_tool("action", {"toolId": TOOL,
                                 "params": {"startDate": day, "endDate": day, "currencyCode": "USD",
                                     "sids": [int(sid)], "aggregateType": "2", "indexName": FIELDS}}))
