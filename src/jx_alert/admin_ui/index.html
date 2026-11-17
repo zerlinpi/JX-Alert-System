@@ -111,6 +111,11 @@
                 </div>
                 <div class="save-bar"><span class="muted">按店铺已结束日期，含最新绩效观测。</span><div class="control-actions"><button class="link-button" id="collection-refresh" type="button">刷新同步状态</button><button class="button secondary" id="sync-latest" type="button" disabled>同步最新日报</button></div></div>
                 <div id="collection-status" class="notice" role="status" hidden></div>
+                <div id="business-daily" hidden>
+                  <div class="section-heading"><div><h4>经营日报</h4><p id="business-daily-period" class="muted"></p></div></div>
+                  <div id="business-daily-table" class="table-scroll" hidden><table class="business-table"><thead><tr><th scope="col">指标</th><th scope="col">当日</th><th scope="col">前一日</th><th scope="col">日环比</th></tr></thead><tbody id="business-daily-rows"></tbody></table></div>
+                  <p id="business-daily-note" class="report-footnote muted"></p>
+                </div>
                 <dl id="metric-summary" class="metrics"></dl>
               </section>
               <section class="panel trends" aria-labelledby="trend-title">

@@ -61,8 +61,9 @@ def test_daily_health_is_sent_without_normal_advertising_or_empty_optional_types
     chunks = render(db, settings, store)
     assert len(chunks) == 1
     text = json.dumps(chunks, ensure_ascii=False)
-    assert '店铺绩效与违规快报' in text and '源时区待确认' in text and '评级良好（源观测）' in text
-    assert '当前判定' in text and '待确认' in text
+    assert '店铺绩效与违规快报' in text and '评分 256 · 评级良好（观测）' in text
+    assert '观测值未确认当前健康' in text
+    assert all(term not in text for term in ('当前判定', '源时区待确认', '源时间与依据', '归档未见待处理通知'))
     assert all(term not in text for term in ('广告无异常', '品牌推广', '展示推广', '商品推广活动待复核'))
 
 
@@ -76,8 +77,8 @@ def test_quiet_morning_keeps_health_observations_and_omits_separate_data_gap_mes
     row = db.get(NotificationOutbox, result['outbox_ids'][0])
     assert row.payload['morning_message_kind'] == 'health'
     text = json.dumps(row.payload['card'], ensure_ascii=False)
-    assert '源时区待确认' not in text and '时效待确认' in text
-    assert '2026-11-14 06:56:17' in text and '当前判定：待确认' in text
+    assert '源时区待确认' not in text and '观测值未确认当前健康' in text
+    assert '评分 256 · 评级良好（观测）' in text and '当前判定' not in text
     assert any(chunk[0]['header']['title']['content']=='广告判断待补齐数据' for chunk in morning_cards(
         db, settings, [store], {store.sid: missing}, send_day=NOW.date(), now=NOW))
 

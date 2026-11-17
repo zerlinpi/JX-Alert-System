@@ -154,6 +154,7 @@ def test_quiet_mode_skips_queued_noise_without_sending_or_retrying(delivery_runt
         "scheduled-daily:morning:a": {"morning_message_kind": "health"},
         "scheduled-daily:morning:b": {"morning_message_kind": "ad_exception"},
         "scheduled-daily:morning:c": {"card": card("广告判断待补齐数据", subtitle="", sections=[])},
+        "scheduled-daily:morning:d": {"morning_message_kind": "business_daily"},
     }
     other = {
         "app:old-freshness": {},
@@ -169,12 +170,12 @@ def test_quiet_mode_skips_queued_noise_without_sending_or_retrying(delivery_runt
             db.add(row)
         db.add(_row("group-question:om_question:0", reply, now))
         db.add(_row("group-question:om_other:0", reply, now))
-    for _ in range(2):
+    for _ in range(3):
         worker.process_outbox_batch()
-    assert len(sent) == 4 and [operation for operation, _ in sent].count("reply") == 1
+    assert len(sent) == 5 and [operation for operation, _ in sent].count("reply") == 1
     pending = {*scheduled, *other, "group-question:om_question:0", "group-question:om_other:0"}
     expected = {"scheduled-daily:morning:a", "scheduled-daily:morning:b",
-                "chat-ad-kpi:verified", "group-question:om_question:0"}
+                "scheduled-daily:morning:d", "chat-ad-kpi:verified", "group-question:om_question:0"}
     with sessions() as db:
         rows = {row.idempotency_key: row for row in db.scalars(select(NotificationOutbox))}
         assert {key for key, row in rows.items() if row.status == "DELIVERED"} == expected

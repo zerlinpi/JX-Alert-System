@@ -131,53 +131,54 @@ def _collection_receipt(warehouse, result):
         return json.dumps(value.payload["card"], ensure_ascii=False)
 
 
+def _legacy_collection_receipt(warehouse, *, private=False):
+    """An existing pre-read-only receipt; new questions cannot create one."""
+    with warehouse[1].begin() as db:
+        collection = SyncJob(job_type="manual_collection", status="PENDING",
+            metadata_json={"store_ids": ["5174"], "retry_at": "2026-11-14T00:03:00"})
+        db.add(collection)
+        db.flush()
+        receipt = SyncJob(job_type="feishu_question", status="SUCCEEDED", started_at=NOW.replace(tzinfo=None),
+            metadata_json={"message_id": "om_legacy", "chat_id": "oc_private" if private else "oc_reports",
+                "chat_type": "p2p" if private else "group", "sender_id": "ou_member",
+                "analysis_provider": "collection_request", "collection_job_id": collection.id,
+                "collection_store_id": "5174"})
+        db.add(receipt)
+        db.flush()
+        return {"job_id": receipt.id}
+
+
 @pytest.mark.parametrize("role", ["operator", "admin"])
-def test_explicit_single_shop_collection_queues_one_scoped_job(warehouse, monkeypatch, role):
+def test_explicit_collection_is_readonly_even_for_operators_and_admins(warehouse, monkeypatch, role):
     _enable_collection(warehouse, monkeypatch, role=role)
     request = event("@_user_1 请实时采集 5174 店铺。")
     queued = enqueue(warehouse, request)
     answered = process(warehouse)
     assert enqueue(warehouse, request) == {"status": "REUSED", "job_id": queued["job_id"]}
     assert process(warehouse)["status"] == "IDLE"
-    assert "等待采集" in _collection_receipt(warehouse, answered)
+    assert "机器人仅提供数据分析" in _collection_receipt(warehouse, answered)
+    assert "后台" in _collection_receipt(warehouse, answered)
     assert FakeClient.calls == []
     with warehouse[1]() as db:
-        tasks = db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")).all()
-        assert len(tasks) == 1
-        job = tasks[0]
-        receipt = db.get(SyncJob, queued["job_id"]).metadata_json
-        assert receipt["collection_job_id"] == job.id
-        assert receipt["collection_store_id"] == "5174"
-        assert job.metadata_json["store_ids"] == ["5174"]
-        assert job.metadata_json["report_date"] is None
-        assert job.status == "PENDING"
+        assert db.scalar(select(SyncJob).where(SyncJob.job_type == "manual_collection")) is None
+        assert "collection_job_id" not in db.get(SyncJob, queued["job_id"]).metadata_json
 
 
-def test_distinct_requests_share_active_job_and_can_refresh_again_after_completion(warehouse, monkeypatch):
+def test_rephrased_collection_commands_never_create_jobs(warehouse, monkeypatch):
     _enable_collection(warehouse, monkeypatch)
-    first = enqueue(warehouse, event("@_user_1 实时采集5174"))
-    process(warehouse)
-    second = enqueue(warehouse, event("@_user_1 重新采集5174", message_id="om_second"))
-    process(warehouse)
-    with warehouse[1].begin() as db:
-        tasks = db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")).all()
-        assert len(tasks) == 1
-        first_id = tasks[0].id
-        assert db.get(SyncJob, first["job_id"]).metadata_json["collection_job_id"] == first_id
-        assert db.get(SyncJob, second["job_id"]).metadata_json["collection_job_id"] == first_id
-        tasks[0].status = "SUCCEEDED"
-    third = enqueue(warehouse, event("@_user_1 立即采集5174", message_id="om_third"))
-    process(warehouse)
+    for index, phrase in enumerate(("实时采集5174", "重新采集5174", "立即采集5174")):
+        enqueue(warehouse, event("@_user_1 " + phrase, message_id="om_repeat" + str(index)))
+        reply = _collection_receipt(warehouse, process(warehouse))
+        assert "机器人仅提供数据分析" in reply
     with warehouse[1]() as db:
-        assert db.scalar(select(func.count(SyncJob.id)).where(SyncJob.job_type == "manual_collection")) == 2
-        assert db.get(SyncJob, third["job_id"]).metadata_json["collection_job_id"] != first_id
+        assert db.scalar(select(func.count(SyncJob.id)).where(SyncJob.job_type == "manual_collection")) == 0
 
 
 @pytest.mark.parametrize("role,phrase,label", [
-    ("other", "立即采集5174", "请由该店铺负责人或群管理员"),
-    ("operator", "重新采集 5174 和 5175", "请确认要采集的店铺"),
-    ("operator", "实时采集 5175", "请由该店铺负责人或群管理员"),
-    ("admin", "现在采集 9999", "店铺不在采集范围内"),
+    ("other", "立即采集5174", "机器人仅提供数据分析"),
+    ("operator", "重新采集 5174 和 5175", "机器人仅提供数据分析"),
+    ("operator", "实时采集 5175", "机器人仅提供数据分析"),
+    ("admin", "现在采集 9999", "机器人仅提供数据分析"),
 ])
 def test_collection_requires_one_explicit_scoped_store_and_role(warehouse, monkeypatch, role, phrase, label):
     _enable_collection(warehouse, monkeypatch, role=role)
@@ -189,10 +190,10 @@ def test_collection_requires_one_explicit_scoped_store_and_role(warehouse, monke
 
 
 @pytest.mark.parametrize("condition,label", [
-    ("paused", "该店铺的采集开关已关闭"),
-    ("authorization", "请先恢复该店铺的领星授权"),
-    ("scheduler", "主动采集或调度服务未启用"),
-    ("operations", "主动采集或调度服务未启用"),
+    ("paused", "机器人仅提供数据分析"),
+    ("authorization", "机器人仅提供数据分析"),
+    ("scheduler", "机器人仅提供数据分析"),
+    ("operations", "机器人仅提供数据分析"),
 ])
 def test_collection_obeys_existing_operational_guards(warehouse, monkeypatch, condition, label):
     _enable_collection(warehouse, monkeypatch)
@@ -217,8 +218,7 @@ def test_collection_obeys_existing_operational_guards(warehouse, monkeypatch, co
 
 def test_collection_query_only_shows_tasks_receipted_in_group_with_current_permission(warehouse, monkeypatch):
     _enable_collection(warehouse, monkeypatch)
-    queued = enqueue(warehouse, event("@_user_1 5174 店铺立即采集"))
-    process(warehouse)
+    queued = _legacy_collection_receipt(warehouse)
     with warehouse[1].begin() as db:
         collection_id = db.get(SyncJob, queued["job_id"]).metadata_json["collection_job_id"]
         job = db.get(SyncJob, collection_id)
@@ -685,38 +685,30 @@ def test_materiality_policy_applies_to_kpi_context_without_changing_source_table
         assert not any(row["metric"] == "CPC" for row in context["screening_candidates"])
 
 
-def test_ambiguous_collection_name_returns_names_and_sites_without_queueing(warehouse, monkeypatch):
+def test_ambiguous_collection_command_needs_no_store_choice_when_readonly(warehouse, monkeypatch):
     _name_stores(warehouse, same_brand=True)
     _enable_collection(warehouse, monkeypatch, role="admin")
     enqueue(warehouse, event("@_user_1 实时采集Geteen"))
     reply = _collection_receipt(warehouse, process(warehouse))
-    assert all(label in reply for label in ("请确认要采集的店铺", "梵界-Geteen-主账号-US", "加拿大", "完整店铺名和站点"))
-    assert "店铺ID" not in reply and "5174" not in reply
+    assert "机器人仅提供数据分析" in reply
+    assert "请确认店铺" not in reply
     with warehouse[1]() as db:
         assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == "manual_collection")) is None
     assert not FakeClient.calls
 
 
 @pytest.mark.parametrize("role", ["operator", "admin"])
-def test_named_collection_and_named_progress_keep_existing_receipts_and_deduplication(warehouse, monkeypatch, role):
+def test_named_progress_can_read_legacy_receipts_but_not_create_new_ones(warehouse, monkeypatch, role):
     _name_stores(warehouse)
     _enable_collection(warehouse, monkeypatch, role=role)
-    request = event("@_user_1 实时采集 geteen 美国")
-    first = enqueue(warehouse, request)
-    reply = _collection_receipt(warehouse, process(warehouse))
-    assert "梵界-Geteen-主账号-US" in reply and "等待采集" in reply
-    assert "店铺ID" not in reply and "任务号" not in reply
-    assert enqueue(warehouse, request)["status"] == "REUSED"
-    enqueue(warehouse, event("@_user_1 重新采集 梵界 美国", message_id="om_again"))
-    process(warehouse)
-    with warehouse[1].begin() as db:
-        jobs = db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")).all()
-        assert len(jobs) == 1 and jobs[0].metadata_json["store_ids"] == ["5174"]
-        jobs[0].metadata_json = {**jobs[0].metadata_json, "retry_at": "2026-11-14T00:03:00"}
-        assert db.get(SyncJob, first["job_id"]).metadata_json["collection_store_id"] == "5174"
+    _legacy_collection_receipt(warehouse)
     enqueue(warehouse, event("@_user_1 查询Geteen美国采集状态", message_id="om_progress"))
     reply = _collection_receipt(warehouse, process(warehouse))
     assert "等待重试，最早北京时间 11-14 08:03:00" in reply and "梵界-Geteen-主账号-US" in reply
+    enqueue(warehouse, event("@_user_1 重新采集Geteen美国", message_id="om_readonly"))
+    assert "机器人仅提供数据分析" in _collection_receipt(warehouse, process(warehouse))
+    with warehouse[1]() as db:
+        assert db.scalar(select(func.count(SyncJob.id)).where(SyncJob.job_type == "manual_collection")) == 1
     assert not FakeClient.calls
 
 
@@ -756,8 +748,7 @@ def test_named_collection_cannot_bypass_role_switch_or_authorization(warehouse, 
 def test_named_progress_rechecks_group_receipt_and_current_permission(warehouse, monkeypatch, condition):
     _name_stores(warehouse)
     _enable_collection(warehouse, monkeypatch)
-    queued = enqueue(warehouse, event("@_user_1 实时采集Geteen美国"))
-    process(warehouse)
+    queued = _legacy_collection_receipt(warehouse)
     with warehouse[1].begin() as db:
         receipt = db.get(SyncJob, queued["job_id"])
         original = db.get(SyncJob, receipt.metadata_json["collection_job_id"])
@@ -785,6 +776,43 @@ def test_model_context_lists_adverse_evidence_explicitly_for_review(warehouse):
         assert context["screening_candidate_count"] == len(context["screening_candidates"]) > 0
         candidate = next(c for c in context["screening_candidates"] if c["metric"] == "CPC" and c["entity_id"] == "sp-campaign")
         assert candidate["current"] == 10 and candidate["baseline"] == 5
+
+
+def test_natural_monthly_forecast_reaches_model_with_readonly_exact_day_evidence(warehouse):
+    _name_stores(warehouse)
+    enqueue(warehouse, event('@_user_1 预测Geteen美国月底SP广告花费'))
+    result = process(warehouse)
+    assert result['status'] == 'QUEUED' and len(FakeClient.calls) == 1
+    context = FakeClient.calls[0][0]
+    assert context['reply_mode'] == 'answer'
+    projection = context['analysis_evidence']['spend_projection']
+    assert projection['basis_end'] == str(DAY)
+    assert projection['month_to_date'] == 1200
+    assert projection['monthly_total'] == 3000 and projection['currency'] == 'USD'
+    with warehouse[1]() as db:
+        assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == 'manual_collection')) is None
+
+
+def test_business_daily_question_uses_verified_dashboard_fields_in_four_columns(warehouse):
+    from jx_alert.notifications.business_daily import SOURCE, DIMENSION
+    _name_stores(warehouse)
+    with warehouse[1].begin() as db:
+        for day, amount in ((DAY, 4089.75), (DAY - timedelta(days=1), 3524.80)):
+            db.add(DataCoverage(store_id='5174', dimension=DIMENSION, metric_date=day,
+                status='COMPLETE', row_count=1))
+            db.add(DailyMetric(store_id='5174', dimension=DIMENSION, entity_id='5174',
+                source=SOURCE, metric_date=day, metric_name='netAmount', value=amount, currency='USD'))
+    enqueue(warehouse, event('@_user_1 Geteen美国日报'))
+    result = process(warehouse)
+    context = FakeClient.calls[0][0]
+    assert context['business_daily_report'] is True
+    assert context['business_daily']['metrics'][1]['current'] == 4089.75
+    with warehouse[1]() as db:
+        values = [db.get(NotificationOutbox, row_id).payload['card'] for row_id in result['outbox_ids']]
+        tables = [element for value in values for element in value['body']['elements'] if element['tag'] == 'table']
+        assert len(tables) == 1 and len(tables[0]['columns']) == 4
+        assert tables[0]['rows'][0]['c0'] == '净销售额'
+        assert tables[0]['rows'][0]['c1'] == '$4,089.75'
 
 
 def test_model_context_cannot_confuse_previous_day_values_with_missing_current_day(warehouse):
@@ -1227,9 +1255,10 @@ def test_private_realtime_collection_keeps_existing_store_role_requirement(wareh
     assert result["status"] == "QUEUED" and FakeClient.calls == []
     with warehouse[1]() as db:
         jobs = list(db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")))
-        assert len(jobs) == int(role != "other")
+        assert len(jobs) == 0
+    assert "机器人仅提供数据分析" in _collection_receipt(warehouse, result)
     if role == "other":
-        assert "请由该店铺负责人或群管理员" in _collection_receipt(warehouse, result)
+        assert "机器人仅提供数据分析" in _collection_receipt(warehouse, result)
 
 
 def test_private_cache_is_not_shared_between_different_senders_even_with_same_chat(warehouse, monkeypatch):
@@ -1324,8 +1353,7 @@ def test_private_role_revoked_during_analysis_prevents_reply(warehouse, monkeypa
 
 def test_private_collection_receipt_is_bound_to_original_sender(warehouse, monkeypatch):
     _enable_collection(warehouse, monkeypatch)
-    enqueue(warehouse, private_event("实时采集5174"))
-    first = process(warehouse)
+    first = _legacy_collection_receipt(warehouse, private=True)
     with warehouse[1]() as db:
         receipt = db.get(SyncJob, first["job_id"])
         collection_id = receipt.metadata_json["collection_job_id"]

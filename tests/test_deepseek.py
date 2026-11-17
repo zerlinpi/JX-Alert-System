@@ -101,6 +101,25 @@ def test_custom_question_can_return_a_short_paragraph_without_an_anomaly_templat
     assert DeepSeekClient(KEY).analyze(context, 'CPC是什么意思') == answer
 
 
+def test_forecast_uses_compact_frozen_evidence_without_action_tools(monkeypatch):
+    context = {**CONTEXT, 'advertising_kpis': {}, 'reply_mode': 'answer',
+        'analysis_evidence': {'spend_projection': {'scenario_only': True, 'monthly_total': 3000,
+            'currency': 'USD', 'basis_start': '2026-11-10', 'basis_end': '2026-11-16'}},
+        'business_daily': {'net_sales': 4089.75, 'currency': 'USD'}}
+    answer = '在日均花费不变的假设下，11月底花费情景估算为美元3,000；未提供预算上限，无法判断超支。'
+    def handler(request):
+        body = json.loads(request.content)
+        prompt = body['messages'][0]['content']
+        packet = json.loads(body['messages'][1]['content'])['frozen_data']
+        assert packet['analysis_evidence'] == context['analysis_evidence']
+        assert packet['business_daily'] == context['business_daily']
+        assert '不是概率或置信区间' in prompt and '没有预算上限不能断言超预算' in prompt
+        assert body['tool_choice'] == 'none' and 'tools' not in body
+        return response(answer)
+    mock_http(monkeypatch, handler)
+    assert DeepSeekClient(KEY).analyze(context, '预测月底广告花费') == answer
+
+
 def test_findings_only_answer_drops_normal_items_under_an_abnormal_heading():
     from jx_alert.ai.deepseek import _actionable_text
     text = '## 店铺绩效\n**待确认**\n- 源时区未确认，当前健康待确认。\n**异常**\n- 无已确认异常；订单缺陷率均未见超标。\n**复核建议**：补齐资料。'

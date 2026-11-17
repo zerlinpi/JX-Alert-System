@@ -115,6 +115,11 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             client, db, report_dates, stores_response=stores_response
         )
         completed_steps.append("sales")
+        from jx_alert.lingxing.business_dashboard import collect_business_for_day
+        results["business_dashboard"] = collect_business_for_day(
+            db, settings, stores_response, report_dates)
+        if results["business_dashboard"]["status"] == "COMPLETE":
+            completed_steps.append("business_dashboard")
         archive_excel()
 
         results["campaigns"] = collect_campaigns(
@@ -168,13 +173,15 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             + sum(results.get("sb_sd_detail_reports", {}).get("rows", {}).values())
             + int(results.get("performance", {}).get("performance_rows", 0))
             + int(results.get("performance", {}).get("notice_rows", 0))
+            + int(results.get("business_dashboard", {}).get("metrics", 0))
         )
         job = db.get(SyncJob, job_id)
         performance_status = results.get("performance", {}).get("status", "DISABLED")
         detail_reports = results.get("sb_sd_detail_reports", {})
         transient_detail_failure = any(item["error_type"] == LingxingTransientError.__name__
                                        for item in detail_reports.get("failures", []))
-        job.status = ("PARTIAL_FAILED" if performance_status == "PARTIAL_FAILED" or transient_detail_failure else
+        job.status = ("PARTIAL_FAILED" if performance_status == "PARTIAL_FAILED" or transient_detail_failure
+                      or results.get("business_dashboard", {}).get("status") == "PARTIAL_FAILED" else
                       "SUCCEEDED_WITH_WARNINGS" if performance_status == "SUCCEEDED_WITH_WARNINGS"
                       or detail_reports.get("status") == "PARTIAL_FAILED"
                       or results.get("ad_currency", {}).get("status") == "LOOKUP_UNAVAILABLE" else "SUCCEEDED")

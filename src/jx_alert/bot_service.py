@@ -439,7 +439,7 @@ def _lookup_store_collection(db, settings, meta, sid):
     ).order_by(SyncJob.id.desc()).limit(1))
     if receipt is not None and type(receipt.metadata_json.get("collection_job_id")) is int:
         return _lookup_collection(db, settings, meta, receipt.metadata_json["collection_job_id"])
-    return card("未找到可查询的采集任务", subtitle="当前会话尚未发起该店铺的采集，可发送：实时采集 店铺名。", sections=[])
+    return card("未找到可查询的采集任务", subtitle="当前会话没有该店铺的历史采集回执，最新同步进度请在后台查看。", sections=[])
 
 
 def _complete_question(db, settings, job_id, meta, cards, provider):
@@ -463,49 +463,24 @@ def _complete_question(db, settings, job_id, meta, cards, provider):
 
 
 def _process_collection_command(db, settings, job_id, meta, command):
-    """Interpret only explicit user commands; model output cannot initiate work."""
-    from jx_alert.operations import CollectionBlocked, enqueue_collection
+    """Retain legacy status reads, but no chat question may enqueue collection."""
 
     action, value = command
     if action == "status":
         reply = _lookup_collection(db, settings, meta, value)
         return _complete_question(db, settings, job_id, meta, [reply], "collection_status")
-    if action in {"name_request", "store_status"}:
+    if action == "store_status":
         snapshots, ids = _resolve_store(db, settings, value)
         multiple = re.search(r"和|以及|还有|及|与|同时|并且|(?<![a-z])and(?![a-z])", _name_text(value))
         if len(ids) != 1 or multiple:
-            reply = _store_clarification(snapshots, ids, collection=action == "name_request")
+            reply = _store_clarification(snapshots, ids)
             return _complete_question(db, settings, job_id, meta, [reply], "store_clarification")
         value = ids[0]
-        if action == "store_status":
-            reply = _lookup_store_collection(db, settings, meta, value)
-            return _complete_question(db, settings, job_id, meta, [reply], "collection_status")
-    if action == "clarify":
-        reply = card("请确认要采集的店铺", subtitle="请提供单个店铺名，例如：实时采集 Geteen 美国。", sections=[])
-    elif not _collection_permission(settings, meta, value):
-        reply = card("采集请求未受理", subtitle="请由该店铺负责人或群管理员发起采集。", sections=[])
-    elif not settings.scheduler_enabled or not settings.mcp_operations_enabled:
-        reply = card("采集请求未受理", subtitle="主动采集或调度服务未启用。", sections=[])
-    else:
-        try:
-            with database_job_lock(db.get_bind(), "collection_enqueue"):
-                try:
-                    result = enqueue_collection(db, store_ids=[value])
-                except CollectionBlocked as exc:
-                    reply = card("采集请求未受理",
-                        subtitle=_COLLECTION_BLOCK_REASONS.get(exc.status, "请检查店铺采集设置。"), sections=[])
-                except ValueError:
-                    reply = card("采集请求未受理", subtitle="请检查店铺采集设置。", sections=[])
-                else:
-                    meta.update(collection_job_id=result["job_id"], collection_store_id=value)
-                    collection_job = db.get(SyncJob, result["job_id"])
-                    reply = _collection_status_card(db, collection_job, value)
-                    # Publish the queue entry and the receipt together before
-                    # releasing the enqueue lock.
-                    return _complete_question(db, settings, job_id, meta, [reply], "collection_request")
-        except JobAlreadyRunning:
-            reply = card("采集请求繁忙", subtitle="请稍后再试。", sections=[])
-    return _complete_question(db, settings, job_id, meta, [reply], "collection_request")
+        reply = _lookup_store_collection(db, settings, meta, value)
+        return _complete_question(db, settings, job_id, meta, [reply], "collection_status")
+    reply = card("机器人仅提供数据分析",
+        subtitle="如需采集最新数据，请在后台使用“同步”按钮。机器人不会发起采集或修改数据。", sections=[])
+    return _complete_question(db, settings, job_id, meta, [reply], "readonly_request")
 
 
 def _ad_totals(db, store_id, on):
@@ -674,7 +649,19 @@ def question_context(db, settings, store_id, *, now=None, question=None):
                 screening.append({"entity_id": entity, "name": name, "metric": metric,
                     **{key: item[key] for key in ("current", "baseline", "current_date", "currency", "change_ratio", "title")}})
     from jx_alert.analysis.materiality import POLICY
-    return {"notification_policy": POLICY if getattr(settings, "alert_materiality_enabled", False) else {},
+    from jx_alert.ai.analyst_evidence import analyst_question, analysis_evidence
+    from jx_alert.notifications.business_daily import business_daily_context, business_daily_card
+    evidence = (analysis_evidence(db, store, target, question, completed=completed)
+                if analyst_question(question) else None)
+    business = business_daily_context(db, store_id, target) if not warning else {
+        "report_date": target.isoformat(), "availability": "UNAVAILABLE", "metrics": [], "reason": warning}
+    from jx_alert.bot_intents import question_topic
+    business_card = (business_daily_card(db, store, target, settings=settings)
+        if not warning and question_topic(question or '') != 'health'
+        and re.search(r'日报|经营快报|经营报告', question or '') else None)
+    return {"analysis_evidence": evidence, "business_daily": business,
+        "business_daily_report": business_card is not None,
+        "notification_policy": POLICY if getattr(settings, "alert_materiality_enabled", False) else {},
         "store_id": store_id, "store_name": store.name, "country": store.country,
         "report_date": target.isoformat(), "requested_report_date": requested.isoformat(),
         "date_selection": selection, "report_date_warning": date_warning, "date_basis": zone["date_basis"],
@@ -691,13 +678,14 @@ def question_context(db, settings, store_id, *, now=None, question=None):
         "health": store_health_snapshot(db, store, settings, now=clock),
         "screening_candidates": screening, "screening_candidate_count": len(screening),
         "campaigns": campaigns, "campaign_count": len(candidates),
-        "campaign_selection": "仅当前花费最高的至多10个活动样本，不代表全活动逐一巡检"}, value
+        "campaign_selection": "仅当前花费最高的至多10个活动样本，不代表全活动逐一巡检"}, business_card or value
 
 
 def _answer_cards(context, data_card, analysis):
     if context.get('operator_compact'):
         from jx_alert.bot_presentation import operator_card
-        cards = [] if context.get('reply_mode') == 'answer' else [operator_card(context)]
+        cards = ([] if context.get('reply_mode') == 'answer' else
+            [data_card if context.get('business_daily_report') else operator_card(context)])
         if analysis:
             value = card('店铺回复', subtitle=context['store_name'], sections=[])
             value['body']['elements'].append({'tag': 'markdown', 'content': html.escape(analysis, quote=False)})
@@ -782,13 +770,15 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                 return _process_collection_command(db, settings, job_id, meta, collection)
             snapshots, ids = _resolve_store(db, settings, meta["question"])
             from jx_alert.bot_intents import global_question_cards, focus_question
-            global_cards = global_question_cards(db, settings, meta['question'], snapshots, ids, now=_utcnow())
+            from jx_alert.ai.analyst_evidence import analyst_question
+            global_cards = (None if len(ids) == 1 and analyst_question(meta['question']) else
+                global_question_cards(db, settings, meta['question'], snapshots, ids, now=_utcnow()))
             if global_cards is not None:
                 meta['reply_store_ids'] = [s['store_id'] for s in snapshots]
                 return _complete_question(db, settings, job_id, meta, global_cards, 'scoped_store_query')
             if not ids and re.fullmatch(r'(?:你好|您好|在吗|你能做什么|有什么功能|怎么使用)[？?。!！\s]*', meta['question']):
                 value = card('使用机器人', subtitle='可以直接用自己的话提问。', sections=[], notes=[
-                    '例如：现在有哪些店铺数据、Geteen美国是否有违规、解释这家店的CPC，或请同步Geteen美国最新数据。'])
+                    '例如：现在有哪些店铺数据、Geteen美国是否有违规、为什么CPC上升，或预测这家店月底的广告花费。'])
                 return _complete_question(db, settings, job_id, meta, [value], 'question_help')
             if not ids and not re.search(r'\d{4,}|[A-Za-z]{3,}', re.sub(r'(?<![A-Za-z0-9])(?:CTR|CPC|CDR|CVR|CPS|ROAS|CPA|TCOAS|TACOS)(?![A-Za-z0-9])', '', meta['question'], flags=re.I)):
                 from jx_alert.bot_intents import operating_snapshots

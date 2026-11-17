@@ -20,7 +20,7 @@ def quiet_blocks(settings, key, payload):
     if key.startswith("scheduled-daily:"):
         kind = payload.get("morning_message_kind")
         if kind is not None:
-            return kind not in {"health", "ad_exception"}
+            return kind not in {"health", "business_daily", "ad_exception"}
         # Legacy focused pages have no kind. Preserve today's health and ad pages.
         if key.startswith("scheduled-daily:morning:"):
             title = value.get("header", {}).get("title", {}).get("content", "")

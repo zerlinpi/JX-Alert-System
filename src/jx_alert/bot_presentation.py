@@ -1,5 +1,6 @@
 """Operator-facing answers: narrow tables, health first, no empty data dumps."""
 import re
+import math
 
 from jx_alert.notifications.cards import card, number, compact_ad_kpi_rows
 
@@ -10,14 +11,14 @@ def general_context(snapshots):
             'status_label', 'confirmation_reason', 'source_updated_at', 'pending_notice_observations')}
             for s in snapshots],
         'capabilities': ['按店铺全名或片段查询已保存数据', '列出当前店铺数据', '解释广告指标和绩效观测',
-            '负责人或管理员明确请求后可排队同步最新已结束日报；口头回答不会执行同步',
+            '基于完整历史日报分析趋势、提出原因假设及花费情景估算；实时采集请使用后台同步',
             '没有广告修改能力；通知发送须明确请求并通过原有通道，不宣称本次已经发送']}
 
 
 def reply_mode(question):
     if re.search(r'表格|日报|快照|完整数据|全部指标', question or ''):
         return 'tables'
-    if re.search(r'为什么|为何|怎么|如何|建议|解释|是否|有没有|正常吗|只回答|只告诉|只要|多少|几单|简短|一句话|不要表格|不用表格|只列|什么意思', question or ''):
+    if re.search(r'为什么|为何|怎么|如何|建议|解释|是否|有没有|正常吗|只回答|只告诉|只要|多少|几单|简短|一句话|不要表格|不用表格|只列|什么意思|预估|预测|预判|拆解|下钻|浪费|趋势', question or ''):
         return 'answer'
     return 'tables' if re.search(r'情况|概况|数据|指标|表现|经营', question or '') else 'answer'
 
@@ -26,13 +27,33 @@ def operator_card(context):
     sections, notes = [], []
     health = context.get('health')
     if health:
-        rows = [('健康评分', number(health['ahr_score']), health['source_status_label'] + '（源观测）'),
-                ('当前判定', health['status_label'], health['confirmation_reason']),
-                ('待处理通知', str(health['pending_notice_observations']), '归档观测，不能证明当前无违规')]
+        rows = []
+        score = health.get('ahr_score')
+        source = health.get('source_status_label')
+        unavailable = health.get('status') in {'AUTHORIZATION_FAILED', 'INACTIVE', 'NO_DATA'}
+        known_source = source not in {None, '', '未知', '未提供', '未识别'}
+        if not unavailable and isinstance(score, (int, float)) and not isinstance(score, bool) and math.isfinite(score):
+            rows.append(('健康评分', number(score), (source if known_source else '') + '（归档观测）'))
+        elif not unavailable and known_source:
+            rows.append(('评级', source, '归档观测'))
+        reason = health.get('confirmation_reason') or health.get('status_label')
+        reason = {'AUTHORIZATION_FAILED': '领星授权失败，请恢复授权后同步',
+                  'NO_DATA': '暂无绩效记录，请同步绩效数据',
+                  'INACTIVE': '店铺未启用，最新绩效待确认'}.get(health.get('status'), reason)
+        if health.get('status') != 'HEALTHY' and reason:
+            if reason == '源时区待确认':
+                reason = '观测时效待确认，暂不能判断当前健康'
+            rows.append(('关注项', reason, ''))
+        if health.get('pending_notice_observations', 0) > 0:
+            rows.append(('归档待处理通知', str(health['pending_notice_observations']), '请核对亚马逊最新通知'))
         rows.extend((r['label'], f"{r['value']:g}%", f"标准{r['standard']:g}%；{r['status_label']}")
-            for r in health['indicators'] if r['value'] is not None and r['standard'] is not None)
+            for r in health.get('indicators', []) if r.get('status') in {'BREACHED', 'AT_THRESHOLD'}
+            and r.get('value') is not None and r.get('standard') is not None)
+        if not rows:
+            rows.append(('绩效', '尚无可用观测，请同步绩效数据', ''))
         sections.append(('店铺绩效快报', ['指标', '观测', '依据'], rows))
-        notes.append('绩效源时间：' + (health['source_updated_at'] or '未提供') + '；' + health['freshness_label'])
+        if not unavailable and health.get('source_updated_at'):
+            notes.append('绩效源时间：' + health['source_updated_at'])
     metrics = context.get('sales_and_spend', [])
     known = [r for r in metrics if not str(r['current_display']).startswith(('未知', '接口无记录', '—'))]
     if known:

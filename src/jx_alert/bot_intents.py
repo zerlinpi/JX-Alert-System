@@ -180,7 +180,7 @@ def global_question_cards(db, settings, question, snapshots, matched_ids, *, now
     topic = question_topic(q)
     cards = [value for value, _ in morning_cards(db, settings, ready, dates,
         send_day=send_day, now=clock,
-        target_dates=targets, warnings=warnings)] if ready else []
+        target_dates=targets, warnings=warnings, include_business=topic != 'ads')] if ready else []
     if topic == 'ads':
         cards = [v for v in cards if not v['header']['title']['content'].startswith('店铺绩效')]
     if len(ready) < len(stores):
@@ -225,7 +225,7 @@ def focus_question(context, data_card, question):
     value['body']['elements'] = result
     if topic == 'health':
         for key in ('advertising_kpis', 'advertising_totals', 'ad_detail_coverage', 'campaigns', 'screening_candidates',
-                    'sales_and_spend', 'coverage', 'data_warning', 'report_date_warning'):
+                    'sales_and_spend', 'coverage', 'data_warning', 'report_date_warning', 'business_daily', 'analysis_evidence'):
             context.pop(key, None)
     elif topic == 'ads':
         context.pop('health', None)

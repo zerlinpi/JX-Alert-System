@@ -137,26 +137,49 @@ def health_notice_summary(db, store, snapshot):
     elif snapshot['notice_freshness_status'] == 'FRESH':
         label = '未见待处理违规通知'
     else:
-        label = '归档未见待处理通知，时效待确认'
+        # An empty, undated archive is not a useful positive assurance. The
+        # page-level scope note preserves that distinction without boilerplate
+        # for every store.
+        label = None
+    relevant = violations or notices
+    if relevant:
+        subjects = list(dict.fromkeys(re.sub(r'\s+', ' ', n.subject or '').strip()[:60]
+                                     for n in relevant if (n.subject or '').strip()))
+        if subjects:
+            label += '：' + '；'.join(subjects[:2])
     return label
 
 
 def morning_health_row(db, settings, store, *, now=None):
     health = store_health_snapshot(db, store, settings, now=now)
-    quiet = getattr(settings, 'feishu_quiet_delivery_enabled', False)
-    observed = health['source_status_label'] + '（源观测）'
-    summary = f"健康评分：{number(health['ahr_score'])}\n{observed}\n当前判定：{health['status_label']}"
-    attention = [health_notice_summary(db, store, health)]
+    notice = health_notice_summary(db, store, health)
+    archived_notice = ('\n' + notice) if notice and health['pending_notice_observations'] else ''
+    # Keep operational blockers once, with the action that can resolve them.
+    # Old observations must not obscure a store whose authorization now fails.
+    if health['status'] == 'AUTHORIZATION_FAILED':
+        return store.name, '店铺授权失效', '在领星重新授权' + archived_notice
+    if health['status'] == 'INACTIVE':
+        return store.name, ('领星欠费停服' if store.status == 3 else '领星已停止同步'), '恢复同步后复核' + archived_notice
+    if health['status'] == 'NO_DATA':
+        return store.name, ('绩效采集失败' if health['freshness_status'] == 'FAILED' else '未取得绩效数据'), '同步绩效后复核' + archived_notice
+
+    observed = []
+    if health['ahr_score'] is not None:
+        observed.append(f"评分 {number(health['ahr_score'])}")
+    if health['source_status_label'] not in {'未提供', '未识别', '不适用'}:
+        observed.append(health['source_status_label'])
+    summary = ' · '.join(observed) or '评级未提供'
+    if health['status'] != 'HEALTHY':
+        summary += '（观测）'
+    attention = [notice] if notice else []
     for indicator in health['indicators']:
         if indicator['status'] in {'BREACHED', 'AT_THRESHOLD'}:
-            attention.append(f"{indicator['label']} {indicator['value']:g}%（标准 {indicator['standard']:g}%）")
-    if not quiet and any(item['status'] == 'INSUFFICIENT_DATA' for item in health['indicators']):
-        attention.append('部分绩效指标待补齐')
-    reason = health['confirmation_reason']
-    if quiet and health['freshness_status'] == 'NOT_CONFIGURED' and health['status'] == 'UNCONFIRMED':
-        reason = '时效待确认'
-    freshness = (health['source_updated_at'] or '未提供源更新时间') + '\n' + reason
-    return store.name, summary, '\n'.join(attention), freshness
+            boundary = '，达到边界' if indicator['status'] == 'AT_THRESHOLD' else ''
+            attention.append(f"{indicator['label']} {indicator['value']:g}%（标准 {indicator['standard']:g}%{boundary}）")
+    issue = {'STALE': '绩效更新滞后', 'FUTURE': '绩效源时间异常', 'FAILED': '绩效采集失败'}.get(health['freshness_status'])
+    if issue:
+        attention.append(issue)
+    return store.name, summary, '\n'.join(attention) or '—'
 
 
 def _health_chunks(db, settings, stores, send_day, now):
@@ -165,9 +188,13 @@ def _health_chunks(db, settings, stores, send_day, now):
     while offset < len(rows):
         size = min(10, len(rows) - offset)
         while size:
-            value = card(f'店铺绩效与违规快报 · {send_day}', subtitle='账户观测与待处理事项',
-                sections=[('店铺绩效', ['店铺', '健康概况', '违规与绩效关注', '源时间与依据'],
-                    [r[1] for r in rows[offset:offset + size]])])
+            batch = [r[1] for r in rows[offset:offset + size]]
+            notes = []
+            if any('（观测）' in row[1] for row in batch):
+                notes.append('观测值未确认当前健康；违规仅列已归档待处理项。')
+            value = card(f'店铺绩效与违规快报 · {send_day}', subtitle='账户绩效与需处理事项',
+                sections=[('店铺绩效', ['店铺', '绩效观测', '待办与风险'],
+                    batch)], notes=notes)
             if card_fits(value):
                 break
             size -= 1
@@ -191,10 +218,32 @@ def select_morning_dates(db, stores, dates, warnings=None, history_allowed=None)
     return actual, warnings
 
 
+def _business_chunks(db, settings, stores, dates, warnings, target_dates):
+    from jx_alert.notifications.business_daily import business_daily_card
+
+    chunks = []
+    for store in stores:
+        actual = _date(dates[store.sid])
+        target = _date((target_dates or dates)[store.sid])
+        value = business_daily_card(db, store, actual, settings=settings,
+                                    data_warning=(warnings or {}).get(store.sid))
+        if value is None:
+            continue
+        if actual != target:
+            value['body']['elements'].append({'tag': 'markdown',
+                'content': f'目标报表日 {target}；展示历史报表日 {actual}。'})
+        if not card_fits(value):
+            raise ValueError('Morning business report exceeds the card limit')
+        chunks.append((value, [store.sid]))
+    return chunks
+
+
 def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=None, target_dates=None,
-                  include_quality=True):
-    """Return full requested health coverage, plus SP exception pages only."""
+                  include_quality=True, include_business=True):
+    """Return health, verified business reports, then material SP exceptions."""
     chunks = _health_chunks(db, settings, stores, send_day, now)
+    if include_business:
+        chunks.extend(_business_chunks(db, settings, stores, dates, warnings, target_dates))
     pending = []
     for store in stores:
         target = _date((target_dates or dates)[store.sid])
@@ -254,7 +303,8 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
             for index, (value, store_ids) in enumerate(chunks):
                 title = plain(value['header']['title']['content'])
                 kind = ('health' if title.startswith('店铺绩效与违规快报') else
-                        'ad_exception' if title == '商品推广活动待复核' else 'data_quality')
+                        'ad_exception' if title == '商品推广活动待复核' else
+                        'business_daily' if '经营日报' in title else 'data_quality')
                 row = NotificationOutbox(idempotency_key=prefix + str(index), chat_id=chat_id,
                     next_attempt_at=due.astimezone(timezone.utc).replace(tzinfo=None), payload={
                         'text': title, 'store_ids': store_ids,
