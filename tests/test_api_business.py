@@ -186,3 +186,47 @@ def test_api_backfill_runs_without_mcp_and_exports_both_exact_dates(warehouse, m
     assert result['status'] == 'COMPLETE'
     assert archived == [{'5174': ['2026-11-15', '2026-11-16']}]
     assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+
+
+def test_later_api_initialization_failure_does_not_leave_old_success_coverage_visible(warehouse):
+    db, store, settings = warehouse
+    collect(db, settings, Client())
+    before = db.scalar(select(func.count()).select_from(DailyMetric))
+    result = collect(db, settings, None)
+    context = api.api_business_context(db, store.sid, DAY)
+    assert result['status'] == 'PARTIAL_FAILED' and len(result['failures']) == 4
+    assert context['product'] == {} and context['settlement'] == {}
+    assert context['availability'] == {'product': 'FAILED', 'settlement': 'FAILED'}
+    assert db.scalar(select(func.count()).select_from(DailyMetric)) == before
+    assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+
+
+def test_mcp_only_backfill_never_initializes_api_and_does_not_restore_cached_authorization(warehouse, monkeypatch):
+    db, store, settings = warehouse
+    spec = importlib.util.spec_from_file_location('mcp_business_backfill', Path(__file__).parents[1] / 'scripts/backfill_business.py')
+    backfill = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backfill)
+    monkeypatch.setattr(backfill, 'get_settings', lambda: settings)
+    monkeypatch.setattr(backfill.LingxingClient, 'from_settings', lambda: pytest.fail('MCP-only cannot depend on OpenAPI'))
+    monkeypatch.setattr(backfill, 'engine', db.get_bind())
+    monkeypatch.setattr(backfill, 'SessionLocal', lambda: Session(db.get_bind()))
+    monkeypatch.setattr(backfill, 'collect_api_business_for_day', lambda *args: pytest.fail('No API call requested'))
+    monkeypatch.setattr(backfill, 'collect_business_for_day', lambda *args: {'status': 'COMPLETE', 'partitions': []})
+    monkeypatch.setattr(backfill, 'archive_partitions', lambda *args: {'status': 'COMPLETE'})
+    result = backfill.backfill(DAY, 'mcp', ['5174'])
+    assert result['status'] == 'COMPLETE' and result['cached_store_identity'] is True
+    assert db.get(Store, store.sid).status == 1
+    assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+
+
+def test_metadata_record_without_metric_fields_cannot_be_reported_as_available(warehouse):
+    db, store, settings = warehouse
+    class MissingFields(Client):
+        def product_performance_daily(self, sid, day, **kwargs):
+            return {'data': {'total': 1, 'list': [{'sids': [5174],
+                'asins': [{'sid': 5174, 'asin': 'A'}], 'currency_code': 'USD'}]}}
+    collect(db, settings, MissingFields())
+    context = api.api_business_context(db, store.sid, DAY)
+    assert context['availability']['product'] == 'FIELDS_UNAVAILABLE'
+    assert context['product'] == {}
+    assert context['availability']['settlement'] == 'AVAILABLE'
