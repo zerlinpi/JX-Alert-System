@@ -85,7 +85,7 @@ def _fetch(client, sid, day, dimension, raw=None):
 def collect_api_business_for_day(client, db, settings, stores_response, report_dates):
     """No notices or business alerts; optional source failure stays isolated."""
     client = getattr(client, "api", client)
-    if client is None or not all(hasattr(client, name) for name in ("product_performance_daily", "profit_report_daily")):
+    if client is not None and not all(hasattr(client, name) for name in ("product_performance_daily", "profit_report_daily")):
         return {"status": "UNAVAILABLE", "partitions": [], "failures": []}
     partitions, failures = [], []
     for store in stores_response["data"]:
@@ -100,6 +100,8 @@ def collect_api_business_for_day(client, db, settings, stores_response, report_d
                     break
                 raw = []
                 try:
+                    if client is None:
+                        raise LingxingError("OpenAPI source is unavailable")
                     rows, raw = _fetch(client, sid, day, dimension, raw)
                     db.add(RawSnapshot(source=SOURCE, store_id=sid, payload={"dimension": dimension,
                         "report_date": day, "responses": raw, "status": "COMPLETE"}))
@@ -130,10 +132,12 @@ def collect_api_business_for_day(client, db, settings, stores_response, report_d
 
 def api_business_context(db, sid, on):
     day = date.fromisoformat(on) if isinstance(on, str) else on
-    result = {"report_date": day.isoformat(), "product": {}, "settlement": {}}
+    result = {"report_date": day.isoformat(), "product": {}, "settlement": {}, "availability": {}}
     for dimension, name in ((PRODUCT, "product"), (FINANCE, "settlement")):
         covered = db.scalar(select(DataCoverage).where(DataCoverage.store_id == str(sid),
             DataCoverage.metric_date == day, DataCoverage.dimension == dimension))
+        result["availability"][name] = ("MISSING" if covered is None else "FAILED" if covered.status != "COMPLETE"
+                                       else "EMPTY" if not covered.row_count else "FIELDS_UNAVAILABLE")
         if covered is None or covered.status != "COMPLETE" or not covered.row_count:
             continue
         rows = list(db.scalars(select(DailyMetric).where(DailyMetric.store_id == str(sid),
@@ -151,4 +155,6 @@ def api_business_context(db, sid, on):
                 values[key] = math.fsum(r.value for r in facts)
         result[name] = {"currency": currency, "metrics": values,
             "basis": "产品表现，下单日" if dimension == PRODUCT else "利润报表，结算日，已发放"}
+        if values:
+            result["availability"][name] = "AVAILABLE"
     return result

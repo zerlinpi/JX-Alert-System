@@ -2,6 +2,7 @@
 import argparse
 from datetime import date, datetime, timedelta, timezone
 import json
+import re
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, func
@@ -14,7 +15,7 @@ from jx_alert.operations import scoped_stores
 from jx_alert.reporting.archive import archive_partitions
 from jx_alert.storage.db import SessionLocal, engine
 from jx_alert.storage.job_lock import database_job_lock
-from jx_alert.storage.models import RawSnapshot, SyncJob
+from jx_alert.storage.models import RawSnapshot, SyncJob, Store
 from jx_alert.storage.raw_archive import archive_raw_snapshots
 from jx_alert.store_controls import collection_states
 
@@ -30,8 +31,22 @@ def backfill(report_date, source, store_ids=None):
     if settings.app_dry_run:
         return {'status': 'DRY_RUN'}
     with database_job_lock(engine), SessionLocal() as db:
-        client = LingxingClient.from_settings()
-        inventory = scoped_stores(client.get_stores(), settings.collection_scope_file, allow_missing=True)
+        client, inventory, api_error = None, None, None
+        if source in {'api', 'both'}:
+            try:
+                client = LingxingClient.from_settings()
+                inventory = client.get_stores()
+            except Exception as exc:
+                client = None
+                code = re.search(r'(?:code|status)[=:]\s*([0-9-]+)', str(exc))
+                api_error = {'error_type': type(exc).__name__, 'provider_code': code.group(1) if code else None}
+        cached_identity = inventory is None
+        if inventory is None:
+            # Cached identity only selects an existing scope. MCP still checks
+            # its actual visible stores; this path never evaluates auth events.
+            inventory = {'data': [{'sid': r.sid, 'name': r.name, 'status': r.status}
+                for r in db.scalars(select(Store))]}
+        inventory = scoped_stores(inventory, settings.collection_scope_file, allow_missing=True)
         enabled = collection_states(settings, [str(row['sid']) for row in inventory['data']])
         selected = [row for row in inventory['data'] if int(row.get('status') or 0) == 1
                     and enabled.get(str(row['sid'])) and (not store_ids or str(row['sid']) in store_ids)]
@@ -44,7 +59,10 @@ def backfill(report_date, source, store_ids=None):
         db.commit()
         job_id = job.id
         before = db.scalar(select(func.max(RawSnapshot.id))) or 0
-        result = {'report_date': report_date, 'source': source, 'store_count': len(selected)}
+        result = {'report_date': report_date, 'source': source, 'store_count': len(selected),
+                  'cached_store_identity': cached_identity}
+        if api_error:
+            result['api_initialization_error'] = api_error
         try:
             stores = {**inventory, 'data': selected}
             if source in {'api', 'both'}:
@@ -80,7 +98,10 @@ if __name__ == '__main__':
     parser.add_argument('--store-id', action='append', dest='store_ids')
     args = parser.parse_args()
     try:
-        print(json.dumps(backfill(args.report_date, args.source, args.store_ids), ensure_ascii=False))
+        result = backfill(args.report_date, args.source, args.store_ids)
+        print(json.dumps(result, ensure_ascii=False))
+        if result.get('status') in {'PARTIAL_FAILED', 'FAILED'}:
+            raise SystemExit(2)
     except Exception as exc:
         print(json.dumps({'status': 'FAILED', 'error_type': type(exc).__name__}))
         raise SystemExit(1) from None
