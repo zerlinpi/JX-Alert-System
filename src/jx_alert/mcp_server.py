@@ -273,7 +273,7 @@ def system_health() -> dict:
         "lingxing_performance_mcp_configured": bool(
             settings.lingxing_mcp_url and settings.lingxing_mcp_key.get_secret_value()
         ),
-        "lingxing_business_dashboard_configured": Path(settings.lingxing_business_credentials_file).is_file(),
+        "lingxing_business_dashboard_configured": Path(getattr(settings, "lingxing_business_credentials_file", "")).is_file(),
         "lingxing_token_mode": token_mode,
         "feishu_enabled": settings.feishu_enabled,
         "feishu_webhook_configured": bool(settings.feishu_webhook_url),

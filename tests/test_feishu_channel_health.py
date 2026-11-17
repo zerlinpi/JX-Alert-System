@@ -101,6 +101,7 @@ def test_system_health_survives_database_failure_and_reports_selected_channel(tm
     monkeypatch.setattr(mcp_server, "get_settings", lambda: config)
     monkeypatch.setattr(mcp_server, "init_db", lambda: (_ for _ in ()).throw(RuntimeError("private-db-error")))
     result = mcp_server.system_health()
+    assert result["lingxing_business_dashboard_configured"] is False
     assert result["database"] == "unavailable"
     assert not result["feishu_webhook_configured"] and result["feishu_transport_configured"]
     assert result["feishu_transport"] == "app"
