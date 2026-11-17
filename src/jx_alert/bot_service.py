@@ -588,8 +588,8 @@ def _intraday_context(db, settings, sid, question):
         raise QuestionDateError('请先在后台配置店铺报表时区，再查询今日观测。') from None
     snapshot = latest_observation(db, sid, day)
     source_rows = snapshot.payload.get('rows', []) if snapshot else []
-    campaigns = []
-    for row in source_rows[:5]:
+    observed = []
+    for row in source_rows:
         item = {'name': str(row.get('campaign_name') or row.get('campaign_id'))[:100],
                 'currency': row.get('confirmed_currency')}
         for key in ('cost', 'orders', 'clicks', 'impressions'):
@@ -603,13 +603,23 @@ def _intraday_context(db, settings, sid, question):
             if math.isfinite(value) and value >= 0:
                 if key != 'cost' or re.fullmatch(r'[A-Z]{3}', item['currency'] or ''):
                     item[key] = value
-        campaigns.append(item)
+        observed.append(item)
+    campaigns = observed[:5]
+    codes = {item.get('currency') for item in observed}
+    currency = next(iter(codes)) if len(codes) == 1 else None
+    totals = {}
+    for field in ('cost', 'orders', 'clicks', 'impressions'):
+        if observed and all(field in item for item in observed):
+            if field != 'cost' or re.fullmatch(r'[A-Z]{3}', currency or ''):
+                totals[field] = math.fsum(item[field] for item in observed)
     context = {'operator_compact': True, 'intraday_report': True, 'reply_mode': reply_mode(question),
         'store_id': sid, 'store_name': store.name, 'report_date': day, 'requested_report_date': day,
         'date_selection': 'INTRADAY_OBSERVATION', 'report_date_is_complete': False,
         'timezone_confirmed': True, 'date_basis': 'marketplace_local_intraday_observation',
         'intraday_observation': {'observation_only': True, 'campaign_count': len(source_rows),
-            'campaigns': campaigns, 'captured_at_utc': snapshot.captured_at.isoformat() if snapshot else None,
+            'campaigns': campaigns, 'displayed_campaign_count': len(campaigns),
+            'campaigns_truncated': len(campaigns) < len(observed), 'totals': totals, 'currency': currency,
+            'captured_at_utc': snapshot.captured_at.isoformat() if snapshot else None,
             'availability': snapshot.payload.get('availability') if snapshot else 'NOT_COLLECTED'}}
     return context, observation_card(context)
 

@@ -207,3 +207,27 @@ def test_actual_dual_source_fallback_flushes_only_raw_observations(warehouse):
         assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
         sources = set(db.scalars(select(RawSnapshot.source)))
         assert {"lingxing_mcp_campaign_sp", "lingxing_source_selection", observation.SOURCE} <= sources
+
+
+@pytest.mark.parametrize('bad_field', [None, 'currency', 'orders'])
+def test_model_receives_complete_totals_even_when_activity_details_are_limited(warehouse, monkeypatch, bad_field):
+    from jx_alert import bot_service
+    settings, sessions = warehouse
+    monkeypatch.setattr(bot_service, '_utcnow', lambda: NOW)
+    rows = [{'campaign_id': str(i), 'campaign_name': f'Campaign{i}', 'cost': 10.0,
+             'orders': 1, 'clicks': 3, 'impressions': 100, 'confirmed_currency': 'USD'} for i in range(8)]
+    if bad_field == 'currency':
+        rows[-1]['confirmed_currency'] = None
+    elif bad_field == 'orders':
+        rows[-1]['orders'] = None
+    with sessions() as db:
+        db.add(RawSnapshot(source=observation.SOURCE, store_id='5174', captured_at=NOW.replace(tzinfo=None),
+            payload={'observation_date': DAY, 'availability': 'AVAILABLE', 'rows': rows}))
+        db.commit()
+        context, _ = bot_service._intraday_context(db, settings, '5174', '今天广告花费和点击')
+        obs = context['intraday_observation']
+        assert obs['campaign_count'] == 8 and len(obs['campaigns']) == 5
+        assert obs['campaigns_truncated'] is True and obs['displayed_campaign_count'] == 5
+        assert obs['totals']['clicks'] == 24 and obs['totals']['impressions'] == 800
+        assert obs['totals'].get('cost') == (None if bad_field == 'currency' else 80)
+        assert obs['totals'].get('orders') == (None if bad_field == 'orders' else 8)
