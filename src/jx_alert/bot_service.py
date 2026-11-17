@@ -6,7 +6,7 @@ import math
 import re
 import time
 import unicodedata
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import func, select
 
@@ -349,10 +349,20 @@ def _collection_command(question):
             r"不要|不用|不必|禁止|取消|停止|别|只看|仅查看|不采集|是否|能否|可以吗|"
             r"如何|怎么|说明|例如|示例|演示|假设|引用|写出|输出|解释|什么|意思|吗|为何|是不是|能不能|可不可以", question):
         return None
+    intraday = re.search(r"今日|今天|盘中|截至现在|截止现在", question)
+    if intraday and re.search(_COLLECTION_VERB + r"|更新|刷新|拉取|重新获取|同步", question):
+        stripped = re.sub(r"今日|今天|盘中|截至现在|截止现在", "", question)
+        parsed = _collection_command(stripped)
+        if parsed and parsed[0] in {"request", "name_request"}:
+            return "intraday_request", parsed[1]
     natural = re.fullmatch(r'(?:请(?:帮我)?|麻烦(?:帮我)?|帮我)?\s*(?:更新|刷新|拉取|重新获取|手动同步|同步)'
         r'(?:一下)?\s*(.+?)(?:的)?(?:最新|今日|今天的?)?数据(?:\s*(?:再|并|然后)(?:做)?(?:分析|看看))?[。！!]?\s*', question)
     if natural:
         return 'name_request', natural[1].strip(' 的')
+    suffix = re.fullmatch(r'(.+?)(?:店铺)?(?:的)?(?:数据)?\s*(?:刷新|同步|更新|实时采集|重新采集|立即采集)'
+                          r'(?:一下)?(?:数据)?[。！!]?\s*', question)
+    if suffix:
+        return 'name_request', suffix[1].strip(' 的')
     status = _COLLECTION_STATUS.fullmatch(question)
     if status:
         return "status", int(status[1])
@@ -396,7 +406,12 @@ def _collection_status_card(db, job, sid):
             state = "等待重试"
     # A follow-up can read the same report day that this job actually completed.
     report_date = (args.get("completed_store_dates") or {}).get(sid)
-    subtitle = f"报表日 {report_date}。可继续查询店铺数据。" if report_date else "可发送店铺名加“采集进度”查询。"
+    intraday = job.job_type == "intraday_observation"
+    if intraday:
+        report_date = args.get("observation_date")
+    subtitle = (f"{report_date} 商品推广广告盘中观测，不作为完整日报或最终转化判断。" if intraday else
+                f"报表日 {report_date}。可继续查询店铺数据。" if report_date else
+                "重新获取最新可用数据，日报按美国太平洋时间已结束日；不会额外发群消息。")
     store = db.get(Store, sid)
     return card("采集任务状态", subtitle=subtitle,
                 sections=[("任务", ["店铺", "站点", "进度"],
@@ -418,7 +433,7 @@ def _lookup_collection(db, settings, meta, collection_id):
     if receipt is not None:
         sid = receipt.metadata_json.get("collection_store_id")
         job = db.get(SyncJob, collection_id)
-        if (sid and job is not None and job.job_type == "manual_collection"
+        if (sid and job is not None and job.job_type in {"manual_collection", "intraday_observation"}
                 and (job.metadata_json or {}).get("store_ids") == [sid]
                 and _collection_permission(settings, meta, sid)):
             try:
@@ -442,14 +457,18 @@ def _lookup_store_collection(db, settings, meta, sid):
     return card("未找到可查询的采集任务", subtitle="当前会话没有该店铺的历史采集回执，最新同步进度请在后台查看。", sections=[])
 
 
-def _complete_question(db, settings, job_id, meta, cards, provider):
+def _complete_question(db, settings, job_id, meta, cards, provider, *, discard_collection=None):
     try:
+        if provider == 'collection_request' and not _collection_permission(settings, meta, meta['collection_store_id']):
+            raise QuestionAccessChanged('Private collection permission changed')
         if meta.get('reply_store_ids'):
             allowed = {s['store_id'] for s in health_brief_snapshots(db, settings)['stores']}
             if not set(meta['reply_store_ids']) <= allowed:
                 raise QuestionAccessChanged('Question stores left the allowed scope')
         response_ids = _reply(db, settings, meta["message_id"], meta["chat_id"], cards, question_meta=meta)
     except QuestionAccessChanged:
+        if discard_collection is not None:
+            db.delete(discard_collection)
         job = db.get(SyncJob, job_id)
         job.status, job.finished_at = "SKIPPED", _utcnow().replace(tzinfo=None)
         job.error_message = "会话或读取权限已变更，本次未回复。"
@@ -463,7 +482,7 @@ def _complete_question(db, settings, job_id, meta, cards, provider):
 
 
 def _process_collection_command(db, settings, job_id, meta, command):
-    """Retain legacy status reads, but no chat question may enqueue collection."""
+    """Explicit authorized private requests enqueue fixed read-only collection."""
 
     action, value = command
     if action == "status":
@@ -478,9 +497,55 @@ def _process_collection_command(db, settings, job_id, meta, command):
         value = ids[0]
         reply = _lookup_store_collection(db, settings, meta, value)
         return _complete_question(db, settings, job_id, meta, [reply], "collection_status")
-    reply = card("机器人仅提供数据分析",
-        subtitle="如需采集最新数据，请在后台使用“同步”按钮。机器人不会发起采集或修改数据。", sections=[])
-    return _complete_question(db, settings, job_id, meta, [reply], "readonly_request")
+    if meta.get("chat_type", "group") != "p2p":
+        reply = card("机器人仅提供数据分析",
+            subtitle="实时采集请由店铺负责人或管理员私聊机器人，或在后台同步。", sections=[])
+        return _complete_question(db, settings, job_id, meta, [reply], "readonly_request")
+    snapshots, ids = _resolve_store(db, settings, str(value or ""))
+    multiple = re.search(r"和|以及|还有|及|与|同时|并且|(?<![a-z])and(?![a-z])", _name_text(str(value or "")))
+    if action == "clarify" or len(ids) != 1 or multiple:
+        reply = _store_clarification(snapshots, ids, collection=True)
+        return _complete_question(db, settings, job_id, meta, [reply], "store_clarification")
+    sid = ids[0]
+    if not _collection_permission(settings, meta, sid):
+        reply = card("暂无该店铺采集权限", subtitle="请由已映射的店铺负责人或管理员发起。", sections=[])
+        return _complete_question(db, settings, job_id, meta, [reply], "collection_denied")
+    if (settings.app_dry_run or not settings.scheduler_enabled or not settings.mcp_operations_enabled):
+        reply = card("采集服务未开启", subtitle="请在后台核实采集服务后重试。", sections=[])
+        return _complete_question(db, settings, job_id, meta, [reply], "collection_blocked")
+    from jx_alert.operations import enqueue_collection, CollectionConfigurationError, CollectionBlocked
+    created = None
+    try:
+        with database_job_lock(db.get_bind(), "collection_enqueue"):
+            if not _collection_permission(settings, meta, sid):
+                raise CollectionBlocked("COLLECTION_PERMISSION_CHANGED")
+            if action == "intraday_request":
+                from jx_alert.lingxing.intraday_observation import enqueue_observation
+                result = enqueue_observation(db, settings, sid, now=_utcnow())
+            else:
+                result = enqueue_collection(db, store_ids=[sid], backfill_days=1)
+            if not result.get("reused"):
+                created = db.get(SyncJob, result["job_id"])
+                created.metadata_json = {**(created.metadata_json or {}), "private_request": {
+                    key: meta[key] for key in ("chat_type", "chat_id", "message_id", "sender_id")}}
+            # Keep action and receipt atomic; revoked conversation access cannot
+            # commit a newly queued job merely because its reply was skipped.
+            if not validate_question_delivery(settings, _question_delivery(settings, meta)):
+                if created is not None:
+                    db.delete(created)
+                raise QuestionAccessChanged("Private collection access changed")
+            meta.update(collection_job_id=result["job_id"], collection_store_id=sid)
+            job = db.get(SyncJob, result["job_id"])
+            reply = _collection_status_card(db, job, sid)
+            return _complete_question(db, settings, job_id, meta, [reply], "collection_request",
+                                      discard_collection=created)
+    except (CollectionConfigurationError, JobAlreadyRunning) as exc:
+        reason = (_COLLECTION_BLOCK_REASONS.get(exc.status, "当前条件不允许采集，请在后台核实店铺配置。")
+                  if isinstance(exc, CollectionBlocked) else
+                  "采集正在登记，请稍后重试。" if isinstance(exc, JobAlreadyRunning) else
+                  "采集配置待核实，请在后台检查店铺范围和报表日期。")
+        reply = card("本次未开始采集", subtitle=reason, sections=[])
+        return _complete_question(db, settings, job_id, meta, [reply], "collection_blocked")
 
 
 def _ad_totals(db, store_id, on):
@@ -510,6 +575,43 @@ def _ad_totals(db, store_id, on):
                     item[metric] = None
         totals.append(item)
     return totals
+
+
+def _intraday_context(db, settings, sid, question):
+    """A separate read surface; current-day raw values never enter daily facts."""
+    from jx_alert.lingxing.intraday_observation import latest_observation
+    from jx_alert.bot_presentation import observation_card, reply_mode
+    store = db.get(Store, sid)
+    try:
+        day = _utcnow().astimezone(ZoneInfo(store.timezone)).date().isoformat()
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        raise QuestionDateError('请先在后台配置店铺报表时区，再查询今日观测。') from None
+    snapshot = latest_observation(db, sid, day)
+    source_rows = snapshot.payload.get('rows', []) if snapshot else []
+    campaigns = []
+    for row in source_rows[:5]:
+        item = {'name': str(row.get('campaign_name') or row.get('campaign_id'))[:100],
+                'currency': row.get('confirmed_currency')}
+        for key in ('cost', 'orders', 'clicks', 'impressions'):
+            value = row.get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value >= 0:
+                if key != 'cost' or re.fullmatch(r'[A-Z]{3}', item['currency'] or ''):
+                    item[key] = value
+        campaigns.append(item)
+    context = {'operator_compact': True, 'intraday_report': True, 'reply_mode': reply_mode(question),
+        'store_id': sid, 'store_name': store.name, 'report_date': day, 'requested_report_date': day,
+        'date_selection': 'INTRADAY_OBSERVATION', 'report_date_is_complete': False,
+        'timezone_confirmed': True, 'date_basis': 'marketplace_local_intraday_observation',
+        'intraday_observation': {'observation_only': True, 'campaign_count': len(source_rows),
+            'campaigns': campaigns, 'captured_at_utc': snapshot.captured_at.isoformat() if snapshot else None,
+            'availability': snapshot.payload.get('availability') if snapshot else 'NOT_COLLECTED'}}
+    return context, observation_card(context)
 
 
 class QuestionDateError(ValueError):
@@ -651,15 +753,18 @@ def question_context(db, settings, store_id, *, now=None, question=None):
     from jx_alert.analysis.materiality import POLICY
     from jx_alert.ai.analyst_evidence import analyst_question, analysis_evidence
     from jx_alert.notifications.business_daily import business_daily_context, business_daily_card
+    from jx_alert.lingxing.source_gateway import source_observations
     evidence = (analysis_evidence(db, store, target, question, completed=completed)
                 if analyst_question(question) else None)
-    business = business_daily_context(db, store_id, target) if not warning else {
+    business_allowed = target <= completed and store.status == 1
+    business = business_daily_context(db, store_id, target) if business_allowed else {
         "report_date": target.isoformat(), "availability": "UNAVAILABLE", "metrics": [], "reason": warning}
     from jx_alert.bot_intents import question_topic
     business_card = (business_daily_card(db, store, target, settings=settings)
-        if not warning and question_topic(question or '') != 'health'
+        if business_allowed and question_topic(question or '') != 'health'
         and re.search(r'日报|经营快报|经营报告', question or '') else None)
     return {"analysis_evidence": evidence, "business_daily": business,
+        "source_observations": source_observations(db, store_id, target),
         "business_daily_report": business_card is not None,
         "notification_policy": POLICY if getattr(settings, "alert_materiality_enabled", False) else {},
         "store_id": store_id, "store_name": store.name, "country": store.country,
@@ -685,7 +790,7 @@ def _answer_cards(context, data_card, analysis):
     if context.get('operator_compact'):
         from jx_alert.bot_presentation import operator_card
         cards = ([] if context.get('reply_mode') == 'answer' else
-            [data_card if context.get('business_daily_report') else operator_card(context)])
+            [data_card if context.get('business_daily_report') or context.get('intraday_report') else operator_card(context)])
         if analysis:
             value = card('店铺回复', subtitle=context['store_name'], sections=[])
             value['body']['elements'].append({'tag': 'markdown', 'content': html.escape(analysis, quote=False)})
@@ -799,8 +904,14 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                 cards, provider = [value], "store_clarification"
             else:
                 try:
-                    context, data_card = question_context(db, settings, ids[0], question=meta["question"])
-                    context, data_card = focus_question(context, data_card, meta['question'])
+                    daily_delivery = re.search(r'(?:今日|今天).{0,4}日报|日报.{0,4}(?:今日|今天)', meta['question'])
+                    if (re.search(r'今日|今天|盘中|实时|截至现在|截止现在', meta['question'])
+                            and re.search(r'广告|推广|花费|点击|曝光|转化|sp\b', meta['question'], re.I)
+                            and (not daily_delivery or re.search(r'盘中|实时|截至|截止|未结束', meta['question']))):
+                        context, data_card = _intraday_context(db, settings, ids[0], meta['question'])
+                    else:
+                        context, data_card = question_context(db, settings, ids[0], question=meta["question"])
+                        context, data_card = focus_question(context, data_card, meta['question'])
                 except QuestionDateError as exc:
                     cards = [card("请确认报表日期", subtitle=str(exc), sections=[])]
                     provider = "date_clarification"

@@ -590,7 +590,7 @@ def test_all_store_analysis_respects_an_explicit_date_and_blocks_unfinished_date
     ('帮我更新Geteen美国的数据再分析', ('name_request', 'Geteen美国')),
     ('请刷新一下Geteen美国最新数据', ('name_request', 'Geteen美国')),
     ('请同步Geteen美国最新数据', ('name_request', 'Geteen美国')),
-    ('手动同步Geteen美国今日数据', ('name_request', 'Geteen美国')),
+    ('手动同步Geteen美国今日数据', ('intraday_request', 'Geteen美国')),
     ('不要同步Geteen美国最新数据', None),
     ('如何同步Geteen美国今日数据', None),
     ('不要更新Geteen美国数据', None), ('如何更新Geteen美国数据', None),
@@ -1255,10 +1255,13 @@ def test_private_realtime_collection_keeps_existing_store_role_requirement(wareh
     assert result["status"] == "QUEUED" and FakeClient.calls == []
     with warehouse[1]() as db:
         jobs = list(db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")))
-        assert len(jobs) == 0
-    assert "机器人仅提供数据分析" in _collection_receipt(warehouse, result)
+        assert len(jobs) == (0 if role == "other" else 1)
     if role == "other":
-        assert "机器人仅提供数据分析" in _collection_receipt(warehouse, result)
+        assert "暂无该店铺采集权限" in _collection_receipt(warehouse, result)
+    else:
+        text = _collection_receipt(warehouse, result)
+        assert "等待采集" in text and "已结束日" in text
+        assert "发送成功" not in text and "通知已发送" not in text
 
 
 def test_private_cache_is_not_shared_between_different_senders_even_with_same_chat(warehouse, monkeypatch):
@@ -1365,6 +1368,104 @@ def test_private_collection_receipt_is_bound_to_original_sender(warehouse, monke
     path.write_text(json.dumps(routing))
     enqueue(warehouse, private_event(f"采集任务{collection_id}状态", message_id="om_other_sender", sender="ou_second"))
     assert "未找到可查询的采集任务" in _collection_receipt(warehouse, process(warehouse))
+
+
+def test_explicit_private_refresh_reuses_inflight_job_and_replies_only_to_original_private_message(warehouse, monkeypatch):
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch)
+    for index, question in enumerate(("请刷新Geteen美国最新数据", "Geteen美国刷新一下数据")):
+        enqueue(warehouse, private_event(question, message_id=f"om_refresh_{index}"))
+        answered = process(warehouse)
+        assert "等待采集" in _collection_receipt(warehouse, answered)
+        with warehouse[1]() as db:
+            for oid in answered["outbox_ids"]:
+                delivery = db.get(NotificationOutbox, oid).payload["delivery"]
+                assert delivery["role"] == "private_question" and delivery["receive_id"] == "oc_private"
+                assert delivery["reply_to_message_id"] == f"om_refresh_{index}"
+    with warehouse[1]() as db:
+        tasks = list(db.scalars(select(SyncJob).where(SyncJob.job_type == "manual_collection")))
+        assert len(tasks) == 1 and tasks[0].metadata_json["store_ids"] == ["5174"]
+    assert FakeClient.calls == []
+
+
+@pytest.mark.parametrize("condition,reason", [
+    ("paused", "采集开关已关闭"), ("authorization", "恢复该店铺"),
+    ("scheduler", "采集服务未开启"), ("operations", "采集服务未开启"),
+])
+def test_private_refresh_preserves_actual_collection_guards(warehouse, monkeypatch, condition, reason):
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch)
+    settings, sessions, _ = warehouse
+    if condition == "paused":
+        from jx_alert.store_controls import get_store_controls, save_store_controls
+        save_store_controls(settings, "5174", False, True, get_store_controls(settings, "5174")["revision"])
+    elif condition == "authorization":
+        with sessions.begin() as db:
+            db.get(Store, "5174").status = 2
+    elif condition == "scheduler":
+        settings.scheduler_enabled = False
+    else:
+        settings.mcp_operations_enabled = False
+    enqueue(warehouse, private_event("请刷新Geteen美国最新数据"))
+    reply = _collection_receipt(warehouse, process(warehouse))
+    assert reason in reply and "通知已发送" not in reply
+    with sessions() as db:
+        assert db.scalar(select(func.count()).select_from(SyncJob).where(SyncJob.job_type == "manual_collection")) == 0
+
+
+@pytest.mark.parametrize("phrase", ["实时采集今天Geteen美国", "同步Geteen美国今日数据", "Geteen美国今天实时采集"])
+def test_explicit_private_today_creates_only_observation_job_not_daily_analysis(warehouse, monkeypatch, phrase):
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch)
+    enqueue(warehouse, private_event(phrase))
+    reply = _collection_receipt(warehouse, process(warehouse))
+    assert "商品推广广告盘中观测" in reply and "不作为完整日报" in reply
+    with warehouse[1]() as db:
+        jobs = list(db.scalars(select(SyncJob).where(SyncJob.job_type == "intraday_observation")))
+        assert len(jobs) == 1 and jobs[0].metadata_json["observation_date"] == "2026-11-13"
+        assert jobs[0].metadata_json["private_request"]["sender_id"] == "ou_member"
+        assert db.scalar(select(func.count()).select_from(SyncJob).where(SyncJob.job_type == "manual_collection")) == 0
+    assert FakeClient.calls == []
+
+
+def test_private_collection_permission_is_rechecked_before_background_dispatch(warehouse, monkeypatch):
+    from jx_alert import operations
+    from jx_alert.storage import db as storage
+    from jx_alert import admin_mapping
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch)
+    enqueue(warehouse, private_event("实时采集Geteen美国"))
+    process(warehouse)
+    _enable_collection(warehouse, monkeypatch, role="other")
+    monkeypatch.setattr(admin_mapping, "_members", lambda *a: {"ou_member": "普通成员"})
+    monkeypatch.setattr(storage, "SessionLocal", warehouse[1])
+    monkeypatch.setattr(storage, "engine", warehouse[2])
+    monkeypatch.setattr(operations, "run_collection", lambda **kw: pytest.fail("Revoked role must not collect"))
+    result = operations.process_pending_collection()
+    assert result["status"] == "BLOCKED"
+    with warehouse[1]() as db:
+        job = db.get(SyncJob, result["job_id"])
+        assert job.metadata_json["result"]["reason"] == "COLLECTION_PERMISSION_CHANGED"
+
+
+def test_confirmed_mcp_business_report_survives_primary_api_daily_failure(warehouse):
+    from jx_alert.lingxing.business_dashboard import persist_business_cards
+    with warehouse[1]() as db:
+        persist_business_cards(db, "5174", DAY, {"code": 200, "data": {
+            "currencyCode": "USD", "current": {"volume": 20, "netAmount": 200, "platformIncome": 170,
+                "grossProfit": 30, "grossRate": 0.15, "totalAdsCostRate": -0.1, "totalRefundsRate": -0.02},
+            "chainCompareStartDate": (DAY - timedelta(days=1)).isoformat(),
+            "chainCompareEndDate": (DAY - timedelta(days=1)).isoformat(),
+            "chainCompare": {"volume": 10, "netAmount": 100, "platformIncome": 90,
+                "grossProfit": 15, "grossRate": 0.15, "totalAdsCostRate": -0.1, "totalRefundsRate": -0.02}}})
+        db.add(SyncJob(job_type="daily_collection", status="FAILED", metadata_json={"report_dates": {"5174": DAY.isoformat()}}))
+        db.commit()
+        context, value = bot_service.question_context(db, warehouse[0], "5174", question="Geteen美国日报")
+        assert context["data_warning"] and context["business_daily"]["availability"] == "AVAILABLE"
+        assert context["business_daily_report"] is True
+        assert "经营日报" in value["header"]["title"]["content"]
+        assert "$200.00" in json.dumps(value, ensure_ascii=False)
+        assert all(row["current_display"].startswith("未知") for row in context["sales_and_spend"])
 
 
 @pytest.mark.parametrize("missing_field", ["schema", "tenant"])

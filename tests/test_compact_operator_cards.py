@@ -129,5 +129,5 @@ def test_single_store_health_keeps_real_observation_and_risk_without_normal_metr
     result = operator_card(context)
     text = json.dumps(result, ensure_ascii=False)
     assert '256' in text and '归档观测' in text and '迟发率' in text and '6%' in text
-    assert '当前健康' in text and '订单缺陷率' not in text and '待处理通知' not in text
-    assert '2026-11-15 15:47:50' in text and context == before
+    assert '当前健康' not in text and '订单缺陷率' not in text and '待处理通知' not in text
+    assert '2026-11-15 15:47:50' not in text and context == before

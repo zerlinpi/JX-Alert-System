@@ -14,7 +14,8 @@ AD_METRICS = AD_REPORT_METRICS
 
 def collect_ads_for_day(client, db,
                         report_date: str | dict[str, str | list[str]], *,
-                        stores_response: dict | None = None, ad_currencies: dict | None = None) -> dict:
+                        stores_response: dict | None = None, ad_currencies: dict | None = None,
+                        report_types=("sp", "sb", "sd")) -> dict:
     """Fetch SP/SB/SD campaign reports for one or more store-local dates.
 
     The date map may contain a single ISO date or an ordered list per sid. The
@@ -46,7 +47,7 @@ def collect_ads_for_day(client, db,
 
         for local_report_date in local_report_dates:
             metric_date = date.fromisoformat(local_report_date)
-            for report_type in ("sp", "sb", "sd"):
+            for report_type in report_types:
                 payload = {
                     "sid": sid,
                     "report_date": local_report_date,

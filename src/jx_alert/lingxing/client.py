@@ -136,8 +136,11 @@ class LingxingClient:
     def from_settings(cls):
         from jx_alert.config import get_settings
         from jx_alert.lingxing.token import LingxingTokenProvider
-        settings = get_settings()
-        token = LingxingTokenProvider(settings).get_access_token()
+        provider = LingxingTokenProvider(get_settings())
+        # The token and signing identity must come from the same immutable
+        # credential snapshot, even if another process rotates the source now.
+        settings = provider.settings
+        token = provider.get_access_token()
         client = cls(
             base_url=settings.lingxing_base_url,
             app_id=settings.lingxing_app_id,

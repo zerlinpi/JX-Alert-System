@@ -6,7 +6,6 @@ from datetime import date, datetime, timedelta, timezone
 import argparse
 import hmac
 import json
-from pathlib import Path
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -238,7 +237,16 @@ def system_health() -> dict:
     配置就绪不等于消息已送达；实际送达查get_notification_logs。
     """
     from jx_alert.readiness import feishu_channel_status, group_bot_status
+    from jx_alert.lingxing.source_credentials import source_configuration, effective_api_settings, SourceCredentialsError
     settings = get_settings()
+    try:
+        sources = source_configuration(settings)
+    except SourceCredentialsError:
+        sources = {kind: {"configured": False, "status": "INVALID"} for kind in ("api", "mcp")}
+    try:
+        api_settings = effective_api_settings(settings)
+    except SourceCredentialsError:
+        api_settings = None
     try:
         init_db()
         with engine.connect() as connection:
@@ -247,9 +255,11 @@ def system_health() -> dict:
     except Exception:
         database_status = "unavailable"
 
-    if settings.lingxing_access_token:
+    if api_settings is None:
+        token_mode = "source_unavailable"
+    elif api_settings.lingxing_access_token:
         token_mode = "static_token"
-    elif settings.lingxing_token_path and settings.lingxing_app_id and settings.lingxing_app_secret:
+    elif api_settings.lingxing_token_path and api_settings.lingxing_app_id and api_settings.lingxing_app_secret:
         token_mode = "managed_token"
     else:
         token_mode = "not_configured"
@@ -268,13 +278,10 @@ def system_health() -> dict:
         "dry_run": settings.app_dry_run,
         "scheduler_enabled": settings.scheduler_enabled,
         **group_bot_status(settings),
-        "lingxing_credentials_configured": bool(
-            settings.lingxing_app_id and settings.lingxing_app_secret
-        ),
-        "lingxing_performance_mcp_configured": bool(
-            settings.lingxing_mcp_url and settings.lingxing_mcp_key.get_secret_value()
-        ),
-        "lingxing_business_dashboard_configured": Path(getattr(settings, "lingxing_business_credentials_file", "")).is_file(),
+        "lingxing_credentials_configured": sources["api"]["configured"],
+        "lingxing_performance_mcp_configured": sources["mcp"]["configured"],
+        "lingxing_business_dashboard_configured": sources["mcp"]["configured"],
+        "lingxing_data_sources": {kind: sources[kind] for kind in ("api", "mcp")},
         "lingxing_token_mode": token_mode,
         "feishu_enabled": settings.feishu_enabled,
         "feishu_webhook_configured": bool(settings.feishu_webhook_url),
@@ -617,9 +624,11 @@ def get_daily_summary(store_id: str, report_date: str) -> dict:
     init_db()
     with SessionLocal() as db:
         from jx_alert.notifications.business_daily import business_daily_context
+        from jx_alert.lingxing.source_gateway import source_observations
         result = _daily_summary(db, str(store_id), target_date)
         if "store" in result:
             result["business_daily"] = business_daily_context(db, str(store_id), target_date)
+            result["source_observations"] = source_observations(db, str(store_id), target_date)
             zone = result["store"].get("timezone")
             try:
                 complete_day = target_date < datetime.now(timezone.utc).astimezone(ZoneInfo(zone)).date()

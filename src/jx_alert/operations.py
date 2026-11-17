@@ -247,7 +247,7 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
     from jx_alert.config import get_settings
     from jx_alert.storage.db import SessionLocal, engine, init_db
     from jx_alert.storage.job_lock import database_job_lock
-    from jx_alert.lingxing.client import LingxingClient
+    from jx_alert.lingxing.source_gateway import create_collection_client
     from jx_alert.lingxing.pipeline import ad_account_inventory, collect_daily_snapshot
     from jx_alert.lingxing.sales_collector import collect_sales_for_day
     from jx_alert.analysis.evaluator import evaluate_daily_anomalies
@@ -273,7 +273,7 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
             if not any(active.values()):
                 return {"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": selected}
         init_db()
-        client = LingxingClient.from_settings()
+        client = create_collection_client(settings)
         inventory = client.get_stores()
         with SessionLocal() as db:
             synced = sync_scoped_store_inventory(db, settings, inventory, selected=selected)
@@ -572,7 +572,7 @@ def process_pending_collection():
         # Owning it proves any RUNNING dispatch is abandoned, without guessing an
         # expiry that might admit a second collector while the first is alive.
         abandoned = db.scalars(select(SyncJob).where(
-            SyncJob.job_type == "manual_collection", SyncJob.status == "RUNNING",
+            SyncJob.job_type.in_(["manual_collection", "intraday_observation"]), SyncJob.status == "RUNNING",
         )).all()
         for old in abandoned:
             args = dict(old.metadata_json or {})
@@ -586,7 +586,7 @@ def process_pending_collection():
             old.metadata_json = args
             old.finished_at = None if old.status == "PENDING" else now
         db.commit()
-        job = db.scalar(select(SyncJob).where(SyncJob.job_type == "manual_collection",
+        job = db.scalar(select(SyncJob).where(SyncJob.job_type.in_(["manual_collection", "intraday_observation"]),
                                             SyncJob.status == "PENDING",
                                             or_(SyncJob.metadata_json["retry_at"].as_string().is_(None),
                                                 SyncJob.metadata_json["retry_at"].as_string()
@@ -625,15 +625,29 @@ def process_pending_collection():
             db.commit()
 
         try:
-            scope = {name: args[name] for name in ("store_ids", "planned_store_dates") if name in args}
-            result = run_collection(
-                report_date=args.get("report_date"),
-                backfill_days=args.get("backfill_days", 1),
-                completed_store_ids=args.get("completed_store_ids"),
-                completed_store_dates=args.get("completed_store_dates"),
-                progress=persist_progress,
-                **scope,
-            )
+            private_request = args.get("private_request")
+            if private_request:
+                from jx_alert.bot_service import _collection_permission, _question_delivery, validate_question_delivery
+                from jx_alert.config import get_settings
+                settings = get_settings()
+                sid = (args.get("store_ids") or [None])[0]
+                if (not _collection_permission(settings, private_request, sid)
+                        or not validate_question_delivery(settings, _question_delivery(settings, private_request))):
+                    raise CollectionBlocked("COLLECTION_PERMISSION_CHANGED")
+            if job.job_type == "intraday_observation":
+                from jx_alert.config import get_settings
+                from jx_alert.lingxing.intraday_observation import run_observation
+                result = run_observation(db, get_settings(), args)
+            else:
+                scope = {name: args[name] for name in ("store_ids", "planned_store_dates") if name in args}
+                result = run_collection(
+                    report_date=args.get("report_date"),
+                    backfill_days=args.get("backfill_days", 1),
+                    completed_store_ids=args.get("completed_store_ids"),
+                    completed_store_dates=args.get("completed_store_dates"),
+                    progress=persist_progress,
+                    **scope,
+                )
             if result.get("completed_store_ids"):
                 args["completed_store_ids"] = result["completed_store_ids"]
                 args["completed_store_dates"] = result.get("completed_store_dates", {})

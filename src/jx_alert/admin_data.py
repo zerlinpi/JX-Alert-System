@@ -184,10 +184,17 @@ def store_detail(db, settings, store, *, requested=None, now=None):
                      "baseline": item["baseline"], "change_ratio": item["change_ratio"]}
                     for code, item in advertising_kpis(db, settings, store.sid, target).items()]
     from jx_alert.notifications.business_daily import business_daily_context
+    from jx_alert.lingxing.source_gateway import source_observations
+    from jx_alert.lingxing.source_credentials import source_configuration, SourceCredentialsError
     business = business_daily_context(db, store.sid, target) if target else None
+    try:
+        business_configured = source_configuration(settings)["mcp"]["configured"]
+    except SourceCredentialsError:
+        business_configured = False
     return {**report, "metrics": metrics, "currency_codes": currencies, "coverage": coverage, "data_warning": data_warning,
             "business_daily": business,
-            "business_source_configured": Path(settings.lingxing_business_credentials_file).is_file(),
+            "source_observations": source_observations(db, store.sid, target) if target else None,
+            "business_source_configured": business_configured,
             "sales_data_status": sales_state, "sales_data_status_label": SALES_DATA_LABELS[sales_state],
             "trend": trend, "ad_breakdown": breakdown, "kpis": kpis,
             "health": {"status": health["status_label"], "score": health["ahr_score"],

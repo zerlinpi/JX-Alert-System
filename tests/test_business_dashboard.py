@@ -221,9 +221,14 @@ def fake_mcp(monkeypatch, tmp_path, *, help_kind='read', schema_kind='read', mis
              inventory_response=None, inventory_properties=None):
     calls = []
     credentials = tmp_path / 'business-test-private.json'
-    credentials.write_text(json.dumps({'url': 'https://official.example.test/mcp',
+    credentials.write_text(json.dumps({'url': 'https://openmcp.lingxing.com/mcp-servers/lingxing-mcp',
                                       'key': 'synthetic-mcp-test-credential'}), encoding='utf-8')
     settings = SimpleNamespace(lingxing_business_credentials_file=str(credentials))
+
+    async def unpaced(session, tool, params):
+        return await session.call_tool(tool, params)
+
+    monkeypatch.setattr(dashboard, 'paced_call', unpaced)
 
     class Http:
         def __init__(self, **kwargs):
@@ -237,7 +242,7 @@ def fake_mcp(monkeypatch, tmp_path, *, help_kind='read', schema_kind='read', mis
 
     @asynccontextmanager
     async def stream(url, **kwargs):
-        assert url == 'https://official.example.test/mcp'
+        assert url == 'https://openmcp.lingxing.com/mcp-servers/lingxing-mcp'
         yield None, None, None
 
     class McpSession:

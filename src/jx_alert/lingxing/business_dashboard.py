@@ -21,6 +21,7 @@ from jx_alert.notifications.business_daily import BUSINESS_METRICS, DIMENSION, S
 from jx_alert.storage.coverage import mark_coverage
 from jx_alert.storage.models import DailyMetric, RawSnapshot
 from jx_alert.store_controls import collection_states
+from jx_alert.lingxing.mcp_pacing import paced_call
 
 
 TOOL = "business_dashboard_performance_cards"
@@ -177,21 +178,25 @@ async def _read_schema(session, tool_id):
     # Neither model output nor a remote description can select another tool.
     if tool_id not in READ_TOOLS:
         raise BusinessDashboardError("Business tool is outside the read-only allowlist")
-    discovery = _document(await session.call_tool("help", {"query": tool_id, "limit": 10}))
+    discovery = _document(await paced_call(session, "help", {"query": tool_id, "limit": 10}))
     if discovery.get("code") != 1 or discovery.get("success") is False:
         raise BusinessDashboardError("Official business discovery failed")
     listing = discovery.get("data", {}).get("tools", [])
     if not any(isinstance(t, dict) and t.get("toolId") == tool_id
                and t.get("toolType") == "read" for t in listing):
         raise BusinessDashboardError("Business tool is not confirmed read-only")
-    schema = unwrap(_document(await session.call_tool("search", {"toolId": tool_id})))
+    schema = unwrap(_document(await paced_call(session, "search", {"toolId": tool_id})))
     if schema.get("toolId") != tool_id or schema.get("toolType") != "read":
         raise BusinessDashboardError("Business tool is not confirmed read-only")
     return schema.get("inputSchema", {})
 
 
 async def _collect(db, settings, stores, report_dates):
-    url, key = _credentials(settings.lingxing_business_credentials_file)
+    from jx_alert.lingxing.source_credentials import mcp_credentials
+    credentials = mcp_credentials(settings)
+    if credentials is None:
+        raise BusinessDashboardError("Official MCP source is not configured")
+    url, key = credentials
     results, failures = [], []
     async with httpx.AsyncClient(headers={"X-Mcp-Key": key},
             timeout=httpx.Timeout(30, read=90), follow_redirects=False, trust_env=False) as http:
@@ -207,7 +212,7 @@ async def _collect(db, settings, stores, report_dates):
                     raise BusinessStoreInventoryError("Official store inventory schema changed")
                 inventory_error = None
                 try:
-                    visible = _visible_store_ids(_document(await session.call_tool(
+                    visible = _visible_store_ids(_document(await paced_call(session,
                         "action", {"toolId": STORE_TOOL, "params": {}})))
                 except BusinessDashboardError:
                     visible, inventory_error = set(), BusinessStoreInventoryError
@@ -228,7 +233,7 @@ async def _collect(db, settings, stores, report_dates):
                             if sid not in visible:
                                 raise (inventory_error or BusinessStoreNotVisibleError)(
                                     "Store is not confirmed visible to the official business source")
-                            response = _document(await session.call_tool("action", {"toolId": TOOL,
+                            response = _document(await paced_call(session, "action", {"toolId": TOOL,
                                 "params": {"startDate": day, "endDate": day, "currencyCode": "USD",
                                     "sids": [int(sid)], "aggregateType": "2", "indexName": FIELDS}}))
                             results.append(persist_business_cards(db, sid, day, response))
@@ -243,12 +248,12 @@ async def _collect(db, settings, stores, report_dates):
 
 def collect_business_for_day(db, settings, stores_response, report_dates):
     """Optional source: its absence/failure never erases sales or stops SP collection."""
-    path = Path(getattr(settings, "lingxing_business_credentials_file", ""))
-    if not path.is_file():
-        return {"status": "NOT_CONFIGURED", "partitions": [], "metrics": 0}
+    from jx_alert.lingxing.source_credentials import mcp_credentials
     from jx_alert.lingxing.report_dates import normalize_store_report_dates
     dates = {}
     try:
+        if mcp_credentials(settings) is None:
+            return {"status": "NOT_CONFIGURED", "partitions": [], "metrics": 0}
         stores = [s for s in stores_response["data"] if int(s.get("status") or 0) == 1]
         dates = {str(s["sid"]): normalize_store_report_dates(report_dates, str(s["sid"])) for s in stores}
         return asyncio.run(_collect(db, settings, stores, dates))
