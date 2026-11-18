@@ -19,6 +19,7 @@ const state = {
   bulkCollection: null, bulkBusy: false, bulkTimer: null,
   groups: { current: null, chats: [], preview: null, saving: false, loading: false, seq: 0 },
   sources: { data: null, loading: false, saving: false },
+  adSubscribers: { data: null, members: null, selected: new Set(), loading: false, saving: false },
 };
 
 function node(tag, text, name) {
@@ -714,6 +715,7 @@ async function setView(view) {
   renderView();
   if (view === "owners" && state.data && !state.members) await loadMembers();
   if (view === "notification-group" && !state.groups.current) await loadGroups();
+  if (view === "notification-group" && !state.adSubscribers.data) await loadAdSubscribers();
   if (view === "data-sources" && !state.sources.data) await loadSources();
 }
 
@@ -902,10 +904,89 @@ async function saveNotificationGroup() {
     $("notification-group-select").value = "";
     notice("group-settings-status", `通知群已保存为「${result.name}」，后续通知使用新配置。`, "success");
     await loadStores();
+    await loadAdSubscribers();
   } catch (error) {
     clearGroupPreview();
     notice("group-settings-status", error.message || "通知群保存失败。", "error");
   } finally { group.saving = false; updateGroupSelection(); }
+}
+
+function updateAdSubscribers() {
+  const model = state.adSubscribers;
+  const current = model.data?.recipients || [];
+  const existing = current.map((row) => row.id);
+  const selected = [...model.selected];
+  const changed = existing.length !== selected.length || selected.some((uid) => !existing.includes(uid));
+  const busy = model.loading || model.saving;
+  $("current-ad-subscribers").replaceChildren(...(current.length ? current.map((row) => node("li", row.name || row.id))
+    : [node("li", "未设置额外私聊接收人", "muted")]));
+  $("reload-ad-subscribers").disabled = busy;
+  $("clear-ad-subscribers").disabled = busy || !model.data || !selected.length;
+  const verified = new Set((model.members || []).map((row) => row.id));
+  const unverified = selected.some((uid) => !verified.has(uid));
+  $("save-ad-subscribers").disabled = busy || !state.csrf || !model.data || !changed || (selected.length > 0 && unverified);
+  $("ad-subscriber-field").disabled = busy;
+  $("ad-subscriber-note").textContent = busy ? "正在处理…" : selected.length ? `已选择 ${selected.length} 人，仅接收广告异常。` : "默认不额外私聊任何人。";
+}
+
+function renderAdSubscriberMembers() {
+  const model = state.adSubscribers;
+  const query = String($("ad-subscriber-search").value || "").trim().toLowerCase();
+  const known = new Set((model.members || []).map((row) => row.id));
+  const missing = (model.data?.recipients || []).filter((row) => !known.has(row.id)).map((row) => ({ ...row, unavailable: true }));
+  $("ad-subscriber-members").replaceChildren(...[...missing, ...(model.members || [])]
+    .filter((row) => (row.name || row.id).toLowerCase().includes(query)).map((member) => {
+      const label = node("label", undefined, "member");
+      const check = node("input"); check.type = "checkbox"; check.checked = model.selected.has(member.id);
+      check.addEventListener("change", () => {
+        if (check.checked) model.selected.add(member.id); else model.selected.delete(member.id);
+        updateAdSubscribers();
+      });
+      label.append(check, node("span", member.name || member.id));
+      if (member.unavailable) label.append(badge("成员待核实"));
+      return label;
+    }));
+  updateAdSubscribers();
+}
+
+async function loadAdSubscribers(includeMembers = false) {
+  const model = state.adSubscribers;
+  if (model.loading || model.saving) return;
+  model.loading = true;
+  updateAdSubscribers();
+  notice("ad-subscriber-status", includeMembers ? "正在读取通知群成员…" : "");
+  try {
+    const value = await api(`ad-alert-subscribers${includeMembers ? "/members" : ""}`);
+    if (!value || !Array.isArray(value.recipients) || !/^[0-9a-f]{64}$/.test(value.revision || "")) throw new Error("私聊接收人配置无法核对，请刷新。");
+    model.data = value;
+    model.selected = new Set(value.recipients.map((row) => row.id));
+    model.members = includeMembers ? value.members || [] : null;
+    $("ad-subscriber-search").hidden = !includeMembers;
+    $("ad-subscriber-field").hidden = !includeMembers;
+    if (includeMembers) renderAdSubscriberMembers();
+    notice("ad-subscriber-status");
+  } catch (error) {
+    notice("ad-subscriber-status", error.message || "无法读取私聊接收人。", "error");
+  } finally { model.loading = false; updateAdSubscribers(); }
+}
+
+async function saveAdSubscribers() {
+  const model = state.adSubscribers;
+  if (model.loading || model.saving || $("save-ad-subscribers").disabled) return;
+  model.saving = true; updateAdSubscribers();
+  try {
+    const result = await api("ad-alert-subscribers", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf },
+      body: JSON.stringify({ open_ids: [...model.selected], revision: model.data.revision }),
+    });
+    model.data = result;
+    model.selected = new Set((result.recipients || []).map((row) => row.id));
+    if (state.groups.current) state.groups.current.revision = result.revision;
+    clearGroupPreview();
+    notice("ad-subscriber-status", "广告异常私聊接收人已保存，不会补发旧告警。", "success");
+  } catch (error) {
+    notice("ad-subscriber-status", error.message || "保存失败，请刷新配置后重试。", "error");
+  } finally { model.saving = false; updateAdSubscribers(); }
 }
 
 function ownerIDs() {
@@ -1046,6 +1127,10 @@ $("notification-group-select").addEventListener("change", () => { clearGroupPrev
 $("preview-group").addEventListener("click", previewGroup);
 $("confirm-group-change").addEventListener("change", updateGroupSelection);
 $("save-notification-group").addEventListener("click", saveNotificationGroup);
+$("reload-ad-subscribers").addEventListener("click", () => loadAdSubscribers(true));
+$("ad-subscriber-search").addEventListener("input", renderAdSubscriberMembers);
+$("save-ad-subscribers").addEventListener("click", saveAdSubscribers);
+$("clear-ad-subscribers").addEventListener("click", () => { state.adSubscribers.selected.clear(); renderAdSubscriberMembers(); });
 for (const button of document.querySelectorAll("[data-view]")) {
   button.addEventListener("click", () => setView(button.dataset.view));
 }

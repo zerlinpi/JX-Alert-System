@@ -22,7 +22,7 @@ from starlette.routing import Route
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
-from jx_alert import admin_data, admin_groups, admin_mapping, admin_sources, store_controls
+from jx_alert import admin_ad_subscribers, admin_data, admin_groups, admin_mapping, admin_sources, store_controls
 from jx_alert.lingxing.source_credentials import SourceCredentialsError
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
 from jx_alert.storage.db import SessionLocal
@@ -441,7 +441,13 @@ class OwnerConsole:
                     _cookie(response, SESSION, "", 0)
                     return response
                 payload = await _body(request, "application/json", limit=16384 if path == "/console/api/data-sources" else 8192)
-                if path == "/console/api/data-sources":
+                if path == '/console/api/ad-alert-subscribers':
+                    if set(payload) != {'open_ids', 'revision'}:
+                        raise ConsoleError('提交内容无效。', 400)
+                    if not self._rate_allowed(request, 'ad-alert-subscribers-write', per_ip=8, total=16):
+                        raise ConsoleError('私聊接收人设置过于频繁，请稍后重试。', 429)
+                    data = await asyncio.to_thread(admin_ad_subscribers.save_ad_subscribers, self.settings, **payload)
+                elif path == "/console/api/data-sources":
                     if not self._rate_allowed(request, "data-sources-write", per_ip=6, total=12):
                         raise ConsoleError("数据源更新太频繁，请稍后重试。", 429)
                     data = await asyncio.to_thread(admin_sources.save_data_source, self.settings, payload)
@@ -478,6 +484,12 @@ class OwnerConsole:
                     if not self._rate_allowed(request, "mapping", per_ip=12, total=24):
                         raise ConsoleError("操作太频繁，请稍后重试。", 429)
                     data = await asyncio.to_thread(self._mapping, sid, "owners", payload)
+            elif path.startswith('/console/api/ad-alert-subscribers'):
+                members = path.endswith('/members')
+                if members and not self._rate_allowed(request, 'ad-alert-subscribers-members', per_ip=12, total=24):
+                    raise ConsoleError('成员列表读取过于频繁，请稍后重试。', 429)
+                data = await asyncio.to_thread(admin_ad_subscribers.get_ad_subscribers, self.settings,
+                                              include_members=members)
             elif path == "/console/api/data-sources":
                 data = await asyncio.to_thread(admin_sources.get_data_sources, self.settings)
             elif path.startswith("/console/api/notification-group"):
@@ -518,6 +530,8 @@ class OwnerConsole:
                 Route("/console/login", self.login, methods=["GET", "POST"]),
                 Route("/console/assets/{asset}", self.asset), Route("/console/api/stores", self.api),
                 Route("/console/api/data-sources", self.api, methods=["GET", "POST"]),
+                Route('/console/api/ad-alert-subscribers', self.api, methods=['GET', 'POST']),
+                Route('/console/api/ad-alert-subscribers/members', self.api),
                 Route("/console/api/notification-group", self.api, methods=["GET", "POST"]),
                 Route("/console/api/notification-group/chats", self.api),
                 Route("/console/api/notification-group/preview", self.api, methods=["POST"]),

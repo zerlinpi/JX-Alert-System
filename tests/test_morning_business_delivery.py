@@ -30,7 +30,7 @@ def renderer(monkeypatch):
     module = ModuleType('jx_alert.notifications.business_daily')
     module.business_daily_card = business
     monkeypatch.setitem(sys.modules, 'jx_alert.notifications.business_daily', module)
-    monkeypatch.setattr(morning_digest, '_health_chunks', lambda *args: [
+    monkeypatch.setattr(morning_digest, '_health_chunks', lambda *args, **kwargs: [
         (card('店铺绩效与违规快报 · 1', subtitle='', sections=[]), ['one']),
         (card('店铺绩效与违规快报 · 2', subtitle='', sections=[]), ['two']),
     ])
@@ -111,7 +111,7 @@ def test_scheduled_outbox_marks_business_kind_and_reuses_the_whole_frozen_digest
         first = morning_digest.enqueue_morning_digest(db, settings, stores, dates, {}, **kwargs)
         rows = list(db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)))
         assert [r.payload['morning_message_kind'] for r in rows] == [
-            'health', 'health', 'business_daily', 'ad_exception',
+            'health', 'health', 'business_daily',
         ]
         assert all(not quiet_blocks(settings, r.idempotency_key, r.payload) for r in rows)
         assert rows[2].payload['store_report_dates'] == {'one': {'target': str(DAY), 'actual': str(DAY)}}

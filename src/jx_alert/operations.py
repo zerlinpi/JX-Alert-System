@@ -419,7 +419,7 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                 "raw_archive": archive}
 
 
-def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
+def queue_scheduled_daily_reports(*, now: datetime | None = None, prepare=False, prepared_dates=None) -> dict:
     """Queue the 08:00 Beijing report from stored facts, independently of collection.
 
     Require explicit store scope and use the configured date policy for each store.
@@ -429,7 +429,7 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
     """
     from jx_alert.config import get_settings
     from jx_alert.storage.db import SessionLocal
-    from jx_alert.storage.models import Store
+    from jx_alert.storage.models import Store, SyncJob
     from jx_alert.notifications.daily_report import enqueue_daily_snapshots
     from apscheduler.triggers.cron import CronTrigger
 
@@ -455,10 +455,25 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
     ))
     if deadline is None or deadline.date() != scheduled_day:
         raise ValueError("Daily report cron has no delivery window on this date")
-    if delivery_now < deadline:
+    # The 08:00 collector may freeze a report before its 09:00 send window.
+    # The outbox retains the true deadline; preparing never authorizes a send.
+    if delivery_now < deadline and not prepare:
         return {"status": "WAITING", "queued": 0, "outbox_ids": [],
                 "delivery_date": scheduled_day.isoformat(),
                 "not_before": deadline.isoformat()}
+    if getattr(settings, 'hourly_ad_monitor_enabled', False) and not prepare:
+        # The morning collector freezes cards after source reads. 09:00 only
+        # releases that snapshot, never substitutes a later/mixed warehouse view.
+        with SessionLocal() as db:
+            jobs = list(db.scalars(select(SyncJob).where(SyncJob.job_type == 'hourly_ad_monitor',
+                SyncJob.started_at >= datetime.combine(scheduled_day, datetime.min.time(), ZoneInfo('Asia/Shanghai'))
+                    .astimezone(timezone.utc).replace(tzinfo=None)).order_by(SyncJob.id.desc())))
+            prepared = next(((j.metadata_json or {}).get('prepared_daily_report') for j in jobs
+                if (j.metadata_json or {}).get('prepared_daily_report')), None)
+        if prepared is None:
+            return {'status': 'WAITING_MORNING_SNAPSHOT', 'queued': 0, 'outbox_ids': [],
+                    'delivery_date': scheduled_day.isoformat()}
+        return prepared
 
     scope_path = Path(settings.collection_scope_file)
     if not scope_path.is_file():
@@ -467,6 +482,10 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
     scope_ids = raw_scope.get("store_ids", []) if isinstance(raw_scope, dict) else []
     selected = scoped_stores({"data": [{"sid": str(sid)} for sid in scope_ids]}, scope_path)["data"]
     selected_ids = sorted({str(row["sid"]) for row in selected})
+    if prepared_dates is not None:
+        selected_ids = [sid for sid in selected_ids if sid in prepared_dates]
+        if not selected_ids:
+            return {"status": "SKIPPED", "queued": 0, "outbox_ids": [], "reason": "no_morning_data"}
     switches = notification_states(settings, selected_ids)
     paused = [sid for sid in selected_ids if not switches[sid][0]]
     selected_ids = [sid for sid in selected_ids if switches[sid][0]]
@@ -504,15 +523,18 @@ def queue_scheduled_daily_reports(*, now: datetime | None = None) -> dict:
                 warnings[sid] = warnings.get(sid, "") + ("；" if sid in warnings else "") + note
             if not item["timezone_confirmed"] and sid not in warnings:
                 history_fallback.add(sid)
-            report_dates[sid] = item["report_date"]
+            report_dates[sid] = prepared_dates[sid] if prepared_dates is not None else item["report_date"]
             store_records.append(store)
         if not report_dates:
-            raise ValueError("No scoped database stores are available for scheduled reports")
+            if not prepare:
+                raise ValueError("No scoped database stores are available for scheduled reports")
+            return {"status": "SKIPPED", "queued": 0, "outbox_ids": [], "reason": "no_morning_data"}
         notifications = enqueue_daily_snapshots(
             db, settings, store_dates=report_dates, delivery_date=delivery_now.date(),
             store_records=store_records, store_warnings=warnings, now=delivery_now,
             history_fallback_store_ids=history_fallback,
-            focused_morning=getattr(settings, "feishu_morning_focus_enabled", False),
+            focused_morning=(getattr(settings, "feishu_morning_focus_enabled", False)
+                             or prepare and settings.feishu_transport == "app"), prepare=prepare,
         )
         db.commit()
     return {"status": "SKIPPED" if notifications.get("skipped") else "QUEUED",

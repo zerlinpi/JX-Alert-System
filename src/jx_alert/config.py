@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     app_dry_run: bool = True
     app_timezone: str = "Asia/Shanghai"
     scheduler_enabled: bool = False
-    daily_sync_cron: str = "30 18 * * *"
-    feishu_daily_report_cron: str = "0 8 * * *"
+    daily_sync_cron: str = "0 8 * * *"
+    feishu_daily_report_cron: str = "0 9 * * *"
+    hourly_ad_monitor_enabled: bool = False
+    hourly_ad_monitor_cron: str = "0 * * * *"
     feishu_daily_report_start_date: str = ""
     feishu_daily_report_group_digest: bool = False
     # Requested daily health/violation brief plus material SP exceptions only.
@@ -177,6 +179,7 @@ def get_settings() -> Settings:
         runtime = json.loads(path.read_text(encoding="utf-8"))
         allowed = {
             "app_dry_run", "scheduler_enabled", "daily_sync_cron",
+            "hourly_ad_monitor_enabled", "hourly_ad_monitor_cron",
             "feishu_daily_report_cron", "feishu_daily_report_start_date",
             "feishu_daily_report_group_digest",
             "sb_sd_detail_reports_enabled",

@@ -89,8 +89,8 @@ ANSWER_PROMPT = SYSTEM_PROMPT.split('服务端会附完整中文数据表')[0] +
 
 def _prompt(context):
     if isinstance(context, dict) and context.get('ad_review'):
-        from jx_alert.ai.ad_review import AD_REVIEW_PROMPT
-        return AD_REVIEW_PROMPT
+        from jx_alert.ai.ad_review import AD_REVIEW_PROMPT, INTRADAY_REVIEW_PROMPT
+        return INTRADAY_REVIEW_PROMPT if context.get('hourly_intraday') else AD_REVIEW_PROMPT
     return ANSWER_PROMPT if isinstance(context, dict) and context.get('reply_mode') == 'answer' else SYSTEM_PROMPT
 
 _DISPLAY_TERMS = {

@@ -38,6 +38,9 @@ def daily_job(*, now=None):
         due = trigger.get_next_fire_time(None, earliest)
         if due is None or due > local:
             return
+        if getattr(settings, "hourly_ad_monitor_enabled", False):
+            from jx_alert.hourly_ad_monitor import run_hourly_monitor
+            return run_hourly_monitor(now=clock)
         day = local.date().isoformat()
         # A fixed Beijing delivery day identifies the plan, while each store's
         # completed local report date is still resolved by the dispatcher. Two
@@ -64,6 +67,19 @@ def manual_collection_job():
         return
     except Exception as exc:
         logger.error("Manual collection failed: %s", type(exc).__name__)
+
+
+def hourly_ad_monitor_job():
+    from jx_alert.hourly_ad_monitor import run_hourly_monitor
+    from jx_alert.storage.job_lock import JobAlreadyRunning
+    try:
+        result = run_hourly_monitor()
+        if result.get("status") not in {"DISABLED", "WAITING", "ALREADY_COMPLETE", "BUSY"}:
+            logger.info("Hourly advertising update status=%s", result.get("status"))
+    except JobAlreadyRunning:
+        return
+    except Exception as exc:
+        logger.error("Hourly advertising update failed: %s", type(exc).__name__)
 
 
 def outbox_job():
@@ -124,7 +140,8 @@ def main():
     scheduler = BlockingScheduler(
         timezone=settings.app_timezone,
         executors={"default": ThreadPoolExecutor(max_workers=4),
-                   "daily_reports": ThreadPoolExecutor(max_workers=1)},
+                   "daily_reports": ThreadPoolExecutor(max_workers=1),
+                   "ad_monitor": ThreadPoolExecutor(max_workers=1)},
     )
     scheduler.add_job(
         daily_report_job,
@@ -167,6 +184,14 @@ def main():
         id="manual_collection", max_instances=1, coalesce=True,
         misfire_grace_time=30,
     )
+    if getattr(settings, "hourly_ad_monitor_enabled", False):
+        scheduler.add_job(hourly_ad_monitor_job,
+            CronTrigger.from_crontab(settings.hourly_ad_monitor_cron, timezone="Asia/Shanghai"),
+            id="hourly_ad_monitor", executor="ad_monitor", max_instances=1, coalesce=True,
+            misfire_grace_time=1800)
+        scheduler.add_job(hourly_ad_monitor_job, IntervalTrigger(minutes=1),
+            id="hourly_ad_monitor_recovery", executor="ad_monitor", max_instances=1,
+            coalesce=True, misfire_grace_time=60)
     scheduler.add_job(excel_archive_job, IntervalTrigger(minutes=1), id="excel_archive_retry",
                       max_instances=1, coalesce=True, misfire_grace_time=60)
     if getattr(settings, "excel_archive_enabled", False) and getattr(settings, "excel_daily_snapshot_enabled", True):
@@ -181,7 +206,13 @@ def main():
         settings.daily_sync_cron, settings.feishu_daily_report_cron, settings.app_dry_run,
     )
     # Recover a missing collection plan before starting independent reports and exports.
-    daily_job()
+    if not getattr(settings, "hourly_ad_monitor_enabled", False):
+        daily_job()
+    else:
+        # Heavy source calls belong to their own executor; starting during the
+        # 08:00 window must not block 09:00 delivery or the outbox worker.
+        scheduler.add_job(hourly_ad_monitor_job, 'date', run_date=datetime.now(timezone.utc),
+            id='hourly_ad_monitor_startup', executor='ad_monitor', max_instances=1)
     # The independent gate prevents pre-08:00 sends and respects the configured
     # first delivery date; persistent idempotency makes restarts safe.
     daily_report_job()

@@ -497,6 +497,15 @@ def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
     planned = application_deliveries(db, settings, **context)
     if roles is not None:
         planned = [item for item in planned if roles.intersection(item.get("covered_roles", [item["role"]]))]
+    if material_ad_alert and roles is None:
+        from jx_alert.notifications.recipient_policy import advertising_scope, advertising_subscriber_deliveries
+        if advertising_scope(context.get('scope'), context.get('store_id')):
+            # Subscribers are explicit extra recipients, not automatic managers.
+            # Existing manager delivery to the same person already covers this
+            # event; keep its original role and idempotency identity unchanged.
+            known = {(r.get('receive_id_type'), r.get('receive_id')) for r in planned if not r.get('routing_failure')}
+            planned.extend(r for r in advertising_subscriber_deliveries(settings)
+                           if (r['receive_id_type'], r['receive_id']) not in known)
     outbox_ids = []
     unresolved = False
     for delivery in planned:

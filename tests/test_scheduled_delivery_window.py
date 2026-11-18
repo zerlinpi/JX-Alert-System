@@ -9,9 +9,10 @@ from jx_alert.notifications import worker
 from jx_alert.notifications.feishu_app import FeishuAppClient
 from jx_alert.notifications.outbox import enqueue_notification, NotificationOutbox
 from jx_alert.storage.db import Base
+from jx_alert.storage.models import Store
 
 
-def test_expired_report_backlog_does_not_block_today_or_send_before_eight(tmp_path, monkeypatch):
+def test_expired_report_backlog_does_not_block_today_or_send_before_nine(tmp_path, monkeypatch):
     engine = create_engine("sqlite:///" + str(tmp_path / "outbox.db"))
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
@@ -35,11 +36,12 @@ def test_expired_report_backlog_does_not_block_today_or_send_before_eight(tmp_pa
     monkeypatch.setattr(worker, "datetime", Clock)
     delivery = {"role": "daily_snapshot", "receive_id": "oc_test", "receive_id_type": "chat_id", "open_ids": []}
     with sessions() as db:
+        db.add(Store(sid='5174', name='Geteen', status=1))
         for n in range(7):
             row = enqueue_notification(db, idempotency_key=f"scheduled-daily:old{n}", text="旧日报", delivery=delivery)
             row.payload = {**row.payload, "scheduled_delivery_date": "2026-11-13", "scheduled_timezone": "Asia/Shanghai"}
             row.next_attempt_at = datetime(2026, 11, 13)
-        today = enqueue_notification(db, idempotency_key="scheduled-daily:today", text="今日日报", delivery=delivery)
+        today = enqueue_notification(db, idempotency_key="scheduled-daily:today", text="今日日报", store_id='5174', delivery=delivery)
         today.payload = {**today.payload, "scheduled_delivery_date": "2026-11-14", "scheduled_timezone": "Asia/Shanghai"}
         today.next_attempt_at = datetime(2026, 11, 13)
         enqueue_notification(db, idempotency_key="normal-alert", text="普通异常", delivery=delivery).next_attempt_at = datetime(2026, 11, 13)
@@ -50,7 +52,7 @@ def test_expired_report_backlog_does_not_block_today_or_send_before_eight(tmp_pa
         rows = db.scalars(select(NotificationOutbox)).all()
         assert sum(r.status == "EXPIRED" for r in rows) == 7
         assert next(r for r in rows if r.payload["text"] == "今日日报").status == "PENDING"
-    instant = datetime(2026, 11, 14, 0, tzinfo=timezone.utc)
+    instant = datetime(2026, 11, 14, 1, tzinfo=timezone.utc)
     assert worker.process_outbox_batch()["sent"] == 1
     assert sent == ["普通异常", "今日日报"]
     assert worker.process_outbox_batch()["sent"] == 0

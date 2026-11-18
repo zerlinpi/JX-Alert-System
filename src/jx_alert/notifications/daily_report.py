@@ -261,7 +261,7 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
                             store_records: list[Store] | None = None,
                             store_warnings: dict[str, str] | None = None,
                             history_fallback_store_ids: set[str] | None = None,
-                            focused_morning: bool = False) -> dict:
+                            focused_morning: bool = False, prepare: bool = False) -> dict:
     """Persist one snapshot per store/date/destination; never send from this function.
 
     Missing records stay unknown. The caller supplies marketplace-local report
@@ -285,11 +285,11 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
         if send_day < local_now.date():
             raise ValueError("Past delivery dates require explicit manual review")
         trigger = CronTrigger.from_crontab(
-            getattr(settings, "feishu_daily_report_cron", "0 8 * * *"), timezone="Asia/Shanghai")
+            getattr(settings, "feishu_daily_report_cron", "0 9 * * *"), timezone="Asia/Shanghai")
         due = trigger.get_next_fire_time(None, datetime.combine(send_day, time.min, ZoneInfo("Asia/Shanghai")))
         if due is None or due.date() != send_day:
             raise ValueError("Daily report cron has no delivery window on this date")
-        if local_now < due:
+        if local_now < due and not prepare:
             return {"queued": 0, "skipped": True, "outbox_ids": [], "reason": "before_scheduled_time"}
     chat_alias = getattr(settings, "feishu_daily_report_chat_id", "")
     if not chat_alias:
@@ -317,6 +317,12 @@ def enqueue_daily_snapshots(db, settings, *, report_date: date | str | None = No
     if store_dates is not None:
         stores_query = stores_query.where(Store.sid.in_(store_dates))
     stores = store_records if store_records is not None else db.scalars(stores_query).all()
+    if send_day is not None:
+        # A scheduled report never advertises an unavailable shop merely to
+        # explain its authorization failure. Explicit readers keep that status.
+        stores = [store for store in stores if store.status == 1]
+        if not stores:
+            return {'queued': 0, 'skipped': True, 'outbox_ids': [], 'reason': 'no_authorized_stores'}
     from jx_alert.store_controls import notification_states
     switches = notification_states(settings, (store.sid for store in stores))
     paused = [store.sid for store in stores if not switches[store.sid][0]]

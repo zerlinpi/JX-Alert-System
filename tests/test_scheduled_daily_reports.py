@@ -215,13 +215,17 @@ def test_report_keeps_target_and_actual_dates_and_masks_failed_recollection(setu
     with sessions() as db:
         payloads = [db.get(NotificationOutbox, row_id).payload for row_id in result["outbox_ids"]]
         report_dates = {sid: dates for payload in payloads for sid, dates in payload["store_report_dates"].items()}
-        assert set(report_dates) == {"5174", "5175", "5176", "5177", "5178", "5179"}
+        assert set(report_dates) == {"5174", "5175", "5176", "5177", "5179"}
         for sid, dates in report_dates.items():
             assert dates == {"target": target_day.isoformat(),
                              "actual": (prior_day if sid == "5175" else target_day).isoformat()}
         serialized = json.dumps(payloads, ensure_ascii=False)
         assert "9187" not in serialized
-        assert all(label in serialized for label in ("采集失败", "授权失败", "接口无记录"))
+        assert "授权失败" not in serialized
+        assert all(label in serialized for label in ("采集失败", "接口无记录"))
+        # Individual on-demand readers still see an accurate authorization gap.
+        unauthorized = daily_report.build_daily_card(db, db.get(Store, "5178"), target_day, settings=settings)
+        assert "授权失败" in json.dumps(unauthorized, ensure_ascii=False)
         assert "目标" in serialized and prior_day.isoformat() in serialized
         tables = [next(e for e in payload["card"]["body"]["elements"] if e["tag"] == "table")
                   for payload in payloads]
@@ -284,7 +288,7 @@ def test_changed_timezone_and_inactive_store_only_warn_without_business_writes(s
         assert db.get(Store, "5174").timezone == "UTC"
 
 
-def test_missing_database_store_queues_a_real_unknown_card_without_creating_store(setup):
+def test_missing_database_store_never_queues_a_card_or_creates_store(setup):
     _, sessions, scope, _ = setup
     # Store 5175 is present in the confirmed timezone file, but not synchronized.
     scope.write_text(json.dumps({"store_ids": [5174, 5175]}), encoding="utf-8")
@@ -292,13 +296,12 @@ def test_missing_database_store_queues_a_real_unknown_card_without_creating_stor
         db.delete(db.get(Store, "5175"))
         db.commit()
     result = operations.queue_scheduled_daily_reports(now=DEADLINE)
-    assert len(result["outbox_ids"]) == 2
+    assert len(result["outbox_ids"]) == 1
     with sessions() as db:
         missing = db.scalar(select(NotificationOutbox).where(
             NotificationOutbox.payload["store_id"].as_string() == "5175",
         ))
-        assert missing is not None and "未知" in missing.payload["text"]
-        assert "尚未完成店铺数据同步" in json.dumps(missing.payload, ensure_ascii=False)
+        assert missing is None
         assert db.get(Store, "5175") is None
         assert db.scalar(select(func.count()).select_from(Store)) == 1
 
@@ -448,7 +451,7 @@ def test_collection_completes_without_enqueuing_a_daily_report(setup, monkeypatc
     assert result["daily_notifications"] == {"queued": 0, "skipped": True, "reason": "scheduled_report"}
 
 
-def test_missing_data_report_still_queues_once_and_repeated_delivery_does_not_resend(setup, monkeypatch):
+def test_missing_data_report_is_skipped_and_repeated_delivery_does_not_resend(setup, monkeypatch):
     settings, sessions, _, _ = setup
     from jx_alert.lingxing.client import LingxingClient
     from jx_alert.notifications.feishu_app import FeishuAppClient
@@ -485,22 +488,22 @@ def test_missing_data_report_still_queues_once_and_repeated_delivery_does_not_re
         send_card=send, send_text=send,
     ))
     first_send = worker.process_outbox_batch(outbox_ids=first["outbox_ids"])
-    assert first_send["sent"] == 1
+    assert first_send["sent"] == 0
     delivered = operations.queue_scheduled_daily_reports(now=DEADLINE + timedelta(minutes=2))
     assert delivered["outbox_ids"] == first["outbox_ids"]
     assert worker.process_outbox_batch(outbox_ids=delivered["outbox_ids"])["claimed"] == 0
-    assert len(sent) == 1
+    assert sent == []
     with sessions() as db:
         assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 1
-        assert db.scalar(select(NotificationOutbox)).status == "DELIVERED"
+        assert db.scalar(select(NotificationOutbox)).status == "SKIPPED"
         # Late collection can update business facts, but cannot resend today's
-        # already-delivered scheduled report under a new snapshot hash.
+        # frozen scheduled report under a new snapshot hash.
         db.add(DailyMetric(store_id="5174", metric_date=datetime(2026, 11, 11).date(),
                            dimension="store", entity_id="5174", metric_name="orders", value=42))
         db.commit()
     late = operations.queue_scheduled_daily_reports(now=DEADLINE + timedelta(minutes=3))
     assert worker.process_outbox_batch(outbox_ids=late["outbox_ids"])["claimed"] == 0
-    assert len(sent) == 1
+    assert sent == []
 
 
 def test_minutely_report_recovery_retries_a_transient_queue_failure_without_restart(setup, monkeypatch):
