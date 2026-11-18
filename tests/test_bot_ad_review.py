@@ -143,6 +143,31 @@ def test_every_candidate_is_reviewed_in_bounded_batches_without_top_n_truncation
     assert client.calls == [str(i) for i in range(25)]
 
 
+def test_one_format_retry_preserves_original_question_and_never_publishes_unverified_numbers():
+    class Retrying:
+        calls = []
+        last_usage = {'prompt_tokens': 10}
+        def analyze(self, context, question):
+            assert question == QUESTION
+            self.calls.append(deepcopy(context))
+            return json.dumps({'findings': [{'evidence_id': '0', 'signals': ['zero_conversion'],
+                'analysis': '花费62.12美元。' if len(self.calls) == 1 else '成熟点击没有带来归因订单，需复核流量质量。'}]})
+    client = Retrying()
+    findings, audit = review_advertising(client, {'campaigns': [row()]}, QUESTION)
+    assert len(client.calls) == 2 and 'output_requirements' in client.calls[1]
+    assert audit['batches'] == 1 and audit['model_requests'] == 2 and audit['model_usage']['prompt_tokens'] == 20
+    assert '62.12' not in findings[0]['analysis']
+    class Invalid:
+        calls = 0
+        def analyze(self, *args):
+            self.calls += 1
+            return '{"findings":[{"evidence_id":"unknown","signals":[],"analysis":"无关文本"}]}'
+    bad = Invalid()
+    with pytest.raises(DeepSeekError):
+        review_advertising(bad, {'campaigns': [row()]}, QUESTION)
+    assert bad.calls == 2
+
+
 def test_review_json_empty_result_and_original_question_use_read_only_official_model_request(monkeypatch):
     original = httpx.Client
     def handler(request):

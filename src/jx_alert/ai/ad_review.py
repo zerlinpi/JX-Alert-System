@@ -78,7 +78,7 @@ def parse_findings(text, campaigns):
 def review_advertising(client, context, question):
     """Bound each request; review every candidate without silently taking top N."""
     candidates = [r for r in context['campaigns'] if r['material_signals']]
-    findings, batches, usage = [], 0, {}
+    findings, batches, requests, usage = [], 0, 0, {}
     # Small batches leave room for concrete explanations without truncating JSON.
     for offset in range(0, len(candidates), 12):
         batch = candidates[offset:offset + 12]
@@ -94,14 +94,28 @@ def review_advertising(client, context, question):
                 for code, kpi in row.get('kpis', {}).items()}
             compact.append(item)
         packet = {**context, 'campaigns': compact}
-        text = client.analyze(packet, question)
-        findings.extend(parse_findings(text, batch))
+        for attempt in range(2):
+            text = client.analyze(packet, question)
+            requests += 1
+            for key, number in getattr(client, 'last_usage', {}).items():
+                if type(number) is int and number >= 0:
+                    usage[key] = usage.get(key, 0) + number
+            try:
+                selected = parse_findings(text, batch)
+                break
+            except DeepSeekError:
+                if attempt:
+                    raise
+                # One bounded format correction retains the original question
+                # and frozen facts; unvalidated text is never sent to Feishu.
+                packet = {**packet, 'output_requirements':
+                    '上一轮输出未通过校验，请重写同一JSON结构。核对证据编号及信号。analysis仅写定性中文，'
+                    '绝对不写任何数字、中文数量、金额、百分比、对象名称、状态限制说明、库存、搜索词、'
+                    '预算、竞价、通知、采集或广告操作。服务端会显示所有数值及活动状态。'}
+        findings.extend(selected)
         batches += 1
-        for key, number in getattr(client, 'last_usage', {}).items():
-            if type(number) is int and number >= 0:
-                usage[key] = usage.get(key, 0) + number
     return findings, {'batches': batches, 'eligible_campaigns': len(context['campaigns']),
-                      'candidate_campaigns': len(candidates), 'model_usage': usage}
+                      'candidate_campaigns': len(candidates), 'model_requests': requests, 'model_usage': usage}
 
 
 def _number(value, *, money=False, rate=False):
