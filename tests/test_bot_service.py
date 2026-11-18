@@ -404,7 +404,7 @@ def test_unfinished_market_ad_question_avoids_a_historical_substitution(warehous
 @pytest.mark.parametrize('question,title', [
     ('店铺今天健康怎么样', '店铺绩效与违规快报'),
     ('店铺绩效', '店铺绩效与违规快报'),
-    ('广告有什么异常', '广告判断待补齐数据'),
+    ('广告有什么异常', '广告查询'),
 ])
 def test_unspecified_health_or_ad_review_uses_operating_store_scope(warehouse, question, title):
     _name_stores(warehouse)

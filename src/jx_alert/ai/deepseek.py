@@ -88,6 +88,9 @@ ANSWER_PROMPT = SYSTEM_PROMPT.split('服务端会附完整中文数据表')[0] +
 
 
 def _prompt(context):
+    if isinstance(context, dict) and context.get('ad_review'):
+        from jx_alert.ai.ad_review import AD_REVIEW_PROMPT
+        return AD_REVIEW_PROMPT
     return ANSWER_PROMPT if isinstance(context, dict) and context.get('reply_mode') == 'answer' else SYSTEM_PROMPT
 
 _DISPLAY_TERMS = {
@@ -212,6 +215,8 @@ def analysis_cache_key(context, question, model):
 
 def _actionable_text(text, context, question):
     """Do not publish model-written watch/positive KPI bullets as findings."""
+    if context.get('ad_review'):
+        return text
     findings_only = bool(re.search(r'(?:只|仅).{0,8}(?:异常|待确认|风险|违规)', question))
     if context.get('reply_mode') == 'answer' and findings_only:
         retained = []
@@ -328,7 +333,7 @@ class DeepSeekClient:
             "messages": [{"role": "system", "content": _prompt(context)},
                          {"role": "user", "content": frozen}],
             "stream": False, "thinking": {"type": "disabled"}, "temperature": 0.2,
-            "max_tokens": 1536, "tool_choice": "none",
+            "max_tokens": 4096 if context.get('ad_review') else 1536, "tool_choice": "none",
         }
         try:
             # Official origin is fixed; no redirects or environment-selected proxy.
@@ -342,13 +347,14 @@ class DeepSeekClient:
                             continue
                     if response.status_code != 200:
                         raise _http_error(response.status_code)
-                    return _actionable_text(self._result(response), context, question)
+                    return _actionable_text(self._result(response,
+                        require_chinese=not context.get('ad_review')), context, question)
         except httpx.TimeoutException:
             raise DeepSeekError("DeepSeek分析超时，请稍后重试。") from None
         except httpx.HTTPError:
             raise DeepSeekError("DeepSeek连接暂时不可用。") from None
 
-    def _result(self, response):
+    def _result(self, response, *, require_chinese=True):
         if len(response.content) > MAX_RESPONSE_BYTES:
             raise DeepSeekError("DeepSeek返回内容过大，请缩小问题范围。")
         try:
@@ -366,7 +372,7 @@ class DeepSeekClient:
         text = text.strip()
         if len(text) > MAX_OUTPUT_CHARS:
             raise DeepSeekError("DeepSeek分析过长，请缩小问题范围。")
-        if self._api_key in text or _COMMAND.search(text) or not re.search(r"[\u4e00-\u9fff]", text):
+        if self._api_key in text or _COMMAND.search(text) or (require_chinese and not re.search(r"[\u4e00-\u9fff]", text)):
             raise DeepSeekError("DeepSeek返回内容不符合中文只读分析要求。")
         usage = data.get("usage", {})
         self.last_usage = ({k: usage[k] for k in ("prompt_tokens", "completion_tokens",
