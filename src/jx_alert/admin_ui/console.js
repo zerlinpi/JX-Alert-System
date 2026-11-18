@@ -918,15 +918,16 @@ function updateAdSubscribers() {
   const selected = [...model.selected];
   const changed = existing.length !== selected.length || selected.some((uid) => !existing.includes(uid));
   const busy = model.loading || model.saving;
-  $("current-ad-subscribers").replaceChildren(...(current.length ? current.map((row) => node("li", row.name || row.id))
-    : [node("li", "未设置额外私聊接收人", "muted")]));
+  $("current-ad-subscribers").replaceChildren(...(current.length === 1
+    ? [node("li", current[0].name || current[0].id)]
+    : [node("li", current.length > 1 ? "旧配置包含多人，请重新选择一人" : "未设置广告总负责人", "muted")]));
   $("reload-ad-subscribers").disabled = busy;
   $("clear-ad-subscribers").disabled = busy || !model.data || !selected.length;
   const verified = new Set((model.members || []).map((row) => row.id));
   const unverified = selected.some((uid) => !verified.has(uid));
-  $("save-ad-subscribers").disabled = busy || !state.csrf || !model.data || !changed || (selected.length > 0 && unverified);
+  $("save-ad-subscribers").disabled = busy || !state.csrf || !model.data || !changed || selected.length > 1 || (selected.length > 0 && unverified);
   $("ad-subscriber-field").disabled = busy;
-  $("ad-subscriber-note").textContent = busy ? "正在处理…" : selected.length ? `已选择 ${selected.length} 人，仅接收广告异常。` : "默认不额外私聊任何人。";
+  $("ad-subscriber-note").textContent = busy ? "正在处理…" : selected.length ? "已选择总负责人。" : "未设置时不额外私聊。";
 }
 
 function renderAdSubscriberMembers() {
@@ -937,9 +938,11 @@ function renderAdSubscriberMembers() {
   $("ad-subscriber-members").replaceChildren(...[...missing, ...(model.members || [])]
     .filter((row) => (row.name || row.id).toLowerCase().includes(query)).map((member) => {
       const label = node("label", undefined, "member");
-      const check = node("input"); check.type = "checkbox"; check.checked = model.selected.has(member.id);
+      const check = node("input"); check.type = "radio"; check.name = "ad-alert-lead";
+      check.checked = model.selected.has(member.id);
+      check.disabled = Boolean(member.unavailable);
       check.addEventListener("change", () => {
-        if (check.checked) model.selected.add(member.id); else model.selected.delete(member.id);
+        if (check.checked) model.selected = new Set([member.id]);
         updateAdSubscribers();
       });
       label.append(check, node("span", member.name || member.id));
@@ -959,7 +962,7 @@ async function loadAdSubscribers(includeMembers = false) {
     const value = await api(`ad-alert-subscribers${includeMembers ? "/members" : ""}`);
     if (!value || !Array.isArray(value.recipients) || !/^[0-9a-f]{64}$/.test(value.revision || "")) throw new Error("私聊接收人配置无法核对，请刷新。");
     model.data = value;
-    model.selected = new Set(value.recipients.map((row) => row.id));
+    model.selected = new Set(value.recipients.length === 1 ? [value.recipients[0].id] : []);
     model.members = includeMembers ? value.members || [] : null;
     $("ad-subscriber-search").hidden = !includeMembers;
     $("ad-subscriber-field").hidden = !includeMembers;
@@ -983,7 +986,7 @@ async function saveAdSubscribers() {
     model.selected = new Set((result.recipients || []).map((row) => row.id));
     if (state.groups.current) state.groups.current.revision = result.revision;
     clearGroupPreview();
-    notice("ad-subscriber-status", "广告异常私聊接收人已保存，不会补发旧告警。", "success");
+    notice("ad-subscriber-status", "广告总负责人已保存，不会补发旧告警。", "success");
   } catch (error) {
     notice("ad-subscriber-status", error.message || "保存失败，请刷新配置后重试。", "error");
   } finally { model.saving = false; updateAdSubscribers(); }

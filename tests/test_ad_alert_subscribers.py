@@ -8,7 +8,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from jx_alert import admin_ad_subscribers as admin, admin_mapping
 from jx_alert.config import Settings
-from jx_alert.notifications.recipient_policy import advertising_subscriber_deliveries, subscriber_delivery_blocked
+from jx_alert.notifications.recipient_policy import (
+    advertising_group_delivery, advertising_subscriber_deliveries, enqueue_advertising_copies, subscriber_delivery_blocked,
+)
 from jx_alert.notifications.routing import enqueue_application_deliveries
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
@@ -55,7 +57,7 @@ def test_owner_selects_verified_members_without_changing_other_routes_or_sending
     assert path.read_bytes() == before
 
 
-@pytest.mark.parametrize('ids', [['ou_unknown'], ['invalid'], 'ou_first', [True]])
+@pytest.mark.parametrize('ids', [['ou_unknown'], ['invalid'], 'ou_first', [True], ['ou_first', 'ou_second']])
 def test_invalid_or_unverified_recipients_cannot_be_added(registry, ids):
     settings, path, _ = registry
     before = path.read_bytes()
@@ -112,12 +114,12 @@ def test_malformed_subscription_blocks_only_its_private_delivery(registry):
 
 
 @pytest.mark.parametrize('scope,material,expected', [
-    ('campaign_sp', True, 2), ('5174:campaign:sp', True, 2), ('5174:product_ad:sd', True, 2),
+    ('campaign_sp', True, 1), ('5174:campaign:sp', True, 1), ('5174:product_ad:sd', True, 1),
     ('campaign_sp', False, 0), ('5174:sales:store', True, 0), ('5174:health', True, 0),
 ])
 def test_only_material_ad_events_append_private_destinations_and_dedupe(registry, scope, material, expected):
     settings, _, _ = registry
-    save(settings, ['ou_first', 'ou_second'])
+    save(settings, ['ou_first'])
     engine = create_engine('sqlite://')
     Base.metadata.create_all(engine)
     context = {'store_id': '5174', 'entity_id': '99', 'scope': scope, 'metrics': {}, 'severity': 'P1', 'status': 'NEW'}
@@ -130,6 +132,45 @@ def test_only_material_ad_events_append_private_destinations_and_dedupe(registry
         assert len(private) == expected
         assert all(r.payload['delivery']['receive_id_type'] == 'open_id' for r in private)
         assert len(rows) == expected + 1
+    engine.dispose()
+
+
+def test_legacy_multiple_private_recipients_require_an_explicit_new_selection(registry):
+    settings, path, original = registry
+    save(settings, ['ou_first'])
+    old = private_payload(settings)
+    routing = json.loads(path.read_text())
+    routing['ad_alert_subscribers']['recipients'].append({
+        'name': '旧接收人', 'open_id': 'ou_second', 'generation': 'a' * 32,
+    })
+    path.write_text(json.dumps(routing))
+    assert advertising_subscriber_deliveries(settings) == []
+    assert subscriber_delivery_blocked(settings, old)
+    assert save(settings, ['ou_second'])['recipients'] == [{'id': 'ou_second', 'name': '运营甲'}]
+    assert json.loads(path.read_text())['stores'] == original['stores']
+
+
+def test_confirmed_mcp_alert_uses_group_mentions_single_lead_and_repeat_guard(registry):
+    from jx_alert.notifications.cards import card
+
+    settings, path, _ = registry
+    save(settings, ['ou_first'])
+    destination = advertising_group_delivery(settings, json.loads(path.read_text()), ['5174'], role='chat_analysis')
+    assert destination['open_ids'] == ['ou_owner']
+    engine = create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    clock = datetime(2026, 11, 19, 4, tzinfo=timezone.utc)
+    kwargs = dict(text='实质广告风险', card=card('实质广告风险', subtitle='', sections=[]),
+        destination=destination, store_id='5174', campaign_id='42', ad_type='sp', report_date='2026-11-10', now=clock)
+    with Session(engine) as db:
+        ids = enqueue_advertising_copies(db, settings, key='chat-analysis:first', **kwargs)
+        assert len(ids) == 2
+        assert [db.get(NotificationOutbox, i).chat_id for i in ids] == ['oc_reports', 'ou_first']
+        group, lead = (db.get(NotificationOutbox, i).payload for i in ids)
+        assert group['ad_group_owners'] is True and lead['delivery']['open_ids'] == []
+        assert not enqueue_advertising_copies(db, settings, key='chat-ad-kpi:second', **kwargs)
+        late = kwargs | {'campaign_id': 'other', 'now': clock.replace(hour=12)}
+        assert not enqueue_advertising_copies(db, settings, key='chat-analysis:night', **late)
     engine.dispose()
 
 

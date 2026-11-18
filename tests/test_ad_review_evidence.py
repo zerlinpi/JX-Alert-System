@@ -1,11 +1,13 @@
 """Maturity and partition evidence gates precede any model interpretation."""
 from datetime import date, datetime, timedelta, timezone
+import json
 
 import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
-from jx_alert.ai.ad_review_evidence import build_ad_review_context
+from jx_alert.ai.ad_review_evidence import automatic_sp_signals, build_ad_review_context
+from jx_alert.ai.ad_review_skills import load_ad_review_skills
 from jx_alert.config import Settings
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
@@ -245,3 +247,74 @@ def test_future_campaign_master_never_claims_current_enabled_state(warehouse):
     db.commit()
     row, = review(warehouse)["campaigns"]
     assert row["current_state"] == "状态未确认" and row["state_observed_at"] is None
+
+
+def _revise(db, day, **changes):
+    for metric, value in changes.items():
+        fact(db, metric, day).value = value
+        update_raw(db, metric, value, day)
+
+
+def test_spend_increase_and_order_decline_with_same_efficiency_do_not_trigger(warehouse):
+    db, _, _ = warehouse
+    seed(db)
+    for prior in range(8, 15):
+        _revise(db, DAY - timedelta(days=prior), orders=10, clicks=100, spend=100, units=10, sales=400)
+    # Mature period halves volume and spend, leaving efficiency unchanged.
+    # The current report doubles spend and clicks with unchanged CPC and improved CTR.
+    _revise(db, DAY, spend=100, clicks=100)
+    db.commit()
+    row, = review(warehouse)["campaigns"]
+    assert row["baseline"]["orders"] == 10 and row["mature"]["orders"] == 5
+    assert row["material_signals"] == []
+
+
+def test_conflicting_zero_and_low_expected_conversion_do_not_trigger(warehouse):
+    db, _, _ = warehouse
+    seed(db)
+    mature = DAY - timedelta(days=7)
+    _revise(db, mature, orders=0)  # Sales and units still report attribution.
+    db.commit()
+    assert review(warehouse)["campaigns"][0]["material_signals"] == []
+    for prior in range(8, 15):
+        _revise(db, DAY - timedelta(days=prior), orders=1)
+    _revise(db, mature, sales=0, units=0)
+    db.commit()
+    row, = review(warehouse)["campaigns"]
+    assert row["mature_comparison"]["expected_orders_at_reference_rate"] == 1
+    assert row["material_signals"] == []
+
+
+def test_active_profile_hot_reloads_and_only_tightens_gate(warehouse, tmp_path):
+    db, _, settings = warehouse
+    seed(db)
+    _revise(db, DAY, clicks=5)
+    db.commit()
+    path = tmp_path / "ad-review-skills.json"
+    settings.ad_review_skills_file = str(path)
+    before, = review(warehouse)["campaigns"]
+    assert automatic_sp_signals(before) == ["CTR"]
+    path.write_text(json.dumps({"version": 1, "defaults": {"min_impressions": 11000},
+        "ad_types": {"sp": {"objective": "discovery"}},
+        "campaigns": {"5174:sp:99": {"objective": "efficiency", "min_impressions": 4000}}}))
+    after, = review(warehouse)["campaigns"]
+    assert after["ad_skill"]["min_impressions"] == 11000
+    assert after["ad_skill"]["objective"] == "efficiency"
+    assert after["evidence_id"] != before["evidence_id"] and not automatic_sp_signals(after)
+    path.write_text('{"version":1,"defaults":{"prompt":"任意指令"}}', encoding="utf-8")
+    invalid, = review(warehouse)["campaigns"]
+    assert invalid["ad_skill"]["status"] == "invalid"
+    assert invalid["material_signals"] == ["CTR"]  # Explicit read-only review still has the proof.
+    assert automatic_sp_signals(invalid) == []
+
+
+@pytest.mark.parametrize("document", [
+    '{"version":1,"version":1}', '{"version":true}', '{"version":1,"defaults":{"min_clicks":4}}',
+    '{"version":1,"ad_types":{"sponsored":{"min_clicks":40}}}',
+    '{"version":1,"campaigns":{"*:sp:99":{}}}', '{"version":1,"defaults":{"min_relative_change":NaN}}',
+])
+def test_skills_reject_invalid_or_unsafe_threshold_files(document, tmp_path):
+    path = tmp_path / "skills.json"
+    path.write_text(document)
+    settings = Settings(_env_file=None, ad_review_skills_file=str(path))
+    assert load_ad_review_skills(settings).status == "invalid"

@@ -1,6 +1,7 @@
 """Hourly updates are bounded, quiet, active-only and idempotent across polls."""
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, select, func
@@ -206,12 +207,16 @@ def _finding(sid, cid, day='2026-11-16'):
         'signals': ['zero_conversion']}
 
 
-def test_daytime_batches_by_owner_and_rechecks_store_level_permission(warehouse):
-    from pathlib import Path
+def test_daytime_batches_in_one_group_and_refreshes_owner_mentions(warehouse):
     settings, session, _, _ = warehouse
+    settings.feishu_group_fallback_enabled = False
     path = Path(settings.feishu_routing_file)
     routing = json.loads(path.read_text())
-    routing['stores'] = {'5174': {'open_ids': ['ou_owner']}, '5175': ['ou_owner']}
+    routing['groups']['reports']['verified_member_open_ids'] = ['ou_owner', 'ou_new_owner', 'ou_lead']
+    routing['stores'] = {'5174': {'open_ids': ['ou_owner']}, '5175': ['ou_owner', 'ou_nonmember']}
+    routing['ad_alert_subscribers'] = {'recipients': [
+        {'open_id': 'ou_lead', 'name': '总负责人', 'generation': 'a'*32},
+    ]}
     path.write_text(json.dumps(routing))
     with session() as db:
         db.get(Store, '5175').status = 1
@@ -220,15 +225,27 @@ def test_daytime_batches_by_owner_and_rechecks_store_level_permission(warehouse)
         db.commit()
         evidence = [_finding('5174', 'active'), _finding('5175', 'b'), _finding('5174', 'paused')]
         ids = hourly_ads.queue_hourly_findings(db, settings, evidence, now=CLOCK, slot='first', send_alerts=True)
-        assert len(ids) == 1
-        row = db.get(NotificationOutbox, ids[0])
-        assert row.chat_id == 'ou_owner'
+        assert len(ids) == 2
+        row, lead = (db.get(NotificationOutbox, oid) for oid in ids)
+        assert (row.chat_id, lead.chat_id) == ('oc_reports', 'ou_lead')
         assert [item['campaign_id'] for item in row.payload['hourly_items']] == ['active', 'b']
-        routing['stores']['5175'] = ['ou_different_owner']
+        assert lead.payload['hourly_items'] == row.payload['hourly_items']
+        initial = json.dumps(hourly_ads.recheck_hourly_card(db, settings, row.payload, CLOCK))
+        assert initial.count('<at id=ou_owner></at>') == 1 and 'ou_nonmember' not in initial
+        private = hourly_ads.recheck_hourly_card(db, settings, lead.payload, CLOCK)
+        assert private is not None and '<at id' not in json.dumps(private)
+        routing['stores']['5175'] = ['ou_new_owner']
         path.write_text(json.dumps(routing))
-        filtered = hourly_ads.recheck_hourly_card(db, settings, row.payload, CLOCK)
-        table = next(item for item in filtered['body']['elements'] if item['tag'] == 'table')
-        assert len(table['rows']) == 1 and 'active' in table['rows'][0]['c0']
+        refreshed = hourly_ads.recheck_hourly_card(db, settings, row.payload, CLOCK)
+        assert '<at id=ou_new_owner></at>' in json.dumps(refreshed)
+        table = next(item for item in refreshed['body']['elements'] if item['tag'] == 'table')
+        assert len(table['rows']) == 2
+        previous_version = {**lead.payload, 'delivery': {'role': 'store_ad_recipient',
+            'receive_id_type': 'open_id', 'receive_id': 'ou_owner'}}
+        assert hourly_ads.recheck_hourly_card(db, settings, previous_version, CLOCK) is None
+        routing['ad_alert_subscribers']['recipients'][0]['generation'] = 'b'*32
+        path.write_text(json.dumps(routing))
+        assert hourly_ads.recheck_hourly_card(db, settings, lead.payload, CLOCK) is None
         changed_date = [_finding('5174', 'active', day='2026-11-17')]
         assert not hourly_ads.queue_hourly_findings(db, settings, changed_date,
             now=CLOCK + timedelta(hours=1), slot='second', send_alerts=True)
@@ -236,6 +253,13 @@ def test_daytime_batches_by_owner_and_rechecks_store_level_permission(warehouse)
 
 def test_night_keeps_incidents_and_releases_one_group_table_at_eight(warehouse):
     settings, session, _, _ = warehouse
+    path = Path(settings.feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing['stores'] = {'5174': ['ou_owner']}
+    routing['ad_alert_subscribers'] = {'recipients': [
+        {'open_id': 'ou_lead', 'name': '总负责人', 'generation': 'a'*32},
+    ]}
+    path.write_text(json.dumps(routing))
     close = CLOCK + timedelta(hours=4)
     open_at = close + timedelta(hours=14)
     with session() as db:
@@ -251,14 +275,31 @@ def test_night_keeps_incidents_and_releases_one_group_table_at_eight(warehouse):
         campaign.updated_at = open_at.replace(tzinfo=None)
         db.commit()
         ids = hourly_ads.queue_overnight_digest(db, settings, open_at)
-        assert len(ids) == 1
-        row = db.get(NotificationOutbox, ids[0])
-        assert row.chat_id == 'oc_reports'
+        assert len(ids) == 2
+        row, lead = (db.get(NotificationOutbox, oid) for oid in ids)
+        assert (row.chat_id, lead.chat_id) == ('oc_reports', 'ou_lead')
+        assert '<at id=ou_owner></at>' in json.dumps(row.payload['card'])
+        assert '<at id' not in json.dumps(lead.payload['card'])
         assert row.payload['text'] == '夜间广告异常汇总'
         assert hourly_ads.delivery_window(row.payload, open_at - timedelta(seconds=1))[0] == 'WAITING'
         assert hourly_ads.delivery_window(row.payload, open_at)[0] == 'READY'
         assert hourly_ads.delivery_window(row.payload, open_at + timedelta(hours=10))[0] == 'EXPIRED'
         assert not hourly_ads.queue_overnight_digest(db, settings, open_at + timedelta(minutes=1))
+
+
+def test_legacy_multiple_leads_have_only_the_group_destination(warehouse):
+    settings, session, _, _ = warehouse
+    path = Path(settings.feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing['ad_alert_subscribers'] = {'recipients': [
+        {'open_id': f'ou_lead{index}', 'name': '旧订阅人员', 'generation': 'a'*32}
+        for index in range(2)
+    ]}
+    path.write_text(json.dumps(routing))
+    with session() as db:
+        ids = hourly_ads.queue_hourly_findings(db, settings, [_finding('5174', 'active')],
+            now=CLOCK, slot='first', send_alerts=True)
+        assert [db.get(NotificationOutbox, oid).chat_id for oid in ids] == ['oc_reports']
 
 
 def test_automatic_analysis_waits_for_campaign_history_and_excludes_spend_alone():
@@ -267,8 +308,11 @@ def test_automatic_analysis_waits_for_campaign_history_and_excludes_spend_alone(
     assert signals({**row, 'campaign_start_date': '2026-11-11'}) == []
     assert signals({**row, 'campaign_start_date': '2026-11-09'}) == ['CPC']
     assert signals({**row, 'material_signals': ['spend']}) == []
-    intraday = {**row, 'intraday': True, 'material_signals': ['intraday_budget']}
+    intraday = {**row, 'intraday': True, 'material_signals': ['intraday_budget'],
+                'current': {'spend': 230}, 'verified_daily_budget': 100}
     assert not signals(intraday)
+    almost = {**intraday, 'current': {'spend': 229.99}}
+    assert not signals(almost, has_mature_history=True)
     assert signals(intraday, has_mature_history=True) == ['intraday_budget']
 
 

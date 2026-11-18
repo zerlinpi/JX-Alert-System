@@ -8,9 +8,11 @@ from sqlalchemy.exc import DBAPIError
 
 from jx_alert.ai.ad_review import review_advertising
 from jx_alert.ai.ad_review_evidence import automatic_sp_signals, build_ad_review_context
-from jx_alert.notifications.hourly_ads import (
-    INCIDENT, campaign_identity, incident_key, queue_hourly_findings, queue_overnight_digest, recent_incidents,
+from jx_alert.ai.ad_review_skills import load_ad_review_skills
+from jx_alert.notifications.ad_repeat import (
+    campaign_identity, incident_already_recorded, load_incident_history, repeat_eligible_signals,
 )
+from jx_alert.notifications.hourly_ads import queue_hourly_findings, queue_overnight_digest
 from jx_alert.storage.models import Campaign, DataCoverage, RawSnapshot, Store, SyncJob
 from jx_alert.store_controls import collection_states
 
@@ -258,26 +260,28 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             phase = 'advertising_evidence'
             from jx_alert.ai.intraday_risk_evidence import intraday_over_budget_candidates
             reviewed_at = now or _utcnow()
-            contexts = [build_ad_review_context(db, settings, ready, dates, now=reviewed_at)]
+            skills = load_ad_review_skills(settings)
+            meta['ad_review_skills_status'] = skills.status
+            contexts = [build_ad_review_context(db, settings, ready, dates, now=reviewed_at, skills=skills)]
             contexts[0]['campaigns'] = [r for r in contexts[0]['campaigns'] if r['current_state'] == '投放中']
             mature_history = {campaign_identity(r) for r in contexts[0]['campaigns']}
             intraday = []
             for sid, snapshot_id in intraday_snapshots.items():
                 snapshot = db.get(RawSnapshot, snapshot_id)
                 if snapshot:
-                    intraday.extend(intraday_over_budget_candidates(db, db.get(Store, sid), snapshot, now=reviewed_at))
+                    intraday.extend(intraday_over_budget_candidates(
+                        db, db.get(Store, sid), snapshot, now=reviewed_at, skills=skills))
             contexts.append({'ad_review': True, 'hourly_intraday': True, 'reply_mode': 'answer',
                 'campaigns': intraday, 'policy': {'advertising_changes_allowed': False}})
             findings, model_usage, model_failures = [], [], []
-            recent = recent_incidents(db, reviewed_at)
+            history = load_incident_history(db, reviewed_at)
             for context in contexts:
                 context['hourly_delivery'] = True
                 for row in context['campaigns']:
                     identity = campaign_identity(row)
-                    row['material_signals'] = automatic_sp_signals(row, has_mature_history=identity in mature_history)
-                    if row['material_signals'] and (identity in recent or db.scalar(select(SyncJob.id).where(
-                            SyncJob.job_type == INCIDENT,
-                            SyncJob.metadata_json['incident_key'].as_string() == incident_key(row)))):
+                    signals = automatic_sp_signals(row, has_mature_history=identity in mature_history)
+                    row['material_signals'] = repeat_eligible_signals(row, signals, history, reviewed_at)
+                    if row['material_signals'] and incident_already_recorded(db, row):
                         row['material_signals'] = []
             db.rollback()
             phase = 'advertising_review'
@@ -293,13 +297,17 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     model_usage.append(audit)
             # Models do not grant a delivery right. Recheck fresh active master data.
             phase = 'evidence_recheck'
-            refreshed = build_ad_review_context(db, settings, ready, dates, now=now or _utcnow())
+            refreshed_skills = load_ad_review_skills(settings)
+            refreshed = build_ad_review_context(db, settings, ready, dates, now=now or _utcnow(),
+                skills=refreshed_skills)
             valid_ids = {r['evidence_id'] for r in refreshed['campaigns'] if r['current_state'] == '投放中'}
+            refreshed_history = {campaign_identity(r) for r in refreshed['campaigns'] if r['current_state'] == '投放中'}
             for sid, snapshot_id in intraday_snapshots.items():
                 snapshot = db.get(RawSnapshot, snapshot_id)
                 if snapshot:
                     valid_ids.update(r['evidence_id'] for r in intraday_over_budget_candidates(
-                        db, db.get(Store, sid), snapshot, now=now or _utcnow()))
+                        db, db.get(Store, sid), snapshot, now=now or _utcnow(), skills=refreshed_skills)
+                        if automatic_sp_signals(r, has_mature_history=campaign_identity(r) in refreshed_history))
             checked = []
             for finding in findings:
                 r = finding['evidence']
