@@ -4,12 +4,14 @@ import json
 
 import pytest
 from sqlalchemy import create_engine, select, func
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from jx_alert import hourly_ad_monitor as monitor
 from jx_alert.config import Settings
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
+from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
 from jx_alert.storage.models import Campaign, Store, SyncJob
 
 
@@ -116,6 +118,63 @@ def test_source_failure_waits_before_retry_and_retains_job(warehouse):
         assert job.metadata_json['attempts'] == 2
         assert 'private upstream' not in json.dumps(job.metadata_json)
         assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+
+
+def test_interrupted_final_attempt_resumes_after_lock_release(warehouse):
+    _, factory, engine, calls = warehouse
+    with factory() as db:
+        job = SyncJob(job_type='hourly_ad_monitor_validation', status='RUNNING',
+            started_at=CLOCK.replace(tzinfo=None),
+            metadata_json={'slot': CLOCK.isoformat(), 'attempts': 3, 'stores': {}})
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    with database_job_lock(engine, 'hourly_ad_monitor'):
+        with pytest.raises(JobAlreadyRunning):
+            run(warehouse, send_alerts=False)
+    assert calls == []
+
+    result = run(warehouse, send_alerts=False)
+    assert result['status'] == 'SUCCEEDED'
+    assert result['job_id'] == job_id
+    with factory() as db:
+        job = db.get(SyncJob, job_id)
+        assert job.metadata_json['attempts'] == 3
+        assert job.finished_at == CLOCK.replace(tzinfo=None)
+
+
+def test_operational_failure_cooldown_starts_at_completion(warehouse, monkeypatch):
+    clock = CLOCK
+    monkeypatch.setattr(monitor, '_utcnow', lambda: clock)
+    completion = CLOCK + timedelta(minutes=8)
+
+    class SlowFailure:
+        def get_stores(self):
+            nonlocal clock
+            clock = completion
+            raise OperationalError('private statement', None, RuntimeError(1038, 'private details'))
+
+    result = run(warehouse, now=None, source=SlowFailure(), send_alerts=False)
+    assert result['status'] == 'PARTIAL_FAILED'
+    retry_at = completion + timedelta(minutes=5)
+    with warehouse[1]() as db:
+        job = db.get(SyncJob, result['job_id'])
+        assert job.finished_at == completion.replace(tzinfo=None)
+        assert job.metadata_json['retry_at'] == retry_at.isoformat()
+        assert job.metadata_json['error_phase'] == 'inventory'
+        assert job.metadata_json['database_error_code'] == 1038
+        assert 'private' not in json.dumps(job.metadata_json)
+
+    clock = retry_at - timedelta(seconds=1)
+    source = Source()
+    assert run(warehouse, now=None, source=source, send_alerts=False)['status'] == 'WAITING'
+    assert source.calls == 0
+    clock = retry_at
+    resumed = run(warehouse, now=None, source=source, send_alerts=False)
+    assert resumed['status'] == 'SUCCEEDED'
+    assert resumed['job_id'] == result['job_id']
+    assert source.calls == 1
 
 
 def test_activity_paused_during_model_call_never_queues(warehouse):
