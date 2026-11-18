@@ -72,8 +72,8 @@ class Analyst:
     def analyze(self, context, question):
         self.calls.append(context)
         assert {r['campaign_name'] for r in context['campaigns']} == {'active'}
-        return json.dumps({'findings': [{'evidence_id': 'active', 'signals': ['zero_conversion'],
-            'analysis': '成熟点击没有带来归因订单，需负责人复核流量质量。'}]})
+        assert context['hourly_delivery'] is True
+        return json.dumps({'findings': [{'evidence_id': 'active', 'signals': ['zero_conversion']}]})
 
 
 def run(warehouse, *, now=CLOCK, source=None, analyst=None, **kwargs):
