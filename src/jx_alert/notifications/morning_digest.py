@@ -7,13 +7,14 @@ import re
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from jx_alert.ai.ad_review_evidence import build_ad_review_context
-from jx_alert.analysis.ad_kpis import KPI_SPECS, compare_kpis
+from jx_alert.ai.ad_review_evidence import automatic_sp_signals, build_ad_review_context
+from jx_alert.analysis.ad_kpis import compare_kpis
 from jx_alert.analysis.evaluator import _ad_entity_events, _comparison_evidence
 from jx_alert.analysis.materiality import material_change
 from jx_alert.analysis.rules import RuleConfig
 from jx_alert.analysis.store_health import store_health_snapshot
 from jx_alert.notifications.cards import card, compact_ad_kpi_rows, number, plain
+from jx_alert.notifications.hourly_ads import advertising_card, alert_item, campaign_identity, recent_incidents
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.notifications.store_health import card_fits
 from jx_alert.storage.collection_attempts import collection_issue_for_date
@@ -265,38 +266,21 @@ def _proactive_ad_chunks(db, settings, stores, dates, warnings, target_dates, no
     eligible = [s for s in stores if not (warnings or {}).get(s.sid)
                 and _date(dates[s.sid]) == _date(targets[s.sid])]
     context = build_ad_review_context(db, settings, eligible, dates, now=now)
-    titles = {'orders': '成熟归因订单下降', 'zero_conversion': '成熟广告有花费但无归因订单',
-              'spend': '广告花费上升'}
-    chunks = []
+    recent = recent_incidents(db, now or datetime.now(timezone.utc))
+    items = []
     for evidence in context['campaigns']:
-        signals = evidence['material_signals']
-        if not signals:
-            continue
-        kpis = {code: item for code, item in evidence['kpis'].items() if code in signals}
-        topics = []
-        for code in signals:
-            if code in kpis:
-                item = kpis[code]
-                topic, day = KPI_SPECS[code][5], item['current_date']
-            else:
-                topic = titles[code]
-                day = evidence['report_date'] if code == 'spend' else evidence['mature_date']
-            topics.append(f'{topic}（{day}）')
-        current, mature = evidence['current'], evidence['mature']
-        values = [('实际复核日', evidence['report_date']),
-                  ('花费', number(current['spend'], money=True, currency=evidence['currency'])),
-                  ('成熟归因日', evidence['mature_date']),
-                  ('成熟花费', number(mature['spend'], money=True, currency=evidence['currency'])),
-                  ('成熟归因订单', number(mature['orders']))]
-        state = evidence['current_state']
-        summary = '；'.join(topics) if state == '状态未确认' else state + '｜' + '；'.join(topics)
-        value = card('商品推广活动待复核', subtitle=evidence['store_name'] + ' · ' + evidence['campaign_name'],
-            sections=[('异常内容', ['问题'], [(summary,)]),
-                      ('关键数据', ['指标', '数值'], values),
-                      ('广告指标', ['指标', '本期/日期', '参考/变化', '判断'], compact_ad_kpi_rows(kpis))])
-        if not card_fits(value):
-            raise ValueError('Morning exception exceeds the card limit')
-        chunks.append((value, [evidence['store_id']]))
+        signals = automatic_sp_signals(evidence)
+        if signals and campaign_identity(evidence) not in recent:
+            item = alert_item({'evidence': evidence, 'signals': signals}, include_dates=True)
+            state = evidence['current_state']
+            if state != '状态未确认':
+                item['campaign'] += '（' + state + '）'
+            items.append(item)
+    chunks = []
+    for offset in range(0, len(items), 10):
+        batch = items[offset:offset + 10]
+        value = advertising_card(batch, title='商品推广活动待复核')
+        chunks.append((value, list(dict.fromkeys(row['store_id'] for row in batch))))
     return chunks
 
 
@@ -382,7 +366,7 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
                         'scheduled_delivery_date': send_day.isoformat(), 'scheduled_timezone': 'Asia/Shanghai',
                         'display_reporting_date': (send_day - timedelta(days=1)).isoformat(),
                         'scheduled_not_before': due.isoformat(), 'morning_focus': True, 'morning_message_kind': kind,
-                        'quiet_verified': True})
+                        'quiet_verified': True, 'morning_batch': prefix})
                 db.add(row)
                 db.flush()
                 ids.append(row.id)

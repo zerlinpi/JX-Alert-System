@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from jx_alert import hourly_ad_monitor as monitor
 from jx_alert.config import Settings
+from jx_alert.notifications import hourly_ads
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
 from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
@@ -100,7 +101,8 @@ def test_hourly_active_only_without_quality_pages_and_deduplicates_future_hour(w
         assert len(rows) == 1
         text = json.dumps(rows[0].payload, ensure_ascii=False)
         assert all(t not in text for t in ('未授权', '待补齐', '数据不足', '2026-11-09', 'UTC'))
-        assert rows[0].payload['ad_campaign_id'] == 'active'
+        assert rows[0].payload['hourly_items'][0]['campaign_id'] == 'active'
+        assert any(element['tag'] == 'table' for element in rows[0].payload['card']['body']['elements'])
         jobs = db.scalars(select(SyncJob).where(SyncJob.job_type == 'hourly_ad_monitor')).all()
         assert all('5174' in j.metadata_json['stores'] for j in jobs)
 
@@ -193,8 +195,81 @@ def test_activity_paused_during_model_call_never_queues(warehouse):
 
 def test_changed_metric_selection_does_not_create_a_second_incident():
     row = {'store_id': '5174', 'campaign_id': '1', 'ad_type': 'sp', 'report_date': '2026-11-16', 'mature_date': '2026-11-09'}
-    assert monitor._incident_key(row) == monitor._incident_key({**row, 'material_signals': ['CPA', 'ROAS']})
-    assert monitor._incident_key(row) != monitor._incident_key({**row, 'intraday': True})
+    assert hourly_ads.incident_key(row) == hourly_ads.incident_key({**row, 'material_signals': ['CPA', 'ROAS']})
+    assert hourly_ads.incident_key(row) != hourly_ads.incident_key({**row, 'intraday': True})
+
+
+def _finding(sid, cid, day='2026-11-16'):
+    return {'evidence': {'store_id': sid, 'campaign_id': cid, 'ad_type': 'sp', 'store_name': '店铺' + sid,
+        'campaign_name': cid, 'report_date': day, 'currency': 'USD', 'kpis': {},
+        'current': {'spend': 50, 'clicks': 27}, 'mature': {'spend': 120, 'clicks': 50, 'orders': 0}},
+        'signals': ['zero_conversion']}
+
+
+def test_daytime_batches_by_owner_and_rechecks_store_level_permission(warehouse):
+    from pathlib import Path
+    settings, session, _, _ = warehouse
+    path = Path(settings.feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing['stores'] = {'5174': {'open_ids': ['ou_owner']}, '5175': ['ou_owner']}
+    path.write_text(json.dumps(routing))
+    with session() as db:
+        db.get(Store, '5175').status = 1
+        db.add(Campaign(store_id='5175', campaign_id='b', campaign_type='sp', state='enabled',
+                        updated_at=CLOCK.replace(tzinfo=None)))
+        db.commit()
+        evidence = [_finding('5174', 'active'), _finding('5175', 'b'), _finding('5174', 'paused')]
+        ids = hourly_ads.queue_hourly_findings(db, settings, evidence, now=CLOCK, slot='first', send_alerts=True)
+        assert len(ids) == 1
+        row = db.get(NotificationOutbox, ids[0])
+        assert row.chat_id == 'ou_owner'
+        assert [item['campaign_id'] for item in row.payload['hourly_items']] == ['active', 'b']
+        routing['stores']['5175'] = ['ou_different_owner']
+        path.write_text(json.dumps(routing))
+        filtered = hourly_ads.recheck_hourly_card(db, settings, row.payload, CLOCK)
+        table = next(item for item in filtered['body']['elements'] if item['tag'] == 'table')
+        assert len(table['rows']) == 1 and 'active' in table['rows'][0]['c0']
+        changed_date = [_finding('5174', 'active', day='2026-11-17')]
+        assert not hourly_ads.queue_hourly_findings(db, settings, changed_date,
+            now=CLOCK + timedelta(hours=1), slot='second', send_alerts=True)
+
+
+def test_night_keeps_incidents_and_releases_one_group_table_at_eight(warehouse):
+    settings, session, _, _ = warehouse
+    close = CLOCK + timedelta(hours=4)
+    open_at = close + timedelta(hours=14)
+    with session() as db:
+        campaign = db.scalar(select(Campaign).where(Campaign.campaign_id == 'active'))
+        campaign.updated_at = close.replace(tzinfo=None)
+        db.commit()
+        evidence = [_finding('5174', 'active')]
+        assert not hourly_ads.queue_hourly_findings(db, settings, evidence, now=close, slot='night', send_alerts=True)
+        assert db.scalar(select(SyncJob.status).where(SyncJob.job_type == hourly_ads.INCIDENT)) == 'HELD'
+        assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+        assert not hourly_ads.queue_overnight_digest(db, settings, open_at - timedelta(seconds=1))
+        assert not hourly_ads.queue_overnight_digest(db, settings, open_at)  # old activity state
+        campaign.updated_at = open_at.replace(tzinfo=None)
+        db.commit()
+        ids = hourly_ads.queue_overnight_digest(db, settings, open_at)
+        assert len(ids) == 1
+        row = db.get(NotificationOutbox, ids[0])
+        assert row.chat_id == 'oc_reports'
+        assert row.payload['text'] == '夜间广告异常汇总'
+        assert hourly_ads.delivery_window(row.payload, open_at - timedelta(seconds=1))[0] == 'WAITING'
+        assert hourly_ads.delivery_window(row.payload, open_at)[0] == 'READY'
+        assert hourly_ads.delivery_window(row.payload, open_at + timedelta(hours=10))[0] == 'EXPIRED'
+        assert not hourly_ads.queue_overnight_digest(db, settings, open_at + timedelta(minutes=1))
+
+
+def test_automatic_analysis_waits_for_campaign_history_and_excludes_spend_alone():
+    signals = monitor.automatic_sp_signals
+    row = {'report_date': '2026-11-16', 'material_signals': ['spend', 'CPC']}
+    assert signals({**row, 'campaign_start_date': '2026-11-11'}) == []
+    assert signals({**row, 'campaign_start_date': '2026-11-09'}) == ['CPC']
+    assert signals({**row, 'material_signals': ['spend']}) == []
+    intraday = {**row, 'intraday': True, 'material_signals': ['intraday_budget']}
+    assert not signals(intraday)
+    assert signals(intraday, has_mature_history=True) == ['intraday_budget']
 
 
 def test_nine_oclock_reuses_only_the_prepared_morning_report(warehouse, monkeypatch):
