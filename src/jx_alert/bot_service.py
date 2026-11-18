@@ -851,6 +851,91 @@ def _answer_cards(context, data_card, analysis):
     return cards
 
 
+def _review_ad_question(db, settings, job_id, meta, stores, factory):
+    """Run a scoped model review before the portfolio/daily template shortcut."""
+    from jx_alert.ai.ad_review import parse_findings, review_advertising, review_cache_key, review_cards
+    from jx_alert.ai.ad_review_evidence import build_ad_review_context
+    from jx_alert.ai.deepseek import DeepSeekError
+    from jx_alert.bot_portfolio import ad_types, period_length
+    from jx_alert.operations import store_report_plan
+
+    clock = _utcnow()
+    question = meta['question']
+    period = period_length(question)
+    if not 1 <= period <= 14:
+        return _complete_question(db, settings, job_id, meta,
+            [card('广告查询', subtitle='请指定一个报表日，或最近二至十四天的广告分析范围。', sections=[])],
+            'ad_review_date_clarification')
+    plan = store_report_plan([{'sid': s.sid, 'status': s.status} for s in stores],
+        settings.store_timezones_file, now=clock, include_inactive=False,
+        allow_unknown_timezone_history=getattr(settings, 'allow_unconfigured_timezone_history', False))
+    targets = {}
+    try:
+        for item in plan:
+            if item['state'] != 'READY':
+                continue
+            completed = date.fromisoformat(item['report_date'])
+            chosen = _question_date(question, completed, timezone_confirmed=item['timezone_confirmed']) or completed
+            if chosen <= completed:
+                targets[item['store_id']] = chosen
+    except QuestionDateError as exc:
+        return _complete_question(db, settings, job_id, meta,
+            [card('请确认报表日期', subtitle=str(exc), sections=[])], 'date_clarification')
+    kinds = ad_types(question) or ('sp',)
+
+    def evidence():
+        context = None
+        for offset in range(period):
+            packet = build_ad_review_context(db, settings, stores,
+                {sid: day - timedelta(days=offset) for sid, day in targets.items()}, ad_types=kinds, now=clock)
+            if context is None:
+                context = packet
+            else:
+                context['campaigns'].extend(packet['campaigns'])
+        return context
+
+    context = evidence()
+    meta['reply_store_ids'] = [s.sid for s in stores]
+    meta['ad_review_report_dates'] = {sid: day.isoformat() for sid, day in targets.items()}
+    meta['ad_review_period_days'] = period
+    candidates = [r for r in context['campaigns'] if r['material_signals']]
+    if not candidates:
+        meta['ad_review_audit'] = {'eligible_campaigns': len(context['campaigns']), 'candidate_campaigns': 0, 'batches': 0}
+        return _complete_question(db, settings, job_id, meta, review_cards([]), 'ad_review_no_findings')
+    # A fingerprint includes exact facts, dates and policy, not just shop names.
+    key = review_cache_key(context, question, settings.deepseek_model)
+    cached = db.scalar(select(SyncJob).where(SyncJob.job_type == 'feishu_question',
+        SyncJob.status == 'SUCCEEDED', SyncJob.finished_at >= clock.replace(tzinfo=None) - timedelta(minutes=10),
+        SyncJob.metadata_json['chat_id'].as_string() == meta['chat_id'],
+        SyncJob.metadata_json['sender_id'].as_string() == meta['sender_id'],
+        SyncJob.metadata_json['ad_review_cache_key'].as_string() == key,
+        SyncJob.metadata_json['analysis_provider'].as_string() == 'deepseek_ad_review')
+        .order_by(SyncJob.id.desc()).limit(1))
+    cached_result = (cached.metadata_json or {}).get('ad_review_result') if cached else None
+    db.rollback()  # Do not hold warehouse reads during the model request.
+    try:
+        if isinstance(cached_result, dict):
+            findings = parse_findings(json.dumps(cached_result, ensure_ascii=False), context['campaigns'])
+            audit, provider = {'batches': 0, 'cached': True}, 'deepseek_ad_review_cache'
+        else:
+            findings, audit = review_advertising(factory(settings), context, question)
+            provider = 'deepseek_ad_review'
+        # Authorization, coverage or facts may change during a slow model call.
+        # An invalidated snapshot cannot be delivered as a current finding.
+        current_stores = list(db.scalars(select(Store).where(Store.sid.in_([s.sid for s in stores]), Store.status == 1)))
+        if {s.sid for s in current_stores} != {s.sid for s in stores} or review_cache_key(
+                evidence(), question, settings.deepseek_model) != key:
+            raise DeepSeekError('广告证据已更新，请重新提问。')
+        meta['ad_review_cache_key'] = key
+        meta['ad_review_result'] = {'findings': [{'evidence_id': f['evidence']['evidence_id'],
+            'signals': f['signals'], 'analysis': f['analysis']} for f in findings]}
+        meta['ad_review_audit'] = audit
+        cards = review_cards(findings)
+    except DeepSeekError:
+        cards, provider = [card('广告分析未完成', subtitle='本次未能完成证据核对，请稍后重试。', sections=[])], 'unavailable'
+    return _complete_question(db, settings, job_id, meta, cards, provider)
+
+
 def process_one_question(settings, session_factory, warehouse_engine, *, client_factory=None):
     if not settings.feishu_bot_enabled or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
@@ -887,7 +972,10 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
             if collection is not None:
                 return _process_collection_command(db, settings, job_id, meta, collection)
             snapshots, ids = _resolve_store(db, settings, meta["question"])
-            from jx_alert.bot_intents import global_question_cards, focus_question
+            from jx_alert.bot_intents import global_question_cards, focus_question, ad_review_stores
+            review_stores = ad_review_stores(db, settings, meta['question'], snapshots, ids)
+            if review_stores is not None:
+                return _review_ad_question(db, settings, job_id, meta, review_stores, factory)
             from jx_alert.ai.analyst_evidence import analyst_question
             global_cards = (None if len(ids) == 1 and analyst_question(meta['question']) else
                 global_question_cards(db, settings, meta['question'], snapshots, ids, now=_utcnow()))

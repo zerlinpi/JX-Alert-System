@@ -42,6 +42,84 @@ def question_topic(question):
     return 'overall'
 
 
+def ad_review_request(question):
+    """Recognize requests for an evidence-based ad judgement, not a fact listing."""
+    q = unicodedata.normalize('NFKC', question or '').casefold()
+    if re.search(r'(?:不要|不用|无需|别|不必).{0,5}(?:分析|检查|排查|诊断|评估).{0,5}(?:广告|推广|投放)', q):
+        return False
+    if not re.search(r'广告|推广|投放|ctr|cpc|cdr|cvr|cps|roas|cpa|tcoas|tacos|acos|(?<![a-z0-9])(?:sp|sb|sd|ppc)(?![a-z0-9])', q):
+        return False
+    if re.search(r'什么意思|是什么|什么是|如何计算|怎么算|怎么计算|如何理解|如何判断|怎么判断|意味着什么|公式|含义|定义', q):
+        return False
+    # Inventory, raw metric lookups and rankings have their own deterministic
+    # readers. A request to judge the findings must reach the analyst instead.
+    judgement = bool(re.search(
+        r'异常|风险|问题|正常|怎么样|好不好|浪费|低效|不出单|无转化|少转化|低转化|'
+        r'排查|诊断|复盘|评估|检查|分析|为什么|为何|恶化|升高|下降|偏高|偏低', q))
+    if not judgement:
+        return False
+    if re.search(r'店铺列表|店铺清单|有哪些店铺数据|哪些店铺有数据|目前有哪些数据|现在有哪些数据', q) and not re.search(r'异常|风险|问题|浪费|低效', q):
+        return False
+    if re.search(r'排名|排行|最高|最多|最大|最低|最少|最小|前\s*\d+|top\s*\d+', q) and not re.search(r'异常|风险|问题|正常|浪费|低效|为什么|为何', q):
+        return False
+    return True
+
+
+def ad_review_stores(db, settings, question, snapshots, matched_ids):
+    """Resolve a review scope without broadening a failed concrete identity.
+
+    Snapshots are the caller's existing allowed scope. Named shops remain
+    readable when paused, while an implicit portfolio uses operating shops.
+    None means that this request needs the existing resolver/clarification;
+    an empty list is a valid scope with no currently authorized shops.
+    """
+    from jx_alert.bot_service import _country_matches, _name_parts
+
+    if not ad_review_request(question):
+        return None
+    q = unicodedata.normalize('NFKC', question or '').casefold()
+    allowed = {str(s['store_id']) for s in snapshots}
+    named = bool(matched_ids)
+    chosen = set(map(str, matched_ids)) & allowed
+    if not named:
+        clean = re.sub(r'\d{4}[-年/]\d{1,2}[-月/]\d{1,2}日?|\d{1,2}月\d{1,2}日', '', q)
+        clean = re.sub(r'(?:最近|过去|近|前|top)\s*\d+\s*(?:天|日|个)?', '', clean)
+        clean = re.sub(r'(?:花费|支出|消耗|预算|金额|曝光|点击|订单|销量).{0,5}?\d+(?:\.\d+)?', '', clean)
+        latin = [p for p in _name_parts(clean) if p.isascii() and len(p) >= 3
+                 and not p.isdigit() and p not in {'and', 'review', 'analyze', 'analyse', 'abnormal', 'risk'}]
+        numeric = re.findall(r'(?<![a-z0-9.])[1-9][0-9]{3,}(?![a-z0-9.])', clean)
+        # The regular resolver intentionally requires all Latin fragments to
+        # fit one shop. A review may explicitly name several real shops.
+        for part in latin:
+            matches = {str(s['store_id']) for s in snapshots if any(
+                part in alias for alias in _name_parts(s.get('store_name') or '') if alias.isascii())}
+            if not matches:
+                return None
+            chosen.update(matches)
+        if numeric:
+            if set(numeric) - allowed:
+                return None
+            chosen.update(numeric)
+        named = bool(latin or numeric)
+        if not named:
+            # Inspect the identity span up to the ad subject, including a name
+            # after "店铺/站点". Later response filters are not shop identities.
+            prefix = re.split(r'广告|推广|投放|ctr|cpc|cdr|cvr|cps|roas|cpa|tcoas|tacos|acos', clean, maxsplit=1)[0]
+            prefix = ' '.join(_name_parts(prefix))
+            generic = (r'麻烦|烦请|劳烦|请|帮我们|帮我|帮忙|想知道|想看|想了解|了解|看一看|一下|看看|看下|查看|查询|分析|检查|排查|评估|诊断|复盘|'
+                       r'当前|现在|目前|最近|最新|现有|所有|全部|各个|每个|有哪几家|有哪些|有哪家|哪些|哪几家|哪家|几个|多少家|'
+                       r'运营|已授权|可见|能看见|能看到|已采集|有数据|可读取|'
+                       r'包含|包括|已关闭|已停用|停用|关闭|历史|我们|系统|我|的|有')
+            if re.sub(generic + r'|[\s，,。！？?！]', '', prefix):
+                return None
+            chosen = {str(s['store_id']) for s in operating_snapshots(settings, snapshots, q)}
+    chosen &= allowed
+    countries = {str(s['store_id']): s.get('country') or '待确认' for s in snapshots}
+    chosen = {sid for sid in chosen if _country_matches(q, countries[sid])}
+    return list(db.scalars(select(Store).where(Store.sid.in_(chosen), Store.status == 1)
+                           .order_by(Store.name, Store.sid)))
+
+
 def _data_state(db, store, day):
     facts = list(db.scalars(select(DailyMetric).where(DailyMetric.store_id == store.sid,
         DailyMetric.metric_date == day, DailyMetric.dimension.in_(['store', 'campaign_sp']))))
