@@ -225,6 +225,106 @@ def test_client_cannot_mix_token_and_signing_identity_during_rotation(settings, 
     assert client.app_id == "app-one" and client.access_token == "token-for-app-one"
 
 
+def test_legacy_api_contract_remains_unchanged_without_a_private_api_entry(settings):
+    settings.lingxing_token_path = "/legacy-token"
+    settings.lingxing_token_request_json = '{"old":"literal-legacy-value"}'
+    settings.lingxing_refresh_path = "/legacy-refresh"
+    before = settings.model_dump()
+    # An independent MCP configuration cannot change the legacy API contract.
+    save(settings)
+    assert sources.effective_api_settings(settings, now=CLOCK) is settings
+    assert settings.model_dump() == before
+
+
+def test_private_api_replaces_literal_legacy_oauth_templates_without_mutating_settings(settings):
+    settings.lingxing_token_path = "/legacy-token"
+    settings.lingxing_token_method = "GET"
+    settings.lingxing_token_request_format = "json"
+    settings.lingxing_token_request_json = '{"appId":"old-id","appSecret":"old-secret"}'
+    settings.lingxing_refresh_path = "/legacy-refresh"
+    settings.lingxing_refresh_method = "GET"
+    settings.lingxing_refresh_request_format = "json"
+    settings.lingxing_refresh_request_json = '{"appId":"old-id","refreshToken":"old-refresh"}'
+    settings.lingxing_token_response_path = "legacy.access"
+    settings.lingxing_refresh_response_path = "legacy.refresh"
+    settings.lingxing_expires_in_response_path = "legacy.ttl"
+    before = settings.model_dump()
+    save(settings, "api", {"app_id": "new-id", "app_secret": API_SECRET, "app_key": "custom-signing-key"})
+    active = sources.effective_api_settings(settings, now=CLOCK)
+    assert active.lingxing_token_path == "/api/auth-server/oauth/access-token"
+    assert active.lingxing_refresh_path == "/api/auth-server/oauth/refresh"
+    assert active.lingxing_token_method == active.lingxing_refresh_method == "POST"
+    assert active.lingxing_token_request_format == active.lingxing_refresh_request_format == "multipart"
+    assert json.loads(active.lingxing_token_request_json) == {
+        "appId": "${LINGXING_APP_ID}", "appSecret": "${LINGXING_APP_SECRET}"}
+    assert json.loads(active.lingxing_refresh_request_json) == {
+        "appId": "${LINGXING_APP_ID}", "refreshToken": "${LINGXING_REFRESH_TOKEN}"}
+    assert (active.lingxing_token_response_path, active.lingxing_refresh_response_path,
+        active.lingxing_expires_in_response_path) == ("data.access_token", "data.refresh_token", "data.expires_in")
+    assert active.lingxing_app_key == "custom-signing-key"
+    assert settings.model_dump() == before
+
+
+@pytest.mark.parametrize("app_id", ["aaaaaaaaaaaaaaaa", "0123456789abcdef"])
+def test_rotated_private_credentials_reach_actual_multipart_token_and_refresh_requests(
+        settings, monkeypatch, app_id):
+    pytest.importorskip("fcntl", reason="The production token cache uses Linux file locks")
+    import httpx
+    from jx_alert import config
+    from jx_alert.lingxing import token
+    from jx_alert.lingxing.client import LingxingClient
+
+    # Reproduce the real regression: the old identity is hardcoded in the
+    # request templates, including when only the secret (not App ID) changes.
+    settings.lingxing_app_id = "aaaaaaaaaaaaaaaa"
+    settings.lingxing_app_secret = "old-synthetic-secret"
+    settings.lingxing_access_token = "old-static-token"
+    settings.lingxing_refresh_token = "old-static-refresh"
+    settings.lingxing_token_path = "/legacy-token"
+    settings.lingxing_token_request_json = '{"appId":"aaaaaaaaaaaaaaaa","appSecret":"old-synthetic-secret"}'
+    settings.lingxing_refresh_request_json = '{"appId":"aaaaaaaaaaaaaaaa","refreshToken":"old-static-refresh"}'
+    old_cache = Path(settings.lingxing_token_store_path)
+    old_cache.write_text('{"access_token":"unrelated-legacy-cache"}', encoding="utf-8")
+    original = old_cache.read_bytes()
+    new_secret = 'new-synthetic-secret-with-"-\\-$-&-+-/'
+    save(settings, "api", {"app_id": app_id, "app_secret": new_secret, "app_key": "private-signing-key"})
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+    clock = 1_795_000_000
+    monkeypatch.setattr(token.time, "time", lambda: clock)
+    calls = []
+
+    def receive(request):
+        body = request.read()
+        assert request.method == "POST"
+        assert request.headers["content-type"].startswith("multipart/form-data; boundary=")
+        assert (f'name="appId"\r\n\r\n{app_id}\r\n').encode() in body
+        assert b"old-synthetic-secret" not in body and b"old-static-refresh" not in body
+        if not calls:
+            assert str(request.url) == sources.API_ORIGIN + "/api/auth-server/oauth/access-token"
+            assert (f'name="appSecret"\r\n\r\n{new_secret}\r\n').encode() in body
+        else:
+            assert str(request.url) == sources.API_ORIGIN + "/api/auth-server/oauth/refresh"
+            assert b'name="refreshToken"\r\n\r\nrefresh-1\r\n' in body
+            assert b'name="appSecret"' not in body
+        calls.append(str(request.url))
+        return httpx.Response(200, json={"code": 200, "data": {
+            "access_token": f"access-{len(calls)}", "refresh_token": f"refresh-{len(calls)}", "expires_in": 7200}})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(token.httpx, "Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(receive), trust_env=False, **kwargs))
+    first = LingxingClient.from_settings()
+    assert first.app_id == app_id and first.app_key == "private-signing-key"
+    assert first.access_token == "access-1"
+    clock += 6301  # The still-valid access token is due for single-use refresh.
+    second = LingxingClient.from_settings()
+    assert second.app_id == app_id and second.access_token == "access-2"
+    assert len(calls) == 2
+    assert old_cache.read_bytes() == original
+    current_cache = json.loads(Path(second._collection_settings.lingxing_token_store_path).read_text())
+    assert current_cache["refresh_token"] == "refresh-2"
+
+
 def test_source_file_symlink_is_not_followed(settings, tmp_path):
     path = Path(settings.lingxing_sources_file)
     path.parent.mkdir()

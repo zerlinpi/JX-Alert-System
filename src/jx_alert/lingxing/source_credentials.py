@@ -189,7 +189,21 @@ def effective_api_settings(settings, *, now=None):
         raise SourceCredentialsError("领星接口已超过登记的更换日期，请在后台更新。")
     values = _api_credentials(entry["credentials"], {})
     updates = {"lingxing_" + key: value for key, value in values.items()}
+    # The console manages the official OpenAPI identity. Legacy token templates
+    # may contain literal credentials; carrying them over would authenticate
+    # with an old secret even though the private identity was saved correctly.
+    # Bind both OAuth requests and their response mappings to this snapshot.
+    # Official contracts: /new/api-docs/Authorization/GetToken/ and RefreshToken/.
     updates.update(lingxing_base_url=API_ORIGIN, lingxing_refresh_token="",
+        lingxing_token_path="/api/auth-server/oauth/access-token",
+        lingxing_token_method="POST", lingxing_token_request_format="multipart",
+        lingxing_token_request_json='{"appId":"${LINGXING_APP_ID}","appSecret":"${LINGXING_APP_SECRET}"}',
+        lingxing_refresh_path="/api/auth-server/oauth/refresh",
+        lingxing_refresh_method="POST", lingxing_refresh_request_format="multipart",
+        lingxing_refresh_request_json='{"appId":"${LINGXING_APP_ID}","refreshToken":"${LINGXING_REFRESH_TOKEN}"}',
+        lingxing_token_response_path="data.access_token",
+        lingxing_refresh_response_path="data.refresh_token",
+        lingxing_expires_in_response_path="data.expires_in",
         lingxing_token_store_path=str(_path(settings).with_name("lingxing-token-api-" + entry["version_id"] + ".json")))
     if hasattr(settings, "model_copy"):
         return settings.model_copy(update=updates)
