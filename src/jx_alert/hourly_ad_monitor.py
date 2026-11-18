@@ -169,7 +169,25 @@ def _alert_card(finding):
                      + ' · 点击 ' + number(values['clicks']))
         if 'orders' in values:
             lines.append('归因订单 ' + number(values['orders']))
-    lines += [html.escape(finding['analysis']), '请负责人复核该活动。']
+        comparisons = []
+        for code in signals:
+            metric = row['kpis'].get(code, {})
+            if metric.get('current') is None or metric.get('baseline') is None:
+                continue
+            current, baseline = metric['current'], metric['baseline']
+            if code in {'CTR', 'CDR'}:
+                current, baseline = f'{current:.2%}', f'{baseline:.2%}'
+            elif code == 'ROAS':
+                current, baseline = f'{current:.2f} 倍', f'{baseline:.2f} 倍'
+            else:
+                current = number(current, money=True, currency=row['currency'])
+                baseline = number(baseline, money=True, currency=row['currency'])
+            comparisons.append(f'{code} {current}，参考 {baseline}')
+        if comparisons:
+            lines.append(' · '.join(comparisons))
+    if finding.get('analysis'):
+        lines.append(html.escape(finding['analysis']))
+    lines.append('请负责人复核该活动。')
     value['body']['elements'].append({'tag': 'markdown', 'content': '\n'.join(lines)})
     return value
 
@@ -213,7 +231,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
     from jx_alert.storage.db import SessionLocal, engine
     from jx_alert.storage.job_lock import database_job_lock
     from jx_alert.lingxing.client import LingxingClient
-    from jx_alert.ai.deepseek import DeepSeekClient
+    from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError
     from jx_alert.operations import scoped_stores, sync_scoped_store_inventory, store_report_plan
     from jx_alert.storage.raw_archive import archive_raw_snapshots
 
@@ -313,8 +331,9 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     intraday.extend(intraday_over_budget_candidates(db, db.get(Store, sid), snapshot, now=reviewed_at))
             contexts.append({'ad_review': True, 'hourly_intraday': True, 'reply_mode': 'answer',
                 'campaigns': intraday, 'policy': {'advertising_changes_allowed': False}})
-            findings, model_usage = [], []
+            findings, model_usage, model_failures = [], [], []
             for context in contexts:
+                context['hourly_delivery'] = True
                 for row in context['campaigns']:
                     if not row['material_signals']:
                         continue
@@ -325,8 +344,12 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             db.rollback()
             for context in contexts:
                 if any(r['material_signals'] for r in context['campaigns']):
-                    found, audit = review_advertising((analyst_factory or DeepSeekClient.from_settings)(settings), context,
-                        '仅检查当前开启的广告活动，有实质风险才列出；不列正常、缺失、未成熟或未授权信息。')
+                    try:
+                        found, audit = review_advertising((analyst_factory or DeepSeekClient.from_settings)(settings),
+                            context, '核对当前开启活动中的实质广告风险。')
+                    except DeepSeekError:
+                        model_failures.append('intraday' if context.get('hourly_intraday') else 'mature')
+                        continue
                     findings.extend(found)
                     model_usage.append(audit)
             # Models do not grant a delivery right. Recheck fresh active master data.
@@ -347,9 +370,10 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                         and r['evidence_id'] in valid_ids):
                     checked.append(finding)
             ids = _queue_findings(db, settings, checked, send_alerts=send_alerts)
-            meta.update(outbox_ids=ids, finding_count=len(checked), model_usage=model_usage,
+            meta.pop('error_type', None)
+            meta.update(outbox_ids=ids, finding_count=len(checked), model_usage=model_usage, model_failures=model_failures,
                 raw_archive=archive_raw_snapshots(db, settings.raw_dir, after_id=raw_start))
-            partial = (len(checked) != len(findings)
+            partial = (bool(model_failures) or len(checked) != len(findings)
                        or any(r.get('status') == 'PARTIAL' for r in meta['stores'].values()))
             job = db.get(SyncJob, job_id)
             job.status = 'PARTIAL_FAILED' if partial else 'SUCCEEDED'
