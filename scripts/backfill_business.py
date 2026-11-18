@@ -74,8 +74,11 @@ def backfill(report_date, source, store_ids=None):
             result['raw_archive'] = archive_raw_snapshots(db, settings.raw_dir, after_id=before)
             result['status'] = 'PARTIAL_FAILED' if any(result[k].get('status') != 'COMPLETE'
                 for k in ('api', 'mcp') if k in result) else 'COMPLETE'
+            if result['status'] == 'COMPLETE' and result['excel']['status'] == 'RETRY_PENDING':
+                result['status'] = 'COMPLETE_WITH_ARCHIVE_RETRY'
             job = db.get(SyncJob, job_id)
-            job.status = 'PARTIAL_FAILED' if result['status'] == 'PARTIAL_FAILED' else 'SUCCEEDED'
+            job.status = ('PARTIAL_FAILED' if result['status'] == 'PARTIAL_FAILED' else
+                          'SUCCEEDED_WITH_WARNINGS' if result['status'] == 'COMPLETE_WITH_ARCHIVE_RETRY' else 'SUCCEEDED')
             job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
             job.store_count = len(selected)
             job.metadata_json = result
@@ -100,7 +103,7 @@ if __name__ == '__main__':
     try:
         result = backfill(args.report_date, args.source, args.store_ids)
         print(json.dumps(result, ensure_ascii=False))
-        if result.get('status') in {'PARTIAL_FAILED', 'FAILED'}:
+        if result.get('status') in {'PARTIAL_FAILED', 'FAILED', 'COMPLETE_WITH_ARCHIVE_RETRY'}:
             raise SystemExit(2)
     except Exception as exc:
         print(json.dumps({'status': 'FAILED', 'error_type': type(exc).__name__}))
