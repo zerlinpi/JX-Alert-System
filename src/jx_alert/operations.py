@@ -247,7 +247,8 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
     from jx_alert.config import get_settings
     from jx_alert.storage.db import SessionLocal, engine, init_db
     from jx_alert.storage.job_lock import database_job_lock
-    from jx_alert.lingxing.source_gateway import create_collection_client
+    from jx_alert.lingxing.client import LingxingCollectionPaused, LingxingError
+    from jx_alert.lingxing.source_gateway import CollectionSources, create_collection_client
     from jx_alert.lingxing.pipeline import ad_account_inventory, collect_daily_snapshot
     from jx_alert.lingxing.sales_collector import collect_sales_for_day
     from jx_alert.analysis.evaluator import evaluate_daily_anomalies
@@ -274,6 +275,7 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                 return {"status": "SKIPPED_COLLECTION_DISABLED", "collection_disabled_store_ids": selected}
         init_db()
         client = create_collection_client(settings)
+        dual = isinstance(client, CollectionSources)
         inventory = client.get_stores()
         with SessionLocal() as db:
             synced = sync_scoped_store_inventory(db, settings, inventory, selected=selected)
@@ -335,19 +337,42 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                     results[sid] = {"status": "REUSED_COMPLETED_CHECKPOINT"}
                     continue
                 one = {**stores, "data": [r for r in stores["data"] if str(r["sid"]) == sid]}
+                pre_collection_failures = []
                 try:
                     # Per-store checkpoints isolate provider failures and let a
                     # bounded manual retry retain already completed stores.
                     confirmed_timezone = next(p["timezone_confirmed"] for p in plan if p["store_id"] == sid)
-                    sp = (collect_sp_targets(client, db, settings, {sid: day},
-                        days=max(backfill_days, settings.sp_refresh_days), scope_store_ids=scope_ids)
-                        if confirmed_timezone else {"status": "DISABLED_UNKNOWN_TIMEZONE", "runs": []})
+                    # API-only prerequisites must not block independent MCP
+                    # business observations; their failures still require retry.
+                    try:
+                        sp = (collect_sp_targets(client, db, settings, {sid: day},
+                            days=max(backfill_days, settings.sp_refresh_days), scope_store_ids=scope_ids)
+                            if confirmed_timezone else {"status": "DISABLED_UNKNOWN_TIMEZONE", "runs": []})
+                    except LingxingCollectionPaused:
+                        raise
+                    except LingxingError as exc:
+                        if not dual:
+                            raise
+                        db.rollback()
+                        failure = {"step": "sp_validation", "report_date": day,
+                                   "error_type": type(exc).__name__}
+                        pre_collection_failures.append(failure)
+                        sp = {"status": "PARTIAL", "runs": [], "source_failures": [failure]}
                     sp_runs.extend(sp.get("runs", []))
                     for offset in range(backfill_days - 1, 0, -1):
                         if not collection_enabled(settings, sid):
                             break
                         older = (date.fromisoformat(day) - timedelta(days=offset)).isoformat()
-                        collect_sales_for_day(client, db, {sid: older}, stores_response=one)
+                        try:
+                            collect_sales_for_day(client, db, {sid: older}, stores_response=one)
+                        except LingxingCollectionPaused:
+                            raise
+                        except LingxingError as exc:
+                            if not dual:
+                                raise
+                            db.rollback()
+                            pre_collection_failures.append({"step": "sales_history", "report_date": older,
+                                                            "error_type": type(exc).__name__})
                     collected = collect_daily_snapshot(client, db, {sid: day}, stores_response=one,
                         settings=settings, ad_accounts=accounts,
                         ad_attribution_refresh_days=max(backfill_days, settings.ad_attribution_refresh_days))
@@ -359,11 +384,13 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                     db.commit()
                     analysis = evaluate_daily_anomalies(db, {sid: day})
                     reports = [str(p) for p in export_daily_reports(db, day, settings.report_dir, store_id=sid)]
-                    status = ("PARTIAL" if sp["status"] == "PARTIAL" or
+                    status = ("PARTIAL" if pre_collection_failures or sp["status"] == "PARTIAL" or
                         collected["status"] not in {"SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"} else
                         "COMPLETE_WITH_WARNINGS" if collected["status"] == "SUCCEEDED_WITH_WARNINGS" else "COMPLETE")
                     results[sid] = {"status": status, "collection": collected, "sp": sp,
                         "analysis": analysis, "reports": reports, "currency_state": currency_state}
+                    if pre_collection_failures:
+                        results[sid]["pre_collection_failures"] = pre_collection_failures
                     if status in {"COMPLETE", "COMPLETE_WITH_WARNINGS"}:
                         completed.add(sid)
                     else:
@@ -371,6 +398,8 @@ def run_collection(*, report_date=None, backfill_days=1, completed_store_ids=Non
                 except Exception as exc:
                     db.rollback()
                     results[sid] = {"status": "FAILED", "error_type": type(exc).__name__}
+                    if pre_collection_failures:
+                        results[sid]["pre_collection_failures"] = pre_collection_failures
                     failures.append(sid)
                 if progress is not None:
                     progress({"completed_store_dates": {s: latest[s] for s in sorted(completed)},

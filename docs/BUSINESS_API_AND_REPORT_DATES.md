@@ -23,4 +23,8 @@ sudo docker compose -p jx-alert exec -T app python /app/scripts/backfill_busines
 
 源文件及每日全历史Excel保留这两个新维度；补采按同店同日替换当前事实，保留原始版本，不重复累计金额。日报仍使用既有08:00队列与去重，不因补采重发历史消息。
 
+自动双源采集中的SP校验、历史销量接口失败，不再阻断独立的MCP经营采集。原步骤记录脱敏失败，整店保留部分失败状态及重试，不能因经营看板成功就标记全店采集完成。暂停开关、配置错误和纯接口模式保持原有保护。
+
+经营数据已保存但Excel归档待重试时，补采返回`COMPLETE_WITH_ARCHIVE_RETRY`，任务记为`SUCCEEDED_WITH_WARNINGS`，命令退出码为2；不得把数据库成功冒充文件归档成功。
+
 官方依据：[产品表现](https://apidoc.lingxing.com/new/api-docs/Statistics/AsinListNew/)、[店铺利润报表](https://apidoc.lingxing.com/new/api-docs/Finance/bdSeller/)、[看板口径](https://www.lingxing.com/help/article/manageBoard)、[官方Python SDK](https://apidoc.lingxing.com/file/openapi-python3-sdk-20230419.zip)。

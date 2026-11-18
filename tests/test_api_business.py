@@ -12,7 +12,7 @@ from jx_alert.lingxing.client import LingxingClient, _endpoint_signature_params,
 from jx_alert.notifications.business_daily import business_daily_card
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
-from jx_alert.storage.models import Store, DailyMetric, DataCoverage, RawSnapshot
+from jx_alert.storage.models import Store, DailyMetric, DataCoverage, RawSnapshot, SyncJob
 
 
 DAY = '2026-11-16'
@@ -168,7 +168,12 @@ def test_model_omits_repetitive_missing_rows_but_keeps_real_zero_and_distinct_ap
     assert context == original
 
 
-def test_api_backfill_runs_without_mcp_and_exports_both_exact_dates(warehouse, monkeypatch):
+@pytest.mark.parametrize('archive_status,result_status,job_status', [
+    ('COMPLETE', 'COMPLETE', 'SUCCEEDED'),
+    ('RETRY_PENDING', 'COMPLETE_WITH_ARCHIVE_RETRY', 'SUCCEEDED_WITH_WARNINGS'),
+])
+def test_api_backfill_runs_without_mcp_and_exports_both_exact_dates(
+        warehouse, monkeypatch, archive_status, result_status, job_status):
     db, store, settings = warehouse
     spec = importlib.util.spec_from_file_location('business_backfill', Path(__file__).parents[1] / 'scripts/backfill_business.py')
     backfill = importlib.util.module_from_spec(spec)
@@ -181,9 +186,11 @@ def test_api_backfill_runs_without_mcp_and_exports_both_exact_dates(warehouse, m
     monkeypatch.setattr(backfill, 'SessionLocal', lambda: Session(db.get_bind()))
     monkeypatch.setattr(backfill, 'collect_business_for_day', lambda *args: pytest.fail('API-only backfill cannot call MCP'))
     archived = []
-    monkeypatch.setattr(backfill, 'archive_partitions', lambda db, settings, dates: archived.append(dates) or {'status': 'COMPLETE'})
+    monkeypatch.setattr(backfill, 'archive_partitions',
+        lambda db, settings, dates: archived.append(dates) or {'status': archive_status})
     result = backfill.backfill(DAY, 'api', ['5174'])
-    assert result['status'] == 'COMPLETE'
+    assert result['status'] == result_status
+    assert db.get(SyncJob, result['job_id']).status == job_status
     assert archived == [{'5174': ['2026-11-15', '2026-11-16']}]
     assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
 
