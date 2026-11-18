@@ -427,9 +427,9 @@ def _notice_last_update(response):
     return response.get("lastUpdateDate") if isinstance(response, dict) else None
 
 
-def _store_performance_for_sid(client, db, sid, store_name, settings):
+def _store_performance_for_sid(client, db, sid, store_name, settings, *, health_only=False):
     store_id = str(sid)
-    observation_only = getattr(settings, "lingxing_performance_observation_only", True)
+    observation_only = health_only or getattr(settings, "lingxing_performance_observation_only", True)
     page_size = int(settings.lingxing_performance_page_size)
     max_pages = int(settings.lingxing_performance_max_pages)
 
@@ -453,7 +453,8 @@ def _store_performance_for_sid(client, db, sid, store_name, settings):
             db, store_id=store_id, dataset="store_performance", status="MISSING",
             source_updated_at=None, record_count=0,
         )
-        _queue_freshness_event(db, store_id, "store_performance", "MISSING", None)
+        if not health_only:
+            _queue_freshness_event(db, store_id, "store_performance", "MISSING", None)
     else:
         normalized = []
         for row in rows:
@@ -531,9 +532,17 @@ def _store_performance_for_sid(client, db, sid, store_name, settings):
             status=freshness, source_updated_at=list_row.get("update_date"),
             record_count=len(rows),
         )
-        _queue_freshness_event(
-            db, store_id, "store_performance", freshness, list_row.get("update_date")
-        )
+        if not health_only:
+            _queue_freshness_event(
+                db, store_id, "store_performance", freshness, list_row.get("update_date")
+            )
+
+    if health_only:
+        # The verified MCP adapter supplies health list and detail only.
+        # Keep existing notice state and evidence separate from this observation.
+        return {"store_id": store_id, "performance_rows": len(rows), "notice_rows": 0,
+                "performance_freshness": freshness if rows else "MISSING",
+                "notice_freshness": "UNAVAILABLE"}
 
     notice_rows, notice_pages = _fetch_all(
         lambda offset, length: client.performance_notice_list({
@@ -586,11 +595,13 @@ def _store_performance_for_sid(client, db, sid, store_name, settings):
     }
 
 
-def collect_store_performance(client, db, *, stores_response, settings):
+def collect_store_performance(client, db, *, stores_response, settings, health_only=False):
     """Collect latest performance snapshot and all notice pages for each store.
 
     The notice request intentionally omits status/isRead/date filters so an
     incomplete filter can never hide a pending notice.
+    Health-only callers archive observations without evaluating health or
+    freshness alerts. Existing notice records and their sync state are retained.
     """
     from jx_alert.store_controls import collection_enabled
 
@@ -604,7 +615,7 @@ def collect_store_performance(client, db, *, stores_response, settings):
         "notice_rows": 0,
         "freshness": [],
         "errors": [],
-        "observation_only": getattr(settings, "lingxing_performance_observation_only", True),
+        "observation_only": health_only or getattr(settings, "lingxing_performance_observation_only", True),
     }
     for store in store_rows:
         sid = store.get("sid") if isinstance(store, dict) else None
@@ -617,7 +628,7 @@ def collect_store_performance(client, db, *, stores_response, settings):
             continue
         try:
             result = _store_performance_for_sid(
-                client, db, sid, str(store.get("name") or sid), settings
+                client, db, sid, str(store.get("name") or sid), settings, health_only=health_only
             )
             summary["performance_rows"] += result["performance_rows"]
             summary["notice_rows"] += result["notice_rows"]
@@ -626,14 +637,16 @@ def collect_store_performance(client, db, *, stores_response, settings):
                 if summary["status"] == "SUCCEEDED":
                     summary["status"] = "SUCCEEDED_WITH_WARNINGS"
         except Exception as exc:
-            message = f"{type(exc).__name__}: {str(exc)[:500]}"
+            message = type(exc).__name__ if health_only else f"{type(exc).__name__}: {str(exc)[:500]}"
             summary["errors"].append({"store_id": store_id, "error": message})
-            for dataset in ("store_performance", "performance_notices"):
+            datasets = ("store_performance",) if health_only else ("store_performance", "performance_notices")
+            for dataset in datasets:
                 _upsert_sync_state(
                     db, store_id=store_id, dataset=dataset, status="FAILED",
                     source_updated_at=None, record_count=0, error_message=message,
                 )
-                _queue_freshness_event(db, store_id, dataset, "FAILED", None)
+                if not health_only:
+                    _queue_freshness_event(db, store_id, dataset, "FAILED", None)
             summary["status"] = "PARTIAL_FAILED"
             db.flush()
     db.commit()

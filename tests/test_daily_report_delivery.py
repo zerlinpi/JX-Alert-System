@@ -28,7 +28,7 @@ def setup(tmp_path):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        store = Store(sid="5174", name="Store", timezone="America/Los_Angeles", currency_code="USD")
+        store = Store(sid="5174", name="Store", status=1, timezone="America/Los_Angeles", currency_code="USD")
         db.add(store)
         db.flush()
         yield db, settings, store

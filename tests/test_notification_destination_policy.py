@@ -14,7 +14,7 @@ from jx_alert.notifications.feishu_app import FeishuAppClient
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.notifications.routing import bind_group_delivery, group_member_mentions, report_group_delivery
 from jx_alert.storage.db import Base
-from jx_alert.storage.models import NotificationLog
+from jx_alert.storage.models import Campaign, NotificationLog, Store
 
 
 @pytest.fixture
@@ -161,12 +161,15 @@ def test_quiet_mode_skips_queued_noise_without_sending_or_retrying(delivery_runt
         "chat-analysis:old-unsupported": {},
         "chat-report:manual": {},
         "store-health-brief:duplicate": {},
-        "chat-ad-kpi:verified": {"material_ad_alert": True},
+        "chat-ad-kpi:verified": {"material_ad_alert": True, "ad_campaign_id": "campaign-1", "ad_campaign_type": "sp"},
     }
     with sessions.begin() as db:
+        db.add(Store(sid="5174", name="授权店铺", status=1))
+        db.add(Campaign(store_id="5174", campaign_type="sp", campaign_id="campaign-1",
+            state="enabled", updated_at=now.replace(tzinfo=None)))
         for key, extra in {**scheduled, **other}.items():
             row = _row(key, group, now)
-            row.payload = {**row.payload, **(due if key in scheduled else {}), **extra}
+            row.payload = {**row.payload, "store_id": "5174", **(due if key in scheduled else {}), **extra}
             db.add(row)
         db.add(_row("group-question:om_question:0", reply, now))
         db.add(_row("group-question:om_other:0", reply, now))

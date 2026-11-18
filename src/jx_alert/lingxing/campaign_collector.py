@@ -17,7 +17,9 @@ def _float_or_none(value, field: str) -> float | None:
 
 
 def collect_campaigns(client, db, *, stores_response: dict | None = None,
-                      page_size: int = 100) -> dict:
+                      page_size: int = 100, report_types=("sp", "sb", "sd")) -> dict:
+    if not report_types or any(kind not in {"sp", "sb", "sd"} for kind in report_types):
+        raise ValueError("Unsupported campaign type")
     stores_response = stores_response or client.get_stores()
     stores = stores_response.get("data") if isinstance(stores_response, dict) else None
     if not isinstance(stores, list):
@@ -32,7 +34,7 @@ def collect_campaigns(client, db, *, stores_response: dict | None = None,
 
     total_campaigns = {"sp": 0, "sb": 0, "sd": 0}
     for store_id, store in active_ad_stores:
-        for campaign_type in ("sp", "sb", "sd"):
+        for campaign_type in dict.fromkeys(report_types):
             rows = list(client.iter_advertising_campaigns(
                 campaign_type,
                 {"sid": store["sid"]},

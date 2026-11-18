@@ -16,7 +16,7 @@ from jx_alert.store_controls import get_store_controls, save_store_controls
 
 
 DAY = date(2026, 11, 12)
-NOW = datetime(2026, 11, 14, tzinfo=timezone.utc)
+NOW = datetime(2026, 11, 14, 1, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def warehouse(tmp_path):
         store = Store(sid='5174', name='Geteen美国', status=1, currency_code='USD')
         db.add(store)
         db.add(StorePerformance(store_id=store.sid, pull_date=DAY, ahr_status='GREAT', ahr_score=256,
-            source_updated_at='2026-11-14 06:56:17', indicators={}, standards={}))
+            source_updated_at='2026-11-14 06:56:17', captured_at=NOW.replace(tzinfo=None), indicators={}, standards={}))
         db.add(Campaign(store_id=store.sid, campaign_id='a', campaign_type='sp', state='enabled', name='普通活动'))
         for i in range(15):
             on = DAY - timedelta(days=i)
@@ -77,7 +77,7 @@ def test_quiet_morning_keeps_health_observations_and_omits_separate_data_gap_mes
     row = db.get(NotificationOutbox, result['outbox_ids'][0])
     assert row.payload['morning_message_kind'] == 'health'
     text = json.dumps(row.payload['card'], ensure_ascii=False)
-    assert '源时区待确认' not in text and '观测值未确认当前健康' in text
+    assert '源时区待确认' not in text and '观测值未确认当前健康' not in text
     assert '评分 256 · 评级良好（观测）' in text and '当前判定' not in text
     assert any(chunk[0]['header']['title']['content']=='广告判断待补齐数据' for chunk in morning_cards(
         db, settings, [store], {store.sid: missing}, send_day=NOW.date(), now=NOW))
@@ -168,7 +168,7 @@ def test_focused_schedule_preserves_disabled_stores_and_reuses_frozen_day(wareho
     ids = first['outbox_ids']
     rows = list(db.scalars(select(NotificationOutbox)))
     assert len(rows) == 1 and rows[0].payload['store_ids'] == ['5174']
-    assert rows[0].payload['scheduled_not_before'] == '2026-11-14T08:00:00+08:00'
+    assert rows[0].payload['scheduled_not_before'] == '2026-11-14T09:00:00+08:00'
     assert rows[0].payload['store_report_dates'] == {'5174': {'target': DAY.isoformat(), 'actual': DAY.isoformat()}}
     rows[0].status = 'DELIVERED'
     db.commit()
@@ -207,7 +207,13 @@ def test_unknown_timezone_history_fallback_keeps_actual_date_and_never_masks_tar
     assert all(p['store_report_dates'][store.sid] == {'target': str(target), 'actual': str(target if failed else DAY)} for p in payloads)
     text = json.dumps(payloads, ensure_ascii=False)
     if failed:
-        assert '采集失败' in text and '商品推广活动待复核' not in text and '仅复核历史' not in text
+        assert '采集失败' not in text and '商品推广活动待复核' not in text and '仅复核历史' not in text
+        requested = morning_cards(db, settings, [store], {store.sid: target}, send_day=NOW.date(), now=NOW)
+        assert '采集失败' in json.dumps(requested, ensure_ascii=False)
     else:
-        assert '商品推广活动待复核' in text and '仅复核历史报表日2026-11-12' in text
-        assert '目标报表日' in text and '实际复核日' in text
+        assert '商品推广活动待复核' not in text and '仅复核历史报表日2026-11-12' not in text
+        requested = morning_cards(db, settings, [store], {store.sid: DAY},
+            target_dates={store.sid: target}, send_day=NOW.date(), now=NOW)
+        requested_text = json.dumps(requested, ensure_ascii=False)
+        assert '仅复核历史报表日2026-11-12' in requested_text
+        assert '目标报表日' in requested_text and '实际复核日' in requested_text

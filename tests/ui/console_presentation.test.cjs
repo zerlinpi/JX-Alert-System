@@ -172,3 +172,30 @@ test("API business observations show known values with their independent date ba
   assert.ok(scope.elements.get("source-observations-basis").textContent.includes("下单日"));
   assert.ok(scope.elements.get("source-observations-basis").textContent.includes("结算日"));
 });
+
+test("advertising private recipients require an explicit verified choice and can be cleared offline", () => {
+  const scope = consoleScope();
+  scope.evaluate('state.csrf="a".repeat(64); state.adSubscribers.data={revision:"b".repeat(64), recipients:[{id:"ou_first",name:"接收人"}]}; state.adSubscribers.selected=new Set(["ou_first"]); updateAdSubscribers()');
+  assert.equal(scope.elements.get("save-ad-subscribers").disabled, true);
+  scope.evaluate('state.adSubscribers.selected=new Set(["ou_unknown"]); updateAdSubscribers()');
+  assert.equal(scope.elements.get("save-ad-subscribers").disabled, true);
+  scope.evaluate('state.adSubscribers.selected.clear(); updateAdSubscribers()');
+  assert.equal(scope.elements.get("save-ad-subscribers").disabled, false);
+  assert.match(scope.elements.get("ad-subscriber-note").textContent, /不额外私聊/);
+});
+
+test("private recipient save uses CSRF and sends no report subscription flag", async () => {
+  const scope = consoleScope();
+  scope.evaluate('state.csrf="a".repeat(64); state.adSubscribers.data={revision:"b".repeat(64),recipients:[]}; state.adSubscribers.members=[{id:"ou_first",name:"接收人"}]; state.adSubscribers.selected=new Set(["ou_first"]); updateAdSubscribers()');
+  let request;
+  scope.context.fetch = async (url, options) => {
+    request = {url,...options};
+    return {ok:true,status:200,json:async()=>({revision:"c".repeat(64),recipients:[{id:"ou_first",name:"接收人"}]})};
+  };
+  await scope.evaluate('saveAdSubscribers()');
+  assert.equal(request.url, '/console/api/ad-alert-subscribers');
+  assert.equal(request.method, 'POST');
+  assert.equal(request.headers['X-CSRF-Token'], 'a'.repeat(64));
+  assert.deepEqual(JSON.parse(request.body), {open_ids:['ou_first'],revision:'b'.repeat(64)});
+  assert.match(scope.elements.get('ad-subscriber-status').textContent, /不会补发旧告警/);
+});

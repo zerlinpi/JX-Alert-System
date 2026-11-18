@@ -196,6 +196,9 @@ def enqueue_anomaly_notifications(db, anomalies: list[AnomalyEvent]) -> int:
         material_ad_alert = (materiality_enabled(settings) and anomaly.rule in _AD_ALERT_RULES
             and anomaly.status != "RECOVERED" and len(scope) == 3 and scope[0] == anomaly.store_id
             and scope[1] in {"campaign", "product_ad"} and scope[2] in {"sp", "sb", "sd"})
+        if material_ad_alert and getattr(settings, 'hourly_ad_monitor_enabled', False):
+            # Keep the analysis history, but the hourly analyst owns automatic ad delivery.
+            continue
         if quiet_delivery(settings) and not material_ad_alert:
             continue
         if not material_rule_notification(db, settings, anomaly):

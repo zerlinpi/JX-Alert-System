@@ -54,6 +54,13 @@
             <label class="group-confirm"><input id="confirm-group-change" type="checkbox">我已核对目标群及上述范围</label>
           </div>
           <div class="save-bar"><span class="muted">目标群未出现时，请先在飞书中将机器人加入该群。</span><button id="save-notification-group" class="button primary" type="button" disabled>保存通知群</button></div>
+          <hr>
+          <div class="picker-heading"><div><h3 id="ad-subscribers-title">广告异常额外私聊</h3><p class="muted">选中人员同时接收所有店铺的广告异常私聊，不包含日报、绩效快报及机器人问答。</p></div><button id="reload-ad-subscribers" class="button secondary" type="button">选择接收人员</button></div>
+          <ul id="current-ad-subscribers" class="owner-chips" aria-label="当前广告异常私聊接收人"></ul>
+          <label class="sr-only" for="ad-subscriber-search">搜索私聊接收人员</label><input id="ad-subscriber-search" type="search" placeholder="搜索当前通知群成员" autocomplete="off" hidden>
+          <fieldset id="ad-subscriber-field" disabled hidden><legend class="sr-only">额外广告异常私聊接收人员</legend><div id="ad-subscriber-members" class="members"></div></fieldset>
+          <div id="ad-subscriber-status" class="notice" role="status" hidden></div>
+          <div class="save-bar"><span id="ad-subscriber-note" class="muted">默认不额外私聊任何人。</span><div class="control-actions"><button id="clear-ad-subscribers" class="link-button" type="button" disabled>清空选择</button><button id="save-ad-subscribers" class="button primary" type="button" disabled>保存私聊接收人</button></div></div>
         </div>
       </section>
       <section id="data-sources-panel" class="data-sources" aria-labelledby="sources-title" hidden>

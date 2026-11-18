@@ -13,11 +13,11 @@ from jx_alert.notifications.routing import (
     _database_entity_open_ids as _routing_database_ids,
 )
 from jx_alert.notifications.outbox import NotificationOutbox
-from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks
+from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks, quiet_delivery, original_question_reply
 from jx_alert.notifications.store_policy import paused_delivery
 from jx_alert.notifications.destination_policy import superseded_group_delivery
 from jx_alert.storage.db import SessionLocal
-from jx_alert.storage.models import NotificationLog
+from jx_alert.storage.models import Campaign, NotificationLog, Store
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def _scheduled_window(key, payload, now):
         return "EXPIRED", None
     try:
         due = datetime.fromisoformat(payload["scheduled_not_before"]) if payload.get("scheduled_not_before") else (
-            datetime.combine(day, time(8), ZoneInfo("Asia/Shanghai")))
+            datetime.combine(day, time(9), ZoneInfo("Asia/Shanghai")))
         if due.tzinfo is None or due.astimezone(ZoneInfo("Asia/Shanghai")).date() != day:
             raise ValueError
     except (TypeError, ValueError):
@@ -49,6 +49,51 @@ def _scheduled_window(key, payload, now):
 
 def _database_entity_open_ids(store_id, entity_id):
     return _routing_database_ids(store_id, entity_id, session_factory=SessionLocal)
+
+
+def _proactive_delivery_reason(db, settings, key, payload, now):
+    """Recheck queued automatic work against present store/campaign state."""
+    if original_question_reply(key, payload):
+        return None
+    ids = set(map(str, payload.get('store_ids') or []))
+    if payload.get('store_id'):
+        ids.add(str(payload['store_id']))
+    strict = (key.startswith('scheduled-daily:') or payload.get('material_ad_alert') is True
+              or quiet_delivery(settings))
+    if ids:
+        available = {s.sid for s in db.scalars(select(Store).where(Store.sid.in_(ids), Store.status == 1))}
+        # Legacy generic webhook rows without warehouse store records retain
+        # their old transport behavior outside the enabled quiet policy.
+        known = set(db.scalars(select(Store.sid).where(Store.sid.in_(ids))))
+        if known - available or strict and ids - available:
+            return '店铺未授权或同步不可用，旧消息保留记录'
+    elif strict:
+        return '主动消息缺少可核验店铺范围，旧消息保留记录'
+    if key.startswith('scheduled-daily:') or payload.get('material_ad_alert') is not True:
+        return None
+    if len(ids) != 1:
+        return '广告告警缺少唯一店铺，旧消息保留记录'
+    context = payload.get('routing_context') or {}
+    metrics = context.get('metrics') or {}
+    campaign_id = payload.get('ad_campaign_id') or metrics.get('campaign_id') or payload.get('entity_id')
+    kind = payload.get('ad_campaign_type') or metrics.get('campaign_type')
+    if not kind:
+        match = re.search(r'(?:campaign_|:campaign:)(sp|sb|sd)$', context.get('scope') or '')
+        kind = match.group(1) if match else None
+    if not campaign_id or kind is not None and kind not in {'sp', 'sb', 'sd'}:
+        return '广告告警缺少可核验活动，旧消息保留记录'
+    campaigns = list(db.scalars(select(Campaign).where(Campaign.store_id == next(iter(ids)),
+        Campaign.campaign_id == str(campaign_id), Campaign.campaign_type == kind if kind else True)))
+    if len(campaigns) != 1:
+        return '广告活动身份不唯一或不可用，旧消息保留记录'
+    campaign = campaigns[0]
+    observed = campaign.updated_at
+    if observed is not None and observed.tzinfo is not None:
+        observed = observed.astimezone(timezone.utc).replace(tzinfo=None)
+    if ((campaign.state or '').casefold() != 'enabled' or observed is None or observed > now
+            or now - observed > timedelta(minutes=90)):
+        return '广告活动已停用或状态未实时确认，旧告警保留记录'
+    return None
 
 
 def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
@@ -138,6 +183,9 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
         )
         try:
             skip_reason = QUIET_REASON if quiet_blocks(settings, dedupe_key, payload) else None
+            if skip_reason is None and payload.get("hourly_ad_monitor") is True and (
+                    now - created_at.replace(tzinfo=None) > timedelta(minutes=90)):
+                skip_reason = "即时告警已过有效期，保留记录"
             if skip_reason is None and payload.get("transport") == "app":
                 destination = payload.get("delivery") or {}
                 if destination.get("role") in {"group_question", "private_question"}:
@@ -148,6 +196,13 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     skip_reason = "通知群已更换，旧消息保留记录，不迁移或补发"
             if skip_reason is None and paused_delivery(settings, payload, created_at):
                 skip_reason = "店铺通知已停用，旧消息保留记录"
+            if skip_reason is None:
+                with SessionLocal() as db:
+                    skip_reason = _proactive_delivery_reason(db, settings, dedupe_key, payload, now)
+            if skip_reason is None and (payload.get('delivery') or {}).get('role') == 'ad_alert_subscriber':
+                from jx_alert.notifications.recipient_policy import subscriber_delivery_blocked
+                if subscriber_delivery_blocked(settings, payload):
+                    skip_reason = '广告异常私聊订阅已变更，旧消息保留记录'
             if skip_reason is not None:
                 with SessionLocal() as db:
                     skipped = db.execute(update(NotificationOutbox).where(

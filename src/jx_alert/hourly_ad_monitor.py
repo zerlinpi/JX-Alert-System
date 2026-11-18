@@ -1,0 +1,365 @@
+"""Lightweight hourly SP observations and read-only analyst-reviewed notifications."""
+from copy import deepcopy
+from datetime import date, datetime, time, timedelta, timezone
+import hashlib
+import html
+import json
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import func, select
+
+from jx_alert.ai.ad_review import review_advertising
+from jx_alert.ai.ad_review_evidence import build_ad_review_context
+from jx_alert.notifications.cards import card, number
+from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.notifications.routing import enqueue_application_deliveries
+from jx_alert.storage.models import Campaign, DataCoverage, RawSnapshot, Store, SyncJob
+from jx_alert.store_controls import collection_states, notification_states
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _naive(value):
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+class _ReadCache:
+    """Share this collection's account inventory without hiding owner switches."""
+    def __init__(self, client, stores):
+        self.client, self.stores, self.accounts = client, stores, None
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def get_stores(self):
+        return self.stores
+
+    def seller_ad_accounts(self):
+        if self.accounts is None:
+            self.accounts = self.client.seller_ad_accounts()
+        return self.accounts
+
+
+def _ready_partition(db, sid, day, zone, *, maturity=0):
+    row = db.scalar(select(DataCoverage).where(DataCoverage.store_id == sid,
+        DataCoverage.metric_date == day, DataCoverage.dimension == 'campaign_sp'))
+    deadline = datetime.combine(day + timedelta(days=maturity + 1), time.min, ZoneInfo(zone))
+    return bool(row and row.status == 'COMPLETE' and row.completed_at is not None
+                and row.completed_at.replace(tzinfo=timezone.utc) >= deadline.astimezone(timezone.utc))
+
+
+def _collect_store(client, db, settings, record, target, *, morning=False, now=None):
+    from jx_alert.lingxing.campaign_collector import collect_campaigns
+    from jx_alert.lingxing.collector import collect_ads_for_day
+    from jx_alert.lingxing.ad_currency import account_currencies
+    from jx_alert.lingxing.intraday_observation import run_observation
+    from jx_alert.reporting.archive import archive_partitions
+
+    sid, errors = str(record['sid']), []
+    one = {'data': [record]}
+    morning_ready = False
+    if morning:
+        from jx_alert.lingxing.sales_collector import collect_sales_for_day
+        from jx_alert.lingxing.api_business import collect_api_business_for_day
+        from jx_alert.lingxing.business_dashboard import collect_business_for_day
+        from jx_alert.lingxing.performance_openapi import collect_store_performance
+        steps = [
+            ('sales', lambda: [collect_sales_for_day(client, db, {sid: day.isoformat()}, stores_response=one)
+                               for day in (target - timedelta(days=1), target)]),
+            ('api_business', lambda: collect_api_business_for_day(client, db, settings, one, {sid: target.isoformat()})),
+            ('business_dashboard', lambda: collect_business_for_day(db, settings, one, {sid: target.isoformat()})),
+        ]
+        if settings.lingxing_performance_enabled:
+            steps.append(('performance', lambda: collect_store_performance(client, db,
+                stores_response=one, settings=settings)))
+        for name, collect in steps:
+            if not collection_states(settings, [sid]).get(sid):
+                return {'status': 'DISABLED', 'errors': errors}
+            try:
+                outcome = collect()
+                if isinstance(outcome, dict) and outcome.get('status') in {'FAILED', 'PARTIAL_FAILED'}:
+                    errors.append({'step': name, 'error_type': 'PartialSource'})
+                if isinstance(outcome, dict) and outcome.get('status') in {'COMPLETE', 'SUCCEEDED', 'SUCCEEDED_WITH_WARNINGS'}:
+                    morning_ready = True
+                if name == 'sales' and any(item.get('sales_rows', 0) > 0 for item in outcome):
+                    morning_ready = True
+            except Exception as exc:
+                db.rollback()
+                errors.append({'step': name, 'error_type': type(exc).__name__})
+    if int(record.get('has_ads_setting') or 0) != 1:
+        return {'status': 'PARTIAL' if errors else 'COMPLETE', 'errors': errors,
+                'ads': 'UNAVAILABLE', 'ad_ready': False, 'intraday_ready': False, 'morning_ready': morning_ready}
+    try:
+        collect_campaigns(client, db, stores_response=one, report_types=('sp',))
+    except Exception as exc:
+        db.rollback()
+        return {'status': 'PARTIAL', 'morning_ready': morning_ready,
+                'errors': [*errors, {'step': 'campaigns', 'error_type': type(exc).__name__}]}
+    try:
+        currencies = account_currencies(client.seller_ad_accounts())
+    except Exception as exc:
+        currencies = {}
+        errors.append({'step': 'ad_accounts', 'error_type': type(exc).__name__})
+    store = db.get(Store, sid)
+    mature = target - timedelta(days=7)
+    days = [target, mature]
+    primary_ready = True
+    for on, lag in ((target - timedelta(days=1), 0), (mature - timedelta(days=1), 7)):
+        if not _ready_partition(db, sid, on, store.timezone, maturity=lag):
+            days.append(on)
+    reports = {}
+    for on in dict.fromkeys(days):
+        try:
+            if not collection_states(settings, [sid]).get(sid):
+                return {'status': 'DISABLED', 'errors': errors}
+            response = collect_ads_for_day(client, db, {sid: on.isoformat()}, stores_response=one,
+                ad_currencies=currencies, report_types=('sp',))
+            count = response['rows']['sp']
+            reports[on.isoformat()] = {'status': 'AVAILABLE' if count else 'EMPTY', 'row_count': count}
+        except Exception as exc:
+            db.rollback()
+            if on in {target, mature}:
+                primary_ready = False
+            cov = db.scalar(select(DataCoverage).where(DataCoverage.store_id == sid,
+                DataCoverage.metric_date == on, DataCoverage.dimension == 'campaign_sp'))
+            if cov is not None:
+                cov.status = 'FAILED'
+                db.commit()
+            errors.append({'step': 'sp_report', 'date': on.isoformat(), 'error_type': type(exc).__name__})
+            reports[on.isoformat()] = {'status': 'FAILED'}
+    try:
+        clock = now or _utcnow()
+        day = clock.astimezone(ZoneInfo(store.timezone)).date().isoformat()
+        observed = run_observation(db, settings, {'store_ids': [sid], 'observation_date': day},
+                                   client=client, now=clock)
+    except Exception as exc:
+        db.rollback()
+        observed = {'error_type': type(exc).__name__}
+        errors.append({'step': 'intraday', 'error_type': type(exc).__name__})
+    archive = archive_partitions(db, settings, {sid: [d.isoformat() for d in days]}) if morning else None
+    return {'status': 'PARTIAL' if errors else 'COMPLETE', 'errors': errors,
+            'ad_ready': primary_ready, 'intraday_ready': observed.get('status') == 'COMPLETE',
+            'observation': observed, 'excel': archive, 'morning_ready': morning_ready or primary_ready,
+            'reports': reports}
+
+
+def _incident_key(row):
+    identity = [row['store_id'], row['campaign_id'], row['ad_type'], row['report_date'],
+                'intraday' if row.get('intraday') else 'daily_review']
+    return 'hourly-ad:' + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _alert_card(finding):
+    row, signals = finding['evidence'], finding['signals']
+    titles = {'CTR': '点击率下降', 'CPC': '点击花费上升', 'CDR': '点击转化率下降',
+        'CPS': '单件转化花费上升', 'CPA': '单均花费上升', 'ROAS': '广告投入产出下降',
+        'spend': '广告花费上升', 'orders': '成熟归因订单下降',
+        'zero_conversion': '成熟广告有花费无转化', 'intraday_budget': '盘中花费需要关注'}
+    value = card('；'.join(titles[code] for code in signals), subtitle='', sections=[])
+    lines = [f"**{html.escape(row['store_name'])}**", html.escape(row['campaign_name'])]
+    if row.get('intraday'):
+        lines.append('盘中花费 ' + number(row['current']['spend'], money=True, currency=row['currency'])
+            + ' · 日预算 ' + number(row['verified_daily_budget'], money=True, currency=row['currency']))
+    else:
+        values = row['current'] if set(signals) <= {'spend', 'CTR', 'CPC'} else row['mature']
+        label = '日报花费 ' if set(signals) <= {'spend', 'CTR', 'CPC'} else '成熟归因花费 '
+        lines.append(label + number(values['spend'], money=True, currency=row['currency'])
+                     + ' · 点击 ' + number(values['clicks']))
+        if 'orders' in values:
+            lines.append('归因订单 ' + number(values['orders']))
+    lines += [html.escape(finding['analysis']), '请负责人复核该活动。']
+    value['body']['elements'].append({'tag': 'markdown', 'content': '\n'.join(lines)})
+    return value
+
+
+def _queue_findings(db, settings, findings, *, send_alerts):
+    ids = []
+    if not settings.feishu_enabled:
+        return ids
+    for finding in findings:
+        row = finding['evidence']
+        controls = notification_states(settings, [row['store_id']])
+        if not controls[row['store_id']][0]:
+            continue
+        key = _incident_key(row)
+        existing = db.scalar(select(SyncJob).where(SyncJob.job_type == 'hourly_ad_incident',
+            SyncJob.metadata_json['incident_key'].as_string() == key))
+        if existing or not send_alerts:
+            continue
+        context = {'store_id': row['store_id'], 'entity_id': row['campaign_id'],
+            'metrics': {'campaign_id': row['campaign_id'], 'campaign_type': row['ad_type']},
+            'scope': f"{row['store_id']}:campaign:{row['ad_type']}", 'severity': 'P2', 'status': 'NEW'}
+        value = _alert_card(finding)
+        planned = enqueue_application_deliveries(db, settings, event_key=key, roles={'group', 'ad_alert_subscriber'},
+            text=value['header']['title']['content'], context=context, card=value, material_ad_alert=True)
+        for outbox_id in planned['outbox_ids']:
+            queued = db.get(NotificationOutbox, outbox_id)
+            queued.payload = {**queued.payload, 'routing_context': context,
+                'ad_campaign_id': row['campaign_id'], 'ad_campaign_type': row['ad_type'],
+                'hourly_ad_monitor': True}
+        db.add(SyncJob(job_type='hourly_ad_incident', status='QUEUED', metadata_json={
+            'incident_key': key, 'store_id': row['store_id'], 'campaign_id': row['campaign_id'],
+            'signals': finding['signals'], 'outbox_ids': planned['outbox_ids']}))
+        ids.extend(planned['outbox_ids'])
+    db.commit()
+    return ids
+
+
+def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehouse_engine=None,
+                       client_factory=None, analyst_factory=None, send_alerts=True):
+    from jx_alert.config import get_settings
+    from jx_alert.storage.db import SessionLocal, engine
+    from jx_alert.storage.job_lock import database_job_lock
+    from jx_alert.lingxing.client import LingxingClient
+    from jx_alert.ai.deepseek import DeepSeekClient
+    from jx_alert.operations import scoped_stores, sync_scoped_store_inventory, store_report_plan
+    from jx_alert.storage.raw_archive import archive_raw_snapshots
+
+    settings = settings or get_settings()
+    if not settings.hourly_ad_monitor_enabled or not settings.scheduler_enabled or settings.app_dry_run:
+        return {'status': 'DISABLED'}
+    clock = now or _utcnow()
+    if clock.tzinfo is None or clock.utcoffset() is None:
+        raise ValueError('Hourly monitor requires an aware clock')
+    slot = clock.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+    factory, warehouse_engine = session_factory or SessionLocal, warehouse_engine or engine
+    kind = 'hourly_ad_monitor' if send_alerts else 'hourly_ad_monitor_validation'
+    with database_job_lock(warehouse_engine, 'hourly_ad_monitor'), factory() as db:
+        job = db.scalar(select(SyncJob).where(SyncJob.job_type == kind,
+            SyncJob.metadata_json['slot'].as_string() == slot).order_by(SyncJob.id.desc()).limit(1))
+        if job and job.status == 'SUCCEEDED':
+            return {'status': 'ALREADY_COMPLETE', 'job_id': job.id}
+        meta = deepcopy(job.metadata_json or {}) if job else {'slot': slot, 'attempts': 0, 'stores': {}}
+        if meta.get('retry_at') and clock < datetime.fromisoformat(meta['retry_at']):
+            return {'status': 'WAITING', 'job_id': job.id}
+        if meta['attempts'] >= 3:
+            return {'status': 'RETRY_LIMIT', 'job_id': job.id}
+        if job is None:
+            job = SyncJob(job_type=kind, started_at=_naive(clock), metadata_json=meta)
+            db.add(job)
+        job.status = 'RUNNING'
+        meta['attempts'] += 1
+        job.metadata_json = deepcopy(meta)
+        db.commit()
+        job_id = job.id
+        ready, intraday_snapshots, dates, morning_dates = [], {}, {}, {}
+        morning = clock.astimezone(ZoneInfo('Asia/Shanghai')).hour == 8
+        raw_start = meta.setdefault('raw_start', db.scalar(select(func.max(RawSnapshot.id))) or 0)
+
+        def freeze_morning():
+            if morning and send_alerts and 'prepared_daily_report' not in meta and morning_dates:
+                from jx_alert.operations import queue_scheduled_daily_reports
+                db.rollback()
+                meta['prepared_daily_report'] = queue_scheduled_daily_reports(
+                    now=now or _utcnow(), prepare=True, prepared_dates=morning_dates)
+                job = db.get(SyncJob, job_id)
+                job.metadata_json = deepcopy(meta)
+                db.commit()
+
+        try:
+            try:
+                client = (client_factory or LingxingClient.from_settings)()
+                inventory = client.get_stores()
+            except Exception:
+                if client_factory is None and 'fallback' not in meta:
+                    from jx_alert.hourly_source_fallback import collect_fallback_observations
+                    db.rollback()
+                    meta['fallback'] = collect_fallback_observations(db, settings, now=clock, morning=morning)
+                    morning_dates.update(meta['fallback'].get('morning_dates', {}))
+                    freeze_morning()
+                raise
+            selected = scoped_stores(inventory, settings.collection_scope_file, allow_missing=True)
+            sync_scoped_store_inventory(db, settings, selected)
+            db.commit()
+            cached = _ReadCache(client, inventory)
+            controls = collection_states(settings, [str(r['sid']) for r in selected['data']])
+            plan = {p['store_id']: p for p in store_report_plan(selected['data'], settings.store_timezones_file, now=clock)}
+            for record in selected['data']:
+                sid = str(record['sid'])
+                if not controls.get(sid) or plan[sid]['state'] != 'READY':
+                    continue
+                target = date.fromisoformat(plan[sid]['report_date'])
+                previous = meta['stores'].get(sid, {})
+                if previous.get('status') == 'COMPLETE':
+                    result = previous
+                else:
+                    try:
+                        result = _collect_store(cached, db, settings, record, target, morning=morning, now=now)
+                    except Exception as exc:
+                        db.rollback()
+                        result = {'status': 'PARTIAL', 'error_type': type(exc).__name__}
+                    meta['stores'][sid] = result
+                    job = db.get(SyncJob, job_id)
+                    job.metadata_json = deepcopy(meta)
+                    db.commit()
+                if result.get('ad_ready'):
+                    ready.append(db.get(Store, sid))
+                    dates[sid] = target
+                if result.get('intraday_ready'):
+                    intraday_snapshots[sid] = result['observation']['snapshot_id']
+                if result.get('morning_ready'):
+                    morning_dates[sid] = target.isoformat()
+            freeze_morning()
+            from jx_alert.ai.intraday_risk_evidence import intraday_over_budget_candidates
+            reviewed_at = now or _utcnow()
+            contexts = [build_ad_review_context(db, settings, ready, dates, now=reviewed_at)]
+            contexts[0]['campaigns'] = [r for r in contexts[0]['campaigns'] if r['current_state'] == '投放中']
+            intraday = []
+            for sid, snapshot_id in intraday_snapshots.items():
+                snapshot = db.get(RawSnapshot, snapshot_id)
+                if snapshot:
+                    intraday.extend(intraday_over_budget_candidates(db, db.get(Store, sid), snapshot, now=reviewed_at))
+            contexts.append({'ad_review': True, 'hourly_intraday': True, 'reply_mode': 'answer',
+                'campaigns': intraday, 'policy': {'advertising_changes_allowed': False}})
+            findings, model_usage = [], []
+            for context in contexts:
+                for row in context['campaigns']:
+                    if not row['material_signals']:
+                        continue
+                    incident = db.scalar(select(SyncJob.id).where(SyncJob.job_type == 'hourly_ad_incident',
+                        SyncJob.metadata_json['incident_key'].as_string() == _incident_key(row)))
+                    if incident:
+                        row['material_signals'] = []
+            db.rollback()
+            for context in contexts:
+                if any(r['material_signals'] for r in context['campaigns']):
+                    found, audit = review_advertising((analyst_factory or DeepSeekClient.from_settings)(settings), context,
+                        '仅检查当前开启的广告活动，有实质风险才列出；不列正常、缺失、未成熟或未授权信息。')
+                    findings.extend(found)
+                    model_usage.append(audit)
+            # Models do not grant a delivery right. Recheck fresh active master data.
+            refreshed = build_ad_review_context(db, settings, ready, dates, now=now or _utcnow())
+            valid_ids = {r['evidence_id'] for r in refreshed['campaigns'] if r['current_state'] == '投放中'}
+            for sid, snapshot_id in intraday_snapshots.items():
+                snapshot = db.get(RawSnapshot, snapshot_id)
+                if snapshot:
+                    valid_ids.update(r['evidence_id'] for r in intraday_over_budget_candidates(
+                        db, db.get(Store, sid), snapshot, now=now or _utcnow()))
+            checked = []
+            for finding in findings:
+                r = finding['evidence']
+                campaign = db.scalar(select(Campaign).where(Campaign.store_id == r['store_id'],
+                    Campaign.campaign_type == r['ad_type'], Campaign.campaign_id == r['campaign_id']))
+                store = db.get(Store, r['store_id'])
+                if (store and store.status == 1 and campaign and campaign.state == 'enabled'
+                        and r['evidence_id'] in valid_ids):
+                    checked.append(finding)
+            ids = _queue_findings(db, settings, checked, send_alerts=send_alerts)
+            meta.update(outbox_ids=ids, finding_count=len(checked), model_usage=model_usage,
+                raw_archive=archive_raw_snapshots(db, settings.raw_dir, after_id=raw_start))
+            partial = (len(checked) != len(findings)
+                       or any(r.get('status') == 'PARTIAL' for r in meta['stores'].values()))
+            job = db.get(SyncJob, job_id)
+            job.status = 'PARTIAL_FAILED' if partial else 'SUCCEEDED'
+            meta['retry_at'] = (clock + timedelta(minutes=5)).isoformat() if partial else None
+        except Exception as exc:
+            db.rollback()
+            job = db.get(SyncJob, job_id)
+            job.status = 'PARTIAL_FAILED'
+            meta.update(error_type=type(exc).__name__, retry_at=(clock + timedelta(minutes=5)).isoformat())
+        job.finished_at, job.metadata_json = _naive(now or _utcnow()), deepcopy(meta)
+        db.commit()
+        return {'status': job.status, 'job_id': job_id, 'store_count': len(meta['stores']),
+                'finding_count': meta.get('finding_count', 0), 'outbox_ids': meta.get('outbox_ids', [])}
