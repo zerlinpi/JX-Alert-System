@@ -1,21 +1,18 @@
 """Lightweight hourly SP observations and read-only analyst-reviewed notifications."""
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
-import hashlib
-import html
-import json
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError
 
 from jx_alert.ai.ad_review import review_advertising
-from jx_alert.ai.ad_review_evidence import build_ad_review_context
-from jx_alert.notifications.cards import card, number
-from jx_alert.notifications.outbox import NotificationOutbox
-from jx_alert.notifications.routing import enqueue_application_deliveries
+from jx_alert.ai.ad_review_evidence import automatic_sp_signals, build_ad_review_context
+from jx_alert.notifications.hourly_ads import (
+    INCIDENT, campaign_identity, incident_key, queue_hourly_findings, queue_overnight_digest, recent_incidents,
+)
 from jx_alert.storage.models import Campaign, DataCoverage, RawSnapshot, Store, SyncJob
-from jx_alert.store_controls import collection_states, notification_states
+from jx_alert.store_controls import collection_states
 
 
 def _utcnow():
@@ -146,86 +143,6 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
             'reports': reports}
 
 
-def _incident_key(row):
-    identity = [row['store_id'], row['campaign_id'], row['ad_type'], row['report_date'],
-                'intraday' if row.get('intraday') else 'daily_review']
-    return 'hourly-ad:' + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-
-
-def _alert_card(finding):
-    row, signals = finding['evidence'], finding['signals']
-    titles = {'CTR': '点击率下降', 'CPC': '点击花费上升', 'CDR': '点击转化率下降',
-        'CPS': '单件转化花费上升', 'CPA': '单均花费上升', 'ROAS': '广告投入产出下降',
-        'spend': '广告花费上升', 'orders': '成熟归因订单下降',
-        'zero_conversion': '成熟广告有花费无转化', 'intraday_budget': '盘中花费需要关注'}
-    value = card('；'.join(titles[code] for code in signals), subtitle='', sections=[])
-    lines = [f"**{html.escape(row['store_name'])}**", html.escape(row['campaign_name'])]
-    if row.get('intraday'):
-        lines.append('盘中花费 ' + number(row['current']['spend'], money=True, currency=row['currency'])
-            + ' · 日预算 ' + number(row['verified_daily_budget'], money=True, currency=row['currency']))
-    else:
-        values = row['current'] if set(signals) <= {'spend', 'CTR', 'CPC'} else row['mature']
-        label = '日报花费 ' if set(signals) <= {'spend', 'CTR', 'CPC'} else '成熟归因花费 '
-        lines.append(label + number(values['spend'], money=True, currency=row['currency'])
-                     + ' · 点击 ' + number(values['clicks']))
-        if 'orders' in values:
-            lines.append('归因订单 ' + number(values['orders']))
-        comparisons = []
-        for code in signals:
-            metric = row['kpis'].get(code, {})
-            if metric.get('current') is None or metric.get('baseline') is None:
-                continue
-            current, baseline = metric['current'], metric['baseline']
-            if code in {'CTR', 'CDR'}:
-                current, baseline = f'{current:.2%}', f'{baseline:.2%}'
-            elif code == 'ROAS':
-                current, baseline = f'{current:.2f} 倍', f'{baseline:.2f} 倍'
-            else:
-                current = number(current, money=True, currency=row['currency'])
-                baseline = number(baseline, money=True, currency=row['currency'])
-            comparisons.append(f'{code} {current}，参考 {baseline}')
-        if comparisons:
-            lines.append(' · '.join(comparisons))
-    if finding.get('analysis'):
-        lines.append(html.escape(finding['analysis']))
-    lines.append('请负责人复核该活动。')
-    value['body']['elements'].append({'tag': 'markdown', 'content': '\n'.join(lines)})
-    return value
-
-
-def _queue_findings(db, settings, findings, *, send_alerts):
-    ids = []
-    if not settings.feishu_enabled:
-        return ids
-    for finding in findings:
-        row = finding['evidence']
-        controls = notification_states(settings, [row['store_id']])
-        if not controls[row['store_id']][0]:
-            continue
-        key = _incident_key(row)
-        existing = db.scalar(select(SyncJob).where(SyncJob.job_type == 'hourly_ad_incident',
-            SyncJob.metadata_json['incident_key'].as_string() == key))
-        if existing or not send_alerts:
-            continue
-        context = {'store_id': row['store_id'], 'entity_id': row['campaign_id'],
-            'metrics': {'campaign_id': row['campaign_id'], 'campaign_type': row['ad_type']},
-            'scope': f"{row['store_id']}:campaign:{row['ad_type']}", 'severity': 'P2', 'status': 'NEW'}
-        value = _alert_card(finding)
-        planned = enqueue_application_deliveries(db, settings, event_key=key, roles={'group', 'ad_alert_subscriber'},
-            text=value['header']['title']['content'], context=context, card=value, material_ad_alert=True)
-        for outbox_id in planned['outbox_ids']:
-            queued = db.get(NotificationOutbox, outbox_id)
-            queued.payload = {**queued.payload, 'routing_context': context,
-                'ad_campaign_id': row['campaign_id'], 'ad_campaign_type': row['ad_type'],
-                'hourly_ad_monitor': True}
-        db.add(SyncJob(job_type='hourly_ad_incident', status='QUEUED', metadata_json={
-            'incident_key': key, 'store_id': row['store_id'], 'campaign_id': row['campaign_id'],
-            'signals': finding['signals'], 'outbox_ids': planned['outbox_ids']}))
-        ids.extend(planned['outbox_ids'])
-    db.commit()
-    return ids
-
-
 def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehouse_engine=None,
                        client_factory=None, analyst_factory=None, send_alerts=True):
     from jx_alert.config import get_settings
@@ -343,6 +260,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             reviewed_at = now or _utcnow()
             contexts = [build_ad_review_context(db, settings, ready, dates, now=reviewed_at)]
             contexts[0]['campaigns'] = [r for r in contexts[0]['campaigns'] if r['current_state'] == '投放中']
+            mature_history = {campaign_identity(r) for r in contexts[0]['campaigns']}
             intraday = []
             for sid, snapshot_id in intraday_snapshots.items():
                 snapshot = db.get(RawSnapshot, snapshot_id)
@@ -351,14 +269,15 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             contexts.append({'ad_review': True, 'hourly_intraday': True, 'reply_mode': 'answer',
                 'campaigns': intraday, 'policy': {'advertising_changes_allowed': False}})
             findings, model_usage, model_failures = [], [], []
+            recent = recent_incidents(db, reviewed_at)
             for context in contexts:
                 context['hourly_delivery'] = True
                 for row in context['campaigns']:
-                    if not row['material_signals']:
-                        continue
-                    incident = db.scalar(select(SyncJob.id).where(SyncJob.job_type == 'hourly_ad_incident',
-                        SyncJob.metadata_json['incident_key'].as_string() == _incident_key(row)))
-                    if incident:
+                    identity = campaign_identity(row)
+                    row['material_signals'] = automatic_sp_signals(row, has_mature_history=identity in mature_history)
+                    if row['material_signals'] and (identity in recent or db.scalar(select(SyncJob.id).where(
+                            SyncJob.job_type == INCIDENT,
+                            SyncJob.metadata_json['incident_key'].as_string() == incident_key(row)))):
                         row['material_signals'] = []
             db.rollback()
             phase = 'advertising_review'
@@ -391,7 +310,9 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                         and r['evidence_id'] in valid_ids):
                     checked.append(finding)
             phase = 'notification_queue'
-            ids = _queue_findings(db, settings, checked, send_alerts=send_alerts)
+            delivery_clock = now or _utcnow()
+            ids = queue_overnight_digest(db, settings, delivery_clock) if send_alerts else []
+            ids += queue_hourly_findings(db, settings, checked, now=delivery_clock, slot=slot, send_alerts=send_alerts)
             for field in ('error_type', 'error_phase', 'database_error_code'):
                 meta.pop(field, None)
             phase = 'raw_archive'

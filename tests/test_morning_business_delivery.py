@@ -94,6 +94,7 @@ def test_scheduled_outbox_marks_business_kind_and_reuses_the_whole_frozen_digest
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import Session
     from jx_alert.notifications.outbox import NotificationOutbox
+    from jx_alert.notifications.worker import _prior_morning_page
     from jx_alert.storage.db import Base
     from jx_alert.storage.models import Store
 
@@ -115,6 +116,14 @@ def test_scheduled_outbox_marks_business_kind_and_reuses_the_whole_frozen_digest
         ]
         assert all(not quiet_blocks(settings, r.idempotency_key, r.payload) for r in rows)
         assert rows[2].payload['store_report_dates'] == {'one': {'target': str(DAY), 'actual': str(DAY)}}
+        assert not _prior_morning_page(db, rows[0].payload, rows[0].id)
+        rows[0].status = 'DELIVERED'
+        rows[1].status = 'RETRY'
+        db.flush()
+        assert _prior_morning_page(db, rows[2].payload, rows[2].id)
+        rows[1].status = 'DELIVERED'
+        db.flush()
+        assert not _prior_morning_page(db, rows[2].payload, rows[2].id)
         again = morning_digest.enqueue_morning_digest(db, settings, stores, dates, {}, **kwargs)
         assert first['outbox_ids'] == again['outbox_ids']
     engine.dispose()

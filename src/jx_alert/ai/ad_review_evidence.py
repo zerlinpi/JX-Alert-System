@@ -28,6 +28,28 @@ _STATES = {"enabled": "投放中", "paused": "已暂停", "archived": "已归档
 _RAW_FIELDS = {"spend": "cost", **{key: key for key in _FIELDS if key != "spend"}}
 
 
+def campaign_start_day(value):
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            pass
+    return None
+
+
+def automatic_sp_signals(row, *, has_mature_history=False):
+    """Use established campaign evidence for proactive ads, including intraday."""
+    start = campaign_start_day(row.get('campaign_start_date'))
+    report = date.fromisoformat(row['report_date'])
+    if start is not None and (report - start).days < AD_ATTRIBUTION_DAYS['sp']:
+        return []
+    if row.get('intraday'):
+        return row['material_signals'] if start is not None or has_mature_history else []
+    # Raw spend growth alone can be planned scaling. Report the evidence-backed
+    # efficiency or conversion problem that warrants an operator's attention.
+    return [code for code in row['material_signals'] if code != 'spend']
+
+
 def _utc(value):
     if not isinstance(value, datetime):
         return None
@@ -176,6 +198,7 @@ def _store_campaigns(db, settings, store, target, kinds, clock):
         row = {"store_id": str(store.sid), "store_name": store.name,
             "campaign_id": campaign.campaign_id, "campaign_name": campaign.name or campaign.campaign_id,
             "ad_type": campaign.campaign_type, "current_state": state,
+            "campaign_start_date": campaign.start_date,
             "state_observed_at": state_at.isoformat() if state_at and state_at <= clock else None,
             "report_date": target.isoformat(), "mature_date": mature_day.isoformat(),
             "attribution_days": lag, "currency": "USD", "source": "lingxing_ads_" + campaign.campaign_type,

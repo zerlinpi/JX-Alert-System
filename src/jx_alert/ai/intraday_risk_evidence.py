@@ -152,6 +152,7 @@ def intraday_over_budget_candidates(db, store, snapshot, *, now=None, max_age_mi
             continue
         row = {"store_id": sid, "store_name": store.name, "campaign_id": cid,
             "campaign_name": campaign.name or cid, "ad_type": "sp", "current_state": "投放中",
+            "campaign_start_date": campaign.start_date,
             "state_observed_at": _utc(campaign.updated_at).isoformat(), "report_date": on.isoformat(),
             "mature_date": on.isoformat(), "intraday": True, "currency": "USD",
             "current": {"spend": spend, "clicks": clicks, "impressions": impressions},

@@ -13,6 +13,7 @@ from jx_alert.notifications.routing import (
     _database_entity_open_ids as _routing_database_ids,
 )
 from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.notifications.hourly_ads import delivery_window, recheck_hourly_card
 from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks, quiet_delivery, original_question_reply
 from jx_alert.notifications.store_policy import paused_delivery
 from jx_alert.notifications.destination_policy import superseded_group_delivery
@@ -23,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 def _scheduled_window(key, payload, now):
-    """A daily report expires at Beijing midnight; ordinary alerts are unaffected."""
+    """Check morning reports and quiet hours for automatic advertising."""
     if not key.startswith("scheduled-daily:"):
-        return "READY", None
+        return delivery_window(payload, now.replace(tzinfo=timezone.utc))
     try:
         day = date.fromisoformat(payload["scheduled_delivery_date"])
         if payload.get("scheduled_timezone") != "Asia/Shanghai":
@@ -49,6 +50,15 @@ def _scheduled_window(key, payload, now):
 
 def _database_entity_open_ids(store_id, entity_id):
     return _routing_database_ids(store_id, entity_id, session_factory=SessionLocal)
+
+
+def _prior_morning_page(db, payload, row_id):
+    batch = payload.get('morning_batch')
+    if not batch:
+        return False
+    return db.scalar(select(NotificationOutbox.id).where(NotificationOutbox.id < row_id,
+        NotificationOutbox.idempotency_key.startswith(batch),
+        NotificationOutbox.status.in_(('PENDING', 'RETRY', 'SENDING'))).limit(1)) is not None
 
 
 def _proactive_delivery_reason(db, settings, key, payload, now):
@@ -153,7 +163,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             for row in rows:
                 window, due = _scheduled_window(row.idempotency_key, row.payload, now)
                 if window == "EXPIRED":
-                    row.status, row.last_error = "EXPIRED", "定时日报已过提醒日，保留记录不跨日补发"
+                    row.status, row.last_error = "EXPIRED", "已过通知时段，保留记录"
                     continue
                 if window == "WAITING":
                     row.next_attempt_at = due
@@ -182,8 +192,21 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             else existing_chat_id
         )
         try:
+            # An earlier page may be retrying. A later page must never overtake it.
+            with SessionLocal() as db:
+                if _prior_morning_page(db, payload, row_id):
+                    db.execute(update(NotificationOutbox).where(
+                        NotificationOutbox.id == row_id, NotificationOutbox.status == "SENDING",
+                        NotificationOutbox.claimed_at == claim_time, NotificationOutbox.attempts == attempts,
+                    ).values(status="RETRY", claimed_at=None, attempts=attempts - 1,
+                             next_attempt_at=now + timedelta(seconds=30)))
+                    db.commit()
+                    continue
             skip_reason = QUIET_REASON if quiet_blocks(settings, dedupe_key, payload) else None
-            if skip_reason is None and payload.get("hourly_ad_monitor") is True and (
+            hourly_batch = isinstance(payload.get('hourly_items'), list)
+            if skip_reason is None and payload.get('hourly_ad_monitor') is True and not hourly_batch:
+                skip_reason = '旧版即时告警保留记录'
+            if skip_reason is None and payload.get("hourly_ad_monitor") is True and not payload.get('hourly_overnight') and (
                     now - created_at.replace(tzinfo=None) > timedelta(minutes=90)):
                 skip_reason = "即时告警已过有效期，保留记录"
             if skip_reason is None and payload.get("transport") == "app":
@@ -194,11 +217,18 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                         skip_reason = "原会话权限或通知群已变更，旧回复保留记录"
                 if skip_reason is None and superseded_group_delivery(settings, payload, created_at):
                     skip_reason = "通知群已更换，旧消息保留记录，不迁移或补发"
-            if skip_reason is None and paused_delivery(settings, payload, created_at):
+            if skip_reason is None and not hourly_batch and paused_delivery(settings, payload, created_at):
                 skip_reason = "店铺通知已停用，旧消息保留记录"
             if skip_reason is None:
                 with SessionLocal() as db:
-                    skip_reason = _proactive_delivery_reason(db, settings, dedupe_key, payload, now)
+                    if hourly_batch:
+                        value = recheck_hourly_card(db, settings, payload, now.replace(tzinfo=timezone.utc))
+                        if value is None:
+                            skip_reason = '当前接收权限或活动状态不满足，旧告警保留记录'
+                        else:
+                            payload['card'] = value
+                    else:
+                        skip_reason = _proactive_delivery_reason(db, settings, dedupe_key, payload, now)
             if skip_reason is None and (payload.get('delivery') or {}).get('role') == 'ad_alert_subscriber':
                 from jx_alert.notifications.recipient_policy import subscriber_delivery_blocked
                 if subscriber_delivery_blocked(settings, payload):
@@ -214,12 +244,15 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                                                error=skip_reason))
                     db.commit()
                 continue
-            if _scheduled_window(dedupe_key, payload, datetime.now(timezone.utc).replace(tzinfo=None))[0] != "READY":
+            window, due = _scheduled_window(dedupe_key, payload, datetime.now(timezone.utc).replace(tzinfo=None))
+            if window != "READY":
                 with SessionLocal() as db:
+                    values = (dict(status="RETRY", next_attempt_at=due, attempts=attempts - 1)
+                              if window == "WAITING" else dict(status="EXPIRED", last_error="已过通知时段"))
                     db.execute(update(NotificationOutbox).where(
                         NotificationOutbox.id == row_id, NotificationOutbox.status == "SENDING",
                         NotificationOutbox.claimed_at == claim_time, NotificationOutbox.attempts == attempts,
-                    ).values(status="EXPIRED", claimed_at=None, last_error="定时日报已过提醒日"))
+                    ).values(claimed_at=None, **values))
                     db.commit()
                 continue
             payload_ids = payload.get("open_ids") or []
