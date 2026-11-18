@@ -168,6 +168,15 @@ def test_one_format_retry_preserves_original_question_and_never_publishes_unveri
     assert bad.calls == 2
 
 
+def test_simultaneous_metric_deterioration_is_not_confused_with_a_data_sync_claim():
+    finding = {'evidence_id': '0', 'signals': ['zero_conversion'],
+        'analysis': '归因订单与点击转化率同步走低，投入产出效率恶化，需复核流量质量。'}
+    assert parse_findings(json.dumps({'findings': [finding]}), [row()])[0]['analysis'] == finding['analysis']
+    finding['analysis'] = '本次已成功同步店铺数据。'
+    with pytest.raises(DeepSeekError):
+        parse_findings(json.dumps({'findings': [finding]}), [row()])
+
+
 def test_review_json_empty_result_and_original_question_use_read_only_official_model_request(monkeypatch):
     original = httpx.Client
     def handler(request):
