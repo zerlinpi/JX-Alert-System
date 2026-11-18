@@ -61,7 +61,7 @@ def _budget(record):
     return _number(raw), kind.lower() if isinstance(kind, str) else None
 
 
-def intraday_over_budget_candidates(db, store, snapshot, *, now=None, max_age_minutes=75):
+def intraday_over_budget_candidates(db, store, snapshot, *, now=None, max_age_minutes=75, skills=None):
     """Return only supported current-SP risk candidates, without writes or notices.
 
     Snapshot capture time, current master and cached master fields all need to
@@ -163,6 +163,8 @@ def intraday_over_budget_candidates(db, store, snapshot, *, now=None, max_age_mi
             "proof": {"snapshot_id": snapshot.id, "master_snapshot_id": master.id,
                 "master_captured_at": _utc(master.captured_at).isoformat(),
                 "budget": budget, "state": campaign.state, "over_budget_event": event}}
+        if skills is not None:
+            row["ad_skill"] = skills.for_campaign(sid, "sp", cid)
         row["evidence_id"] = hashlib.sha256(json.dumps(row, sort_keys=True, allow_nan=False,
             ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
         results.append(row)

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
+from jx_alert.ai.ad_review_skills import DEFAULT_SKILL, load_ad_review_skills
 from jx_alert.analysis.ad_kpis import compare_kpis
 from jx_alert.analysis.materiality import POLICY, material_change
 from jx_alert.lingxing.attribution import AD_ATTRIBUTION_DAYS
@@ -26,6 +27,7 @@ _KPI_FIELDS = ("label", "current", "baseline", "current_date", "currency", "form
                "change_ratio", "comparison_basis", "comparison_dates", "formula", "status")
 _STATES = {"enabled": "投放中", "paused": "已暂停", "archived": "已归档"}
 _RAW_FIELDS = {"spend": "cost", **{key: key for key in _FIELDS if key != "spend"}}
+_TRAFFIC_SIGNALS = {"CTR", "CPC", "spend"}
 
 
 def campaign_start_day(value):
@@ -39,12 +41,29 @@ def campaign_start_day(value):
 
 def automatic_sp_signals(row, *, has_mature_history=False):
     """Use established campaign evidence for proactive ads, including intraday."""
+    skill = row.get('ad_skill') or DEFAULT_SKILL
+    if skill.get('status') == 'invalid':
+        return []
     start = campaign_start_day(row.get('campaign_start_date'))
     report = date.fromisoformat(row['report_date'])
-    if start is not None and (report - start).days < AD_ATTRIBUTION_DAYS['sp']:
+    lag = AD_ATTRIBUTION_DAYS.get(row.get('ad_type'), AD_ATTRIBUTION_DAYS['sp'])
+    learning = max(lag, skill['learning_days'])
+    if start is not None and (report - start).days < learning:
         return []
+    if start is None and learning > lag:
+        established = [date.fromisoformat(x) for x in row.get('evidence_dates', {})]
+        if not established or (report - min(established)).days < learning:
+            return []
     if row.get('intraday'):
-        return row['material_signals'] if start is not None or has_mature_history else []
+        spend = row.get('current', {}).get('spend')
+        budget = row.get('verified_daily_budget')
+        # Amazon's average daily budget may use up to 100% more from other
+        # days. A source event alone does not establish a material overrun.
+        if (not (start is not None or has_mature_history) or not _valid(spend) or not _valid(budget)
+                or budget == 0 or spend < budget * skill['intraday_budget_multiple']
+                or spend - 2 * budget < skill['intraday_overage_usd']):
+            return []
+        return row['material_signals']
     # Raw spend growth alone can be planned scaling. Report the evidence-backed
     # efficiency or conversion problem that warrants an operator's attention.
     return [code for code in row['material_signals'] if code != 'spend']
@@ -71,7 +90,47 @@ def _period(observations, days):
     return {metric: math.fsum(observations[day][metric] for day in days) / len(days) for metric in keys}
 
 
-def _store_campaigns(db, settings, store, target, kinds, clock):
+def _sample_passes(observed, on, prior, signal, skill):
+    fields = {"impressions": skill["min_impressions"]} if signal == "CTR" else {
+        "clicks": skill["min_clicks"], "spend": skill["min_spend_usd"]}
+    current = observed[on]
+    reference = [observed.get(day, {}) for day in prior]
+    return bool(reference) and all(current.get(key, 0) >= floor
+        and all(_valid(r.get(key)) for r in reference)
+        and math.fsum(r[key] for r in reference) / len(reference) >= floor for key, floor in fields.items())
+
+
+def _zero_outcome(row):
+    return row["orders"] == 0 and row["sales"] == 0 and row.get("units", 0) == 0
+
+
+def _mature_signals(observed, day, baseline, prior, skill):
+    current = observed[day]
+    # Disagreement between orders, units and sales is not verified zero.
+    if (not _sample_passes(observed, day, prior, "orders", skill)
+            or any(not observed[ref]["orders"] and not _zero_outcome(observed[ref]) for ref in prior)):
+        return {}, []
+    rate = baseline["orders"] / baseline["clicks"]
+    expected = current["clicks"] * rate
+    minimum = skill["min_expected_orders"]
+    if len(prior) == 1 or skill["objective"] in {"reach", "discovery"}:
+        minimum *= 1.5
+    proof = {"reference_click_conversion_rate": rate, "expected_orders_at_reference_rate": expected,
+             "min_expected_orders": minimum, "basis": "SEVEN_DAY" if len(prior) == 7 else "PREVIOUS_DAY"}
+    if not math.isfinite(expected) or (current["orders"] == 0 and not _zero_outcome(current)):
+        return {}, []
+    signals = []
+    if _zero_outcome(current) and expected >= minimum and material_change(observed, day, "zero_conversion"):
+        signals.append("zero_conversion")
+    # Lower order volume explained by fewer clicks is not evidence of an
+    # efficiency issue. ROAS and CPA are tested separately against their data.
+    if (current["orders"] > 0 and rate > 0 and material_change(observed, day, "orders")
+            and current["orders"] / current["clicks"] <= rate * (1 - skill["min_relative_change"])):
+        signals.append("orders")
+    return proof, signals
+
+
+def _store_campaigns(db, settings, store, target, kinds, clock, skills):
     try:
         zone = ZoneInfo(store.timezone)
     except (TypeError, ValueError, ZoneInfoNotFoundError):
@@ -157,6 +216,7 @@ def _store_campaigns(db, settings, store, target, kinds, clock):
     campaigns = db.scalars(select(Campaign).where(Campaign.store_id == str(store.sid),
         Campaign.campaign_type.in_(kinds)).order_by(Campaign.campaign_type, Campaign.campaign_id))
     for campaign in campaigns:
+        skill = skills.for_campaign(store.sid, campaign.campaign_type, campaign.campaign_id)
         lag = AD_ATTRIBUTION_DAYS[campaign.campaign_type]
         mature_day = target - timedelta(days=lag)
         current, mature = evidence(campaign, target, mature=False), evidence(campaign, mature_day, mature=True)
@@ -182,11 +242,19 @@ def _store_campaigns(db, settings, store, target, kinds, clock):
             min_impressions=getattr(settings, "alert_kpi_min_impressions", 1000),
             min_spend=getattr(settings, "alert_min_spend", 20),
             ratio=getattr(settings, "alert_kpi_change_ratio", .15))
-        signals = [metric for metric, on in (("zero_conversion", mature_day), ("orders", mature_day),
-                    ("spend", target)) if material_change(observed, on, metric)]
+        baseline = _period(observed, baseline_days)
+        mature_comparison, signals = _mature_signals(observed, mature_day, baseline, baseline_days, skill)
+        # A sparse all-zero outcome must not sneak back in as ROAS or CDR.
+        # A verified zero outcome has its own specific signal.
+        mature_kpi_ready = mature[0]["orders"] > 0 and bool(mature_comparison)
         for code, kpi in kpis.items():
             if kpi["status"] == "ADVERSE":
-                if material_change(observed, kpi["current_date"], code):
+                on = date.fromisoformat(kpi["current_date"])
+                references = [date.fromisoformat(value) for value in kpi["comparison_dates"][1:]]
+                if ((code in _TRAFFIC_SIGNALS or mature_kpi_ready)
+                        and abs(kpi["change_ratio"]) + 1e-10 >= skill["min_relative_change"]
+                        and _sample_passes(observed, on, references, code, skill)
+                        and material_change(observed, on, code)):
                     signals.append(code)
                 else:
                     kpi["status"] = "WATCH"
@@ -205,7 +273,8 @@ def _store_campaigns(db, settings, store, target, kinds, clock):
             "current": {key: current[0][key] for key in _CURRENT},
             "mature": {key: mature[0][key] for key in _FIELDS if key in mature[0]},
             "baseline": {"basis": "SEVEN_DAY" if len(baseline_days) == 7 else "PREVIOUS_DAY",
-                "dates": [day.isoformat() for day in baseline_days], **_period(observed, baseline_days)},
+                "dates": [day.isoformat() for day in baseline_days], **baseline},
+            "ad_skill": skill, "mature_comparison": mature_comparison,
             "kpis": selected_kpis, "material_signals": signals,
             "evidence_dates": capture}
         row["evidence_id"] = hashlib.sha256(json.dumps({"row": row, "facts": proof},
@@ -214,7 +283,7 @@ def _store_campaigns(db, settings, store, target, kinds, clock):
     return result
 
 
-def build_ad_review_context(db, settings, stores, report_dates, *, ad_types=("sp",), now=None):
+def build_ad_review_context(db, settings, stores, report_dates, *, ad_types=("sp",), now=None, skills=None):
     """Freeze every eligible campaign in an already-authorized scope, with no writes.
 
     Dates remain marketplace-local. Callers batch all returned candidates instead
@@ -228,6 +297,7 @@ def build_ad_review_context(db, settings, stores, report_dates, *, ad_types=("sp
     if clock.tzinfo is None or clock.utcoffset() is None:
         raise ValueError("Advertising reviews require an aware clock")
     clock = clock.astimezone(timezone.utc)
+    skills = skills or load_ad_review_skills(settings)
     campaigns = []
     for store in stores:
         raw = report_dates.get(str(store.sid))
@@ -236,9 +306,10 @@ def build_ad_review_context(db, settings, stores, report_dates, *, ad_types=("sp
         target = date.fromisoformat(raw) if isinstance(raw, str) else raw
         if not isinstance(target, date) or isinstance(target, datetime):
             raise ValueError("Advertising report dates must be dates")
-        campaigns.extend(_store_campaigns(db, settings, store, target, kinds, clock))
+        campaigns.extend(_store_campaigns(db, settings, store, target, kinds, clock, skills))
     return {"ad_review": True, "reply_mode": "answer", "campaigns": campaigns,
         "policy": {**POLICY, "scope": "仅当前可见、完整且归因成熟的同源广告活动",
             "ad_types": list(kinds), "advertising_changes_allowed": False,
+            "skills_status": skills.status,
             "analysis": "结合原始问题选取有实质影响的异常；正常、缺失和未成熟数据不出现在回复中。"
                         "不同统计日期、广告粒度、来源不得拼接；花费增加本身不等于浪费。"}}

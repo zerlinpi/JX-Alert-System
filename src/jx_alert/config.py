@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     deepseek_credentials_file: str = "/app/data/secrets/deepseek.json"
     deepseek_model: str = "deepseek-flash"
     deepseek_request_timeout: float = Field(default=45.0, ge=1, le=120)
+    ad_review_skills_file: str = "/app/data/ad-review-skills.json"
     excel_archive_enabled: bool = False
     excel_archive_dir: str = "/app/data/excel"
     excel_daily_snapshot_enabled: bool = True

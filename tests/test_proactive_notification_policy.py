@@ -8,12 +8,13 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from jx_alert.notifications import worker
+from jx_alert.notifications.ad_repeat import INCIDENT
 from jx_alert.notifications.daily_report import enqueue_daily_snapshots
 from jx_alert.notifications.morning_digest import morning_cards
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.notifications.quiet_policy import quiet_blocks
 from jx_alert.storage.db import Base
-from jx_alert.storage.models import Campaign, NotificationLog, Store, StorePerformance
+from jx_alert.storage.models import Campaign, NotificationLog, Store, StorePerformance, SyncJob
 
 
 NOW = datetime(2026, 11, 18, 1, tzinfo=timezone.utc)
@@ -98,19 +99,29 @@ def test_proactive_daily_ad_reuses_mature_source_proof_and_preserves_campaign_na
     ad = seed(db)
     ad.state = 'paused'
     ad.name = '接口无记录测试活动'
-    fact(db, 'orders').value = 0
-    update_raw(db, 'orders', 0)
+    for metric in ('orders', 'sales', 'units'):
+        fact(db, metric).value = 0
+        update_raw(db, metric, 0)
+    record = snapshot(db)
+    captured = record.captured_at
+    record.captured_at = datetime(2026, 11, 10)
+    db.commit()
+    cards = morning_cards(db, settings, [store], {store.sid: DAY}, send_day=NOW.date(), now=NOW, proactive=True)
+    assert all(card['header']['title']['content'] != '商品推广活动待复核' for card, _ in cards)
+    record.captured_at = captured
     db.commit()
     result = enqueue_daily_snapshots(db, settings, store_dates={store.sid: DAY},
         delivery_date=NOW.date(), now=NOW, focused_morning=True)
     rows = [db.get(NotificationOutbox, key) for key in result['outbox_ids']]
     ad_notice, = [row for row in rows if row.payload['morning_message_kind'] == 'ad_exception']
+    assert ad_notice.payload['ad_group_owners'] is True
     assert not quiet_blocks(settings, ad_notice.idempotency_key, ad_notice.payload)
     message = json.dumps(ad_notice.payload, ensure_ascii=False)
     assert '接口无记录测试活动' in message and '已暂停' in message
     assert '成熟广告有花费但无归因订单' in message and '未知（' not in message
-    snapshot(db).captured_at = datetime(2026, 11, 10)
-    db.commit()
+    reservation, = list(db.scalars(select(SyncJob).where(SyncJob.job_type == INCIDENT)))
+    assert reservation.metadata_json['origin'] == 'daily_report'
+    assert reservation.metadata_json['outbox_ids'] == [ad_notice.id]
     cards = morning_cards(db, settings, [store], {store.sid: DAY}, send_day=NOW.date(), now=NOW, proactive=True)
     assert all(card['header']['title']['content'] != '商品推广活动待复核' for card, _ in cards)
 

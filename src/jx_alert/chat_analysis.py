@@ -19,6 +19,7 @@ from jx_alert.analysis.materiality import materiality_enabled
 from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card, number
 from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.notifications.quiet_policy import quiet_delivery, quiet_skip
+from jx_alert.notifications.recipient_policy import advertising_group_delivery, enqueue_advertising_copies
 from jx_alert.notifications.routing import (
     _load_routing, _routed_open_ids, group_member_mentions, report_group_delivery,
 )
@@ -375,6 +376,8 @@ def submit_review(db, settings, review_id, findings, *, now=None):
         raise ValueError("A configured application-bot report group is required")
     admins = group_member_mentions(group, group.get("admin_open_ids", []))
     ids, titles = [], []
+    owner_ad_route = (context["dimension"].startswith("campaign_") and materiality_enabled(settings)
+                      and getattr(settings, "hourly_ad_monitor_enabled", False))
     for topic, summary, action, evidence, comparison in validated:
         entity_id = evidence[0]["entity_id"]
         owners = group_member_mentions(group, _routed_open_ids(routing, context["store_id"], entity_id))
@@ -385,6 +388,8 @@ def submit_review(db, settings, review_id, findings, *, now=None):
         if policy["group_fallback_enabled"] and (not owners or not admins):
             reason = "missing_operator_mapping" if not owners else "missing_group_administrator"
             delivery = report_group_delivery(settings, routing, role="chat_analysis", reason=reason)
+        if owner_ad_route:
+            delivery = advertising_group_delivery(settings, routing, [context["store_id"]], role="chat_analysis")
         # The same topic/entity/date is one incident even if a later hourly run
         # phrases it differently. An explicit new date creates a new incident.
         identity = [context["store_id"], topic, evidence[0]["dimension"], entity_id,
@@ -431,12 +436,21 @@ def submit_review(db, settings, review_id, findings, *, now=None):
             sections.append(("广告指标", AD_KPI_HEADERS, ad_kpi_rows(kpis)))
         sections.append((date_label, ["指标", "观测值", "参考值"], rows))
         value = card(title, subtitle=subtitle, sections=sections)
-        row = enqueue_notification(db, idempotency_key=key, text=title + "：" + summary + "；" + action,
-            store_id=context["store_id"], entity_id=evidence[0]["entity_id"], chat_id=chat_id, card=value,
-            fixed_route=True, delivery=delivery, material_ad_alert=is_ad and materiality_enabled(settings))
-        ids.append(row.id)
-        titles.append(row.payload["card"]["header"]["title"]["content"])
-    result = {"status": "QUEUED" if ids else ("NO_ACTIONABLE_ANOMALY"
+        text = title + "：" + summary + "；" + action
+        if owner_ad_route:
+            planned = enqueue_advertising_copies(db, settings, key=key, text=text, card=value,
+                destination=delivery, store_id=context["store_id"], campaign_id=entity_id,
+                ad_type=context["dimension"].removeprefix("campaign_"), report_date=comparison["current_date"], now=clock)
+            if not planned:
+                continue
+            ids.extend(planned)
+        else:
+            row = enqueue_notification(db, idempotency_key=key, text=text,
+                store_id=context["store_id"], entity_id=entity_id, chat_id=chat_id, card=value,
+                fixed_route=True, delivery=delivery, material_ad_alert=is_ad and materiality_enabled(settings))
+            ids.append(row.id)
+        titles.append(value["header"]["title"]["content"])
+    result = {"status": "QUEUED" if ids else "REVIEWED_WITHOUT_NOTIFICATION" if owner_ad_route and validated else ("NO_ACTIONABLE_ANOMALY"
                 if findings and materiality_enabled(settings) else "NO_ANOMALY") if context["comparison_coverage"] == "COMPLETE"
               else "PARTIAL_REVIEW" if context.get("data_sufficient") else "INSUFFICIENT_DATA",
               "outbox_ids": ids, "review_id": review_id, "finding_count": len(validated),

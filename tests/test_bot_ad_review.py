@@ -25,6 +25,8 @@ def ready(warehouse):
             if row.metric_date == DAY - timedelta(days=7):
                 row.value = {'spend': 200, 'orders': 0, 'units': 0, 'sales': 0,
                              'clicks': 60, 'impressions': 4000}[row.metric_name]
+            elif row.metric_name == 'clicks':
+                row.value = 40  # Adequate mature reference sample; three orders expected on 60 clicks.
         for cov in db.scalars(select(DataCoverage)):
             cov.completed_at = NOW.replace(tzinfo=None)
         for campaign in db.scalars(select(Campaign)):
@@ -62,6 +64,8 @@ def test_exact_operator_prompt_reaches_model_and_omits_every_ineligible_store(wa
     assert {r['store_id'] for r in context['campaigns']} == {'5174'}
     assert {r['ad_type'] for r in context['campaigns']} == {'sp'}
     assert context['campaigns'][0]['mature']['orders'] == 0
+    assert context['campaigns'][0]['ad_skill']['objective'] == 'balanced'
+    assert context['campaigns'][0]['mature_comparison']['expected_orders_at_reference_rate'] == pytest.approx(3)
     assert 'evidence_dates' not in context['campaigns'][0]
     with warehouse[1]() as db:
         payload = json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)

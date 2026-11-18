@@ -10,6 +10,7 @@ from jx_alert.analysis.materiality import materiality_enabled
 from jx_alert.chat_analysis import _chinese, _now, _scope
 from jx_alert.notifications.cards import AD_KPI_HEADERS, ad_kpi_rows, card
 from jx_alert.notifications.outbox import enqueue_notification
+from jx_alert.notifications.recipient_policy import advertising_group_delivery, enqueue_advertising_copies
 from jx_alert.notifications.routing import (
     _load_routing, _routed_open_ids, group_member_mentions, report_group_delivery,
 )
@@ -122,6 +123,8 @@ def submit_kpi_review(db, settings, review_id, findings, *, now=None):
         proposed.append((metric, summary, action))
     routing = _load_routing(settings.feishu_routing_file) if proposed else {}
     ids, titles = [], []
+    owner_ad_route = (context["dimension"].startswith("campaign_") and materiality_enabled(settings)
+                      and getattr(settings, "hourly_ad_monitor_enabled", False))
     for metric, summary, action in proposed:
         delivery = report_group_delivery(settings, routing, role="chat_ad_kpi")
         entity_id = context["entity_id"] or store.sid
@@ -132,6 +135,8 @@ def submit_kpi_review(db, settings, review_id, findings, *, now=None):
             raise ValueError("Verified operator mapping is required")
         if owners and admins:
             delivery["open_ids"] = list(dict.fromkeys(owners + admins))
+        if owner_ad_route:
+            delivery = advertising_group_delivery(settings, routing, [store.sid], role="chat_ad_kpi")
         title = live[metric]["title"]
         state = (context.get("current_state") or "").lower()
         subtitle = store.name + "（" + store.sid + "） · " + context["object_name"]
@@ -142,12 +147,21 @@ def submit_kpi_review(db, settings, review_id, findings, *, now=None):
                       ("广告指标", AD_KPI_HEADERS, ad_kpi_rows(live))])
         identity = [store.sid, context["dimension"], entity_id, metric, live[metric]["current_date"], delivery["receive_id"]]
         key = "chat-ad-kpi:" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
-        row = enqueue_notification(db, idempotency_key=key, text=title + "：" + summary,
-            store_id=store.sid, entity_id=entity_id, chat_id=delivery["receive_id"],
-            card=value, delivery=delivery, fixed_route=True, material_ad_alert=materiality_enabled(settings))
-        ids.append(row.id)
-        titles.append(row.payload["card"]["header"]["title"]["content"])
-    result = {"status": "QUEUED" if ids else "NO_ADVERSE_KPI",
+        text = title + "：" + summary
+        if owner_ad_route:
+            planned = enqueue_advertising_copies(db, settings, key=key, text=text, card=value,
+                destination=delivery, store_id=store.sid, campaign_id=entity_id,
+                ad_type=context["dimension"].removeprefix("campaign_"), report_date=live[metric]["current_date"], now=clock)
+            if not planned:
+                continue
+            ids.extend(planned)
+        else:
+            row = enqueue_notification(db, idempotency_key=key, text=text,
+                store_id=store.sid, entity_id=entity_id, chat_id=delivery["receive_id"],
+                card=value, delivery=delivery, fixed_route=True, material_ad_alert=materiality_enabled(settings))
+            ids.append(row.id)
+        titles.append(value["header"]["title"]["content"])
+    result = {"status": "QUEUED" if ids else "REVIEWED_WITHOUT_NOTIFICATION" if owner_ad_route and proposed else "NO_ADVERSE_KPI",
               "outbox_ids": ids, "notification_titles": titles,
               "kpi_statuses": {k: v["status"] for k, v in live.items()}}
     job.metadata_json = {**meta, "findings": findings, "result": result}

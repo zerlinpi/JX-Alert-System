@@ -265,6 +265,24 @@ def report_group_delivery(settings, routing, *, role="group", reason=None):
     return bind_group_delivery(routing, alias, delivery)
 
 
+def report_group_owner_mentions(routing, delivery, store_id):
+    """Resolve this store's owners against the group receiving this message."""
+    try:
+        entry = _route_entry(routing.get('stores', {}), store_id)
+        groups = routing.get('groups', {})
+        group = groups.get(delivery.get('routing_alias'), {})
+        chat_id = group.get('chat_id')
+        if not isinstance(chat_id, str) or not chat_id.startswith('oc_') or chat_id != delivery.get('receive_id'):
+            return []
+        alias = entry.get('chat_id') or routing.get('default_chat_id')
+        own_group = groups.get(alias, {})
+        if 'verified_member_open_ids' not in group and own_group.get('chat_id') != chat_id:
+            return []
+        return group_member_mentions(group, _app_open_ids(entry.get('open_ids', [])))
+    except (ApplicationRoutingError, TypeError, AttributeError):
+        return []
+
+
 def _application_route_entry(mapping, key, groups):
     """Distinguish an absent owner from a malformed responsible route."""
     if key not in mapping:

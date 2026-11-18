@@ -1,4 +1,4 @@
-"""Owner edits to the existing routing file for advertising-only private alerts."""
+"""Owner edits to the single private advertising lead in the routing registry."""
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -38,13 +38,15 @@ def save_ad_subscribers(settings, open_ids, revision):
             or not isinstance(revision, str) or not admin_mapping._REVISION.fullmatch(revision)):
         raise admin_mapping.MappingError(400, '请选择有效的接收人员并刷新配置版本。')
     ids = list(dict.fromkeys(open_ids))
+    if len(ids) > 1:
+        raise admin_mapping.MappingError(400, '只能设置一位广告总负责人。')
     raw, routing, current, alias, group, entries = _snapshot(settings)
     if current != revision:
         raise admin_mapping.MappingError(409, '通知配置已更新，请刷新后重新选择。')
     roster = admin_mapping._members(settings, group['chat_id']) if ids else {}
     if any(uid not in roster for uid in ids):
         raise admin_mapping.MappingError(400, '有选中人员不在当前通知群，请刷新群成员。')
-    old = {row['open_id']: row for row in entries}
+    old = {row['open_id']: row for row in entries} if len(entries) == 1 else {}
     recipients = [{'open_id': uid, 'name': admin_mapping._label(roster[uid], uid),
                    'generation': old[uid]['generation'] if uid in old else uuid.uuid4().hex} for uid in ids]
     if recipients == entries:

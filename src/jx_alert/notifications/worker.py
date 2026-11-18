@@ -14,6 +14,7 @@ from jx_alert.notifications.routing import (
 )
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.notifications.hourly_ads import delivery_window, recheck_hourly_card
+from jx_alert.notifications.recipient_policy import ROLE, advertising_group_delivery
 from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks, quiet_delivery, original_question_reply
 from jx_alert.notifications.store_policy import paused_delivery
 from jx_alert.notifications.destination_policy import superseded_group_delivery
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 def _scheduled_window(key, payload, now):
     """Check morning reports and quiet hours for automatic advertising."""
     if not key.startswith("scheduled-daily:"):
+        if payload.get('material_ad_delivery_window') is True:
+            payload = {**payload, 'hourly_ad_monitor': True}
         return delivery_window(payload, now.replace(tzinfo=timezone.utc))
     try:
         day = date.fromisoformat(payload["scheduled_delivery_date"])
@@ -217,6 +220,19 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                         skip_reason = "原会话权限或通知群已变更，旧回复保留记录"
                 if skip_reason is None and superseded_group_delivery(settings, payload, created_at):
                     skip_reason = "通知群已更换，旧消息保留记录，不迁移或补发"
+                if (skip_reason is None and getattr(settings, 'hourly_ad_monitor_enabled', False)
+                        and destination.get('receive_id_type') == 'open_id' and destination.get('role') != ROLE
+                        and not original_question_reply(dedupe_key, payload)):
+                    skip_reason = "主动提醒使用通知群，旧私聊保留记录"
+                if skip_reason is None and payload.get('ad_group_owners') is True:
+                    store_ids = payload.get('store_ids') or [payload.get('store_id')]
+                    fresh = advertising_group_delivery(settings, _load_routing(settings.feishu_routing_file),
+                                                        store_ids, role=destination['role'])
+                    if (fresh['receive_id'] != destination.get('receive_id')
+                            or destination.get('receive_id_type') != 'chat_id'):
+                        skip_reason = "通知群已变更，旧消息保留记录"
+                    else:
+                        payload['delivery'] = fresh
             if skip_reason is None and not hourly_batch and paused_delivery(settings, payload, created_at):
                 skip_reason = "店铺通知已停用，旧消息保留记录"
             if skip_reason is None:
