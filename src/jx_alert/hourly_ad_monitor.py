@@ -7,6 +7,7 @@ import json
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
 
 from jx_alert.ai.ad_review import review_advertising
 from jx_alert.ai.ad_review_evidence import build_ad_review_context
@@ -250,21 +251,32 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
         if job and job.status == 'SUCCEEDED':
             return {'status': 'ALREADY_COMPLETE', 'job_id': job.id}
         meta = deepcopy(job.metadata_json or {}) if job else {'slot': slot, 'attempts': 0, 'stores': {}}
+        if job and job.status == 'RUNNING' and not meta.get('resumed_interruption'):
+            # The prior owner has lost the database lock. Resume once without
+            # charging the slot for an attempt that never recorded an outcome.
+            meta['attempts'] = max(0, meta['attempts'] - 1)
+            meta['resumed_interruption'] = True
+            meta.pop('retry_at', None)
         if meta.get('retry_at') and clock < datetime.fromisoformat(meta['retry_at']):
             return {'status': 'WAITING', 'job_id': job.id}
         if meta['attempts'] >= 3:
+            if job.status == 'RUNNING':
+                job.status = 'PARTIAL_FAILED'
+                job.finished_at = _naive(now or _utcnow())
+                meta.update(error_type='Interrupted', retry_at=None)
+                job.metadata_json = deepcopy(meta)
+                db.commit()
             return {'status': 'RETRY_LIMIT', 'job_id': job.id}
         if job is None:
             job = SyncJob(job_type=kind, started_at=_naive(clock), metadata_json=meta)
             db.add(job)
-        job.status = 'RUNNING'
+        job.status, job.finished_at = 'RUNNING', None
         meta['attempts'] += 1
         job.metadata_json = deepcopy(meta)
         db.commit()
         job_id = job.id
         ready, intraday_snapshots, dates, morning_dates = [], {}, {}, {}
         morning = clock.astimezone(ZoneInfo('Asia/Shanghai')).hour == 8
-        raw_start = meta.setdefault('raw_start', db.scalar(select(func.max(RawSnapshot.id))) or 0)
 
         def freeze_morning():
             if morning and send_alerts and 'prepared_daily_report' not in meta and morning_dates:
@@ -276,7 +288,11 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                 job.metadata_json = deepcopy(meta)
                 db.commit()
 
+        phase = 'raw_archive_checkpoint'
         try:
+            if 'raw_start' not in meta:
+                meta['raw_start'] = db.scalar(select(func.max(RawSnapshot.id))) or 0
+            phase = 'inventory'
             try:
                 client = (client_factory or LingxingClient.from_settings)()
                 inventory = client.get_stores()
@@ -291,6 +307,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             selected = scoped_stores(inventory, settings.collection_scope_file, allow_missing=True)
             sync_scoped_store_inventory(db, settings, selected)
             db.commit()
+            phase = 'store_collection'
             cached = _ReadCache(client, inventory)
             controls = collection_states(settings, [str(r['sid']) for r in selected['data']])
             plan = {p['store_id']: p for p in store_report_plan(selected['data'], settings.store_timezones_file, now=clock)}
@@ -319,7 +336,9 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     intraday_snapshots[sid] = result['observation']['snapshot_id']
                 if result.get('morning_ready'):
                     morning_dates[sid] = target.isoformat()
+            phase = 'morning_report'
             freeze_morning()
+            phase = 'advertising_evidence'
             from jx_alert.ai.intraday_risk_evidence import intraday_over_budget_candidates
             reviewed_at = now or _utcnow()
             contexts = [build_ad_review_context(db, settings, ready, dates, now=reviewed_at)]
@@ -342,6 +361,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     if incident:
                         row['material_signals'] = []
             db.rollback()
+            phase = 'advertising_review'
             for context in contexts:
                 if any(r['material_signals'] for r in context['campaigns']):
                     try:
@@ -353,6 +373,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     findings.extend(found)
                     model_usage.append(audit)
             # Models do not grant a delivery right. Recheck fresh active master data.
+            phase = 'evidence_recheck'
             refreshed = build_ad_review_context(db, settings, ready, dates, now=now or _utcnow())
             valid_ids = {r['evidence_id'] for r in refreshed['campaigns'] if r['current_state'] == '投放中'}
             for sid, snapshot_id in intraday_snapshots.items():
@@ -369,21 +390,32 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                 if (store and store.status == 1 and campaign and campaign.state == 'enabled'
                         and r['evidence_id'] in valid_ids):
                     checked.append(finding)
+            phase = 'notification_queue'
             ids = _queue_findings(db, settings, checked, send_alerts=send_alerts)
-            meta.pop('error_type', None)
+            for field in ('error_type', 'error_phase', 'database_error_code'):
+                meta.pop(field, None)
+            phase = 'raw_archive'
             meta.update(outbox_ids=ids, finding_count=len(checked), model_usage=model_usage, model_failures=model_failures,
-                raw_archive=archive_raw_snapshots(db, settings.raw_dir, after_id=raw_start))
+                raw_archive=archive_raw_snapshots(db, settings.raw_dir, after_id=meta['raw_start']))
             partial = (bool(model_failures) or len(checked) != len(findings)
                        or any(r.get('status') == 'PARTIAL' for r in meta['stores'].values()))
             job = db.get(SyncJob, job_id)
             job.status = 'PARTIAL_FAILED' if partial else 'SUCCEEDED'
-            meta['retry_at'] = (clock + timedelta(minutes=5)).isoformat() if partial else None
+            finished_at = now or _utcnow()
+            meta['retry_at'] = (finished_at + timedelta(minutes=5)).isoformat() if partial else None
         except Exception as exc:
             db.rollback()
             job = db.get(SyncJob, job_id)
             job.status = 'PARTIAL_FAILED'
-            meta.update(error_type=type(exc).__name__, retry_at=(clock + timedelta(minutes=5)).isoformat())
-        job.finished_at, job.metadata_json = _naive(now or _utcnow()), deepcopy(meta)
+            finished_at = now or _utcnow()
+            meta.pop('database_error_code', None)
+            if isinstance(exc, DBAPIError):
+                args = getattr(exc.orig, 'args', ())
+                if args and type(args[0]) is int:
+                    meta['database_error_code'] = args[0]
+            meta.update(error_type=type(exc).__name__, error_phase=phase,
+                        retry_at=(finished_at + timedelta(minutes=5)).isoformat())
+        job.finished_at, job.metadata_json = _naive(finished_at), deepcopy(meta)
         db.commit()
         return {'status': job.status, 'job_id': job_id, 'store_count': len(meta['stores']),
                 'finding_count': meta.get('finding_count', 0), 'outbox_ids': meta.get('outbox_ids', [])}
