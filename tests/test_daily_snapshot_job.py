@@ -39,7 +39,8 @@ def warehouse(tmp_path, monkeypatch):
 def test_default_schedule_and_snapshot_use_beijing_even_if_application_timezone_differs(warehouse):
     settings, sessions, calls, _, _ = warehouse
     settings.app_timezone = "UTC"
-    assert settings.daily_sync_cron == "30 18 * * *"
+    assert settings.daily_sync_cron == "0 8 * * *"
+    assert settings.feishu_daily_report_cron == "0 9 * * *"
     assert run_daily_snapshot(now=datetime(2026, 11, 14, 15, 29, tzinfo=timezone.utc))["status"] == "WAITING"
     assert calls == []
     result = run_daily_snapshot(now=datetime(2026, 11, 14, 15, 30, tzinfo=timezone.utc))
