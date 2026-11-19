@@ -290,32 +290,36 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             candidates = {}
             for context in contexts:
                 period = 'intraday' if context.get('hourly_intraday') else 'mature'
-                counts = {'supported': 0, 'deduplicated': 0, 'submitted': 0}
+                counts = {'supported': 0, 'deduplicated': 0, 'submitted': 0, 'confirmed': 0}
                 context['hourly_delivery'] = True
                 for row in context['campaigns']:
                     identity = campaign_identity(row)
                     signals = automatic_sp_signals(row, has_mature_history=identity in mature_history)
-                    if signals:
-                        counts['supported'] += 1
-                    row['material_signals'] = repeat_eligible_signals(row, signals, history, reviewed_at)
-                    if row['material_signals'] and incident_already_recorded(db, row, now=reviewed_at):
-                        row['material_signals'] = []
-                    if row['material_signals']:
-                        counts['submitted'] += 1
-                    elif signals:
+                    row['material_signals'] = signals
+                    if not signals:
+                        continue
+                    counts['supported'] += 1
+                    if (not repeat_eligible_signals(row, signals, history, reviewed_at)
+                            or incident_already_recorded(db, row, now=reviewed_at)):
+                        # Count notification reservations without withholding
+                        # evidence from this hour's independent model review.
                         counts['deduplicated'] += 1
                 candidates[period] = counts
             meta['review_counts'] = candidates
             db.rollback()
             phase = 'advertising_review'
             for context in contexts:
-                if any(r['material_signals'] for r in context['campaigns']):
+                period = 'intraday' if context.get('hourly_intraday') else 'mature'
+                counts = candidates[period]
+                if counts['supported']:
+                    counts['submitted'] = counts['supported']
                     try:
                         found, audit = review_advertising((analyst_factory or DeepSeekClient.from_settings)(settings),
-                            context, '核对当前开启活动中的实质广告风险。')
+                            context, '逐活动复核当前实质广告风险。重复提醒由系统处理。')
                     except DeepSeekError:
-                        model_failures.append('intraday' if context.get('hourly_intraday') else 'mature')
+                        model_failures.append(period)
                         continue
+                    counts['confirmed'] = len(found)
                     findings.extend(found)
                     model_usage.append(audit)
             # Models do not grant a delivery right. Recheck fresh active master data.

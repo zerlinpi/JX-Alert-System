@@ -28,6 +28,7 @@ _KPI_FIELDS = ("label", "current", "baseline", "current_date", "currency", "form
 _STATES = {"enabled": "投放中", "paused": "已暂停", "archived": "已归档"}
 _RAW_FIELDS = {"spend": "cost", **{key: key for key in _FIELDS if key != "spend"}}
 _TRAFFIC_SIGNALS = {"CTR", "CPC", "spend"}
+MIN_CTR_EXPECTED_CLICK_GAP = 10
 
 
 def campaign_start_day(value):
@@ -37,6 +38,16 @@ def campaign_start_day(value):
         except ValueError:
             pass
     return None
+
+
+def ctr_expected_click_gap(row):
+    """Estimate the gap at this day's exposure using the verified reference CTR."""
+    traffic = row.get('current', {})
+    reference = row.get('kpis', {}).get('CTR', {}).get('baseline')
+    impressions, clicks = traffic.get('impressions'), traffic.get('clicks')
+    if not all(_valid(value) for value in (reference, impressions, clicks)) or reference > 1 or clicks > impressions:
+        return None
+    return max(0.0, reference * impressions - clicks)
 
 
 def automatic_sp_signals(row, *, has_mature_history=False):
@@ -66,7 +77,9 @@ def automatic_sp_signals(row, *, has_mature_history=False):
         return row['material_signals']
     # Raw spend growth alone can be planned scaling. Report the evidence-backed
     # efficiency or conversion problem that warrants an operator's attention.
-    return [code for code in row['material_signals'] if code != 'spend']
+    gap = ctr_expected_click_gap(row) if 'CTR' in row['material_signals'] else None
+    return [code for code in row['material_signals'] if code != 'spend'
+            and (code != 'CTR' or gap is not None and gap >= MIN_CTR_EXPECTED_CLICK_GAP)]
 
 
 def _utc(value):

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, tuple_
 
+from jx_alert.ai.ad_review_evidence import ctr_expected_click_gap
 from jx_alert.ai.ad_review_skills import load_ad_review_skills, skill_fingerprint
 from jx_alert.notifications.ad_repeat import (
     INCIDENT, campaign_identity, incident_already_recorded, incident_metadata,
@@ -31,6 +32,18 @@ TITLES = {
     'zero_conversion': '广告花了钱，统计期结束仍没带来订单', 'intraday_budget': '今天的花费远超平均日预算',
 }
 TRAFFIC = {'spend', 'CTR', 'CPC'}
+_RATE_LABELS = {'CTR': '点击率', 'CDR': '点击转化率'}
+_NEXT_CHECK = {
+    'intraday_budget': '活动预算与自动预算规则',
+    'CTR': '搜索词与广告位',
+    'CPC': '广告位花费和出价记录',
+    'zero_conversion': '花费最多的投放与商品页',
+    'CDR': '引流词与商品页',
+    'CPS': '花费最多的投放与出单成本',
+    'CPA': '花费最多的投放与出单成本',
+    'ROAS': '归因销售额与花费最多的投放',
+    'orders': '点击量与商品页转化',
+}
 
 
 def _routing(settings):
@@ -78,22 +91,33 @@ def alert_item(finding, *, include_dates=False):
             label = ('成熟花费 ' + row['mature_date']) if include_dates else '成熟花费'
             text.append(label + ' ' + number(mature['spend'], money=True, currency=currency))
             text.append('点击 ' + number(mature['clicks']) + ' · 归因订单 ' + number(mature['orders']))
+            expected = (row.get('mature_comparison') or {}).get('expected_orders_at_reference_rate')
+            if 'zero_conversion' in signals and type(expected) in (int, float):
+                text.append(f'按参考转化率估算 {expected:.1f} 单')
         for code in signals:
             metric = row['kpis'].get(code, {})
             a, b = metric.get('current'), metric.get('baseline')
             if a is not None and b is not None:
                 reference = {'SEVEN_DAY': '前七日', 'PREVIOUS_DAY': '前一日'}.get(
                     metric.get('comparison_basis'), '参考')
-                text.append(f'{code} {_metric(a, code, currency)}（{reference} {_metric(b, code, currency)}）')
+                label = _RATE_LABELS.get(code, code)
+                delta = f'，低 {(b - a) * 100:.2f} 个百分点' if code in _RATE_LABELS and b > a else ''
+                text.append(f'{label} {_metric(a, code, currency)}（{reference} {_metric(b, code, currency)}{delta}）')
+        gap = ctr_expected_click_gap(row) if 'CTR' in signals else None
+        if gap:
+            text.append(f'按参考点击率估算少约 {gap:.0f} 次点击')
+    checks = list(dict.fromkeys(_NEXT_CHECK[code] for code in signals if code in _NEXT_CHECK))
     return {field: row[field] for field in ('store_id', 'ad_type', 'campaign_id')} | {
         'store': plain(row['store_name'], 64), 'campaign': plain(row['campaign_name'], 105),
         'signal': '；'.join(TITLES[code] for code in signals), 'numbers': '\n'.join(text),
+        'next_check': '；'.join(checks[:2]),
     }
 
 
 def _advertising_card_with_items(items, *, title='广告异常', store_mentions=None):
     def render(rows):
-        checks = [(i['store'] + '\n' + i['campaign'], i['signal'], i['numbers']) for i in rows]
+        checks = [(i['store'] + '\n' + i['campaign'],
+            i['signal'] + ('\n先查 ' + i['next_check'] if i.get('next_check') else ''), i['numbers']) for i in rows]
         notes = [f'另有 {len(items) - len(rows)} 项异常已保留记录。'] if len(rows) < len(items) else []
         value = card(title, subtitle='', sections=[('', ['店铺／活动', '异常', '关键数据'], checks)],
                      notes=notes, color='orange')
@@ -210,7 +234,7 @@ def queue_hourly_findings(db, settings, findings, *, now, slot, send_alerts):
     history = load_incident_history(db, now)
     skills = load_ad_review_skills(settings)
     candidates = {}
-    for finding in findings:
+    for finding in sorted(findings, key=lambda f: f['evidence'].get('intraday') is not True):
         evidence = finding['evidence']
         identity = campaign_identity(evidence)
         if identity in candidates:
@@ -221,7 +245,7 @@ def queue_hourly_findings(db, settings, findings, *, now, slot, send_alerts):
         if not incident_already_recorded(db, evidence, now=now):
             profile = evidence.get('ad_skill') or skills.for_campaign(*identity)
             incident = incident_metadata(evidence, signals)
-            item = alert_item({**finding, 'signals': signals}) | {
+            item = alert_item({**finding, 'signals': signals}, include_dates=True) | {
                 'detected_at': now.isoformat(), 'skill_fingerprint': skill_fingerprint(profile),
                 'incident_key': incident['incident_key'],
             }
