@@ -87,7 +87,7 @@ def run(warehouse, *, now=CLOCK, source=None, analyst=None, **kwargs):
         now=now, client_factory=lambda: source or Source(), analyst_factory=lambda _: analyst or Analyst(), **kwargs)
 
 
-def test_hourly_active_only_without_quality_pages_and_deduplicates_future_hour(warehouse):
+def test_hourly_rechecks_active_campaigns_without_repeating_delivered_alerts(warehouse):
     Analyst.calls = []
     source = Source()
     first = run(warehouse, source=source)
@@ -95,18 +95,27 @@ def test_hourly_active_only_without_quality_pages_and_deduplicates_future_hour(w
     assert warehouse[3] == [('5174', '2026-11-16', False)]
     assert run(warehouse, now=CLOCK + timedelta(minutes=20), source=source)['status'] == 'ALREADY_COMPLETE'
     assert source.calls == 1
+    with warehouse[1]() as db:
+        message = db.get(NotificationOutbox, first['outbox_ids'][0])
+        message.status = 'DELIVERED'
+        message.payload = {**message.payload, 'hourly_delivered_items': message.payload['hourly_items']}
+        db.commit()
     second = run(warehouse, now=CLOCK + timedelta(hours=1), source=source)
-    assert second['status'] == 'SUCCEEDED' and second['outbox_ids'] == []
-    assert len(Analyst.calls) == 1
+    assert second['status'] == 'SUCCEEDED' and second['finding_count'] == 1
+    assert second['outbox_ids'] == [] and len(Analyst.calls) == 2
     with warehouse[1]() as db:
         rows = list(db.scalars(select(NotificationOutbox)))
         assert len(rows) == 1
         text = json.dumps(rows[0].payload, ensure_ascii=False)
-        assert all(t not in text for t in ('未授权', '待补齐', '数据不足', '2026-11-09', 'UTC'))
+        assert all(t not in text for t in ('未授权', '待补齐', '数据不足', 'UTC'))
+        assert '成熟花费 2026-11-09' in text
         assert rows[0].payload['hourly_items'][0]['campaign_id'] == 'active'
         assert any(element['tag'] == 'table' for element in rows[0].payload['card']['body']['elements'])
         jobs = db.scalars(select(SyncJob).where(SyncJob.job_type == 'hourly_ad_monitor')).all()
         assert all('5174' in j.metadata_json['stores'] for j in jobs)
+        assert db.get(SyncJob, second['job_id']).metadata_json['review_counts']['mature'] == {
+            'supported': 1, 'deduplicated': 1, 'submitted': 1, 'confirmed': 1,
+        }
 
 
 def test_source_failure_waits_before_retry_and_retains_job(warehouse):
@@ -204,6 +213,7 @@ def test_changed_metric_selection_does_not_create_a_second_incident():
 def _finding(sid, cid, day='2026-11-16'):
     return {'evidence': {'store_id': sid, 'campaign_id': cid, 'ad_type': 'sp', 'store_name': '店铺' + sid,
         'campaign_name': cid, 'report_date': day, 'currency': 'USD', 'kpis': {},
+        'mature_date': (datetime.fromisoformat(day) - timedelta(days=7)).date().isoformat(),
         'current': {'spend': 50, 'clicks': 27}, 'mature': {'spend': 120, 'clicks': 50, 'orders': 0}},
         'signals': ['zero_conversion']}
 
@@ -403,6 +413,42 @@ def test_budget_alert_explains_the_actual_spend_and_difference():
     }})
     assert item['signal'] == '今天的花费远超平均日预算'
     assert item['numbers'].splitlines() == ['今天已花 美元 50.08', '平均日预算 美元 1.00', '比平均日预算多 美元 49.08']
+
+
+def test_group_card_gives_verified_click_impact_and_specific_first_check():
+    finding = _finding('5174', 'AirBird活动', day='2026-11-17')
+    finding['signals'] = ['CTR']
+    finding['evidence'].update(current={'spend': 30.87, 'clicks': 28, 'impressions': 4046},
+        kpis={'CTR': {'current': 28 / 4046, 'baseline': .0121833693, 'comparison_basis': 'SEVEN_DAY'}})
+    item = hourly_ads.alert_item(finding, include_dates=True)
+    value = hourly_ads.advertising_card([item])
+    row, = next(x['rows'] for x in value['body']['elements'] if x['tag'] == 'table')
+    assert '先查 搜索词与广告位' in row['c1']
+    assert '2026-11-17 美元 30.87' in row['c2']
+    assert '点击率 0.69%（前七日 1.22%，低 0.53 个百分点）' in row['c2']
+    assert '按参考点击率估算少约 21 次点击' in row['c2']
+
+
+def test_zero_conversion_card_separates_attributed_orders_from_reference_estimate():
+    finding = _finding('5174', '零转化活动')
+    finding['evidence']['mature_comparison'] = {'expected_orders_at_reference_rate': 4.5}
+    item = hourly_ads.alert_item(finding, include_dates=True)
+    assert '归因订单 0' in item['numbers']
+    assert '按参考转化率估算 4.5 单' in item['numbers']
+    assert '花费最多的投放与商品页' in item['next_check']
+
+
+def test_same_campaign_groups_current_budget_risk_before_mature_finding(warehouse):
+    settings, sessions, _, _ = warehouse
+    daily = _finding('5174', 'active')
+    budget = {'signals': ['intraday_budget'], 'evidence': {**daily['evidence'],
+        'intraday': True, 'current': {'spend': 50.08}, 'verified_daily_budget': 1.0}}
+    with sessions() as db:
+        row_id, = hourly_ads.queue_hourly_findings(db, settings, [daily, budget],
+            now=CLOCK, slot='paired-risks', send_alerts=True)
+        item, = db.get(NotificationOutbox, row_id).payload['hourly_items']
+        assert item['signal'] == hourly_ads.TITLES['intraday_budget']
+        assert '比平均日预算多 美元 49.08' in item['numbers']
 
 
 def test_nine_oclock_reuses_only_the_prepared_morning_report(warehouse, monkeypatch):

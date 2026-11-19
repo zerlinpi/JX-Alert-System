@@ -308,6 +308,19 @@ def test_active_profile_hot_reloads_and_only_tightens_gate(warehouse, tmp_path):
     assert automatic_sp_signals(invalid) == []
 
 
+@pytest.mark.parametrize(("impressions", "clicks", "reference", "included"), [
+    (2000, 0, .004, False),
+    (2000, 0, .005, True),
+    (4046, 28, .0121833693, True),
+    (None, 0, .013, False),
+])
+def test_proactive_ctr_uses_verified_reference_click_gap(impressions, clicks, reference, included):
+    row = {"report_date": DAY.isoformat(), "ad_type": "sp", "material_signals": ["CTR"],
+           "current": {"impressions": impressions, "clicks": clicks},
+           "kpis": {"CTR": {"baseline": reference}}}
+    assert automatic_sp_signals(row) == (["CTR"] if included else [])
+
+
 @pytest.mark.parametrize("document", [
     '{"version":1,"version":1}', '{"version":true}', '{"version":1,"defaults":{"min_clicks":4}}',
     '{"version":1,"ad_types":{"sponsored":{"min_clicks":40}}}',
