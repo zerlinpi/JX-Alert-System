@@ -1,9 +1,11 @@
 from datetime import date
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select, func
+from sqlalchemy import create_engine, event, select, func
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from jx_alert.config import Settings
@@ -46,6 +48,17 @@ class Client:
              'totalSalesQuantity': 7, 'platformIncome': 80, 'grossProfit': -20, 'grossRate': -.25, 'refundsRate': .1}]}}
 
 
+class PagedProductClient(Client):
+    def product_performance_daily(self, sid, day, *, offset, length):
+        assert length == 1000
+        result = super().product_performance_daily(sid, day)
+        row = result['data']['list'][0]
+        row['asins'][0]['asin'] = f'A{offset}'
+        result['data']['total'] = 3
+        result['test_padding'] = 'x' * 4096
+        return result
+
+
 def collect(db, settings, client):
     return api.collect_api_business_for_day(client, db, settings, {'data': [{'sid': 5174, 'status': 1}]}, DAY)
 
@@ -65,6 +78,53 @@ def test_api_facts_remain_separate_repeat_collection_preserves_versions_and_cann
     assert context['settlement']['metrics']['volume'] == 7
     assert context['settlement']['metrics']['grossProfit'] == -20
     assert '下单日' in context['product']['basis'] and '结算日' in context['settlement']['basis']
+
+
+def test_business_pages_are_archived_one_statement_at_a_time_under_packet_limit(warehouse):
+    db, store, settings = warehouse
+    client = PagedProductClient()
+
+    @event.listens_for(db.get_bind(), 'before_cursor_execute')
+    def enforce_packet_limit(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith('INSERT INTO raw_snapshots'):
+            assert not executemany
+            if len(json.dumps(context.compiled_parameters[0]['payload']).encode()) > 8192:
+                raise OperationalError(statement, None, RuntimeError('packet limit exceeded'))
+
+    assert collect(db, settings, client)['status'] == 'COMPLETE'
+    captured = list(db.scalars(select(RawSnapshot).where(
+        RawSnapshot.source == api.SOURCE, RawSnapshot.payload['dimension'].as_string() == api.PRODUCT,
+        RawSnapshot.payload['report_date'].as_string() == DAY).order_by(RawSnapshot.id)))
+    pages = [row.payload for row in captured]
+    assert [p['page_index'] for p in pages] == [1, 2, 3]
+    assert {p['page_count'] for p in pages} == {3}
+    assert len({p['capture_id'] for p in pages}) == 1
+    assert [p['responses'] for p in pages] == [
+        [client.product_performance_daily(store.sid, DAY, offset=index, length=1000)] for index in range(3)]
+    assert api.api_business_context(db, store.sid, DAY)['product']['metrics']['volume'] == 30
+
+
+def test_failed_business_page_write_rolls_back_complete_archive_and_preserves_old_facts(warehouse):
+    db, store, settings = warehouse
+    collect(db, settings, Client())
+    prior = db.scalar(select(func.count()).select_from(DailyMetric).where(DailyMetric.dimension == api.PRODUCT))
+
+    @event.listens_for(db.get_bind(), 'before_cursor_execute')
+    def fail_second_page(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith('INSERT INTO raw_snapshots'):
+            payload = context.compiled_parameters[0]['payload']
+            if payload.get('status') == 'COMPLETE' and payload.get('page_index') == 2:
+                raise OperationalError(statement, None, RuntimeError('archive connection interrupted'))
+
+    assert collect(db, settings, PagedProductClient())['status'] == 'PARTIAL_FAILED'
+    assert db.scalar(select(func.count()).select_from(DailyMetric).where(DailyMetric.dimension == api.PRODUCT)) == prior
+    snapshots = list(db.scalars(select(RawSnapshot).where(
+        RawSnapshot.payload['dimension'].as_string() == api.PRODUCT,
+        RawSnapshot.payload['report_date'].as_string() == DAY).order_by(RawSnapshot.id)))
+    assert [row.payload['status'] for row in snapshots] == ['COMPLETE', 'FAILED', 'FAILED', 'FAILED']
+    assert [row.payload['page_index'] for row in snapshots[1:]] == [1, 2, 3]
+    assert len({row.payload['capture_id'] for row in snapshots[1:]}) == 1
+    assert api.api_business_context(db, store.sid, DAY)['availability']['product'] == 'FAILED'
 
 
 def test_exact_finance_failure_preserves_old_values_but_does_not_show_them_as_current_success(warehouse):
