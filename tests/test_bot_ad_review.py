@@ -8,7 +8,7 @@ import httpx
 import pytest
 from sqlalchemy import select, func
 
-from test_bot_service import DAY, NOW, enqueue, event, process, warehouse  # noqa: F401
+from test_bot_service import DAY, NOW, _enable_collection, enqueue, event, private_event, process, warehouse  # noqa: F401
 from jx_alert.ai.ad_review import parse_findings, review_advertising, review_cache_key, review_cards
 from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError
 from jx_alert.notifications.outbox import NotificationOutbox
@@ -108,6 +108,50 @@ def test_no_mature_evidence_gives_no_missing_data_list_or_model_normality_claim(
         payload = json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)
         assert '没有需列出的异常广告记录' in payload
         assert all(t not in payload for t in ('待补齐', '数据不足', '缺少成熟', '广告正常', '绩效'))
+
+
+def test_recent_private_anomalies_refresh_first_then_confirm_and_reply_without_gaps(warehouse, monkeypatch):
+    from jx_alert import bot_ad_refresh
+
+    _enable_collection(warehouse, monkeypatch)
+    pulls = []
+
+    def refresh(db, settings, stores, targets, *, ad_types, now, may_collect):
+        assert may_collect('5174') and not may_collect('5175')
+        assert set(targets) == {'5174', '5175'} and ad_types == ('sp',)
+        pulls.append(True)
+        db.rollback()
+        ready(warehouse)
+        return {'attempted': 1, 'refreshed': 1}
+
+    monkeypatch.setattr(bot_ad_refresh, 'refresh_ad_evidence', refresh)
+    Analyst.calls = []
+    enqueue(warehouse, private_event('最近有没有广告异常的广告活动，一次性列举除了'))
+    result = process(warehouse, factory=lambda _: Analyst())
+    assert len(pulls) == 1 and len(Analyst.calls) == 1
+    with warehouse[1]() as db:
+        reply, = db.scalars(select(NotificationOutbox))
+        assert reply.payload['delivery']['role'] == 'private_question'
+        payload = json.dumps(reply.payload['card'], ensure_ascii=False)
+        assert '已确认的广告异常' in payload and '200.00' in payload
+        assert all(text not in payload for text in ('广告判断待补齐数据', '样本不足', '授权失败', '未知（'))
+        assert db.get(SyncJob, result['job_id']).metadata_json['ad_refresh']['refreshed'] == 1
+
+
+def test_recent_private_anomalies_stay_quiet_after_an_unsuccessful_refresh(warehouse, monkeypatch):
+    from jx_alert import bot_ad_refresh
+
+    _enable_collection(warehouse, monkeypatch)
+    monkeypatch.setattr(bot_ad_refresh, 'refresh_ad_evidence',
+        lambda *args, **kwargs: {'attempted': 2, 'failed': 1, 'empty': 1})
+    enqueue(warehouse, private_event('最近有没有广告异常的活动，一次性列举除了'))
+    result = process(warehouse, factory=lambda _: pytest.fail('Unconfirmed data cannot enter the analyst'))
+    with warehouse[1]() as db:
+        row, = db.scalars(select(NotificationOutbox))
+        text = json.dumps(row.payload, ensure_ascii=False)
+        assert '没有需列出的异常广告记录' in text
+        assert all(s not in text for s in ('待补齐数据', '授权失败', '无法判断广告', '未知（'))
+        assert db.get(SyncJob, result['job_id']).metadata_json['ad_refresh']['failed'] == 1
 
 
 def row(index=0):

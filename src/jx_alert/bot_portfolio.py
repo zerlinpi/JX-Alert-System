@@ -20,7 +20,7 @@ _RANK = r'排名|排行|最高|最多|最大|最好|最低|最少|最小|前\s*\
 _DATED = r'今日|今天|当日|昨日|昨天|前天|\d{1,2}月\d{1,2}日|\d{4}[-/]\d'
 
 
-def period_length(question):
+def period_length(question, *, default=1):
     match = re.search(r'(?:最近|过去|近)\s*(\d+|[一二三四五六七八九十两]+)\s*(?:天|日)', question)
     if match:
         token = match[1]
@@ -33,7 +33,7 @@ def period_length(question):
         return digits.get(token, 0)
     if re.search(r'本周|上周|本月|上月|(?:最近|过去|近)\s*(?:\d+|[一二三四五六七八九十两]+)\s*(?:周|月)', question):
         return 0
-    return 1
+    return default
 
 
 def ad_types(question):

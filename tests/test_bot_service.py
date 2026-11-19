@@ -1217,7 +1217,7 @@ def test_private_question_lists_only_recent_scoped_confirmed_ad_alerts(warehouse
                 'delivery': {'receive_id_type': 'chat_id'}, 'hourly_items': [item, {
                     **item, 'store_id': '9999', 'campaign': '无权查看活动'}]}))
         db.commit()
-    queued = enqueue(warehouse, private_event('最近有没有广告异常的广告活动，一次性列举'))
+    queued = enqueue(warehouse, private_event('最近有没有已发送的广告异常记录，一次性列举'))
     result = process(warehouse)
     assert result['status'] == 'QUEUED' and FakeClient.calls == []
     with warehouse[1]() as db:
