@@ -227,3 +227,52 @@ def test_eight_snapshot_is_frozen_until_nine_and_cannot_send_early(warehouse, mo
     assert worker.process_outbox_batch()['sent'] == 0 and sent == []
     instant = NOW
     assert worker.process_outbox_batch()['sent'] == 1 and len(sent) == 1
+
+
+@pytest.mark.parametrize('updated_profile, ad_sent', [
+    ('{"version":1', False),
+    ('{"version":1,"campaigns":{"5174:sp:99":{"min_clicks":60}}}', False),
+    ('{"version":1,"campaigns":{"5175:sp:99":{"min_clicks":60}}}', True),
+])
+def test_morning_ad_delivery_rechecks_frozen_profile(warehouse, monkeypatch, tmp_path, updated_profile, ad_sent):
+    from test_ad_review_evidence import fact, seed, update_raw
+
+    db, settings, store, sessions = warehouse
+    eight = NOW - timedelta(hours=1)
+    skill_file = tmp_path / 'ad-review-skills.json'
+    skill_file.write_text('{"version":1}', encoding='utf-8')
+    settings.ad_review_skills_file = str(skill_file)
+    seed(db)
+    db.scalar(select(StorePerformance)).captured_at = eight.replace(tzinfo=None)
+    for metric in ('orders', 'sales', 'units'):
+        fact(db, metric).value = 0
+        update_raw(db, metric, 0)
+    db.commit()
+    prepared = enqueue_daily_snapshots(db, settings, store_dates={store.sid: DAY},
+        delivery_date=NOW.date(), now=eight, focused_morning=True, prepare=True)
+    db.commit()
+    db.expire_all()
+    health, ad = [db.get(NotificationOutbox, row_id) for row_id in prepared['outbox_ids']]
+    assert ad.payload['morning_message_kind'] == 'ad_exception'
+    assert ad.payload['ad_skill_checks'][0][:3] == ['5174', 'sp', '99']
+    skill_file.write_text(updated_profile, encoding='utf-8')
+
+    class ReportClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW.astimezone(tz) if tz else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(worker, 'datetime', ReportClock)
+    monkeypatch.setattr(worker, 'get_settings', lambda: settings)
+    monkeypatch.setattr(worker, 'SessionLocal', sessions)
+    sent = []
+    monkeypatch.setattr('jx_alert.notifications.feishu_app.FeishuAppClient.from_settings',
+        lambda _: SimpleNamespace(send_card=lambda value, **kwargs:
+            sent.append(kwargs['idempotency_key']) or {'message_id': 'om_test'}))
+    assert worker.process_outbox_batch()['sent'] == (2 if ad_sent else 1)
+    db.expire_all()
+    assert health.status == 'DELIVERED'
+    assert ad.status == ('DELIVERED' if ad_sent else 'SKIPPED')
+    assert sent == ([health.idempotency_key, ad.idempotency_key] if ad_sent else [health.idempotency_key])
+    if not ad_sent:
+        assert '广告分析规则' in ad.last_error

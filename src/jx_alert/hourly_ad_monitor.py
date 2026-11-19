@@ -255,6 +255,18 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     intraday_snapshots[sid] = result['observation']['snapshot_id']
                 if result.get('morning_ready'):
                     morning_dates[sid] = target.isoformat()
+            # Night findings have already passed analysis. Release them after
+            # the activity refresh, independently of new evidence/model calls.
+            phase = 'overnight_digest'
+            if send_alerts:
+                try:
+                    overnight_ids = queue_overnight_digest(db, settings, now or _utcnow())
+                except Exception as exc:
+                    db.rollback()
+                    meta['overnight_digest_error'] = type(exc).__name__
+                else:
+                    meta.pop('overnight_digest_error', None)
+                    meta['outbox_ids'] = list(dict.fromkeys([*meta.get('outbox_ids', []), *overnight_ids]))
             phase = 'morning_report'
             freeze_morning()
             phase = 'advertising_evidence'
@@ -275,14 +287,25 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                 'campaigns': intraday, 'policy': {'advertising_changes_allowed': False}})
             findings, model_usage, model_failures = [], [], []
             history = load_incident_history(db, reviewed_at)
+            candidates = {}
             for context in contexts:
+                period = 'intraday' if context.get('hourly_intraday') else 'mature'
+                counts = {'supported': 0, 'deduplicated': 0, 'submitted': 0}
                 context['hourly_delivery'] = True
                 for row in context['campaigns']:
                     identity = campaign_identity(row)
                     signals = automatic_sp_signals(row, has_mature_history=identity in mature_history)
+                    if signals:
+                        counts['supported'] += 1
                     row['material_signals'] = repeat_eligible_signals(row, signals, history, reviewed_at)
                     if row['material_signals'] and incident_already_recorded(db, row):
                         row['material_signals'] = []
+                    if row['material_signals']:
+                        counts['submitted'] += 1
+                    elif signals:
+                        counts['deduplicated'] += 1
+                candidates[period] = counts
+            meta['review_counts'] = candidates
             db.rollback()
             phase = 'advertising_review'
             for context in contexts:
@@ -319,14 +342,14 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     checked.append(finding)
             phase = 'notification_queue'
             delivery_clock = now or _utcnow()
-            ids = queue_overnight_digest(db, settings, delivery_clock) if send_alerts else []
-            ids += queue_hourly_findings(db, settings, checked, now=delivery_clock, slot=slot, send_alerts=send_alerts)
+            ids = queue_hourly_findings(db, settings, checked, now=delivery_clock, slot=slot, send_alerts=send_alerts)
+            meta['outbox_ids'] = list(dict.fromkeys([*meta.get('outbox_ids', []), *ids]))
             for field in ('error_type', 'error_phase', 'database_error_code'):
                 meta.pop(field, None)
             phase = 'raw_archive'
-            meta.update(outbox_ids=ids, finding_count=len(checked), model_usage=model_usage, model_failures=model_failures,
+            meta.update(finding_count=len(checked), model_usage=model_usage, model_failures=model_failures,
                 raw_archive=archive_raw_snapshots(db, settings.raw_dir, after_id=meta['raw_start']))
-            partial = (bool(model_failures) or len(checked) != len(findings)
+            partial = (bool(model_failures) or 'overnight_digest_error' in meta or len(checked) != len(findings)
                        or any(r.get('status') == 'PARTIAL' for r in meta['stores'].values()))
             job = db.get(SyncJob, job_id)
             job.status = 'PARTIAL_FAILED' if partial else 'SUCCEEDED'

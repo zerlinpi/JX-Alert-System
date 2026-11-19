@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, tuple_
 
-from jx_alert.ai.ad_review_skills import load_ad_review_skills
+from jx_alert.ai.ad_review_skills import load_ad_review_skills, skill_fingerprint
 from jx_alert.notifications.ad_repeat import (
     INCIDENT, campaign_identity, incident_key, incident_metadata, load_incident_history, repeat_eligible_signals,
 )
@@ -123,11 +123,6 @@ def _key(bucket, destination):
     return 'app:hourly-batch:' + hashlib.sha256(raw.encode()).hexdigest()
 
 
-def _skill_fingerprint(profile):
-    raw = json.dumps(profile, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 def _group_mentions(routing, delivery, items):
     return {sid: report_group_owner_mentions(routing, delivery, sid) for sid in {i['store_id'] for i in items}}
 
@@ -147,7 +142,7 @@ def _write_batch(db, bucket, destination, items, day, *, group, routing, overnig
     return row.id
 
 
-def eligible_items(db, settings, items, now):
+def eligible_items(db, settings, items, now, *, refreshed_since=None):
     ids = {campaign_identity(i) for i in items}
     if not ids:
         return []
@@ -155,15 +150,18 @@ def eligible_items(db, settings, items, now):
     if skills.status == 'invalid':
         return []
     clock = now.astimezone(timezone.utc).replace(tzinfo=None)
+    earliest = clock - timedelta(minutes=90)
+    if refreshed_since is not None:
+        earliest = max(earliest, refreshed_since.astimezone(timezone.utc).replace(tzinfo=None))
     controls = notification_states(settings, {item[0] for item in ids})
     ready = set()
     for campaign in db.scalars(select(Campaign).join(Store, Store.sid == Campaign.store_id).where(
             Store.status == 1, Campaign.state == 'enabled',
-            Campaign.updated_at.between(clock - timedelta(minutes=90), clock),
+            Campaign.updated_at.between(earliest, clock),
             tuple_(Campaign.store_id, Campaign.campaign_type, Campaign.campaign_id).in_(ids))):
         ready.add((campaign.store_id, campaign.campaign_type, campaign.campaign_id))
     return [i for i in items if campaign_identity(i) in ready and controls[i['store_id']][0]
-            and i.get('skill_fingerprint') == _skill_fingerprint(skills.for_campaign(
+            and i.get('skill_fingerprint') == skill_fingerprint(skills.for_campaign(
                 i['store_id'], i['ad_type'], i['campaign_id']))
             and (controls[i['store_id']][1] is None
                  or controls[i['store_id']][1] < datetime.fromisoformat(i['detected_at']))]
@@ -209,7 +207,7 @@ def queue_hourly_findings(db, settings, findings, *, now, slot, send_alerts):
         if not exists:
             profile = evidence.get('ad_skill') or skills.for_campaign(*identity)
             item = alert_item({**finding, 'signals': signals}) | {
-                'detected_at': now.isoformat(), 'skill_fingerprint': _skill_fingerprint(profile),
+                'detected_at': now.isoformat(), 'skill_fingerprint': skill_fingerprint(profile),
             }
             candidates[identity] = incident_metadata(evidence, signals), item
     valid = eligible_items(db, settings, [i for _, i in candidates.values()], now)
@@ -240,7 +238,8 @@ def queue_overnight_digest(db, settings, now):
         return []
     held = list(db.scalars(select(SyncJob).where(SyncJob.job_type == INCIDENT, SyncJob.status == 'HELD',
         SyncJob.metadata_json['release_day'].as_string() == day.isoformat()).order_by(SyncJob.id)))
-    items = eligible_items(db, settings, [job.metadata_json['hourly_item'] for job in held], now)
+    items = eligible_items(db, settings, [job.metadata_json['hourly_item'] for job in held], now,
+                           refreshed_since=datetime.combine(day, OPENS, BEIJING))
     ids = _write_routes(db, settings, bucket, items, day, overnight=True)
     if not ids:
         return []

@@ -1,11 +1,11 @@
 """Only scheduled, verified business pages extend the quiet morning digest."""
 from datetime import date, datetime, timezone
-from types import ModuleType, SimpleNamespace
-import sys
+import json
+from types import SimpleNamespace
 
 import pytest
 
-from jx_alert.notifications import morning_digest
+from jx_alert.notifications import business_daily, morning_digest
 from jx_alert.notifications.cards import card
 from jx_alert.notifications.quiet_policy import quiet_blocks
 
@@ -27,9 +27,7 @@ def renderer(monkeypatch):
             sections=[('经营日报', ['指标', '当日', '前一日', '日环比'], [('销量', '25', '20', '+25.00%')])])
             if store.sid == 'one' and data_warning is None else None)
 
-    module = ModuleType('jx_alert.notifications.business_daily')
-    module.business_daily_card = business
-    monkeypatch.setitem(sys.modules, 'jx_alert.notifications.business_daily', module)
+    monkeypatch.setattr(business_daily, 'business_daily_card', business)
     monkeypatch.setattr(morning_digest, '_health_chunks', lambda *args, **kwargs: [
         (card('店铺绩效与违规快报 · 1', subtitle='', sections=[]), ['one']),
         (card('店铺绩效与违规快报 · 2', subtitle='', sections=[]), ['two']),
@@ -126,4 +124,95 @@ def test_scheduled_outbox_marks_business_kind_and_reuses_the_whole_frozen_digest
         assert not _prior_morning_page(db, rows[2].payload, rows[2].id)
         again = morning_digest.enqueue_morning_digest(db, settings, stores, dates, {}, **kwargs)
         assert first['outbox_ids'] == again['outbox_ids']
+    engine.dispose()
+
+
+def _store_business_card(name, day):
+    return card(f'{name} 经营日报', subtitle='美元 USD',
+        sections=[('', ['指标', '当日', '前一日', '日环比'], [
+            ('毛利率', '15.00%', '13.00%', '+2.00 个百分点'),
+            ('净销售额', '$20.00', '$25.00', '-20.00%'),
+        ])], notes=[f'美国统计日：{day}', '前一日：2026-11-15'])
+
+
+def test_scheduled_business_compacts_full_tables_without_losing_comparisons(monkeypatch):
+    from jx_alert.notifications.store_health import card_fits
+
+    stores = [SimpleNamespace(sid=str(n), name=f'店铺{n}') for n in range(1, 9)]
+    dates = {s.sid: DAY for s in stores} | {'7': date(2026, 11, 15)}
+    targets = {s.sid: DAY for s in stores}
+    monkeypatch.setattr(business_daily, 'business_daily_card', lambda db, store, day, **kw:
+        None if store.sid == '8' else _store_business_card(store.name, day))
+    spans = []
+    chunks = morning_digest._business_chunks(None, None, stores, dates, {}, targets, DAY,
+                                            proactive=True, business_pages=spans)
+    assert [ids for _, ids in chunks] == [['1', '2', '3', '4', '5'], ['6']]
+    grouped = chunks[0][0]
+    assert card_fits(grouped) and card_fits(chunks[1][0])
+    tables = [value for value in grouped['body']['elements'] if value['tag'] == 'table']
+    assert len(tables) == 5
+    assert all(table['rows'][0]['c3'] == '+2.00 个百分点' for table in tables)
+    text = json.dumps(grouped, ensure_ascii=False)
+    assert text.count('美国统计日：2026-11-16') == 5
+    assert text.count('前一日：2026-11-15') == 5
+    assert [section[0] for section in spans[0]] == chunks[0][1] and spans[1] == []
+
+
+def test_scheduled_business_sends_only_still_eligible_store_sections(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jx_alert.notifications import worker
+    from jx_alert.notifications.feishu_app import FeishuAppClient
+    from jx_alert.notifications.outbox import NotificationOutbox
+    from jx_alert.storage.db import Base
+    from jx_alert.storage.models import Store
+
+    engine = create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(engine)
+    now = datetime(2026, 11, 17, 1, tzinfo=timezone.utc)
+    routing = tmp_path / 'routing.json'
+    routing.write_text(json.dumps({'default_chat_id': 'report', 'groups': {
+        'report': {'chat_id': 'oc_test'}}}), encoding='utf-8')
+    controls = tmp_path / 'store-controls.json'
+    settings = SimpleNamespace(app_dry_run=False, feishu_enabled=True, feishu_transport='app', feishu_timeout=1,
+        feishu_quiet_delivery_enabled=True, feishu_routing_file=str(routing), store_controls_file=str(controls))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(worker, 'datetime', Clock)
+    monkeypatch.setattr(worker, 'get_settings', lambda: settings)
+    monkeypatch.setattr(worker, 'SessionLocal', sessions)
+    monkeypatch.setattr(morning_digest, '_health_chunks', lambda *a, **kw: [])
+    monkeypatch.setattr(morning_digest, '_proactive_ad_chunks', lambda *a, **kw: [])
+    monkeypatch.setattr(business_daily, 'business_daily_card', lambda db, store, day, **kw:
+        _store_business_card(store.name, day))
+    sent = []
+    monkeypatch.setattr(FeishuAppClient, 'from_settings', lambda s: SimpleNamespace(
+        send_card=lambda value, **kw: sent.append(value) or {'message_id': 'om_test'}))
+    delivery = {'role': 'daily_snapshot', 'receive_id': 'oc_test', 'receive_id_type': 'chat_id', 'open_ids': []}
+    with sessions() as db:
+        stores = [Store(sid=sid, name=name, status=1) for sid, name in [
+            ('111', '授权关闭店铺'), ('222', '通知关闭店铺'), ('333', '正常店铺')]]
+        db.add_all(stores)
+        db.flush()
+        result = morning_digest.enqueue_morning_digest(db, settings, stores, {s.sid: DAY for s in stores}, {},
+            send_day=now.date(), due=now, delivery=delivery, now=now)
+        row_id, = result['outbox_ids']
+        assert db.get(NotificationOutbox, row_id).payload['store_ids'] == ['111', '222', '333']
+        stores[0].status = 2
+        db.commit()
+    controls.write_text(json.dumps({'version': 1, 'stores': {'222': {
+        'collection_enabled': True, 'notifications_enabled': False, 'updated_at': now.isoformat()}}}),
+        encoding='utf-8')
+    assert worker.process_outbox_batch()['sent'] == 1
+    rendered = json.dumps(sent[0], ensure_ascii=False)
+    assert '正常店铺' in rendered
+    assert '授权关闭店铺' not in rendered and '通知关闭店铺' not in rendered
+    assert worker.process_outbox_batch()['sent'] == 0
+    with sessions() as db:
+        assert len(db.get(NotificationOutbox, row_id).payload['business_sections']) == 3
     engine.dispose()
