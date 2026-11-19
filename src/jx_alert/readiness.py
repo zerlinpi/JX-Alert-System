@@ -1,4 +1,5 @@
 """Read-only setup and operational checks. Never reveal IDs or credential contents."""
+from collections import Counter
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -115,14 +116,16 @@ def analysis_plan(db, settings, *, now=None):
         item["store_name"] = store.name if store else None
         item["collection_enabled"] = collection[sid]
         item["notifications_enabled"] = notifications[sid]
-        item["collection_ready"] = item["state"] == "READY" and collection[sid] is True
+        item["collection_ready"] = (store is not None and item["state"] == "READY" and collection[sid] is True
+                                    and (item["timezone_confirmed"]
+                                         or not getattr(settings, "hourly_ad_monitor_enabled", False)))
         item["currency_code"] = getattr(store, "currency_code", None) or item["currency_code"] or None
         item["currency_confirmed"] = bool(item["currency_code"])
         item["analysis_ready"] = False
         item["amount_analysis_ready"] = False
         sales_status = None
         if store is None:
-            item["state"] = "WAITING_STORE_SYNC"
+            item.update(state="WAITING_STORE_SYNC", status_code=None, intraday_enabled=False)
         elif store.status != 1:
             sales_status = store_sales_data_status(store.status, None, [])
         elif item["state"] == "READY":
@@ -160,6 +163,28 @@ def analysis_plan(db, settings, *, now=None):
     return {"checked_at_utc": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
             "enabled_store_count": len(plan), "collection_ready_count": sum(x["collection_ready"] for x in plan),
             "analysis_ready_count": sum(x["analysis_ready"] for x in plan), "stores": plan}
+
+
+def _collection_job_snapshot(job):
+    if job is None:
+        return None
+    result = {"job_id": job.id, "job_type": job.job_type, "status": job.status,
+              "started_at_utc": str(job.started_at),
+              "finished_at_utc": str(job.finished_at) if job.finished_at is not None else None,
+              "store_count": job.store_count}
+    stores = (job.metadata_json or {}).get("stores")
+    if job.job_type == "hourly_ad_monitor" and isinstance(stores, dict):
+        # A complete scheduled run can legitimately contain empty SP partitions.
+        partitions = Counter()
+        for store in stores.values():
+            reports = store.get("reports") if isinstance(store, dict) else None
+            if isinstance(reports, dict):
+                partitions.update(report["status"] for report in reports.values()
+                                  if isinstance(report, dict)
+                                  and report.get("status") in ("AVAILABLE", "EMPTY", "FAILED"))
+        result["store_count"] = len(stores)
+        result["sp_report_partition_counts"] = dict(partitions)
+    return result
 
 
 def configuration_status(db, settings):
@@ -212,19 +237,24 @@ def configuration_status(db, settings):
         missing.append({"field": "verified_health_source_timezone"})
     if not settings.mcp_public_url:
         missing.append({"field": "mcp_public_url_dns_tls"})
-    latest = db.scalar(select(SyncJob).where(SyncJob.job_type == "daily_collection",
-                                            SyncJob.status.in_(["SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"]))
-                       .order_by(SyncJob.id.desc()).limit(1))
+    hourly = getattr(settings, "hourly_ad_monitor_enabled", False)
+    collection_mode = "hourly_ad_monitor" if hourly else "daily_collection"
+    collection_jobs = select(SyncJob).where(SyncJob.job_type == collection_mode)
+    latest_attempt = db.scalar(collection_jobs.order_by(SyncJob.started_at.desc(), SyncJob.id.desc()).limit(1))
+    latest_success = db.scalar(collection_jobs.where(SyncJob.status.in_(["SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"]),
+                                                     SyncJob.finished_at.is_not(None))
+                               .order_by(SyncJob.finished_at.desc(), SyncJob.id.desc()).limit(1))
     report = {"stores": stores, "manager_count": len(managers), "manual_mapping_required": missing,
-            "scheduler_enabled": settings.scheduler_enabled, "cron": settings.daily_sync_cron,
+            "scheduler_enabled": settings.scheduler_enabled, "collection_mode": collection_mode,
+            "cron": getattr(settings, "hourly_ad_monitor_cron", "0 * * * *") if hourly else settings.daily_sync_cron,
             "cron_timezone": "Asia/Shanghai", "mcp_auth_mode": settings.mcp_auth_mode,
             "daily_report_cron": getattr(settings, "feishu_daily_report_cron", "0 8 * * *"),
             "daily_report_timezone": "Asia/Shanghai",
             "daily_report_start_date": getattr(settings, "feishu_daily_report_start_date", ""),
             "business_alert_delivery_mode": getattr(settings, "business_alert_delivery_mode", "rules"),
             "chat_notifications_enabled": getattr(settings, "mcp_notifications_enabled", False),
-            "last_successful_collection": None if latest is None else {
-                "job_id": latest.id, "status": latest.status, "finished_at_utc": str(latest.finished_at)},
+            "last_collection_attempt": _collection_job_snapshot(latest_attempt),
+            "last_successful_collection": _collection_job_snapshot(latest_success),
             "health_collection_enabled": settings.lingxing_performance_enabled,
             "health_observation_only": getattr(settings, "lingxing_performance_observation_only", True),
             "health_source_timezone_configured": bool(settings.lingxing_performance_source_timezone),

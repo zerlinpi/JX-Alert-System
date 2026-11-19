@@ -1206,6 +1206,48 @@ def test_mapped_owner_private_question_needs_no_mention_and_replies_only_in_priv
         and d["open_ids"] == [] for d in deliveries)
 
 
+@pytest.mark.parametrize('question,expected,live', [
+    ('拉去最新的数据看看有什么广告活动异常', {'5174', '5175'}, True),
+    ('拉去所有店铺最新的数据看看有什么广告活动异常', {'5174', '5175'}, True),
+    ('哪个店铺有异常广告活动', {'5174', '5175'}, False),
+    ('拉去Geteen美国店铺最新的数据看看有什么广告活动异常', {'5174'}, True),
+    ('拉去不存在品牌店铺最新的数据看看有什么广告活动异常', set(), False),
+    ('拉去美国站最新商品推广活动数据看看有没有异常', {'5174'}, True),
+    ('实时查看2026-11-12广告活动异常', {'5174', '5175'}, False),
+])
+def test_private_natural_ad_requests_scope_refresh_without_extra_store_prompt(warehouse, monkeypatch,
+                                                                            question, expected, live):
+    from jx_alert import bot_ad_refresh
+    from jx_alert.lingxing import intraday_observation
+
+    _name_stores(warehouse)
+    _enable_collection(warehouse, monkeypatch)
+    refreshed, observed = [], set()
+
+    def refresh(_db, _settings, stores, report_dates, **kwargs):
+        refreshed.append(({s.sid for s in stores}, set(report_dates)))
+        return {'attempted': 0}
+
+    def observe(_db, sid, _on):
+        observed.add(sid)
+        return None
+
+    monkeypatch.setattr(bot_ad_refresh, 'refresh_ad_evidence', refresh)
+    monkeypatch.setattr(intraday_observation, 'latest_observation', observe)
+    queued = enqueue(warehouse, private_event(question))
+    result = process(warehouse)
+    assert result['status'] == 'QUEUED' and FakeClient.calls == []
+    assert refreshed == ([(expected, expected)] if expected else [])
+    assert observed == (expected if live else set())
+    with warehouse[1]() as db:
+        job = db.get(SyncJob, queued['job_id'])
+        assert job.metadata_json['analysis_provider'] == (
+            'ad_review_no_findings' if expected else 'ad_review_scope_clarification')
+        value = db.get(NotificationOutbox, result['outbox_ids'][0]).payload
+        assert value['delivery']['role'] == 'private_question'
+        assert ('请确认店铺' in json.dumps(value, ensure_ascii=False)) is not bool(expected)
+
+
 def test_private_question_lists_only_recent_scoped_confirmed_ad_alerts(warehouse, monkeypatch):
     _enable_collection(warehouse, monkeypatch)
     item = {'store_id': '5174', 'ad_type': 'sp', 'campaign_id': 'budget-campaign', 'store': '测试店铺',

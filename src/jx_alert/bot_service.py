@@ -856,8 +856,9 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
 
     clock = _utcnow()
     question = meta['question']
-    latest_question = recent_alert_lookup(question)
-    period = period_length(question, default=7 if latest_question else 1)
+    recent_question = recent_alert_lookup(question)
+    wants_live_data = bool(re.search(r'最新|实时|盘中|截至现在|截止现在|今天|今日|当日', question))
+    period = period_length(question, default=7 if recent_question else 1)
     if not 1 <= period <= 14:
         return _complete_question(db, settings, job_id, meta,
             [card('广告查询', subtitle='请指定一个报表日，或最近二至十四天的广告分析范围。', sections=[])],
@@ -865,19 +866,23 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
     plan = store_report_plan([{'sid': s.sid, 'status': s.status} for s in stores],
         settings.store_timezones_file, now=clock, include_inactive=False,
         allow_unknown_timezone_history=getattr(settings, 'allow_unconfigured_timezone_history', False))
-    targets = {}
+    targets, intraday_store_ids = {}, set()
     try:
         for item in plan:
             if item['state'] != 'READY':
                 continue
             completed = date.fromisoformat(item['report_date'])
-            chosen = _question_date(question, completed, timezone_confirmed=item['timezone_confirmed']) or completed
-            if chosen <= completed:
-                targets[item['store_id']] = chosen
+            explicit_day = _question_date(question, completed, timezone_confirmed=item['timezone_confirmed'])
+            if explicit_day is None or explicit_day <= completed:
+                targets[item['store_id']] = explicit_day or completed
+            if (item['timezone_confirmed'] and (wants_live_data or recent_question)
+                    and explicit_day in (None, completed + timedelta(days=1))):
+                intraday_store_ids.add(item['store_id'])
     except QuestionDateError as exc:
         return _complete_question(db, settings, job_id, meta,
             [card('请确认报表日期', subtitle=str(exc), sections=[])], 'date_clarification')
     kinds = ad_types(question) or ('sp',)
+    latest_question = recent_question or bool(intraday_store_ids)
 
     def may_collect(sid):
         return (_collection_permission(settings, meta, sid)
@@ -912,7 +917,7 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
             mature = {campaign_identity(row) for row in rows}
             intraday = []
             for store in stores:
-                if store.sid not in targets or 'sp' not in kinds:
+                if store.sid not in intraday_store_ids or 'sp' not in kinds:
                     continue
                 try:
                     day = clock.astimezone(ZoneInfo(store.timezone)).date().isoformat()

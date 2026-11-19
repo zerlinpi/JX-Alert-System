@@ -18,6 +18,21 @@ from jx_alert.storage.models import DailyMetric, DataCoverage, Store
 from jx_alert.store_controls import store_control_snapshots
 
 
+_AD_SUBJECT = re.compile(
+    r'商品推广|品牌推广|展示推广|广告|推广|投放|点击率|点击花费|点击转化率|归因转化率|投入产出比|'
+    r'(?<![a-z0-9])(?:sp|sb|sd|ppc|ctr|cpc|cdr|cvr|cps|roas|cpa|tcoas|tacos|acos)(?![a-z0-9])')
+_AD_SCOPE_WORDS = re.compile(
+    r'麻烦|烦请|劳烦|请|帮我们|帮我|帮忙|给我们|给我|想知道|想看|想了解|了解|看一看|一下子|一下|'
+    r'看看|看下|查看|查询|分析|检查|排查|评估|诊断|复盘|核对|复核|筛选|列举|列出|汇总|找出|'
+    r'获取|拉取|拉去|取数|刷新|更新|同步|调取|'
+    r'当前|现在|目前|最近|近期|最新|现有|今天|今日|当天|昨天|昨日|前天|昨晚|本周|上周|本月|上月|'
+    r'盘中|全部|所有|各个|每个|各家|全店|每家|有哪几家|有哪家|有哪些|有没有|是否有|有无|'
+    r'哪些|什么|哪一个|哪几个|哪个|哪几家|哪家|几个|多少家|是否|可以|能不能|能否|一次性|只看|只列|'
+    r'已开启|已启用|开启|启用|正在|在投|活跃|正在运营|运营|已授权|可见|能看见|能看到|已采集|'
+    r'有数据|可读取|已发送|发过|已提醒|提醒过|已记录|接收过|'
+    r'包含|包括|已关闭|已停用|停用|关闭|历史|我们|系统|活动|站内|站|店|我|的|有')
+
+
 def include_paused(question):
     return bool(re.search(r'停用|已关闭|已停用|关闭的|含关闭|历史店铺|所有站点|全部站点', question or ''))
 
@@ -47,7 +62,7 @@ def ad_review_request(question):
     q = unicodedata.normalize('NFKC', question or '').casefold()
     if re.search(r'(?:不要|不用|无需|别|不必).{0,5}(?:分析|检查|排查|诊断|评估).{0,5}(?:广告|推广|投放)', q):
         return False
-    if not re.search(r'广告|推广|投放|ctr|cpc|cdr|cvr|cps|roas|cpa|tcoas|tacos|acos|(?<![a-z0-9])(?:sp|sb|sd|ppc)(?![a-z0-9])', q):
+    if not _AD_SUBJECT.search(q):
         return False
     if re.search(r'什么意思|是什么|什么是|如何计算|怎么算|怎么计算|如何理解|如何判断|怎么判断|意味着什么|公式|含义|定义', q):
         return False
@@ -104,14 +119,10 @@ def ad_review_stores(db, settings, question, snapshots, matched_ids):
         if not named:
             # Inspect the identity span up to the ad subject, including a name
             # after "店铺/站点". Later response filters are not shop identities.
-            prefix = re.split(r'广告|推广|投放|ctr|cpc|cdr|cvr|cps|roas|cpa|tcoas|tacos|acos', clean, maxsplit=1)[0]
+            prefix = _AD_SUBJECT.split(clean, maxsplit=1)[0]
             prefix = re.sub(r'(?:异常|有风险)(?:的)?\s*$', '', prefix)
             prefix = ' '.join(_name_parts(prefix))
-            generic = (r'麻烦|烦请|劳烦|请|帮我们|帮我|帮忙|想知道|想看|想了解|了解|看一看|一下|看看|看下|查看|查询|分析|检查|排查|评估|诊断|复盘|'
-                       r'当前|现在|目前|最近|近期|最新|现有|所有|全部|各个|每个|有没有|有无|是否有|有哪几家|有哪些|有哪家|哪些|哪几家|哪家|几个|多少家|'
-                       r'运营|已授权|可见|能看见|能看到|已采集|有数据|可读取|已发送|发过|已提醒|提醒过|已记录|'
-                       r'包含|包括|已关闭|已停用|停用|关闭|历史|我们|系统|我|的|有')
-            if re.sub(generic + r'|[\s，,。！？?！]', '', prefix):
+            if _AD_SCOPE_WORDS.sub('', prefix).strip():
                 return None
             chosen = {str(s['store_id']) for s in operating_snapshots(settings, snapshots, q)}
     chosen &= allowed
