@@ -1206,6 +1206,48 @@ def test_mapped_owner_private_question_needs_no_mention_and_replies_only_in_priv
         and d["open_ids"] == [] for d in deliveries)
 
 
+def test_private_question_lists_only_recent_scoped_confirmed_ad_alerts(warehouse, monkeypatch):
+    _enable_collection(warehouse, monkeypatch)
+    item = {'store_id': '5174', 'ad_type': 'sp', 'campaign_id': 'budget-campaign', 'store': '测试店铺',
+        'campaign': '看到的活动', 'signal': '盘中花费超出复核线',
+        'numbers': '花费 美元 50.08\n日预算 美元 1.00', 'detected_at': NOW.isoformat()}
+    with warehouse[1]() as db:
+        db.add(NotificationOutbox(idempotency_key='existing:alert', status='DELIVERED',
+            created_at=NOW.replace(tzinfo=None), payload={'hourly_ad_monitor': True,
+                'delivery': {'receive_id_type': 'chat_id'}, 'hourly_items': [item, {
+                    **item, 'store_id': '9999', 'campaign': '无权查看活动'}]}))
+        db.commit()
+    queued = enqueue(warehouse, private_event('最近有没有广告异常的广告活动，一次性列举'))
+    result = process(warehouse)
+    assert result['status'] == 'QUEUED' and FakeClient.calls == []
+    with warehouse[1]() as db:
+        assert db.get(SyncJob, queued['job_id']).metadata_json['analysis_provider'] == 'recorded_ad_alerts'
+        payload = db.get(NotificationOutbox, result['outbox_ids'][0]).payload
+        assert payload['delivery']['role'] == 'private_question'
+        assert payload['delivery']['reply_to_message_id'] == 'om_private'
+        output = json.dumps(payload['card'], ensure_ascii=False)
+        assert all(s in output for s in ('看到的活动', '当时的花费远超平均日预算', '50.08', '平均日预算 美元 1.00'))
+        assert '无权查看活动' not in output and '复核线' not in output
+
+
+def test_private_question_exhausting_retries_gets_one_failure_reply(warehouse, monkeypatch):
+    _enable_collection(warehouse, monkeypatch)
+    queued = enqueue(warehouse, private_event())
+    with warehouse[1]() as db:
+        job = db.get(SyncJob, queued['job_id'])
+        job.status = 'RUNNING'
+        job.metadata_json = {**job.metadata_json, 'attempts': 2}
+        db.commit()
+    assert process(warehouse)['status'] == 'IDLE'
+    assert process(warehouse)['status'] == 'IDLE'
+    with warehouse[1]() as db:
+        job = db.get(SyncJob, queued['job_id'])
+        assert job.status == 'FAILED'
+        row, = db.scalars(select(NotificationOutbox))
+        assert row.payload['delivery']['reply_to_message_id'] == 'om_private'
+        assert row.payload['text'] == '这次没能完成查询'
+
+
 @pytest.mark.parametrize("is_member", [True, False])
 def test_private_read_checks_current_group_members_before_any_data_or_model_work(warehouse, monkeypatch, is_member):
     from jx_alert import admin_mapping

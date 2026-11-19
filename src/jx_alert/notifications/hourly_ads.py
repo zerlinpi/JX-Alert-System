@@ -24,10 +24,10 @@ from jx_alert.store_controls import notification_states
 BEIJING = ZoneInfo('Asia/Shanghai')
 OPENS, CLOSES = time(8), time(18)
 TITLES = {
-    'CTR': '点击率下降', 'CPC': '点击花费上升', 'CDR': '点击转化率下降',
-    'CPS': '单件转化花费上升', 'CPA': '单均花费上升', 'ROAS': '广告投入产出下降',
-    'spend': '花费上升', 'orders': '成熟归因订单下降',
-    'zero_conversion': '成熟广告有花费但无归因订单', 'intraday_budget': '盘中花费超出复核线',
+    'CTR': '看到广告的人更少点击', 'CPC': '每次点击更贵了', 'CDR': '点击后下单的比例下降',
+    'CPS': '每卖出一件的广告费上涨', 'CPA': '每带来一单的广告费上涨', 'ROAS': '同样的广告费带来的销售额变少',
+    'spend': '广告花费增加', 'orders': '广告带来的订单减少',
+    'zero_conversion': '广告花了钱，统计期结束仍没带来订单', 'intraday_budget': '今天的花费远超平均日预算',
 }
 TRAFFIC = {'spend', 'CTR', 'CPC'}
 
@@ -60,8 +60,10 @@ def alert_item(finding, *, include_dates=False):
     currency = row['currency']
     text = []
     if row.get('intraday'):
-        text.append('花费 ' + number(row['current']['spend'], money=True, currency=currency))
-        text.append('日预算 ' + number(row['verified_daily_budget'], money=True, currency=currency))
+        spend, budget = row['current']['spend'], row['verified_daily_budget']
+        text.extend(f'{label} {number(value, money=True, currency=currency)}' for label, value in (
+            ('今天已花', spend), ('平均日预算', budget), ('比平均日预算多', spend - budget),
+        ))
     else:
         current, mature = row['current'], row['mature']
         if TRAFFIC.intersection(signals):

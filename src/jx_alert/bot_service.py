@@ -936,6 +936,30 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
     return _complete_question(db, settings, job_id, meta, cards, provider)
 
 
+def _recover_interrupted_questions(db, settings):
+    """Retry interrupted work once, then let an authorized reader know it failed."""
+    from jx_alert.admin_mapping import MappingError
+    abandoned = db.scalars(select(SyncJob).where(
+        SyncJob.job_type == "feishu_question", SyncJob.status == "RUNNING")).all()
+    clock = _utcnow().replace(tzinfo=None)
+    for row in abandoned:
+        meta = row.metadata_json or {}
+        if meta.get("attempts", 0) < 2:
+            row.status = "PENDING"
+            continue
+        row.status, row.finished_at = "FAILED", clock
+        if (meta.get("chat_type") != "p2p"
+                or clock - row.started_at > timedelta(minutes=settings.feishu_bot_question_max_age_minutes)):
+            continue
+        try:
+            response = card("这次没能完成查询", subtitle="请稍后重新发送问题。", sections=[])
+            ids = _reply(db, settings, meta["message_id"], meta["chat_id"], [response], question_meta=meta)
+        except (QuestionAccessChanged, MappingError):
+            # The membership check still applies to the original conversation.
+            continue
+        row.metadata_json = {**meta, "outbox_ids": ids, "analysis_provider": "processing_failed"}
+
+
 def process_one_question(settings, session_factory, warehouse_engine, *, client_factory=None):
     if not settings.feishu_bot_enabled or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
@@ -943,12 +967,7 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
     factory = client_factory or DeepSeekClient.from_settings
     with database_job_lock(warehouse_engine, "feishu_question_worker"):
         with session_factory() as db:
-            abandoned = db.scalars(select(SyncJob).where(SyncJob.job_type == "feishu_question", SyncJob.status == "RUNNING")).all()
-            for row in abandoned:
-                attempts = (row.metadata_json or {}).get("attempts", 0)
-                row.status = "FAILED" if attempts >= 2 else "PENDING"
-                if row.status == "FAILED":
-                    row.finished_at = _utcnow().replace(tzinfo=None)
+            _recover_interrupted_questions(db, settings)
             db.commit()
             job = db.scalar(select(SyncJob).where(SyncJob.job_type == "feishu_question", SyncJob.status == "PENDING")
                             .order_by(SyncJob.id).limit(1))
@@ -975,6 +994,11 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
             from jx_alert.bot_intents import global_question_cards, focus_question, ad_review_stores
             review_stores = ad_review_stores(db, settings, meta['question'], snapshots, ids)
             if review_stores is not None:
+                from jx_alert.bot_alert_history import recent_alert_cards, recent_alert_lookup
+                if recent_alert_lookup(meta['question']):
+                    meta['reply_store_ids'] = [store.sid for store in review_stores]
+                    cards = recent_alert_cards(db, review_stores, meta['question'], _utcnow())
+                    return _complete_question(db, settings, job_id, meta, cards, 'recorded_ad_alerts')
                 return _review_ad_question(db, settings, job_id, meta, review_stores, factory)
             from jx_alert.ai.analyst_evidence import analyst_question
             global_cards = (None if len(ids) == 1 and analyst_question(meta['question']) else

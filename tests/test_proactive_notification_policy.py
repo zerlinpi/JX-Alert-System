@@ -118,7 +118,7 @@ def test_proactive_daily_ad_reuses_mature_source_proof_and_preserves_campaign_na
     assert not quiet_blocks(settings, ad_notice.idempotency_key, ad_notice.payload)
     message = json.dumps(ad_notice.payload, ensure_ascii=False)
     assert '接口无记录测试活动' in message and '已暂停' in message
-    assert '成熟广告有花费但无归因订单' in message and '未知（' not in message
+    assert '广告花了钱，统计期结束仍没带来订单' in message and '未知（' not in message
     reservation, = list(db.scalars(select(SyncJob).where(SyncJob.job_type == INCIDENT)))
     assert reservation.metadata_json['origin'] == 'daily_report'
     assert reservation.metadata_json['outbox_ids'] == [ad_notice.id]
