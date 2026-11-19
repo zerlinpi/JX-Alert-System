@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 from jx_alert.analysis.ad_kpis import compare_kpis
 from jx_alert.bot_intents import inventory_cards
+from jx_alert.bot_presentation import analysis_cards
 from jx_alert.notifications.cards import compact_ad_kpi_rows
 from jx_alert.notifications.morning_digest import morning_cards, sp_campaign_exceptions
 from jx_alert.notifications.store_health import card_fits
@@ -28,6 +29,24 @@ def observations():
 
 def tables(value):
     return [element for element in value['body']['elements'] if element.get('tag') == 'table']
+
+
+def test_model_table_and_numeric_prose_become_native_tables_without_changing_qualitative_text():
+    value, = analysis_cards('店铺回复', '以下是已核对数据。\n指标 | 本期 | 参考\n---|---:|:---\n'
+        '点击率 | 0.69% | 1.22%\n\n点击 28 次，花费美元 30.87。\n优先核查流量质量。')
+    native, prose = tables(value)
+    assert native['rows'] == [{'c0': '点击率', 'c1': '0.69%', 'c2': '1.22%'}]
+    assert prose['rows'] == [{'c0': '点击 28 次，花费美元 30.87。'}]
+    assert value['body']['elements'][-1] == {'tag': 'markdown', 'content': '优先核查流量质量。'}
+    assert card_fits(value)
+
+
+def test_model_data_pagination_preserves_every_value_and_feishu_size_limits():
+    records = [f'记录 {i} ' + '长' * 510 for i in range(6)]
+    values = analysis_cards('店铺回复', '\n以上为对应报表观测。\n'.join(records))
+    assert len(values) == 2 and all(card_fits(value) for value in values)
+    cells = [row['c0'] for value in values for block in tables(value) for row in block['rows']]
+    assert ''.join(cells) == ''.join(records)
 
 
 def test_compact_kpis_retain_value_dates_reference_changes_and_real_zero_without_mutation():

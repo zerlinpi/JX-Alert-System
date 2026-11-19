@@ -8,7 +8,8 @@ from sqlalchemy import select, tuple_
 
 from jx_alert.ai.ad_review_skills import load_ad_review_skills, skill_fingerprint
 from jx_alert.notifications.ad_repeat import (
-    INCIDENT, campaign_identity, incident_key, incident_metadata, load_incident_history, repeat_eligible_signals,
+    INCIDENT, campaign_identity, incident_already_recorded, incident_metadata,
+    load_incident_history, repeat_eligible_signals, subscriber_reservations,
 )
 from jx_alert.notifications.cards import card, number, plain, with_mentions
 from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
@@ -69,6 +70,10 @@ def alert_item(finding, *, include_dates=False):
         if TRAFFIC.intersection(signals):
             label = ('日报花费 ' + row['report_date']) if include_dates else '日报花费'
             text.append(label + ' ' + number(current['spend'], money=True, currency=currency))
+            traffic = [f'{name} {number(current[field])}' for field, name in (
+                ('clicks', '点击'), ('impressions', '曝光')) if current.get(field) is not None]
+            if traffic:
+                text.append(' · '.join(traffic))
         if set(signals) - TRAFFIC:
             label = ('成熟花费 ' + row['mature_date']) if include_dates else '成熟花费'
             text.append(label + ' ' + number(mature['spend'], money=True, currency=currency))
@@ -77,14 +82,16 @@ def alert_item(finding, *, include_dates=False):
             metric = row['kpis'].get(code, {})
             a, b = metric.get('current'), metric.get('baseline')
             if a is not None and b is not None:
-                text.append(f'{code} {_metric(a, code, currency)}，参考 {_metric(b, code, currency)}')
+                reference = {'SEVEN_DAY': '前七日', 'PREVIOUS_DAY': '前一日'}.get(
+                    metric.get('comparison_basis'), '参考')
+                text.append(f'{code} {_metric(a, code, currency)}（{reference} {_metric(b, code, currency)}）')
     return {field: row[field] for field in ('store_id', 'ad_type', 'campaign_id')} | {
         'store': plain(row['store_name'], 64), 'campaign': plain(row['campaign_name'], 105),
         'signal': '；'.join(TITLES[code] for code in signals), 'numbers': '\n'.join(text),
     }
 
 
-def advertising_card(items, *, title='广告异常', store_mentions=None):
+def _advertising_card_with_items(items, *, title='广告异常', store_mentions=None):
     def render(rows):
         checks = [(i['store'] + '\n' + i['campaign'], i['signal'], i['numbers']) for i in rows]
         notes = [f'另有 {len(items) - len(rows)} 项异常已保留记录。'] if len(rows) < len(items) else []
@@ -102,7 +109,11 @@ def advertising_card(items, *, title='广告异常', store_mentions=None):
     while len(visible) > 1 and not card_fits(result):
         visible = visible[:-1]
         result = render(visible)
-    return result
+    return result, list(visible)
+
+
+def advertising_card(items, *, title='广告异常', store_mentions=None):
+    return _advertising_card_with_items(items, title=title, store_mentions=store_mentions)[0]
 
 
 def delivery_window(payload, now):
@@ -182,7 +193,11 @@ def _write_routes(db, settings, bucket, items, day, *, overnight=False):
     lead = advertising_subscriber_deliveries(settings)
     if len(lead) != 1:
         return [primary]
-    copy = _write_batch(db, bucket, lead[0], items, day, group=group, routing=routing, overnight=overnight)
+    reserved = subscriber_reservations(db, (i.get('incident_key') for i in items), lead[0])
+    private_items = [i for i in items if i.get('incident_key') not in reserved]
+    if not private_items:
+        return [primary]
+    copy = _write_batch(db, bucket, lead[0], private_items, day, group=group, routing=routing, overnight=overnight)
     return [primary, copy] if copy is not None else [primary]
 
 
@@ -203,15 +218,14 @@ def queue_hourly_findings(db, settings, findings, *, now, slot, send_alerts):
         signals = repeat_eligible_signals(evidence, finding['signals'], history, now)
         if not signals:
             continue
-        key = incident_key(evidence)
-        exists = db.scalar(select(SyncJob.id).where(SyncJob.job_type == INCIDENT,
-            SyncJob.metadata_json['incident_key'].as_string() == key))
-        if not exists:
+        if not incident_already_recorded(db, evidence, now=now):
             profile = evidence.get('ad_skill') or skills.for_campaign(*identity)
+            incident = incident_metadata(evidence, signals)
             item = alert_item({**finding, 'signals': signals}) | {
                 'detected_at': now.isoformat(), 'skill_fingerprint': skill_fingerprint(profile),
+                'incident_key': incident['incident_key'],
             }
-            candidates[identity] = incident_metadata(evidence, signals), item
+            candidates[identity] = incident, item
     valid = eligible_items(db, settings, [i for _, i in candidates.values()], now)
     ids = [] if overnight else _write_routes(db, settings, slot, valid, day)
     if not overnight and not ids:
@@ -257,8 +271,8 @@ def queue_overnight_digest(db, settings, now):
     return ids
 
 
-def recheck_hourly_card(db, settings, payload, now):
-    """Keep only authorized, still-enabled activities in this exact destination."""
+def recheck_hourly_delivery(db, settings, payload, now):
+    """Return the outgoing card and precisely the activities shown on it."""
     destination = payload['delivery']
     routing = _routing(settings)
     current = _group(settings, routing)
@@ -274,5 +288,5 @@ def recheck_hourly_card(db, settings, payload, now):
     if not rows:
         return None
     mentions = _group_mentions(routing, current, rows) if destination == current else None
-    return advertising_card(rows, title='夜间广告异常汇总' if payload['hourly_overnight'] else '广告异常',
-                            store_mentions=mentions)
+    return _advertising_card_with_items(rows,
+        title='夜间广告异常汇总' if payload['hourly_overnight'] else '广告异常', store_mentions=mentions)

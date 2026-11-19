@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -7,6 +8,7 @@ from jx_alert.notifications.ad_repeat import (
     INCIDENT, campaign_identity, incident_already_recorded, incident_metadata,
     load_incident_history, repeat_eligible_signals,
 )
+from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
 from jx_alert.storage.models import SyncJob
 
@@ -18,6 +20,14 @@ def _evidence(day, mature_day, spend, **overrides):
     return {'store_id': '5174', 'campaign_id': 'seven', 'ad_type': 'sp',
             'report_date': day, 'mature_date': mature_day, 'currency': 'USD',
             'mature': {'orders': 0, 'spend': spend}, **overrides}
+
+
+def _outbox(db, label, status, destination='chat_id', **payload):
+    row = NotificationOutbox(idempotency_key=label, status=status,
+        payload={'delivery': {'receive_id_type': destination}, **payload})
+    db.add(row)
+    db.flush()
+    return row.id
 
 
 def test_steady_incident_needs_fresh_material_worsening_after_cooldown():
@@ -42,20 +52,22 @@ def test_recent_history_includes_held_and_daily_reservations_and_has_a_seven_day
     start = _evidence('2026-11-13', '2026-11-06', 80)
     with Session(engine) as db:
         latest = incident_metadata(start, ['zero_conversion'])
+        group = _outbox(db, 'daily-report', 'PENDING')
         db.add(SyncJob(job_type=INCIDENT, status='HELD',
-            started_at=(CLOCK - timedelta(days=4)).replace(tzinfo=None), metadata_json=latest))
+            started_at=(CLOCK - timedelta(days=4)).replace(tzinfo=None),
+            metadata_json={**latest, 'release_day': '2026-11-19'}))
         db.add(SyncJob(job_type=INCIDENT, status='QUEUED',
             started_at=(CLOCK - timedelta(hours=3)).replace(tzinfo=None),
-            metadata_json={**latest, 'origin': 'daily_report'}))
+            metadata_json={**latest, 'origin': 'daily_report', 'outbox_ids': [group]}))
         db.add(SyncJob(job_type=INCIDENT, status='QUEUED',
             started_at=(CLOCK - timedelta(days=7)).replace(tzinfo=None),
-            metadata_json={**latest, 'campaign_id': 'outside'}))
+            metadata_json={**latest, 'campaign_id': 'outside', 'outbox_ids': [group]}))
         db.add(SyncJob(job_type=INCIDENT, status='HELD',
             started_at=(CLOCK - timedelta(days=3)).replace(tzinfo=None),
             metadata_json={**latest, 'campaign_id': 'not_released', 'release_day': '2026-11-17'}))
         db.commit()
-        assert incident_already_recorded(db, start)
-        assert not incident_already_recorded(db, current)
+        assert incident_already_recorded(db, start, now=CLOCK)
+        assert not incident_already_recorded(db, current, now=CLOCK)
         history = load_incident_history(db, CLOCK)
         assert [m.get('origin') for _, m in history[campaign_identity(current)]] == ['daily_report', None]
         assert repeat_eligible_signals(current, ['zero_conversion'], history, CLOCK) == []
@@ -65,6 +77,58 @@ def test_recent_history_includes_held_and_daily_reservations_and_has_a_seven_day
             ['zero_conversion'], history, CLOCK) == ['zero_conversion']
         assert repeat_eligible_signals({**current, 'store_id': 'another'},
             ['zero_conversion'], history, CLOCK) == ['zero_conversion']
+    engine.dispose()
+
+
+@pytest.mark.parametrize(('status', 'receipt', 'reserved'), [
+    ('PENDING', None, True), ('RETRY', None, True), ('SENDING', None, True),
+    ('DEAD', None, False), ('SKIPPED', None, False), ('EXPIRED', None, False),
+    ('DELIVERED', None, True),    # Acknowledged legacy per-campaign card.
+    ('DELIVERED', 'included', True),
+    ('DELIVERED', 'filtered_out', False),
+    ('DELIVERED', 'different_store', False),
+])
+def test_repeat_reservation_follows_group_delivery_and_its_visible_activities(status, receipt, reserved):
+    engine = create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    current = _evidence('2026-11-18', '2026-11-11', 90)
+    incident = incident_metadata(current, ['zero_conversion'])
+    receipt_data = {}
+    if receipt is not None:
+        receipt_data['hourly_delivered_items'] = [{
+            'store_id': '5174' if receipt != 'different_store' else '5175', 'ad_type': 'sp',
+            'campaign_id': 'seven' if receipt != 'filtered_out' else 'another',
+        }]
+    with Session(engine) as db:
+        group = _outbox(db, 'group', status, **receipt_data)
+        lead = _outbox(db, 'lead', 'DELIVERED', destination='open_id')
+        db.add(SyncJob(job_type=INCIDENT, status='QUEUED',
+            started_at=(CLOCK - timedelta(hours=1)).replace(tzinfo=None),
+            metadata_json={**incident, 'outbox_ids': [group, lead]}))
+        db.commit()
+        assert incident_already_recorded(db, current, now=CLOCK) is reserved
+        recent = load_incident_history(db, CLOCK)
+        assert (campaign_identity(current) in recent) is reserved
+        assert repeat_eligible_signals(current, ['zero_conversion'], recent, CLOCK) == (
+            [] if reserved else ['zero_conversion'])
+    engine.dispose()
+
+
+def test_exact_incident_releases_expired_holds_and_unrouted_reservations():
+    engine = create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    row = _evidence('2026-11-18', '2026-11-11', 90)
+    incident = incident_metadata(row, ['zero_conversion'])
+    with Session(engine) as db:
+        db.add(SyncJob(job_type=INCIDENT, status='HELD',
+            started_at=(CLOCK - timedelta(days=2)).replace(tzinfo=None),
+            metadata_json={**incident, 'release_day': '2026-11-18'}))
+        db.add(SyncJob(job_type=INCIDENT, status='QUEUED',
+            started_at=(CLOCK - timedelta(days=1)).replace(tzinfo=None), metadata_json=incident))
+        db.commit()
+        assert incident_already_recorded(db, row, now=CLOCK - timedelta(days=1))
+        assert not incident_already_recorded(db, row, now=CLOCK)
+        assert campaign_identity(row) not in load_incident_history(db, CLOCK)
     engine.dispose()
 
 

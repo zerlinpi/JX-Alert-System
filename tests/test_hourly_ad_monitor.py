@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from jx_alert import hourly_ad_monitor as monitor
 from jx_alert.config import Settings
 from jx_alert.notifications import hourly_ads
+from jx_alert.notifications.ad_repeat import incident_key
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
 from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
@@ -196,8 +197,8 @@ def test_activity_paused_during_model_call_never_queues(warehouse):
 
 def test_changed_metric_selection_does_not_create_a_second_incident():
     row = {'store_id': '5174', 'campaign_id': '1', 'ad_type': 'sp', 'report_date': '2026-11-16', 'mature_date': '2026-11-09'}
-    assert hourly_ads.incident_key(row) == hourly_ads.incident_key({**row, 'material_signals': ['CPA', 'ROAS']})
-    assert hourly_ads.incident_key(row) != hourly_ads.incident_key({**row, 'intraday': True})
+    assert incident_key(row) == incident_key({**row, 'material_signals': ['CPA', 'ROAS']})
+    assert incident_key(row) != incident_key({**row, 'intraday': True})
 
 
 def _finding(sid, cid, day='2026-11-16'):
@@ -230,25 +231,100 @@ def test_daytime_batches_in_one_group_and_refreshes_owner_mentions(warehouse):
         assert (row.chat_id, lead.chat_id) == ('oc_reports', 'ou_lead')
         assert [item['campaign_id'] for item in row.payload['hourly_items']] == ['active', 'b']
         assert lead.payload['hourly_items'] == row.payload['hourly_items']
-        initial = json.dumps(hourly_ads.recheck_hourly_card(db, settings, row.payload, CLOCK))
+        initial = json.dumps(hourly_ads.recheck_hourly_delivery(db, settings, row.payload, CLOCK)[0])
         assert initial.count('<at id=ou_owner></at>') == 1 and 'ou_nonmember' not in initial
-        private = hourly_ads.recheck_hourly_card(db, settings, lead.payload, CLOCK)
+        private = hourly_ads.recheck_hourly_delivery(db, settings, lead.payload, CLOCK)
         assert private is not None and '<at id' not in json.dumps(private)
         routing['stores']['5175'] = ['ou_new_owner']
         path.write_text(json.dumps(routing))
-        refreshed = hourly_ads.recheck_hourly_card(db, settings, row.payload, CLOCK)
+        refreshed, included = hourly_ads.recheck_hourly_delivery(db, settings, row.payload, CLOCK)
         assert '<at id=ou_new_owner></at>' in json.dumps(refreshed)
         table = next(item for item in refreshed['body']['elements'] if item['tag'] == 'table')
         assert len(table['rows']) == 2
+        assert included == row.payload['hourly_items']
         previous_version = {**lead.payload, 'delivery': {'role': 'store_ad_recipient',
             'receive_id_type': 'open_id', 'receive_id': 'ou_owner'}}
-        assert hourly_ads.recheck_hourly_card(db, settings, previous_version, CLOCK) is None
+        assert hourly_ads.recheck_hourly_delivery(db, settings, previous_version, CLOCK) is None
         routing['ad_alert_subscribers']['recipients'][0]['generation'] = 'b'*32
         path.write_text(json.dumps(routing))
-        assert hourly_ads.recheck_hourly_card(db, settings, lead.payload, CLOCK) is None
+        assert hourly_ads.recheck_hourly_delivery(db, settings, lead.payload, CLOCK) is None
         changed_date = [_finding('5174', 'active', day='2026-11-17')]
         assert not hourly_ads.queue_hourly_findings(db, settings, changed_date,
             now=CLOCK + timedelta(hours=1), slot='second', send_alerts=True)
+
+
+def test_delivered_group_records_only_visible_activities_and_later_rechecks_missing_one(warehouse, monkeypatch):
+    from jx_alert.notifications import worker
+    from jx_alert.notifications.feishu_app import FeishuAppClient
+
+    settings, sessions, _, _ = warehouse
+    clock = CLOCK
+    sends = []
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock.astimezone(tz) if tz else clock.replace(tzinfo=None)
+
+    class Feishu:
+        def send_card(self, card, **kwargs):
+            sends.append(card)
+            return {'message_id': 'om_receipt'}
+
+    monkeypatch.setattr(worker, 'datetime', FixedClock)
+    monkeypatch.setattr(worker, 'get_settings', lambda: settings)
+    monkeypatch.setattr(worker, 'SessionLocal', sessions)
+    monkeypatch.setattr(FeishuAppClient, 'from_settings', lambda _: Feishu())
+    findings = [_finding('5174', 'active'), _finding('5174', 'other')]
+    with sessions() as db:
+        other = Campaign(store_id='5174', campaign_id='other', campaign_type='sp', state='enabled',
+            updated_at=clock.replace(tzinfo=None))
+        db.add(other)
+        db.commit()
+        first, = hourly_ads.queue_hourly_findings(db, settings, findings, now=clock, slot='first', send_alerts=True)
+        # The queued card had both activities. An activity disabled at actual
+        # send time must be absent from the committed delivery receipt.
+        row = db.get(NotificationOutbox, first)
+        row.next_attempt_at = row.created_at = clock.replace(tzinfo=None)
+        other.state = 'paused'
+        db.commit()
+    assert worker.process_outbox_batch(outbox_ids=[first])['sent'] == 1
+    with sessions() as db:
+        row = db.get(NotificationOutbox, first)
+        assert row.status == 'DELIVERED'
+        assert [i['campaign_id'] for i in row.payload['hourly_items']] == ['active', 'other']
+        assert [i['campaign_id'] for i in row.payload['hourly_delivered_items']] == ['active']
+        assert row.payload['card'] == sends[0]
+        other = db.scalar(select(Campaign).where(Campaign.campaign_id == 'other'))
+        clock += timedelta(hours=1)
+        other.state = 'enabled'
+        other.updated_at = clock.replace(tzinfo=None)
+        db.commit()
+        replacement, = hourly_ads.queue_hourly_findings(
+            db, settings, findings, now=clock, slot='second', send_alerts=True)
+        assert [i['campaign_id'] for i in db.get(NotificationOutbox, replacement).payload['hourly_items']] == ['other']
+
+
+def test_group_retry_does_not_repeat_a_delivered_lead_copy(warehouse):
+    settings, sessions, _, _ = warehouse
+    path = Path(settings.feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing['ad_alert_subscribers'] = {'recipients': [
+        {'open_id': 'ou_lead', 'name': '总负责人', 'generation': 'a'*32},
+    ]}
+    path.write_text(json.dumps(routing))
+    findings = [_finding('5174', 'active')]
+    with sessions() as db:
+        group_id, lead_id = hourly_ads.queue_hourly_findings(
+            db, settings, findings, now=CLOCK, slot='first', send_alerts=True)
+        db.get(NotificationOutbox, group_id).status = 'DEAD'
+        lead = db.get(NotificationOutbox, lead_id)
+        lead.status = 'DELIVERED'
+        lead.payload = {**lead.payload, 'hourly_delivered_items': lead.payload['hourly_items']}
+        db.commit()
+        new_id, = hourly_ads.queue_hourly_findings(
+            db, settings, findings, now=CLOCK + timedelta(hours=1), slot='second', send_alerts=True)
+        assert db.get(NotificationOutbox, new_id).chat_id == 'oc_reports'
 
 
 def test_night_keeps_incidents_and_releases_one_group_table_at_eight(warehouse):

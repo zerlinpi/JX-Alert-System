@@ -8,6 +8,15 @@ import html
 import re
 
 
+_NUMERIC_EVIDENCE = re.compile(
+    r'\d|[零〇一二两三四五六七八九十百千万亿]+(?:点[零〇一二两三四五六七八九]+)?'
+    r'\s*(?:美元|美金|元|单|件|次|家|倍|成|个点|个百分点|月|日|时|分|秒)|百分之')
+
+
+def has_quantitative_text(value):
+    return bool(_NUMERIC_EVIDENCE.search(value))
+
+
 def plain(value, maximum=500):
     if value is None:
         return "未知"

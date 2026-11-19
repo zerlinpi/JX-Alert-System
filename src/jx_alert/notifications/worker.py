@@ -14,7 +14,7 @@ from jx_alert.notifications.routing import (
     _database_entity_open_ids as _routing_database_ids,
 )
 from jx_alert.notifications.outbox import NotificationOutbox
-from jx_alert.notifications.hourly_ads import BEIJING, CLOSES, OPENS, delivery_window, recheck_hourly_card
+from jx_alert.notifications.hourly_ads import BEIJING, CLOSES, OPENS, delivery_window, recheck_hourly_delivery
 from jx_alert.notifications.recipient_policy import ROLE, advertising_group_delivery
 from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks, quiet_delivery, original_question_reply
 from jx_alert.notifications.store_policy import paused_delivery
@@ -215,6 +215,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
     for row_id, dedupe_key, payload, attempts, existing_chat_id, created_at in jobs:
         channel = "feishu_app" if payload.get("transport") == "app" else "feishu_webhook"
         message_id = None
+        hourly_delivered_items = None
         chat_id = (
             default_chat_id
             if existing_chat_id in (None, "", "default")
@@ -270,11 +271,11 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             if skip_reason is None:
                 with SessionLocal() as db:
                     if hourly_batch:
-                        value = recheck_hourly_card(db, settings, payload, now.replace(tzinfo=timezone.utc))
-                        if value is None:
+                        checked = recheck_hourly_delivery(db, settings, payload, now.replace(tzinfo=timezone.utc))
+                        if checked is None:
                             skip_reason = '当前接收权限或活动状态不满足，旧告警保留记录'
                         else:
-                            payload['card'] = value
+                            payload['card'], hourly_delivered_items = checked
                     elif business_batch:
                         value = _business_card_for_delivery(db, settings, dedupe_key, payload, created_at, now)
                         if value is None:
@@ -362,6 +363,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
         with SessionLocal() as db:
             values = dict(chat_id=chat_id, status=status, last_error=error,
                           claimed_at=None, delivered_at=delivered_at)
+            if status == "DELIVERED" and hourly_delivered_items is not None:
+                values["payload"] = {**payload, "hourly_delivered_items": hourly_delivered_items}
             if status == "RETRY":
                 delay = min(30 * (2 ** max(attempts - 1, 0)), 3600)
                 values["next_attempt_at"] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=delay)

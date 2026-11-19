@@ -1,7 +1,7 @@
 """Evidence-based repeat suppression for automatic advertising notifications."""
 
 from collections import defaultdict
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -9,12 +9,14 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
+from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.models import SyncJob
 
 
 INCIDENT = 'hourly_ad_incident'
 COOLDOWN = timedelta(hours=72)
 REVIEW_INTERVAL = timedelta(days=7)
+_RESERVING_OUTBOX_STATES = {'PENDING', 'RETRY', 'SENDING'}
 
 _FAMILIES = {
     'CTR': 'traffic', 'CPC': 'traffic',
@@ -41,28 +43,92 @@ def incident_key(row):
     return 'hourly-ad:' + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
-def incident_already_recorded(db, row):
-    """The exact source day/window is not replayed after the cooldown."""
-    return db.scalar(select(SyncJob.id).where(SyncJob.job_type == INCIDENT,
-        SyncJob.metadata_json['incident_key'].as_string() == incident_key(row)).limit(1)) is not None
+def _outbox_ids(item):
+    raw = item.get('outbox_ids') if isinstance(item, dict) else None
+    return [oid for oid in raw if type(oid) is int and oid > 0] if isinstance(raw, list) else []
+
+
+def _group_outboxes(db, incident_items):
+    ids = {oid for item in incident_items for oid in _outbox_ids(item)}
+    return {oid: (status, payload) for oid, status, payload in db.execute(
+        select(NotificationOutbox.id, NotificationOutbox.status, NotificationOutbox.payload).where(
+            NotificationOutbox.id.in_(ids),
+            NotificationOutbox.payload['delivery']['receive_id_type'].as_string() == 'chat_id',
+            NotificationOutbox.status.in_((*_RESERVING_OUTBOX_STATES, 'DELIVERED')),
+    ))} if ids else {}
+
+
+def _stored_identity(item):
+    return item.get('store_id'), item.get('ad_type', 'sp'), item.get('campaign_id')
+
+
+def _outbox_reserves(state, payload, item):
+    if state in _RESERVING_OUTBOX_STATES:
+        return True
+    if state != 'DELIVERED':
+        return False
+    # Older deliveries had no per-activity receipt. Preserve their reservation.
+    if 'hourly_delivered_items' not in payload:
+        return True
+    sent = payload['hourly_delivered_items']
+    return isinstance(sent, list) and any(isinstance(row, dict)
+        and _stored_identity(row) == _stored_identity(item) for row in sent)
+
+
+def _reserved_incident(status, item, outboxes, today):
+    if not isinstance(item, dict) or not item.get('store_id') or not item.get('campaign_id'):
+        return False
+    if status == 'HELD':
+        release = _day(item.get('release_day'))
+        return release is not None and release >= today
+    return any(_outbox_reserves(*outboxes.get(oid, (None, {})), item) for oid in _outbox_ids(item))
+
+
+def subscriber_reservations(db, incident_keys, destination):
+    """Avoid a second private copy when a new group attempt is needed."""
+    keys = {key for key in incident_keys if key}
+    if not keys:
+        return set()
+    incidents = list(db.scalars(select(SyncJob.metadata_json).where(
+        SyncJob.job_type == INCIDENT, SyncJob.status == 'QUEUED',
+        SyncJob.metadata_json['incident_key'].as_string().in_(keys))))
+    ids = {oid for item in incidents for oid in _outbox_ids(item)}
+    if not ids:
+        return set()
+    outboxes = {oid: (status, payload) for oid, status, payload in db.execute(
+        select(NotificationOutbox.id, NotificationOutbox.status, NotificationOutbox.payload).where(
+            NotificationOutbox.id.in_(ids), NotificationOutbox.chat_id == destination['receive_id'],
+            NotificationOutbox.status.in_((*_RESERVING_OUTBOX_STATES, 'DELIVERED'))))
+        if payload.get('delivery') == destination}
+    return {item['incident_key'] for item in incidents
+            if any(_outbox_reserves(*outboxes.get(oid, (None, {})), item) for oid in _outbox_ids(item))}
+
+
+def incident_already_recorded(db, row, *, now=None):
+    """Check whether the exact source day is reserved or reached the group."""
+    clock = now or datetime.now(timezone.utc)
+    today = clock.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
+    candidates = db.execute(select(SyncJob.status, SyncJob.metadata_json).where(
+        SyncJob.job_type == INCIDENT, SyncJob.status.in_(('HELD', 'QUEUED')),
+        SyncJob.metadata_json['incident_key'].as_string() == incident_key(row),
+    )).all()
+    outboxes = _group_outboxes(db, (item for _, item in candidates))
+    return any(_reserved_incident(status, item, outboxes, today) for status, item in candidates)
 
 
 def load_incident_history(db, now):
-    """Return one bounded cross-channel history for this analysis batch."""
+    """Return group reservations and receipts from the past seven days."""
     end = now.astimezone(timezone.utc).replace(tzinfo=None)
     today = now.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
     rows = db.execute(select(SyncJob.started_at, SyncJob.status, SyncJob.metadata_json).where(
         SyncJob.job_type == INCIDENT, SyncJob.status.in_(('HELD', 'QUEUED')),
         SyncJob.started_at > end - REVIEW_INTERVAL, SyncJob.started_at <= end,
-    ).order_by(SyncJob.started_at.desc(), SyncJob.id.desc()))
+    ).order_by(SyncJob.started_at.desc(), SyncJob.id.desc())).all()
+    outboxes = _group_outboxes(db, (item for _, _, item in rows))
     history = defaultdict(list)
     for started_at, status, item in rows:
-        if isinstance(item, dict) and item.get('store_id') and item.get('campaign_id'):
-            release = _day(item.get('release_day'))
-            if status == 'HELD' and release and release < today:
-                continue
-            identity = item['store_id'], item.get('ad_type', 'sp'), item['campaign_id']
-            history[identity].append((started_at.replace(tzinfo=timezone.utc), item))
+        if _reserved_incident(status, item, outboxes, today):
+            history[_stored_identity(item)].append((started_at.replace(tzinfo=timezone.utc), item))
     return history
 
 

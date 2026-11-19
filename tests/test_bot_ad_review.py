@@ -68,8 +68,13 @@ def test_exact_operator_prompt_reaches_model_and_omits_every_ineligible_store(wa
     assert context['campaigns'][0]['mature_comparison']['expected_orders_at_reference_rate'] == pytest.approx(3)
     assert 'evidence_dates' not in context['campaigns'][0]
     with warehouse[1]() as db:
-        payload = json.dumps([r.payload for r in db.scalars(select(NotificationOutbox))], ensure_ascii=False)
+        replies = list(db.scalars(select(NotificationOutbox)))
+        payload = json.dumps([r.payload for r in replies], ensure_ascii=False)
         assert '成熟点击已积累' in payload and '200.00' in payload
+        elements = replies[0].payload['card']['body']['elements']
+        assert any('200.00' in cell for item in elements if item['tag'] == 'table'
+                   for row in item['rows'] for cell in row.values())
+        assert all('200.00' not in item['content'] for item in elements if item['tag'] == 'markdown')
         assert all(t not in payload for t in ('数据不全', '缺少成熟', '待补齐', '绩效', '品牌推广', '展示推广', '范围外店铺'))
         assert db.get(SyncJob, result['job_id']).metadata_json['analysis_provider'] == 'deepseek_ad_review'
         assert db.scalar(select(func.count()).select_from(SyncJob).where(SyncJob.job_type == 'manual_collection')) == 0
@@ -238,3 +243,26 @@ def test_review_json_empty_result_and_original_question_use_read_only_official_m
     result = DeepSeekClient('synthetic-key').analyze({'ad_review': True, 'campaigns': [row()]}, QUESTION)
     assert parse_findings(result, [row()]) == []
     assert review_cards([])[0]['header']['title']['content'] == '广告查询'
+
+
+def test_traffic_findings_show_the_actual_date_and_reference_in_native_table():
+    finding = {'signals': ['CTR'], 'analysis': '优先核查广告流量的相关性。', 'evidence': {
+        'store_name': 'AirBird-主账号-US', 'campaign_name': 'T+人群属性词根打包+br+0.85',
+        'ad_type': 'sp', 'current_state': '投放中', 'report_date': '2026-11-17', 'currency': 'USD',
+        'current': {'spend': 30.87, 'clicks': 28},
+        'kpis': {'CTR': {'current': .0069, 'baseline': .0122, 'current_date': '2026-11-17',
+                        'comparison_basis': 'SEVEN_DAY'}},
+    }}
+    result, = review_cards([finding])
+    data, interpretation = result['body']['elements']
+    assert data['tag'] == 'table'
+    assert data['rows'] == [
+        {'c0': '活动', 'c1': 'AirBird-主账号-US\nT+人群属性词根打包+br+0.85', 'c2': '商品推广 · 投放中'},
+        {'c0': '花费', 'c1': '美元 30.87\n2026-11-17', 'c2': ''},
+        {'c0': '点击', 'c1': '28\n2026-11-17', 'c2': ''},
+        {'c0': '点击率下降（CTR）', 'c1': '0.69%\n2026-11-17', 'c2': '前七日 1.22%'},
+    ]
+    assert interpretation == {'tag': 'markdown', 'content': '优先核查广告流量的相关性。'}
+    numeric_note = '点击率是 0.69%。'
+    result, = review_cards([{**finding, 'analysis': numeric_note}])
+    assert result['body']['elements'][1]['rows'] == [{'c0': numeric_note}]

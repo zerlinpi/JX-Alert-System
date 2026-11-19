@@ -286,7 +286,7 @@ def _proactive_ad_chunks(db, settings, stores, dates, warnings, target_dates, no
     items = []
     for evidence in context['campaigns']:
         signals = repeat_eligible_signals(evidence, automatic_sp_signals(evidence), history, clock)
-        if signals and not incident_already_recorded(db, evidence):
+        if signals and not incident_already_recorded(db, evidence, now=clock):
             item = alert_item({'evidence': evidence, 'signals': signals}, include_dates=True)
             state = evidence['current_state']
             if state != '状态未确认':

@@ -2,12 +2,27 @@
 from datetime import datetime, timedelta, timezone
 import re
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from jx_alert.bot_portfolio import ad_types, period_length
 from jx_alert.notifications.cards import card
 from jx_alert.notifications.hourly_ads import BEIJING, TITLES, advertising_card, campaign_identity
 from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.storage.models import Campaign
+
+
+_LEGACY_SIGNALS = {
+    '点击率下降': TITLES['CTR'], '点击花费上升': TITLES['CPC'], '点击转化率下降': TITLES['CDR'],
+    '单件转化花费上升': TITLES['CPS'], '单均花费上升': TITLES['CPA'], '广告投入产出下降': TITLES['ROAS'],
+    '广告花费上升': TITLES['spend'], '成熟归因订单下降': TITLES['orders'],
+    '成熟广告有花费无转化': TITLES['zero_conversion'], '盘中花费需要关注': TITLES['intraday_budget'],
+}
+_AMOUNT = r'[\d,]+(?:\.\d+)?'
+_MONEY = rf'(?:[A-Z]{{3}}|美元|人民币|欧元|英镑|日元|加拿大元|澳元|墨西哥比索|巴西雷亚尔) {_AMOUNT}'
+_LEGACY_METRIC = re.compile(
+    rf'(?:日报花费|成熟归因花费|盘中花费) {_MONEY}(?: · (?:点击 {_AMOUNT}|日预算 {_MONEY}))?'
+    rf'|归因订单 {_AMOUNT}|(?:CTR|CDR) {_AMOUNT}%，参考 {_AMOUNT}%'
+)
 
 
 def recent_alert_lookup(question):
@@ -22,24 +37,53 @@ def recorded_alert_lookup(question):
         re.search(r'已发送|发过|已提醒|提醒过|已记录|告警记录|通知记录', question))
 
 
+def _legacy_item(db, payload, stores, kinds):
+    """Read a historical single-activity card without consulting current metrics."""
+    sid, kind, cid = (payload.get(key) for key in ('store_id', 'ad_campaign_type', 'ad_campaign_id'))
+    if sid not in stores or kind not in kinds or not isinstance(cid, str) or not cid:
+        return None
+    name = db.scalar(select(Campaign.name).where(
+        Campaign.store_id == sid, Campaign.campaign_type == kind, Campaign.campaign_id == cid))
+    original = payload.get('card') or {}
+    old_title = original.get('header', {}).get('title', {}).get('content') or ''
+    signals = [_LEGACY_SIGNALS[part] for part in old_title.split('；') if part in _LEGACY_SIGNALS]
+    # The archived card mixed measurements and model prose. Copy only the
+    # operands from known historical line formats and retain their old values.
+    metrics = [line for el in original.get('body', {}).get('elements', [])
+               if el.get('tag') == 'markdown' for line in el.get('content', '').splitlines()
+               if _LEGACY_METRIC.fullmatch(line)]
+    return {'store_id': sid, 'ad_type': kind, 'campaign_id': cid,
+            'store': stores[sid], 'campaign': name or cid,
+            'signal': '；'.join(signals) or '广告异常', 'numbers': '\n'.join(dict.fromkeys(metrics))}
+
+
 def recent_alert_cards(db, stores, question, now):
     explicit_period = re.search(r'(?:最近|过去|近)\s*(?:\d+|[一二三四五六七八九十两]+)\s*[天日]', question)
     parsed = period_length(question)
     days = parsed if explicit_period or parsed == 0 else 7
     if not 1 <= days <= 14:
         return [card('请确认查询范围', subtitle='可以查询最近 1 到 14 天的广告异常记录。', sections=[])]
-    scope = {store.sid for store in stores}
+    scope = {store.sid: store.name for store in stores}
     kinds = set(ad_types(question)) or {'sp', 'sb', 'sd'}
     threshold = (now - timedelta(days=days)).astimezone(timezone.utc).replace(tzinfo=None)
-    batches = db.scalars(select(NotificationOutbox.payload).where(
-        NotificationOutbox.status == 'DELIVERED', NotificationOutbox.created_at >= threshold,
+    sent_at = func.coalesce(NotificationOutbox.delivered_at, NotificationOutbox.created_at)
+    batches = db.execute(select(NotificationOutbox.payload, NotificationOutbox.delivered_at,
+        NotificationOutbox.created_at).where(
+        NotificationOutbox.status == 'DELIVERED', sent_at >= threshold,
         NotificationOutbox.payload['hourly_ad_monitor'].as_boolean() == True,  # noqa: E712
         NotificationOutbox.payload['delivery']['receive_id_type'].as_string() == 'chat_id',
-    ).order_by(NotificationOutbox.id.desc()))
+    ).order_by(sent_at.desc(), NotificationOutbox.id.desc()))
     items = {}
-    for batch in batches:
-        for item in batch.get('hourly_items', []):
-            if item.get('store_id') not in scope or item.get('ad_type') not in kinds:
+    for batch, delivered_at, created_at in batches:
+        if 'hourly_delivered_items' in batch:
+            rows = batch['hourly_delivered_items']
+        elif 'hourly_items' in batch:
+            rows = batch['hourly_items']
+        else:
+            rows = [_legacy_item(db, batch, scope, kinds)]
+        for item in rows or ():
+            if (not isinstance(item, dict) or item.get('store_id') not in scope
+                    or item.get('ad_type') not in kinds or not item.get('campaign_id')):
                 continue
             identity = campaign_identity(item)
             if identity in items:
@@ -57,6 +101,10 @@ def recent_alert_cards(db, stores, question, now):
                     pass
                 else:
                     value['numbers'] = f'发现日期 {on}\n' + value['numbers']
+            sent = (delivered_at or created_at).replace(tzinfo=timezone.utc).astimezone(BEIJING)
+            time_label = '发送时间' if delivered_at else '记录时间'
+            value['numbers'] = '\n'.join(filter(None, (
+                f'{time_label} {sent:%Y-%m-%d %H:%M}（北京时间）', value['numbers'])))
             items[identity] = value
     title = f'最近 {days} 天已记录的广告异常'
     if not items:
