@@ -7,6 +7,7 @@ cannot overwrite the MCP dashboard or paid-order/advertising alert baselines.
 from datetime import date, timedelta
 import math
 import re
+from uuid import uuid4
 
 from sqlalchemy import delete, select
 
@@ -82,6 +83,20 @@ def _fetch(client, sid, day, dimension, raw=None):
     raise LingxingError("Business report exceeded pagination limit")
 
 
+def _archive_pages(db, sid, day, dimension, raw, *, status, error_type=None):
+    capture = {"dimension": dimension, "report_date": day, "status": status,
+               "capture_id": uuid4().hex, "page_count": len(raw)}
+    if error_type is not None:
+        capture["error_type"] = error_type
+    for index in range(max(1, len(raw))):
+        db.add(RawSnapshot(source=SOURCE, store_id=sid, payload={
+            **capture, "page_index": index + 1 if raw else None, "responses": raw[index:index + 1],
+        }))
+        # Keep each provider page in its own SQL statement, but commit the
+        # complete partition together with its normalized facts and coverage.
+        db.flush()
+
+
 def collect_api_business_for_day(client, db, settings, stores_response, report_dates):
     """No notices or business alerts; optional source failure stays isolated."""
     client = getattr(client, "api", client)
@@ -103,8 +118,7 @@ def collect_api_business_for_day(client, db, settings, stores_response, report_d
                     if client is None:
                         raise LingxingError("OpenAPI source is unavailable")
                     rows, raw = _fetch(client, sid, day, dimension, raw)
-                    db.add(RawSnapshot(source=SOURCE, store_id=sid, payload={"dimension": dimension,
-                        "report_date": day, "responses": raw, "status": "COMPLETE"}))
+                    _archive_pages(db, sid, day, dimension, raw, status="COMPLETE")
                     db.execute(delete(DailyMetric).where(DailyMetric.store_id == sid,
                         DailyMetric.metric_date == date.fromisoformat(day), DailyMetric.dimension == dimension))
                     for row in rows:
@@ -122,8 +136,7 @@ def collect_api_business_for_day(client, db, settings, stores_response, report_d
                     coverage = mark_coverage(db, store_id=sid, metric_date=date.fromisoformat(day),
                                              dimension=dimension, row_count=0)
                     coverage.status = "FAILED"
-                    db.add(RawSnapshot(source=SOURCE, store_id=sid, payload={"dimension": dimension,
-                        "report_date": day, "status": "FAILED", "error_type": type(exc).__name__, "responses": raw}))
+                    _archive_pages(db, sid, day, dimension, raw, status="FAILED", error_type=type(exc).__name__)
                     db.commit()
                     failures.append({"store_id": sid, "report_date": day, "dimension": dimension,
                                      "error_type": type(exc).__name__})
