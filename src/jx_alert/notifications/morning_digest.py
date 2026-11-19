@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from jx_alert.ai.ad_review_evidence import automatic_sp_signals, build_ad_review_context
+from jx_alert.ai.ad_review_skills import load_ad_review_skills, skill_fingerprint
 from jx_alert.analysis.ad_kpis import compare_kpis
 from jx_alert.analysis.evaluator import _ad_entity_events, _comparison_evidence
 from jx_alert.analysis.materiality import material_change
@@ -242,10 +243,11 @@ def select_morning_dates(db, stores, dates, warnings=None, history_allowed=None)
     return actual, warnings
 
 
-def _business_chunks(db, settings, stores, dates, warnings, target_dates, reporting_day, *, proactive=False):
-    from jx_alert.notifications.business_daily import business_daily_card
+def _business_chunks(db, settings, stores, dates, warnings, target_dates, reporting_day, *,
+                     proactive=False, business_pages=None):
+    from jx_alert.notifications.business_daily import business_daily_card, grouped_business_pages
 
-    chunks = []
+    reports = []
     for store in stores:
         actual = _date(dates[store.sid])
         target = _date((target_dates or dates)[store.sid])
@@ -258,9 +260,16 @@ def _business_chunks(db, settings, stores, dates, warnings, target_dates, report
         if actual != target:
             value['body']['elements'].append({'tag': 'markdown',
                 'content': f'目标报表日 {target}；展示历史报表日 {actual}。'})
-        if not card_fits(value):
+        if not proactive and not card_fits(value):
             raise ValueError('Morning business report exceeds the card limit')
-        chunks.append((value, [store.sid]))
+        reports.append((store.sid, value))
+    if not proactive:
+        return [(value, [sid]) for sid, value in reports]
+    chunks = []
+    for value, store_ids, sections in grouped_business_pages(reports, reporting_day):
+        chunks.append((value, store_ids))
+        if business_pages is not None:
+            business_pages.append(sections)
     return chunks
 
 
@@ -268,7 +277,10 @@ def _proactive_ad_chunks(db, settings, stores, dates, warnings, target_dates, no
     targets = target_dates or dates
     eligible = [s for s in stores if not (warnings or {}).get(s.sid)
                 and _date(dates[s.sid]) == _date(targets[s.sid])]
-    context = build_ad_review_context(db, settings, eligible, dates, now=now)
+    skills = load_ad_review_skills(settings)
+    if skills.status == 'invalid':
+        return []
+    context = build_ad_review_context(db, settings, eligible, dates, now=now, skills=skills)
     clock = now or datetime.now(timezone.utc)
     history = load_incident_history(db, clock)
     items = []
@@ -279,7 +291,10 @@ def _proactive_ad_chunks(db, settings, stores, dates, warnings, target_dates, no
             state = evidence['current_state']
             if state != '状态未确认':
                 item['campaign'] += '（' + state + '）'
-            items.append((item, incident_metadata(evidence, signals)))
+            incident = incident_metadata(evidence, signals)
+            identity = (incident['store_id'], incident['ad_type'], incident['campaign_id'])
+            check = (*identity, skill_fingerprint(evidence.get('ad_skill') or skills.for_campaign(*identity)))
+            items.append((item, (incident, check)))
     chunks = []
     for offset in range(0, len(items), 10):
         batch, incidents = zip(*items[offset:offset + 10])
@@ -291,7 +306,7 @@ def _proactive_ad_chunks(db, settings, stores, dates, warnings, target_dates, no
 
 
 def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=None, target_dates=None,
-                  include_quality=True, include_business=True, proactive=False, incident_pages=None):
+                  include_quality=True, include_business=True, proactive=False, incident_pages=None, business_pages=None):
     """Return health, verified business reports, then material SP exceptions."""
     if proactive:
         stores = [s for s in stores if s.status == 1]
@@ -299,7 +314,8 @@ def morning_cards(db, settings, stores, dates, *, send_day, now=None, warnings=N
               _health_chunks(db, settings, stores, send_day, now))
     if include_business:
         chunks.extend(_business_chunks(db, settings, stores, dates, warnings, target_dates,
-                                      _date(send_day) - timedelta(days=1), proactive=proactive))
+                                      _date(send_day) - timedelta(days=1), proactive=proactive,
+                                      business_pages=business_pages))
     if proactive:
         chunks.extend(_proactive_ad_chunks(db, settings, stores, dates, warnings, target_dates, now, incident_pages))
         return chunks
@@ -353,10 +369,11 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
         return {'queued': len(existing), 'skipped': False, 'outbox_ids': [r.id for r in existing]}
     prefix = 'scheduled-daily:morning:' + hashlib.sha256(f'{send_day}:{chat_id}'.encode()).hexdigest() + ':'
     actual, warnings = select_morning_dates(db, stores, dates, warnings, history_allowed)
-    incident_pages = []
+    incident_pages, business_pages = [], []
     chunks = morning_cards(db, settings, stores, actual, send_day=send_day, now=now,
-        warnings=warnings, target_dates=dates, include_quality=False, proactive=True, incident_pages=incident_pages)
-    incident_pages = iter(incident_pages)
+        warnings=warnings, target_dates=dates, include_quality=False, proactive=True, incident_pages=incident_pages,
+        business_pages=business_pages)
+    incident_pages, business_pages = iter(incident_pages), iter(business_pages)
     ids = []
     try:
         with db.begin_nested():
@@ -365,6 +382,8 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
                 kind = ('health' if title.startswith('店铺绩效与违规快报') else
                         'ad_exception' if title == '商品推广活动待复核' else
                         'business_daily' if '经营日报' in title else 'data_quality')
+                incident_pairs = next(incident_pages, ()) if kind == 'ad_exception' else ()
+                business_sections = next(business_pages, ()) if kind == 'business_daily' else ()
                 row = NotificationOutbox(idempotency_key=prefix + str(index), chat_id=chat_id,
                     next_attempt_at=due.astimezone(timezone.utc).replace(tzinfo=None), payload={
                         'text': title, 'store_ids': store_ids,
@@ -375,12 +394,14 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
                         'display_reporting_date': (send_day - timedelta(days=1)).isoformat(),
                         'scheduled_not_before': due.isoformat(), 'morning_focus': True, 'morning_message_kind': kind,
                         'quiet_verified': True, 'morning_batch': prefix,
-                        **({'ad_group_owners': True} if kind == 'ad_exception' else {})})
+                        **({'business_sections': business_sections} if business_sections else {}),
+                        **({'ad_group_owners': True, 'ad_skill_checks': [check for _, check in incident_pairs]}
+                           if kind == 'ad_exception' else {})})
                 db.add(row)
                 db.flush()
                 ids.append(row.id)
                 if kind == 'ad_exception':
-                    for incident in next(incident_pages, ()):
+                    for incident, _ in incident_pairs:
                         db.add(SyncJob(job_type=INCIDENT, status='QUEUED',
                             started_at=now.astimezone(timezone.utc).replace(tzinfo=None),
                             metadata_json={**incident, 'outbox_ids': [row.id], 'origin': 'daily_report'}))

@@ -1,6 +1,7 @@
 """Read owner-managed, bounded advertising review profiles without executable instructions."""
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -49,6 +50,28 @@ class AdReviewSkills:
             for key, value in layer.items():
                 resolved[key] = value if key == "objective" else max(resolved[key], value)
         return {**resolved, "status": self.status}
+
+
+def skill_fingerprint(profile):
+    raw = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def frozen_ad_skills_current(settings, checks):
+    """Revalidate the relevant effective profiles without rebuilding frozen data."""
+    skills = load_ad_review_skills(settings)
+    if skills.status == "invalid":
+        return False
+    if checks is None:
+        # Before policy fingerprints, an already-frozen page can only prove
+        # compatibility with the built-in rules and only while they are active.
+        return skills.status == "default"
+    return isinstance(checks, list) and bool(checks) and all(
+        isinstance(check, (list, tuple)) and len(check) == 4
+        and all(isinstance(value, str) and value for value in check)
+        and check[3] == skill_fingerprint(skills.for_campaign(*check[:3]))
+        for check in checks
+    )
 
 
 def _profile(value):

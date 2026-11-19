@@ -272,6 +272,9 @@ def test_night_keeps_incidents_and_releases_one_group_table_at_eight(warehouse):
         assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
         assert not hourly_ads.queue_overnight_digest(db, settings, open_at - timedelta(seconds=1))
         assert not hourly_ads.queue_overnight_digest(db, settings, open_at)  # old activity state
+        campaign.updated_at = (open_at - timedelta(minutes=10)).replace(tzinfo=None)
+        db.commit()
+        assert not hourly_ads.queue_overnight_digest(db, settings, open_at)  # before morning refresh
         campaign.updated_at = open_at.replace(tzinfo=None)
         db.commit()
         ids = hourly_ads.queue_overnight_digest(db, settings, open_at)
@@ -335,9 +338,45 @@ def test_nine_oclock_reuses_only_the_prepared_morning_report(warehouse, monkeypa
     monkeypatch.setattr(daily_report, 'enqueue_daily_snapshots', enqueue)
     monkeypatch.setattr(monitor, '_collect_store', lambda *args, **kwargs:
         {'status': 'COMPLETE', 'morning_ready': True, 'ad_ready': False})
-    run(warehouse, now=morning)
+    def offline_digest(*args, **kwargs):
+        raise RuntimeError('overnight outbox unavailable')
+
+    monkeypatch.setattr(monitor, 'queue_overnight_digest', offline_digest)
+    assert run(warehouse, now=morning)['status'] == 'PARTIAL_FAILED'
     assert len(captured) == 1 and captured[0]['prepare'] is True
     assert captured[0]['store_dates'] == {'5174': '2026-11-16'}
     assert operations.queue_scheduled_daily_reports(now=send_at - timedelta(seconds=1))['outbox_ids'] == []
     assert operations.queue_scheduled_daily_reports(now=send_at)['outbox_ids'] == [123]
     assert len(captured) == 1
+
+
+def test_existing_night_summary_does_not_wait_for_new_ad_analysis_and_survives_retry(warehouse, monkeypatch):
+    collect = monitor._collect_store
+    evidence = monitor.build_ad_review_context
+    morning = CLOCK.replace(hour=0)
+    events = []
+
+    def collect_store(*args, **kwargs):
+        events.append('refresh')
+        return collect(*args, **kwargs)
+
+    def release(*args, **kwargs):
+        events.append('digest')
+        return [123] if events.count('digest') == 1 else []
+
+    def fail(*args, **kwargs):
+        events.append('analysis')
+        raise RuntimeError('new analysis unavailable')
+
+    monkeypatch.setattr(monitor, '_collect_store', collect_store)
+    monkeypatch.setattr(monitor, 'queue_overnight_digest', release)
+    monkeypatch.setattr(monitor, 'build_ad_review_context', fail)
+    first = run(warehouse, now=morning)
+    assert events == ['refresh', 'digest', 'analysis']
+    assert first['status'] == 'PARTIAL_FAILED' and first['outbox_ids'] == [123]
+    monkeypatch.setattr(monitor, 'build_ad_review_context', evidence)
+    with warehouse[1]() as db:
+        job = db.get(SyncJob, first['job_id'])
+        assert job.metadata_json['error_phase'] == 'advertising_evidence'
+    recovered = run(warehouse, now=morning + timedelta(minutes=5))
+    assert recovered['status'] == 'SUCCEEDED' and recovered['outbox_ids'][0] == 123

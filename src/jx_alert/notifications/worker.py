@@ -2,18 +2,19 @@
 import logging
 import re
 from datetime import date, datetime, time, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select, update
 
+from jx_alert.ai.ad_review_skills import frozen_ad_skills_current
 from jx_alert.config import get_settings
+from jx_alert.notifications.business_daily import select_business_stores
 from jx_alert.notifications.feishu import FeishuClient
 from jx_alert.notifications.routing import (
     _load_routing, _routed_open_ids, _route_chat_id, _feishu_group_config,
     _database_entity_open_ids as _routing_database_ids,
 )
 from jx_alert.notifications.outbox import NotificationOutbox
-from jx_alert.notifications.hourly_ads import delivery_window, recheck_hourly_card
+from jx_alert.notifications.hourly_ads import BEIJING, CLOSES, OPENS, delivery_window, recheck_hourly_card
 from jx_alert.notifications.recipient_policy import ROLE, advertising_group_delivery
 from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks, quiet_delivery, original_question_reply
 from jx_alert.notifications.store_policy import paused_delivery
@@ -24,25 +25,37 @@ from jx_alert.storage.models import Campaign, NotificationLog, Store
 logger = logging.getLogger(__name__)
 
 
-def _scheduled_window(key, payload, now):
-    """Check morning reports and quiet hours for automatic advertising."""
+def _scheduled_window(key, payload, now, *, hourly_mode=False, created_at=None):
+    """Apply Beijing delivery windows to queued proactive notices."""
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+    if original_question_reply(key, payload):
+        return "READY", None
+    current = now.astimezone(BEIJING)
     if not key.startswith("scheduled-daily:"):
         if payload.get('material_ad_delivery_window') is True:
             payload = {**payload, 'hourly_ad_monitor': True}
-        return delivery_window(payload, now.replace(tzinfo=timezone.utc))
+        if hourly_mode and payload.get('material_ad_alert') is True and not payload.get('hourly_ad_monitor'):
+            # Old rows have no hourly evidence or nightly grouping context.
+            # Keep them within the daylight window in which they were queued.
+            instant = created_at if created_at is not None else now
+            created = (instant.replace(tzinfo=timezone.utc) if instant.tzinfo is None else instant).astimezone(BEIJING)
+            if (created.date() != current.date() or not OPENS <= created.time() < CLOSES
+                    or not OPENS <= current.time() < CLOSES):
+                return "EXPIRED", None
+        return delivery_window(payload, now)
     try:
         day = date.fromisoformat(payload["scheduled_delivery_date"])
         if payload.get("scheduled_timezone") != "Asia/Shanghai":
             raise ValueError
     except (KeyError, TypeError, ValueError):
         return "EXPIRED", None
-    current = now.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
-    if day < current.date():
+    focused = key.startswith("scheduled-daily:morning:") or payload.get("morning_focus") is True
+    if day < current.date() or (focused and day == current.date() and current.time() >= CLOSES):
         return "EXPIRED", None
     try:
         due = datetime.fromisoformat(payload["scheduled_not_before"]) if payload.get("scheduled_not_before") else (
-            datetime.combine(day, time(9), ZoneInfo("Asia/Shanghai")))
-        if due.tzinfo is None or due.astimezone(ZoneInfo("Asia/Shanghai")).date() != day:
+            datetime.combine(day, time(9), BEIJING))
+        if due.tzinfo is None or due.astimezone(BEIJING).date() != day:
             raise ValueError
     except (TypeError, ValueError):
         return "EXPIRED", None
@@ -109,6 +122,17 @@ def _proactive_delivery_reason(db, settings, key, payload, now):
     return None
 
 
+def _business_card_for_delivery(db, settings, key, payload, created_at, now):
+    store_ids = payload.get('store_ids') or []
+    allowed = set()
+    for sid in store_ids:
+        scope = {**payload, 'store_ids': [sid], 'store_id': sid}
+        if (not paused_delivery(settings, scope, created_at)
+                and _proactive_delivery_reason(db, settings, key, scope, now) is None):
+            allowed.add(sid)
+    return select_business_stores(payload['card'], payload['business_sections'], store_ids, allowed)
+
+
 def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                          outbox_ids: list[int] | None = None) -> dict:
     if outbox_ids is not None and any(type(x) is not int or x <= 0 for x in outbox_ids):
@@ -117,6 +141,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
     if settings.app_dry_run or not settings.feishu_enabled:
         return {"sent": 0, "skipped": True, "reason": "dry-run or Feishu disabled"}
     transport = getattr(settings, "feishu_transport", "webhook")
+    hourly_mode = getattr(settings, "hourly_ad_monitor_enabled", False)
     routing = {} if transport == "app" else _load_routing(settings.feishu_routing_file)
     if transport == "webhook" and not routing.get("groups") and not settings.feishu_webhook_url:
         raise RuntimeError("FEISHU_WEBHOOK_URL is required when FEISHU_ENABLED=true")
@@ -164,7 +189,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             if not rows:
                 break
             for row in rows:
-                window, due = _scheduled_window(row.idempotency_key, row.payload, now)
+                window, due = _scheduled_window(row.idempotency_key, row.payload, now,
+                                                hourly_mode=hourly_mode, created_at=row.created_at)
                 if window == "EXPIRED":
                     row.status, row.last_error = "EXPIRED", "已过通知时段，保留记录"
                     continue
@@ -206,7 +232,13 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     db.commit()
                     continue
             skip_reason = QUIET_REASON if quiet_blocks(settings, dedupe_key, payload) else None
+            if (skip_reason is None and dedupe_key.startswith('scheduled-daily:')
+                    and payload.get('morning_message_kind') == 'ad_exception'
+                    and not frozen_ad_skills_current(settings, payload.get('ad_skill_checks'))):
+                skip_reason = '广告分析规则已变更或无法核验，日报广告页保留记录'
             hourly_batch = isinstance(payload.get('hourly_items'), list)
+            business_batch = (dedupe_key.startswith('scheduled-daily:')
+                and payload.get('morning_message_kind') == 'business_daily' and 'business_sections' in payload)
             if skip_reason is None and payload.get('hourly_ad_monitor') is True and not hourly_batch:
                 skip_reason = '旧版即时告警保留记录'
             if skip_reason is None and payload.get("hourly_ad_monitor") is True and not payload.get('hourly_overnight') and (
@@ -233,7 +265,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                         skip_reason = "通知群已变更，旧消息保留记录"
                     else:
                         payload['delivery'] = fresh
-            if skip_reason is None and not hourly_batch and paused_delivery(settings, payload, created_at):
+            if skip_reason is None and not (hourly_batch or business_batch) and paused_delivery(settings, payload, created_at):
                 skip_reason = "店铺通知已停用，旧消息保留记录"
             if skip_reason is None:
                 with SessionLocal() as db:
@@ -241,6 +273,12 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                         value = recheck_hourly_card(db, settings, payload, now.replace(tzinfo=timezone.utc))
                         if value is None:
                             skip_reason = '当前接收权限或活动状态不满足，旧告警保留记录'
+                        else:
+                            payload['card'] = value
+                    elif business_batch:
+                        value = _business_card_for_delivery(db, settings, dedupe_key, payload, created_at, now)
+                        if value is None:
+                            skip_reason = '店铺未授权、通知已停用或经营日报无法核验，旧消息保留记录'
                         else:
                             payload['card'] = value
                     else:
@@ -260,7 +298,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                                                error=skip_reason))
                     db.commit()
                 continue
-            window, due = _scheduled_window(dedupe_key, payload, datetime.now(timezone.utc).replace(tzinfo=None))
+            window, due = _scheduled_window(dedupe_key, payload, datetime.now(timezone.utc),
+                                            hourly_mode=hourly_mode, created_at=created_at)
             if window != "READY":
                 with SessionLocal() as db:
                     values = (dict(status="RETRY", next_attempt_at=due, attempts=attempts - 1)

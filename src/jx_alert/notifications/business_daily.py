@@ -1,12 +1,14 @@
 """Compact business reports from the official business dashboard, never renamed sales."""
 from datetime import date, timedelta
 from decimal import Decimal
+from html import escape
 import math
 import re
 
 from sqlalchemy import select
 
 from jx_alert.notifications.cards import card
+from jx_alert.notifications.store_health import card_fits
 from jx_alert.storage.models import DailyMetric, DataCoverage
 
 
@@ -85,6 +87,62 @@ def business_display(value, unit, currency=None):
     if unit == "money":
         return f"${value:,.2f}" if currency == "USD" else f"{currency} {value:,.2f}"
     return f"{value:,.0f}"
+
+
+def _business_page(reports, reporting_day):
+    if len(reports) == 1:
+        store_id, value = reports[0]
+        return value, [store_id], []
+    value = card(f"经营日报 · {reporting_day}", subtitle="", sections=[])
+    elements, sections = [], []
+    for store_id, report in reports:
+        start = len(elements)
+        title = report["header"]["title"]["content"]
+        elements.append({"tag": "markdown", "content": f"**{escape(title, quote=False)}**"})
+        elements.extend(report["body"]["elements"])
+        sections.append([store_id, start, len(elements)])
+    value["body"]["elements"] = elements
+    return value, [sid for sid, _ in reports], sections
+
+
+def grouped_business_pages(reports, reporting_day):
+    """Pack complete existing store cards without truncating verified fields."""
+    batch, page = [], None
+    for report in reports:
+        candidate = _business_page([*batch, report], reporting_day)
+        if not card_fits(candidate[0]):
+            if page is None:
+                raise ValueError("Morning business report exceeds the card limit")
+            yield page
+            batch = []
+            candidate = _business_page([report], reporting_day)
+            if not card_fits(candidate[0]):
+                raise ValueError("Morning business report exceeds the card limit")
+        batch.append(report)
+        page = candidate
+    if page is not None:
+        yield page
+
+
+def select_business_stores(value, sections, expected_ids, allowed_ids):
+    """Redact sections after a store's notification permission changes."""
+    elements = value["body"]["elements"]
+    if not isinstance(sections, list) or not expected_ids or len(sections) != len(expected_ids):
+        return None
+    current, selected = 0, []
+    for entry, store_id in zip(sections, expected_ids):
+        if not isinstance(entry, list) or len(entry) != 3:
+            return None
+        sid, start, end = entry
+        if (sid != store_id or type(start) is not int or type(end) is not int
+                or start != current or not start < end <= len(elements)):
+            return None
+        if sid in allowed_ids:
+            selected.extend(elements[start:end])
+        current = end
+    if not selected or current != len(elements):
+        return None
+    return {**value, "body": {**value["body"], "elements": selected}}
 
 
 def business_daily_card(db, store, day, *, settings=None, data_warning=None, reporting_day=None):
