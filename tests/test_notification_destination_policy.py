@@ -19,7 +19,14 @@ from jx_alert.storage.models import Campaign, NotificationLog, Store
 
 @pytest.fixture
 def delivery_runtime(tmp_path, monkeypatch):
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 11, 19, 2, 10, tzinfo=timezone.utc)
+
+    class DaytimeClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(worker, "datetime", DaytimeClock)
     changed = (now - timedelta(minutes=1)).isoformat()
     routing = {"default_chat_id": "ops", "groups": {
         "ops": {"chat_id": "oc_new", "notifications_changed_at": changed,
@@ -53,7 +60,8 @@ def delivery_runtime(tmp_path, monkeypatch):
 
 def _row(key, delivery, created):
     return NotificationOutbox(idempotency_key=key, chat_id=delivery["receive_id"],
-        created_at=created.replace(tzinfo=None), payload={"transport": "app", "delivery": delivery,
+        created_at=created.replace(tzinfo=None), next_attempt_at=created.replace(tzinfo=None),
+        payload={"transport": "app", "delivery": delivery,
             "card": card("测试报告", subtitle="", sections=[])})
 
 
