@@ -319,6 +319,16 @@ def test_automatic_analysis_waits_for_campaign_history_and_excludes_spend_alone(
     assert signals(intraday, has_mature_history=True) == ['intraday_budget']
 
 
+def test_budget_alert_explains_the_actual_spend_and_difference():
+    item = hourly_ads.alert_item({'signals': ['intraday_budget'], 'evidence': {
+        'store_id': '5174', 'ad_type': 'sp', 'campaign_id': '42', 'store_name': '测试店铺',
+        'campaign_name': '测试活动', 'intraday': True, 'currency': 'USD',
+        'current': {'spend': 50.08}, 'verified_daily_budget': 1,
+    }})
+    assert item['signal'] == '今天的花费远超平均日预算'
+    assert item['numbers'].splitlines() == ['今天已花 美元 50.08', '平均日预算 美元 1.00', '比平均日预算多 美元 49.08']
+
+
 def test_nine_oclock_reuses_only_the_prepared_morning_report(warehouse, monkeypatch):
     from jx_alert import config, operations
     from jx_alert.notifications import daily_report

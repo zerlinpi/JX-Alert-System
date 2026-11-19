@@ -83,7 +83,7 @@ def ad_review_stores(db, settings, question, snapshots, matched_ids):
     chosen = set(map(str, matched_ids)) & allowed
     if not named:
         clean = re.sub(r'\d{4}[-年/]\d{1,2}[-月/]\d{1,2}日?|\d{1,2}月\d{1,2}日', '', q)
-        clean = re.sub(r'(?:最近|过去|近|前|top)\s*\d+\s*(?:天|日|个)?', '', clean)
+        clean = re.sub(r'(?:最近|过去|近|前|top)\s*(?:\d+|[一二三四五六七八九十两]+)\s*(?:天|日|个)?', '', clean)
         clean = re.sub(r'(?:花费|支出|消耗|预算|金额|曝光|点击|订单|销量).{0,5}?\d+(?:\.\d+)?', '', clean)
         latin = [p for p in _name_parts(clean) if p.isascii() and len(p) >= 3
                  and not p.isdigit() and p not in {'and', 'review', 'analyze', 'analyse', 'abnormal', 'risk'}]
@@ -107,7 +107,7 @@ def ad_review_stores(db, settings, question, snapshots, matched_ids):
             prefix = re.split(r'广告|推广|投放|ctr|cpc|cdr|cvr|cps|roas|cpa|tcoas|tacos|acos', clean, maxsplit=1)[0]
             prefix = ' '.join(_name_parts(prefix))
             generic = (r'麻烦|烦请|劳烦|请|帮我们|帮我|帮忙|想知道|想看|想了解|了解|看一看|一下|看看|看下|查看|查询|分析|检查|排查|评估|诊断|复盘|'
-                       r'当前|现在|目前|最近|最新|现有|所有|全部|各个|每个|有哪几家|有哪些|有哪家|哪些|哪几家|哪家|几个|多少家|'
+                       r'当前|现在|目前|最近|近期|最新|现有|所有|全部|各个|每个|有没有|有无|是否有|有哪几家|有哪些|有哪家|哪些|哪几家|哪家|几个|多少家|'
                        r'运营|已授权|可见|能看见|能看到|已采集|有数据|可读取|'
                        r'包含|包括|已关闭|已停用|停用|关闭|历史|我们|系统|我|的|有')
             if re.sub(generic + r'|[\s，,。！？?！]', '', prefix):
