@@ -31,7 +31,10 @@ def enqueue_advertising_copies(db, settings, *, key, text, card, destination,
     """Preserve the caller's evidence-approved action on the group and lead routes."""
     from sqlalchemy import select
     from jx_alert.ai.ad_review_skills import load_ad_review_skills
-    from jx_alert.notifications.ad_repeat import INCIDENT, campaign_identity, incident_key, load_incident_history
+    from jx_alert.notifications.ad_repeat import (
+        INCIDENT, campaign_identity, incident_already_recorded, incident_key, load_incident_history,
+        subscriber_reservations,
+    )
     from jx_alert.notifications.hourly_ads import BEIJING, delivery_window
     from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
     from jx_alert.storage.models import SyncJob
@@ -46,8 +49,7 @@ def enqueue_advertising_copies(db, settings, *, key, text, card, destination,
     if (delivery_window({'hourly_ad_monitor': True}, now)[0] != 'READY'
             or load_ad_review_skills(settings).status == 'invalid'
             or campaign_identity(evidence) in load_incident_history(db, now)
-            or db.scalar(select(SyncJob.id).where(SyncJob.job_type == INCIDENT,
-                         SyncJob.metadata_json['incident_key'].as_string() == event))):
+            or incident_already_recorded(db, evidence, now=now)):
         return []
     context = dict(text=text, store_id=store_id, entity_id=campaign_id, card=card,
                    fixed_route=True, material_ad_alert=True)
@@ -57,6 +59,8 @@ def enqueue_advertising_copies(db, settings, *, key, text, card, destination,
     group.payload = {**group.payload, **window, 'ad_group_owners': True, 'ad_campaign_type': ad_type}
     ids = [group.id]
     for lead in advertising_subscriber_deliveries(settings):
+        if subscriber_reservations(db, [event], lead):
+            continue
         lead_key = 'app:confirmed-ad-lead:' + hashlib.sha256(key.encode()).hexdigest()
         copy = enqueue_notification(db, idempotency_key=lead_key, chat_id=lead['receive_id'],
                                     delivery=lead, **context)

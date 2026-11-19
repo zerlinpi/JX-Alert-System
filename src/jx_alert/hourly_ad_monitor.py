@@ -298,7 +298,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     if signals:
                         counts['supported'] += 1
                     row['material_signals'] = repeat_eligible_signals(row, signals, history, reviewed_at)
-                    if row['material_signals'] and incident_already_recorded(db, row):
+                    if row['material_signals'] and incident_already_recorded(db, row, now=reviewed_at):
                         row['material_signals'] = []
                     if row['material_signals']:
                         counts['submitted'] += 1

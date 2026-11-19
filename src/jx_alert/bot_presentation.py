@@ -1,8 +1,67 @@
 """Operator-facing answers: narrow tables, health first, no empty data dumps."""
+import html
 import re
 import math
 
-from jx_alert.notifications.cards import card, number, compact_ad_kpi_rows
+from jx_alert.notifications.cards import card, number, compact_ad_kpi_rows, has_quantitative_text, table
+from jx_alert.notifications.store_health import card_fits
+
+
+def _model_table(lines, offset):
+    def cells(line):
+        return [item.strip() for item in re.split(r'(?<!\\)\|', line.strip().strip('|'))]
+
+    if offset + 2 >= len(lines) or '|' not in lines[offset]:
+        return None
+    headers, divider = cells(lines[offset]), cells(lines[offset + 1])
+    if not (2 <= len(headers) == len(divider) <= 4 and all(headers)
+            and all(re.fullmatch(r':?-{3,}:?', cell) for cell in divider)):
+        return None
+    rows = []
+    for line in lines[offset + 2:]:
+        row = cells(line)
+        if len(row) != len(headers) or not all(len(cell) <= 500 for cell in row):
+            break
+        rows.append(row)
+    if rows:
+        return headers, rows
+    return None
+
+
+def analysis_cards(title, analysis, *, subtitle=''):
+    """Use native, inert table cells for data even when the model sends prose."""
+    lines = [line.strip() for line in analysis.splitlines() if line.strip()]
+    elements, data = [], []
+    offset = 0
+    while offset < len(lines):
+        parsed = _model_table(lines, offset)
+        line = lines[offset]
+        if not parsed and (has_quantitative_text(line) or '|' in line):
+            data.extend((line[i:i + 500],) for i in range(0, len(line), 500))
+            offset += 1
+            continue
+        if data:
+            elements.extend(table(['数据与依据'], data[i:i + 10]) for i in range(0, len(data), 10))
+            data.clear()
+        if parsed:
+            headers, rows = parsed
+            elements.extend(table(headers, rows[i:i + 3]) for i in range(0, len(rows), 3))
+            offset += len(rows) + 2
+        else:
+            elements.extend({'tag': 'markdown', 'content': html.escape(line[i:i + 1200], quote=False)}
+                            for i in range(0, len(line), 1200))
+            offset += 1
+    elements.extend(table(['数据与依据'], data[i:i + 10]) for i in range(0, len(data), 10))
+    cards = [card(title, subtitle=subtitle, sections=[])]
+    for element in elements:
+        contents = cards[-1]['body']['elements']
+        contents.append(element)
+        if not card_fits(cards[-1]):
+            contents.pop()
+            value = card(title, subtitle=subtitle, sections=[])
+            value['body']['elements'].append(element)
+            cards.append(value)
+    return cards
 
 
 def general_context(snapshots):

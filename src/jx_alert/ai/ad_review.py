@@ -6,7 +6,7 @@ import math
 import re
 
 from jx_alert.ai.deepseek import DeepSeekError
-from jx_alert.notifications.cards import card
+from jx_alert.notifications.cards import card, has_quantitative_text, number, table
 from jx_alert.notifications.store_health import card_fits
 
 
@@ -136,9 +136,9 @@ def review_advertising(client, context, question):
         for attempt in range(2):
             text = client.analyze(packet, question)
             requests += 1
-            for key, number in getattr(client, 'last_usage', {}).items():
-                if type(number) is int and number >= 0:
-                    usage[key] = usage.get(key, 0) + number
+            for key, tokens in getattr(client, 'last_usage', {}).items():
+                if type(tokens) is int and tokens >= 0:
+                    usage[key] = usage.get(key, 0) + tokens
             try:
                 selected = parse_findings(text, batch, selection_only=selection_only)
                 break
@@ -161,53 +161,60 @@ def review_advertising(client, context, question):
                       'candidate_campaigns': len(candidates), 'model_requests': requests, 'model_usage': usage}
 
 
-def _number(value, *, money=False, rate=False):
-    return f'{value * 100:.2f}%' if rate else f'{value:.2f}' if money else f'{value:g}'
+def _review_metric(value, signal, currency):
+    if signal in {'CTR', 'CDR'}:
+        return f'{value:.2%}'
+    if signal == 'ROAS':
+        return f'{value:.2f} 倍'
+    return number(value, money=signal in {'CPC', 'CPS', 'CPA'}, currency=currency)
 
 
 def review_cards(findings):
     """Render verified values separately from the model's concise interpretation."""
     if not findings:
         return [card('广告查询', subtitle='本次符合筛选条件的数据中，没有需列出的异常广告记录。', sections=[])]
-    cards = []
+    cards, findings_in_card = [], 0
     for finding in findings:
         row, signals = finding['evidence'], finding['signals']
         kind = {'sp': '商品推广', 'sb': '品牌推广', 'sd': '展示推广'}[row['ad_type']]
         state = row['current_state']
-        lines = [f"**{html.escape(row['store_name'])}｜{kind}**",
-                 html.escape(row['campaign_name']) + (' · ' + html.escape(state) if state != '状态未确认' else '')]
-        if set(signals) & {'spend', 'CTR', 'CPC'}:
-            current = row['current']
-            lines.append(f"报表日 {row['report_date']}：花费 {row['currency']} {_number(current['spend'], money=True)} · "
-                         f"点击 {_number(current['clicks'])}")
-        if set(signals) - {'spend', 'CTR', 'CPC'}:
-            mature = row['mature']
-            lines.append(f"成熟归因日 {row['mature_date']}：花费 {row['currency']} {_number(mature['spend'], money=True)} · "
-                         f"归因订单 {_number(mature['orders'])} · 点击 {_number(mature['clicks'])}")
-        labels = []
+        currency = row['currency']
+        activity = f"{row['store_name']}\n{row['campaign_name']}"
+        rows = [('活动', activity, kind + (' · ' + state if state != '状态未确认' else ''))]
+        traffic = {'spend', 'CTR', 'CPC'}
+        periods = []
+        if set(signals) & traffic:
+            periods.append((row['report_date'], row['current'], ('spend', 'clicks', 'impressions'), ''))
+        if set(signals) - traffic:
+            periods.append((row['mature_date'], row['mature'], ('spend', 'orders', 'clicks'), '成熟 '))
+        labels = {'spend': '花费', 'clicks': '点击', 'impressions': '曝光', 'orders': '归因订单'}
+        for day, metrics, keys, label in periods:
+            rows.extend((label + labels[key],
+                number(metrics[key], money=key == 'spend', currency=currency) + '\n' + day, '')
+                for key in keys if metrics.get(key) is not None)
         for signal in signals:
             item = row['kpis'].get(signal)
             if item and item.get('current') is not None and item.get('baseline') is not None:
-                rate = signal in {'CTR', 'CDR'}
-                money = signal in {'CPC', 'CPS', 'CPA'}
-                values = (_number(item['current'], money=money, rate=rate),
-                          _number(item['baseline'], money=money, rate=rate))
-                suffix = ' 倍' if signal == 'ROAS' else ''
-                metric_day = item['current_date']
                 basis = '前七日' if item.get('comparison_basis') == 'SEVEN_DAY' else '前一日'
-                labels.append(f"{signal} {values[0]}{suffix}（{basis} {values[1]}{suffix}；{metric_day}）")
+                rows.append((f"{_METRICS.get(signal, signal)}（{signal}）",
+                    f"{_review_metric(item['current'], signal, currency)}\n{item['current_date']}",
+                    basis + ' ' + _review_metric(item['baseline'], signal, currency)))
             else:
-                labels.append(_METRICS.get(signal, signal))
-        lines += ['；'.join(labels), html.escape(finding['analysis'])]
-        element = {'tag': 'markdown', 'content': '\n'.join(lines)}
+                rows.append(('异常', _METRICS.get(signal, signal), ''))
+        note = finding['analysis']
+        explanation = (table(['分析依据'], [(note,)]) if has_quantitative_text(note)
+                       else {'tag': 'markdown', 'content': html.escape(note, quote=False)})
+        elements = [table(['项目', '本期／日期', '参考'], rows), explanation]
         value = card('广告异常', subtitle='', sections=[])
-        value['body']['elements'].append(element)
+        value['body']['elements'] = elements
         if not card_fits(value):
             raise DeepSeekError('广告分析内容过长，请缩小查询范围。')
-        if cards and len(cards[-1]['body']['elements']) < 4:
-            combined = {**cards[-1], 'body': {'elements': [*cards[-1]['body']['elements'], element]}}
+        if cards and findings_in_card < 3:
+            combined = {**cards[-1], 'body': {'elements': [*cards[-1]['body']['elements'], *elements]}}
             if card_fits(combined):
                 cards[-1] = combined
+                findings_in_card += 1
                 continue
         cards.append(value)
+        findings_in_card = 1
     return cards
