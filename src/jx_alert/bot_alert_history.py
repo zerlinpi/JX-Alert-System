@@ -17,6 +17,11 @@ def recent_alert_lookup(question):
             and not re.search(r'为什么|为何|如何|怎么办|预测|诊断|重新分析', question))
 
 
+def recorded_alert_lookup(question):
+    return recent_alert_lookup(question) and bool(
+        re.search(r'已发送|发过|已提醒|提醒过|已记录|告警记录|通知记录', question))
+
+
 def recent_alert_cards(db, stores, question, now):
     explicit_period = re.search(r'(?:最近|过去|近)\s*(?:\d+|[一二三四五六七八九十两]+)\s*[天日]', question)
     parsed = period_length(question)
