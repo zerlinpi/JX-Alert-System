@@ -191,3 +191,64 @@ def test_dry_run_and_naive_clock_never_persist_a_daily_plan(warehouse, monkeypat
     scheduler.daily_job(now=datetime(2026, 11, 14, 10, 30, tzinfo=timezone.utc))
     with warehouse() as db:
         assert db.scalar(select(SyncJob)) is None
+
+
+def test_hourly_mode_starts_only_hourly_collection_and_recovery(warehouse, monkeypatch):
+    settings = scheduler.get_settings()
+    settings.scheduler_enabled = True
+    settings.hourly_ad_monitor_enabled = True
+    settings.app_timezone = "UTC"
+    settings.daily_sync_cron = "0 8 * * *"
+    settings.hourly_ad_monitor_cron = "0 * * * *"
+    settings.feishu_daily_report_cron = "0 9 * * *"
+    jobs = {}
+
+    class FakeScheduler:
+        def __init__(self, **kwargs):
+            pass
+
+        def add_job(self, callback, trigger, *, id, **kwargs):
+            jobs[id] = (callback, trigger, kwargs)
+
+        def start(self):
+            pass
+
+    def forbidden():
+        pytest.fail("Hourly mode must bypass the legacy daily collector")
+
+    monkeypatch.setattr(scheduler, "BlockingScheduler", FakeScheduler)
+    monkeypatch.setattr(scheduler, "init_db", lambda: None)
+    monkeypatch.setattr(scheduler, "daily_job", forbidden)
+    monkeypatch.setattr(scheduler, "daily_report_job", lambda: None)
+    monkeypatch.setattr(scheduler, "daily_excel_snapshot_job", lambda: None)
+    scheduler.main()
+
+    assert "daily_pipeline" not in jobs and "daily_pipeline_recovery" not in jobs
+    due = datetime(2026, 11, 19, tzinfo=timezone.utc)  # 08:00 Beijing
+    assert jobs["hourly_ad_monitor"][1].get_next_fire_time(None, due) == due
+    assert jobs["hourly_ad_monitor_recovery"][1].interval == timedelta(minutes=1)
+    for job_id in ("hourly_ad_monitor", "hourly_ad_monitor_recovery", "hourly_ad_monitor_startup"):
+        callback, _, kwargs = jobs[job_id]
+        assert callback is scheduler.hourly_ad_monitor_job and kwargs["executor"] == "ad_monitor"
+    assert "feishu_daily_report" in jobs and "feishu_outbox" in jobs
+
+
+def test_legacy_hourly_entry_point_does_not_freeze_collector_to_pre_fetch_clock(warehouse, monkeypatch):
+    from jx_alert import hourly_ad_monitor
+
+    settings = scheduler.get_settings()
+    settings.hourly_ad_monitor_enabled = True
+    settings.daily_sync_cron = "0 8 * * *"
+    due = datetime(2026, 11, 19, tzinfo=timezone.utc)
+    observed = []
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz):
+            return due.astimezone(tz)
+
+    monkeypatch.setattr(scheduler, "datetime", Clock)
+    monkeypatch.setattr(hourly_ad_monitor, "run_hourly_monitor", lambda *, now: observed.append(now))
+    scheduler.daily_job()
+    scheduler.daily_job(now=due)
+    assert observed == [None, due]
