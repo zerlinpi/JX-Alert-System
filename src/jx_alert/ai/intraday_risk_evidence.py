@@ -1,9 +1,4 @@
-"""Verified SP intraday budget risk, separate from mature conversion evidence.
-
-The signal means current observed spend exceeds a freshly observed daily budget
-and the source itself reports a same-day over-budget event. It is an operational
-review threshold, not a claim of an Amazon violation or a hard spending cap.
-"""
+"""Verified same-day SP risks, separate from mature conversion evidence."""
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -14,6 +9,9 @@ from sqlalchemy import select
 
 from jx_alert.lingxing.intraday_observation import SOURCE
 from jx_alert.storage.models import Campaign, RawSnapshot
+
+
+MIN_NO_CLICK_IMPRESSIONS = 10_000
 
 
 def _utc(value):
@@ -61,7 +59,7 @@ def _budget(record):
     return _number(raw), kind.lower() if isinstance(kind, str) else None
 
 
-def intraday_over_budget_candidates(db, store, snapshot, *, now=None, max_age_minutes=75, skills=None):
+def intraday_risk_candidates(db, store, snapshot, *, now=None, max_age_minutes=75, skills=None):
     """Return only supported current-SP risk candidates, without writes or notices.
 
     Snapshot capture time, current master and cached master fields all need to
@@ -91,9 +89,8 @@ def intraday_over_budget_candidates(db, store, snapshot, *, now=None, max_age_mi
             or payload.get("report_timezone", store.timezone) != store.timezone
             or not isinstance(payload.get("rows"), list)):
         return []
-    # The budget/current-spend equivalence is verified for OpenAPI observations.
-    # MCP campaign UI observations remain useful to chat, but cannot silently be
-    # promoted into this source-specific live budget alarm.
+    # OpenAPI supplies the verified same-day spend and traffic metrics. MCP
+    # campaign UI observations cannot establish these live risks.
     if payload.get("sources") not in (None, [], ["lingxing_openapi"]):
         return []
     latest = db.scalar(select(RawSnapshot.id).where(RawSnapshot.store_id == sid,
@@ -131,24 +128,39 @@ def intraday_over_budget_candidates(db, store, snapshot, *, now=None, max_age_mi
         if ((str(master_row.get("state") or "")).lower() != "enabled"
                 or str(observed.get("report_date")) != on.isoformat()
                 or observed.get("sid") is not None and str(observed["sid"]) != sid
+                or master_row.get("sid") is not None and str(master_row["sid"]) != sid
                 or observed.get("_source") not in (None, "lingxing_openapi")
                 or observed.get("_attribution_unconfirmed") is True
                 or observed.get("confirmed_currency") != "USD"):
             continue
-        budget, kind = _budget(master_row)
-        if (kind != "daily" or (campaign.budget_type or "").lower() != "daily"
-                or budget is None or budget <= 0 or budget != _number(campaign.budget)):
-            continue
-        event = master_row.get("lastOverBudgetAt") or master_row.get("last_over_budget_at")
-        if event != campaign.last_over_budget_at:
-            continue
-        date_basis = _event_date(event, on, zone, clock)
-        if date_basis is None:
+        profiles = {str(profile) for profile in
+                    (campaign.profile_id, master_row.get("profile_id"), observed.get("profile_id"))
+                    if profile is not None}
+        if len(profiles) > 1:
             continue
         spend = _number(observed.get("cost"))
         clicks, impressions = (_number(observed.get(key), count=True) for key in ("clicks", "impressions"))
         if (spend is None or clicks is None or impressions is None
-                or spend < budget * 1.2 or spend - budget < 30):
+                or clicks > impressions or (spend > 0 and clicks == 0)):
+            continue
+        signals, verified_budget, event, date_basis = [], None, None, None
+        budget, kind = _budget(master_row)
+        # The observed cost and matching daily budget stand on their own.
+        # Allow for Amazon's daily budget flexibility before raising a risk.
+        budget_currency = master_row.get("currency_code") or master_row.get("currency")
+        if (kind == "daily" and (campaign.budget_type or "").lower() == "daily"
+                and budget_currency in (None, "USD") and budget is not None
+                and budget > 0 and budget == _number(campaign.budget) and spend - 2 * budget >= 30):
+            signals.append("intraday_budget")
+            verified_budget = budget
+            candidate_event = master_row.get("lastOverBudgetAt") or master_row.get("last_over_budget_at")
+            if candidate_event == campaign.last_over_budget_at:
+                date_basis = _event_date(candidate_event, on, zone, clock)
+                if date_basis is not None:
+                    event = candidate_event
+        if impressions >= MIN_NO_CLICK_IMPRESSIONS and clicks == spend == 0:
+            signals.append("intraday_no_clicks")
+        if not signals:
             continue
         row = {"store_id": sid, "store_name": store.name, "campaign_id": cid,
             "campaign_name": campaign.name or cid, "ad_type": "sp", "current_state": "投放中",
@@ -156,13 +168,13 @@ def intraday_over_budget_candidates(db, store, snapshot, *, now=None, max_age_mi
             "state_observed_at": _utc(campaign.updated_at).isoformat(), "report_date": on.isoformat(),
             "mature_date": on.isoformat(), "intraday": True, "currency": "USD",
             "current": {"spend": spend, "clicks": clicks, "impressions": impressions},
-            "mature": {}, "baseline": {}, "kpis": {}, "verified_daily_budget": budget,
-            "material_signals": ["intraday_budget"], "source": SOURCE,
+            "mature": {}, "baseline": {}, "kpis": {}, "verified_daily_budget": verified_budget,
+            "material_signals": signals, "source": SOURCE,
             "observation_captured_at": _utc(snapshot.captured_at).isoformat(),
             "source_budget_event": event, "source_budget_event_date_basis": date_basis,
             "proof": {"snapshot_id": snapshot.id, "master_snapshot_id": master.id,
                 "master_captured_at": _utc(master.captured_at).isoformat(),
-                "budget": budget, "state": campaign.state, "over_budget_event": event}}
+                "budget": verified_budget, "state": campaign.state, "over_budget_event": event}}
         if skills is not None:
             row["ad_skill"] = skills.for_campaign(sid, "sp", cid)
         row["evidence_id"] = hashlib.sha256(json.dumps(row, sort_keys=True, allow_nan=False,

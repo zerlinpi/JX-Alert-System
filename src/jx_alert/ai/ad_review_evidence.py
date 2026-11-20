@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 
 from jx_alert.ai.ad_review_skills import DEFAULT_SKILL, load_ad_review_skills
+from jx_alert.ai.intraday_risk_evidence import MIN_NO_CLICK_IMPRESSIONS
 from jx_alert.analysis.ad_kpis import compare_kpis
 from jx_alert.analysis.materiality import POLICY, material_change
 from jx_alert.lingxing.attribution import AD_ATTRIBUTION_DAYS
@@ -66,15 +67,24 @@ def automatic_sp_signals(row, *, has_mature_history=False):
         if not established or (report - min(established)).days < learning:
             return []
     if row.get('intraday'):
-        spend = row.get('current', {}).get('spend')
-        budget = row.get('verified_daily_budget')
-        # Amazon's average daily budget may use up to 100% more from other
-        # days. A source event alone does not establish a material overrun.
-        if (not (start is not None or has_mature_history) or not _valid(spend) or not _valid(budget)
-                or budget == 0 or spend < budget * skill['intraday_budget_multiple']
-                or spend - 2 * budget < skill['intraday_overage_usd']):
+        if start is None and not has_mature_history:
             return []
-        return row['material_signals']
+        current = row.get('current', {})
+        spend, clicks, impressions = (current.get(field) for field in ('spend', 'clicks', 'impressions'))
+        budget = row.get('verified_daily_budget')
+        available = set(row['material_signals'])
+        supported = []
+        # The budget may vary during a day. Flag the observed difference from
+        # the verified current setting without inferring an Amazon violation.
+        if ('intraday_budget' in available and _valid(spend) and _valid(budget) and budget > 0
+                and spend >= budget * skill['intraday_budget_multiple']
+                and spend - 2 * budget >= skill['intraday_overage_usd']):
+            supported.append('intraday_budget')
+        if ('intraday_no_clicks' in available and all(_valid(v) for v in (spend, clicks, impressions))
+                and spend == clicks == 0
+                and impressions >= max(MIN_NO_CLICK_IMPRESSIONS, skill['min_impressions'])):
+            supported.append('intraday_no_clicks')
+        return supported
     # Raw spend growth alone can be planned scaling. Report the evidence-backed
     # efficiency or conversion problem that warrants an operator's attention.
     gap = ctr_expected_click_gap(row) if 'CTR' in row['material_signals'] else None

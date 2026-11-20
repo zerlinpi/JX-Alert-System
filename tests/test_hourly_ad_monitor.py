@@ -412,7 +412,7 @@ def test_budget_alert_explains_the_actual_spend_and_difference():
         'current': {'spend': 50.08}, 'verified_daily_budget': 1,
     }})
     assert item['signal'] == '今天的花费远超平均日预算'
-    assert item['numbers'].splitlines() == ['今天已花 美元 50.08', '平均日预算 美元 1.00', '比平均日预算多 美元 49.08']
+    assert item['numbers'].splitlines() == ['今天已花 美元 50.08', '当前日预算 美元 1.00', '比当前日预算多 美元 49.08']
 
 
 def test_group_card_gives_verified_click_impact_and_specific_first_check():
@@ -448,7 +448,27 @@ def test_same_campaign_groups_current_budget_risk_before_mature_finding(warehous
             now=CLOCK, slot='paired-risks', send_alerts=True)
         item, = db.get(NotificationOutbox, row_id).payload['hourly_items']
         assert item['signal'] == hourly_ads.TITLES['intraday_budget']
-        assert '比平均日预算多 美元 49.08' in item['numbers']
+        assert '比当前日预算多 美元 49.08' in item['numbers']
+
+
+def test_single_day_no_clicks_has_independent_evidence_and_table(warehouse):
+    settings, sessions, _, _ = warehouse
+    evidence = {**_finding('5174', 'active')['evidence'], 'campaign_start_date': '2026-10-01',
+        'intraday': True, 'baseline': {}, 'mature': {}, 'material_signals': ['intraday_no_clicks'],
+        'current': {'spend': 0, 'clicks': 0, 'impressions': 10000}}
+    signals = monitor.automatic_sp_signals(evidence)
+    assert signals == ['intraday_no_clicks']
+    assert monitor.automatic_sp_signals({**evidence, 'campaign_start_date': '2026-11-14'}) == []
+    assert monitor.automatic_sp_signals({**evidence, 'current': {**evidence['current'], 'impressions': 9999}}) == []
+    with sessions() as db:
+        row_id, = hourly_ads.queue_hourly_findings(db, settings, [{'signals': signals, 'evidence': evidence}],
+            now=CLOCK, slot='same-day-no-clicks', send_alerts=True)
+        payload = db.get(NotificationOutbox, row_id).payload
+        table, = [x for x in payload['card']['body']['elements'] if x['tag'] == 'table']
+        row, = table['rows']
+        assert '今天有大量曝光，点击仍为零' in row['c1']
+        assert '今天曝光 10,000' in row['c2'] and '今天点击 0' in row['c2']
+        assert '订单' not in row['c2'] and '参考' not in row['c2']
 
 
 def test_nine_oclock_reuses_only_the_prepared_morning_report(warehouse, monkeypatch):

@@ -30,11 +30,13 @@ TITLES = {
     'CPS': '每卖出一件的广告费上涨', 'CPA': '每带来一单的广告费上涨', 'ROAS': '同样的广告费带来的销售额变少',
     'spend': '广告花费增加', 'orders': '广告带来的订单减少',
     'zero_conversion': '广告花了钱，统计期结束仍没带来订单', 'intraday_budget': '今天的花费远超平均日预算',
+    'intraday_no_clicks': '今天有大量曝光，点击仍为零',
 }
 TRAFFIC = {'spend', 'CTR', 'CPC'}
 _RATE_LABELS = {'CTR': '点击率', 'CDR': '点击转化率'}
 _NEXT_CHECK = {
-    'intraday_budget': '活动预算与自动预算规则',
+    'intraday_budget': '当天预算变更与自动预算规则',
+    'intraday_no_clicks': '广告位表现与点击报表',
     'CTR': '搜索词与广告位',
     'CPC': '广告位花费和出价记录',
     'zero_conversion': '花费最多的投放与商品页',
@@ -73,11 +75,17 @@ def alert_item(finding, *, include_dates=False):
     row, signals = finding['evidence'], finding['signals']
     currency = row['currency']
     text = []
-    if row.get('intraday'):
+    if 'intraday_budget' in signals:
         spend, budget = row['current']['spend'], row['verified_daily_budget']
         text.extend(f'{label} {number(value, money=True, currency=currency)}' for label, value in (
-            ('今天已花', spend), ('平均日预算', budget), ('比平均日预算多', spend - budget),
+            ('今天已花', spend), ('当前日预算', budget), ('比当前日预算多', spend - budget),
         ))
+    elif 'intraday_no_clicks' in signals:
+        current = row['current']
+        text.extend(f'{label} {number(current[field])}' for label, field in (
+            ('今天曝光', 'impressions'), ('今天点击', 'clicks'),
+        ))
+        text.append('今天已花 ' + number(current['spend'], money=True, currency=currency))
     else:
         current, mature = row['current'], row['mature']
         if TRAFFIC.intersection(signals):

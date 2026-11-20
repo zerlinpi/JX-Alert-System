@@ -270,7 +270,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             phase = 'morning_report'
             freeze_morning()
             phase = 'advertising_evidence'
-            from jx_alert.ai.intraday_risk_evidence import intraday_over_budget_candidates
+            from jx_alert.ai.intraday_risk_evidence import intraday_risk_candidates
             reviewed_at = now or _utcnow()
             skills = load_ad_review_skills(settings)
             meta['ad_review_skills_status'] = skills.status
@@ -281,7 +281,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             for sid, snapshot_id in intraday_snapshots.items():
                 snapshot = db.get(RawSnapshot, snapshot_id)
                 if snapshot:
-                    intraday.extend(intraday_over_budget_candidates(
+                    intraday.extend(intraday_risk_candidates(
                         db, db.get(Store, sid), snapshot, now=reviewed_at, skills=skills))
             contexts.append({'ad_review': True, 'hourly_intraday': True, 'reply_mode': 'answer',
                 'campaigns': intraday, 'policy': {'advertising_changes_allowed': False}})
@@ -332,7 +332,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             for sid, snapshot_id in intraday_snapshots.items():
                 snapshot = db.get(RawSnapshot, snapshot_id)
                 if snapshot:
-                    valid_ids.update(r['evidence_id'] for r in intraday_over_budget_candidates(
+                    valid_ids.update(r['evidence_id'] for r in intraday_risk_candidates(
                         db, db.get(Store, sid), snapshot, now=now or _utcnow(), skills=refreshed_skills)
                         if automatic_sp_signals(r, has_mature_history=campaign_identity(r) in refreshed_history))
             checked = []

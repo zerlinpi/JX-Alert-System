@@ -1,4 +1,4 @@
-"""Only current, same-source, fresh enabled SP budget observations can alert."""
+"""Only current, same-source, fresh enabled SP observations can alert."""
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
-from jx_alert.ai.intraday_risk_evidence import intraday_over_budget_candidates
+from jx_alert.ai.intraday_risk_evidence import MIN_NO_CLICK_IMPRESSIONS, intraday_risk_candidates
 from jx_alert.lingxing.intraday_observation import SOURCE
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
@@ -82,7 +82,7 @@ def warehouse():
                     {
                         "campaign_id": "99",
                         "report_date": DAY,
-                        "cost": 160,
+                        "cost": 230,
                         "clicks": 45,
                         "impressions": 2000,
                         "orders": 0,
@@ -99,7 +99,7 @@ def warehouse():
 
 def review(warehouse, **kwargs):
     db, store, _, _, snapshot = warehouse
-    return intraday_over_budget_candidates(db, store, snapshot, now=CLOCK, **kwargs)
+    return intraday_risk_candidates(db, store, snapshot, now=CLOCK, **kwargs)
 
 
 def test_real_budget_signal_has_proof_but_no_unmatured_orders_or_writes(warehouse):
@@ -118,7 +118,7 @@ def test_real_budget_signal_has_proof_but_no_unmatured_orders_or_writes(warehous
     )
     before = [db.scalar(select(func.count()).select_from(table)) for table in tables]
     (row,) = review(warehouse)
-    assert row["current"] == {"spend": 160, "clicks": 45, "impressions": 2000}
+    assert row["current"] == {"spend": 230, "clicks": 45, "impressions": 2000}
     assert row["verified_daily_budget"] == 100 and row["currency"] == "USD"
     assert row["intraday"] is True and row["material_signals"] == ["intraday_budget"]
     assert row["current_state"] == "投放中" and row["report_date"] == DAY
@@ -142,6 +142,9 @@ def test_real_budget_signal_has_proof_but_no_unmatured_orders_or_writes(warehous
         "ads_unauthorized",
         "wrong_timezone",
         "wrong_store",
+        "wrong_master_store",
+        "wrong_report_store",
+        "wrong_profile",
         "wrong_source",
         "old_day",
         "empty",
@@ -160,16 +163,15 @@ def test_real_budget_signal_has_proof_but_no_unmatured_orders_or_writes(warehous
         "future_state",
         "wrong_budget",
         "lifetime_budget",
-        "no_overbudget_event",
-        "old_event",
-        "future_event",
-        "wrong_event",
+        "wrong_budget_currency",
         "missing_currency",
         "other_currency",
         "missing_spend",
         "missing_clicks",
         "missing_impressions",
         "fractional_clicks",
+        "clicks_above_impressions",
+        "positive_spend_without_clicks",
         "negative_spend",
         "nan_spend",
         "bool_spend",
@@ -193,6 +195,13 @@ def test_unverified_or_immaterial_cases_are_silent(warehouse, bad):
         store.timezone = "not-an-IANA-zone"
     elif bad == "wrong_store":
         snapshot.store_id = "9999"
+    elif bad == "wrong_master_store":
+        identity["sid"] = 9999
+    elif bad == "wrong_report_store":
+        row["sid"] = 9999
+    elif bad == "wrong_profile":
+        campaign.profile_id = identity["profile_id"] = "111"
+        row["profile_id"] = 222
     elif bad == "wrong_source":
         snapshot.source = "mcp_campaign_sp"
     elif bad == "old_day":
@@ -229,14 +238,8 @@ def test_unverified_or_immaterial_cases_are_silent(warehouse, bad):
         campaign.budget = 99
     elif bad == "lifetime_budget":
         campaign.budget_type = identity["budget_type"] = "lifetime"
-    elif bad == "no_overbudget_event":
-        campaign.last_over_budget_at = identity["lastOverBudgetAt"] = None
-    elif bad == "old_event":
-        campaign.last_over_budget_at = identity["lastOverBudgetAt"] = "2026-11-17T09:00:00-08:00"
-    elif bad == "future_event":
-        campaign.last_over_budget_at = identity["lastOverBudgetAt"] = "2026-11-18T23:00:00-08:00"
-    elif bad == "wrong_event":
-        campaign.last_over_budget_at = "2026-11-18T09:01:00-08:00"
+    elif bad == "wrong_budget_currency":
+        identity["currency_code"] = "CAD"
     elif bad == "missing_currency":
         row.pop("confirmed_currency")
     elif bad == "other_currency":
@@ -249,6 +252,10 @@ def test_unverified_or_immaterial_cases_are_silent(warehouse, bad):
         row.pop("impressions")
     elif bad == "fractional_clicks":
         row["clicks"] = 4.5
+    elif bad == "clicks_above_impressions":
+        row["clicks"] = row["impressions"] + 1
+    elif bad == "positive_spend_without_clicks":
+        row["clicks"] = 0
     elif bad == "negative_spend":
         row["cost"] = -1
     elif bad == "nan_spend":
@@ -261,9 +268,9 @@ def test_unverified_or_immaterial_cases_are_silent(warehouse, bad):
         masters["rows"].append(dict(identity))
     elif bad == "low_relative_impact":
         campaign.budget = identity["daily_budget"] = 140
+        row["cost"] = 279.99
     elif bad == "low_absolute_impact":
-        campaign.budget = identity["daily_budget"] = 25
-        row["cost"] = 40
+        row["cost"] = 229.99
     elif bad == "mcp_fallback":
         payload["sources"] = ["official_mcp_observation"]
     elif bad == "unconfirmed_source":
@@ -272,6 +279,60 @@ def test_unverified_or_immaterial_cases_are_silent(warehouse, bad):
     db.commit()
     assert review(warehouse) == []
     assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+
+
+@pytest.mark.parametrize(
+    ("source_event", "campaign_event"),
+    [
+        (None, None),
+        ("2026-11-17T09:00:00-08:00", "2026-11-17T09:00:00-08:00"),
+        ("2026-11-18T23:00:00-08:00", "2026-11-18T23:00:00-08:00"),
+        ("2026-11-18T09:00:00-08:00", "2026-11-18T09:01:00-08:00"),
+    ],
+)
+def test_budget_excess_uses_verified_cost_even_without_supported_source_event(warehouse, source_event, campaign_event):
+    db, _, campaign, master, _ = warehouse
+    payload = deepcopy(master.payload)
+    payload["rows"][0]["lastOverBudgetAt"] = source_event
+    campaign.last_over_budget_at = campaign_event
+    master.payload = payload
+    db.commit()
+    (result,) = review(warehouse)
+    assert result["material_signals"] == ["intraday_budget"]
+    assert result["source_budget_event"] is None and result["source_budget_event_date_basis"] is None
+    assert result["proof"]["over_budget_event"] is None
+
+
+def test_exact_no_click_threshold_uses_only_complete_current_traffic(warehouse):
+    db, _, campaign, master, snapshot = warehouse
+    payload, identity = deepcopy(snapshot.payload), deepcopy(master.payload)
+    campaign.budget = campaign.budget_type = None
+    identity["rows"][0].pop("daily_budget")
+    payload["rows"][0].update(cost="0.00", clicks=0, impressions=MIN_NO_CLICK_IMPRESSIONS, orders=999)
+    snapshot.payload, master.payload = payload, identity
+    db.commit()
+    (result,) = review(warehouse)
+    assert result["material_signals"] == ["intraday_no_clicks"]
+    assert result["current"] == {"spend": 0, "clicks": 0, "impressions": MIN_NO_CLICK_IMPRESSIONS}
+    assert result["verified_daily_budget"] is None and result["source_budget_event"] is None
+    assert result["mature"] == result["baseline"] == result["kpis"] == {}
+    assert "orders" not in result["current"]
+
+
+@pytest.mark.parametrize("overrides", [
+    {"impressions": MIN_NO_CLICK_IMPRESSIONS - 1},
+    {"clicks": 1},
+    {"cost": .01},
+    {"clicks": None},
+    {"cost": None},
+])
+def test_below_threshold_or_incomplete_no_click_observations_are_silent(warehouse, overrides):
+    db, _, _, _, snapshot = warehouse
+    payload = deepcopy(snapshot.payload)
+    payload["rows"][0].update({"cost": 0, "clicks": 0, "impressions": MIN_NO_CLICK_IMPRESSIONS, **overrides})
+    snapshot.payload = payload
+    db.commit()
+    assert review(warehouse) == []
 
 
 def test_explicit_offset_event_uses_store_day_instead_of_utc_date(warehouse):
@@ -317,11 +378,11 @@ def test_current_event_and_exact_boundary_is_a_risk_not_zero_conversion(warehous
     db, _, campaign, master, snapshot = warehouse
     payload, identity = deepcopy(snapshot.payload), deepcopy(master.payload)
     campaign.budget = identity["rows"][0]["daily_budget"] = 150
-    payload["rows"][0].update(cost=180, orders=999)
+    payload["rows"][0].update(cost=330, orders=999)
     snapshot.payload, master.payload = payload, identity
     db.commit()
     (result,) = review(warehouse)
-    assert result["current"]["spend"] == 180 and result["verified_daily_budget"] == 150
+    assert result["current"]["spend"] == 330 and result["verified_daily_budget"] == 150
     assert result["material_signals"] == ["intraday_budget"] and result["mature"] == {}
 
 
@@ -329,4 +390,4 @@ def test_current_event_and_exact_boundary_is_a_risk_not_zero_conversion(warehous
 def test_invalid_internal_clock_or_freshness_fails_closed(warehouse, clock, age):
     db, store, _, _, snapshot = warehouse
     with pytest.raises(ValueError):
-        intraday_over_budget_candidates(db, store, snapshot, now=clock, max_age_minutes=age)
+        intraday_risk_candidates(db, store, snapshot, now=clock, max_age_minutes=age)
