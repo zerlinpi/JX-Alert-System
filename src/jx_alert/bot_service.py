@@ -846,7 +846,7 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
     from jx_alert.ai.ad_review_evidence import automatic_sp_signals, build_ad_review_context
     from jx_alert.ai.ad_review_skills import load_ad_review_skills
     from jx_alert.ai.deepseek import DeepSeekError
-    from jx_alert.ai.intraday_risk_evidence import intraday_over_budget_candidates
+    from jx_alert.ai.intraday_risk_evidence import intraday_risk_candidates
     from jx_alert.bot_alert_history import recent_alert_lookup
     from jx_alert.bot_ad_refresh import refresh_ad_evidence
     from jx_alert.bot_portfolio import ad_types, period_length
@@ -926,7 +926,7 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
                 snapshot = latest_observation(db, store.sid, day)
                 if snapshot is None:
                     continue
-                intraday.extend(row for row in intraday_over_budget_candidates(
+                intraday.extend(row for row in intraday_risk_candidates(
                     db, store, snapshot, now=clock, skills=skills)
                     if automatic_sp_signals(row, has_mature_history=campaign_identity(row) in mature))
             context['campaigns'].extend(intraday)

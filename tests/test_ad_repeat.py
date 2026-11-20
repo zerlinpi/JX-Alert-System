@@ -22,6 +22,11 @@ def _evidence(day, mature_day, spend, **overrides):
             'mature': {'orders': 0, 'spend': spend}, **overrides}
 
 
+def _intraday(day='2026-11-19', *, spend=0, clicks=0, impressions=20000):
+    return _evidence(day, None, 0, intraday=True, verified_daily_budget=10,
+        current={'spend': spend, 'clicks': clicks, 'impressions': impressions})
+
+
 def _outbox(db, label, status, destination='chat_id', **payload):
     row = NotificationOutbox(idempotency_key=label, status=status,
         payload={'delivery': {'receive_id_type': destination}, **payload})
@@ -146,3 +151,61 @@ def test_repeat_kpi_requires_same_comparison_basis_and_both_worsening_dimensions
                    {'baseline': 3, 'current': 4}, {'current_date': '2026-11-14'}):
         assert repeat_eligible_signals({**later, 'kpis': {'CPC': {**kpi, **change}}},
             ['CPC'], history, now) == []
+
+
+@pytest.mark.parametrize('status', ('PENDING', 'DELIVERED'))
+def test_completed_day_group_reservation_does_not_suppress_new_intraday_risk(status):
+    engine = create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    older = _evidence('2026-11-18', '2026-11-11', 90)
+    traffic, budget = _intraday(), _intraday(spend=60, clicks=11)
+    with Session(engine) as db:
+        incident = incident_metadata(older, ['zero_conversion'])
+        incident.pop('intraday')  # Older valid receipts do not have this discriminator.
+        group = _outbox(db, 'daily', status)
+        db.add(SyncJob(job_type=INCIDENT, status='QUEUED',
+            started_at=(CLOCK - timedelta(hours=1)).replace(tzinfo=None),
+            metadata_json={**incident, 'outbox_ids': [group]}))
+        db.commit()
+        history = load_incident_history(db, CLOCK)
+        assert repeat_eligible_signals(traffic, ['intraday_no_clicks', 'CTR'], history, CLOCK) == ['intraday_no_clicks']
+        assert repeat_eligible_signals(budget, ['intraday_budget', 'CPC'], history, CLOCK) == ['intraday_budget']
+        assert repeat_eligible_signals(older, ['zero_conversion'], history, CLOCK) == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize('previous_kind', ('intraday_budget', 'intraday_no_clicks', 'unknown_legacy'))
+def test_intraday_cooldown_checks_all_recent_group_reservations(previous_kind):
+    engine = create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    older = _evidence('2026-11-18', '2026-11-11', 90)
+    prior_intraday = _intraday('2026-11-18', spend=60 if previous_kind == 'intraday_budget' else 0)
+    if previous_kind == 'unknown_legacy':
+        previous = {key: prior_intraday[key] for key in ('store_id', 'campaign_id', 'ad_type', 'report_date')}
+    else:
+        previous = incident_metadata(prior_intraday, [previous_kind])
+    with Session(engine) as db:
+        for hours, metadata in ((1, incident_metadata(older, ['zero_conversion'])), (2, previous)):
+            group = _outbox(db, f'group-{hours}', 'DELIVERED')
+            db.add(SyncJob(job_type=INCIDENT, status='QUEUED',
+                started_at=(CLOCK - timedelta(hours=hours)).replace(tzinfo=None),
+                metadata_json={**metadata, 'outbox_ids': [group]}))
+        db.commit()
+        history = load_incident_history(db, CLOCK)
+        assert repeat_eligible_signals(_intraday(), ['intraday_no_clicks'], history, CLOCK) == []
+        assert repeat_eligible_signals(_intraday(spend=60), ['intraday_budget'], history, CLOCK) == []
+    engine.dispose()
+
+
+def test_repeat_zero_clicks_requires_new_day_and_materially_more_impressions():
+    prior = _intraday('2026-11-14', impressions=50000)
+    signals = ['intraday_no_clicks']
+    meta = incident_metadata(prior, signals)
+    assert meta['risk_metrics']['intraday_no_clicks'] == (
+        'intraday_zero_click_impressions', '2026-11-14', 50000, None)
+    history = {campaign_identity(prior): [(CLOCK, meta)]}
+    now = CLOCK + timedelta(days=3)
+    assert not repeat_eligible_signals(_intraday(impressions=61000), signals, history, now)
+    assert not repeat_eligible_signals(_intraday('2026-11-14', impressions=63000), signals, history, now)
+    assert not repeat_eligible_signals(_intraday(spend=10, impressions=63000), signals, history, now)
+    assert repeat_eligible_signals(_intraday(impressions=63000), signals, history, now) == signals

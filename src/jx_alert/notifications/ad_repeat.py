@@ -17,18 +17,20 @@ INCIDENT = 'hourly_ad_incident'
 COOLDOWN = timedelta(hours=72)
 REVIEW_INTERVAL = timedelta(days=7)
 _RESERVING_OUTBOX_STATES = {'PENDING', 'RETRY', 'SENDING'}
+_ABSOLUTE_INTRADAY_SIGNALS = frozenset({'intraday_budget', 'intraday_no_clicks'})
 
 _FAMILIES = {
     'CTR': 'traffic', 'CPC': 'traffic',
     'CDR': 'conversion', 'CPS': 'conversion', 'CPA': 'conversion', 'ROAS': 'conversion',
     'orders': 'conversion', 'zero_conversion': 'conversion',
     'intraday_budget': 'budget',
+    'intraday_no_clicks': 'intraday_traffic',
 }
 # Increase in adverse difference from the comparison, in each metric's units.
 _ADDITIONAL_IMPACT = {
     'CTR': .002, 'CDR': .02,  # 0.2 and 2 percentage points
     'CPC': .25, 'CPA': 5, 'CPS': 5, 'ROAS': .5, 'orders': 3,
-    'zero_conversion': 30, 'intraday_budget': 30,
+    'zero_conversion': 30, 'intraday_budget': 30, 'intraday_no_clicks': 10000,
 }
 _NEGATIVE_DIRECTION = {'CTR', 'CDR', 'ROAS', 'orders'}
 
@@ -157,6 +159,13 @@ def _measure(row, code):
         if _number(orders) and orders == 0 and _number(amount):
             return 'mature_spend', _day(row.get('mature_date')), amount, None
         return None
+    if code == 'intraday_no_clicks':
+        current = row.get('current') or {}
+        amount, clicks, impressions = (current.get(key) for key in ('spend', 'clicks', 'impressions'))
+        if (_number(amount) and amount == 0 and _number(clicks) and clicks == 0
+                and _number(impressions) and impressions > 0):
+            return 'intraday_zero_click_impressions', _day(row.get('report_date')), impressions, None
+        return None
     if code == 'intraday_budget':
         value = (row.get('current') or {}).get('spend')
         reference = row.get('verified_daily_budget')
@@ -181,6 +190,7 @@ def incident_metadata(row, signals):
     return {
         'incident_key': incident_key(row), 'store_id': row['store_id'], 'ad_type': row['ad_type'],
         'campaign_id': row['campaign_id'], 'report_date': row['report_date'], 'currency': row.get('currency'),
+        'intraday': row.get('intraday') is True,
         'risk_metrics': {code: _measure(row, code) for code in signals},
     }
 
@@ -199,16 +209,32 @@ def _worsened(current, previous, code):
     return ratio is None or (_number(prior_ratio) and ratio - prior_ratio + 1e-9 >= .10)
 
 
+def _earlier_daily_incident(item, report_day):
+    """Classify only proven completed-day history, including known older receipts."""
+    prior_day = _day(item.get('report_date'))
+    intraday = item.get('intraday')
+    if (prior_day is None or prior_day >= report_day
+            or intraday is not None and intraday is not False):
+        return False
+    metrics = item.get('risk_metrics')
+    if isinstance(metrics, dict) and metrics:
+        return all(code in _FAMILIES and code not in _ABSOLUTE_INTRADAY_SIGNALS for code in metrics)
+    return item.get('origin') == 'daily_report'
+
+
 def repeat_eligible_signals(row, signals, history, now):
-    """Enforce per-activity cooldown, then verify changes within each family."""
+    """Keep ordinary cooldowns and allow one independently verified intraday risk."""
     previous = history.get(campaign_identity(row), ())
     if not previous:
         return list(signals)
-    if now - previous[0][0] < COOLDOWN:
-        return []
     report_day = _day(row.get('report_date'))
     if report_day is None:
         return []
+    if now - previous[0][0] < COOLDOWN:
+        if row.get('intraday') is not True or not all(_earlier_daily_incident(prior, report_day)
+                for stamped, prior in previous if now - stamped < COOLDOWN):
+            return []
+        return [code for code in signals if code in _ABSOLUTE_INTRADAY_SIGNALS and _measure(row, code)]
     accepted = []
     for code in signals:
         family = _FAMILIES.get(code)
