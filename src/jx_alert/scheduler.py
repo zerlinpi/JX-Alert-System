@@ -7,7 +7,7 @@ from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from jx_alert.config import get_settings
+from jx_alert.config import effective_daily_sync_cron, get_settings
 from jx_alert.storage.db import init_db
 
 logging.basicConfig(
@@ -34,15 +34,10 @@ def daily_job(*, now=None):
         local = clock.astimezone(ZoneInfo("Asia/Shanghai"))
         midnight = datetime.combine(local.date(), time.min, local.tzinfo)
         earliest = max(midnight, local - timedelta(seconds=DAILY_COLLECTION_GRACE_SECONDS))
-        trigger = CronTrigger.from_crontab(settings.daily_sync_cron, timezone=local.tzinfo)
+        trigger = CronTrigger.from_crontab(effective_daily_sync_cron(settings), timezone=local.tzinfo)
         due = trigger.get_next_fire_time(None, earliest)
         if due is None or due > local:
             return
-        if getattr(settings, "hourly_ad_monitor_enabled", False):
-            from jx_alert.hourly_ad_monitor import run_hourly_monitor
-            # The initial clock finds the due slot. Real collection must
-            # evaluate freshness against the clock after source reads.
-            return run_hourly_monitor(now=now)
         day = local.date().isoformat()
         # A fixed Beijing delivery day identifies the plan, while each store's
         # completed local report date is still resolved by the dispatcher. Two
@@ -139,6 +134,7 @@ def main():
         return
 
     hourly_mode = getattr(settings, "hourly_ad_monitor_enabled", False)
+    collection_cron = effective_daily_sync_cron(settings)
     init_db()
     scheduler = BlockingScheduler(
         timezone=settings.app_timezone,
@@ -159,21 +155,20 @@ def main():
         replace_existing=True, max_instances=1, coalesce=True,
         misfire_grace_time=60,
     )
-    if not hourly_mode:
-        scheduler.add_job(
-            daily_job,
-            CronTrigger.from_crontab(settings.daily_sync_cron, timezone="Asia/Shanghai"),
-            id="daily_pipeline",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=DAILY_COLLECTION_GRACE_SECONDS,
-        )
-        scheduler.add_job(
-            daily_job, IntervalTrigger(minutes=1),
-            id="daily_pipeline_recovery",
-            replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=60,
-        )
+    scheduler.add_job(
+        daily_job,
+        CronTrigger.from_crontab(collection_cron, timezone="Asia/Shanghai"),
+        id="daily_pipeline",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=DAILY_COLLECTION_GRACE_SECONDS,
+    )
+    scheduler.add_job(
+        daily_job, IntervalTrigger(minutes=1),
+        id="daily_pipeline_recovery",
+        replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=60,
+    )
     scheduler.add_job(
         outbox_job,
         IntervalTrigger(seconds=10),
@@ -207,12 +202,11 @@ def main():
             id="excel_daily_snapshot_recovery", max_instances=1, coalesce=True, misfire_grace_time=60)
     logger.info(
         "Scheduler started (daily_timezone=Asia/Shanghai, collection_cron=%s, report_cron=%s, dry_run=%s)",
-        settings.daily_sync_cron, settings.feishu_daily_report_cron, settings.app_dry_run,
+        collection_cron, settings.feishu_daily_report_cron, settings.app_dry_run,
     )
     # Recover a missing collection plan before starting independent reports and exports.
-    if not hourly_mode:
-        daily_job()
-    else:
+    daily_job()
+    if hourly_mode:
         # Heavy source calls belong to their own executor; starting during the
         # 08:00 window must not block 09:00 delivery or the outbox worker.
         scheduler.add_job(hourly_ad_monitor_job, 'date', run_date=datetime.now(timezone.utc),

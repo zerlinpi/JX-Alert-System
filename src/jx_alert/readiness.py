@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
+from jx_alert.config import effective_daily_sync_cron
 from jx_alert.storage.collection_attempts import collection_issue_for_date
 from jx_alert.storage.coverage import SALES_DATA_LABELS, store_sales_data_status
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, SyncJob
@@ -244,10 +245,20 @@ def configuration_status(db, settings):
     latest_success = db.scalar(collection_jobs.where(SyncJob.status.in_(["SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"]),
                                                      SyncJob.finished_at.is_not(None))
                                .order_by(SyncJob.finished_at.desc(), SyncJob.id.desc()).limit(1))
+    # The durable dispatcher uses manual_collection for scheduled and manual work.
+    # Only scheduled jobs have the Beijing-day key.
+    scheduled_jobs = select(SyncJob).where(
+        SyncJob.job_type == "manual_collection",
+        SyncJob.metadata_json["idempotency_key"].as_string().like("scheduled-collection:%"),
+    )
+    latest_scheduled = db.scalar(scheduled_jobs.order_by(SyncJob.id.desc()).limit(1))
     report = {"stores": stores, "manager_count": len(managers), "manual_mapping_required": missing,
             "scheduler_enabled": settings.scheduler_enabled, "collection_mode": collection_mode,
             "cron": getattr(settings, "hourly_ad_monitor_cron", "0 * * * *") if hourly else settings.daily_sync_cron,
             "cron_timezone": "Asia/Shanghai", "mcp_auth_mode": settings.mcp_auth_mode,
+            "scheduled_collection_cron": effective_daily_sync_cron(settings),
+            "scheduled_collection_timezone": "Asia/Shanghai",
+            "last_scheduled_collection_attempt": _collection_job_snapshot(latest_scheduled),
             "daily_report_cron": getattr(settings, "feishu_daily_report_cron", "0 8 * * *"),
             "daily_report_timezone": "Asia/Shanghai",
             "daily_report_start_date": getattr(settings, "feishu_daily_report_start_date", ""),

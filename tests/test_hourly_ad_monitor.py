@@ -19,6 +19,7 @@ from jx_alert.storage.models import Campaign, Store, SyncJob
 
 
 CLOCK = datetime(2026, 11, 18, 6, tzinfo=timezone.utc)
+real_collect_store = monitor._collect_store
 
 
 @pytest.fixture
@@ -500,6 +501,65 @@ def test_nine_oclock_reuses_only_the_prepared_morning_report(warehouse, monkeypa
     assert operations.queue_scheduled_daily_reports(now=send_at - timedelta(seconds=1))['outbox_ids'] == []
     assert operations.queue_scheduled_daily_reports(now=send_at)['outbox_ids'] == [123]
     assert len(captured) == 1
+
+
+def test_morning_sales_coverage_is_dated_and_requires_store_and_both_sku_grains(warehouse):
+    from jx_alert.storage.coverage import mark_coverage
+
+    day = CLOCK.date() - timedelta(days=1)
+    with warehouse[1]() as db:
+        mark_coverage(db, store_id='5174', metric_date=day, dimension='campaign_sp', row_count=3)
+        db.flush()
+        assert monitor._morning_sales_status(db, '5174', day)['store_sales'] == 'NOT_COLLECTED'
+        mark_coverage(db, store_id='5174', metric_date=day, dimension='store', row_count=0)
+        db.flush()
+        assert not monitor._morning_sales_status(db, '5174', day)['ready']
+        for dim in ('sku_asin', 'sku_msku'):
+            mark_coverage(db, store_id='5174', metric_date=day, dimension=dim, row_count=0)
+        db.flush()
+        status = monitor._morning_sales_status(db, '5174', day)
+        assert status['ready'] and status['store_sales'] == 'EMPTY'
+        assert not monitor._morning_sales_status(db, '5174', day + timedelta(days=1))['ready']
+
+
+def test_morning_sales_source_failure_does_not_skip_other_date_or_hide_behind_ads(
+        warehouse, monkeypatch):
+    from jx_alert.lingxing import api_business, business_dashboard, campaign_collector, collector
+    from jx_alert.lingxing import intraday_observation, sales_collector
+    from jx_alert.reporting import archive
+    from jx_alert.storage.coverage import mark_coverage
+
+    settings, factory, _, _ = warehouse
+    settings.lingxing_performance_enabled = False
+    day = CLOCK.date() - timedelta(days=2)
+    tried = []
+
+    def get_sales(client, db, dates, **kwargs):
+        from datetime import date
+        actual = date.fromisoformat(dates['5174'])
+        tried.append(actual)
+        if actual == day:
+            raise RuntimeError('upstream failure')
+        for dim in ('store', 'sku_asin', 'sku_msku'):
+            mark_coverage(db, store_id='5174', metric_date=actual, dimension=dim, row_count=0)
+        db.commit()
+
+    monkeypatch.setattr(sales_collector, 'collect_sales_for_day', get_sales)
+    monkeypatch.setattr(api_business, 'collect_api_business_for_day', lambda *a: {'status': 'COMPLETE'})
+    monkeypatch.setattr(business_dashboard, 'collect_business_for_day', lambda *a: {'status': 'COMPLETE'})
+    monkeypatch.setattr(campaign_collector, 'collect_campaigns', lambda *a, **kw: None)
+    monkeypatch.setattr(collector, 'collect_ads_for_day', lambda *a, **kw: {'rows': {'sp': 3}})
+    monkeypatch.setattr(intraday_observation, 'run_observation', lambda *a, **kw: {'status': 'COMPLETE'})
+    monkeypatch.setattr(archive, 'archive_partitions', lambda *a: {})
+    client = type('Client', (), {'seller_ad_accounts': lambda self: {'data': []}})()
+    # Restore the collector overridden by the warehouse fixture.
+    with factory() as db:
+        status = real_collect_store(client, db, settings, Source().get_stores()['data'][0],
+                                    day, morning=True, now=CLOCK)
+    assert tried == [day, day - timedelta(days=1)]
+    assert status['ad_ready'] and status['morning_ready'] and status['status'] == 'PARTIAL'
+    assert status['sales_coverage'][day.isoformat()] == {'ready': False, 'collection': 'FAILED'}
+    assert status['sales_coverage'][(day - timedelta(days=1)).isoformat()]['store_sales'] == 'EMPTY'
 
 
 def test_existing_night_summary_does_not_wait_for_new_ad_analysis_and_survives_retry(warehouse, monkeypatch):
