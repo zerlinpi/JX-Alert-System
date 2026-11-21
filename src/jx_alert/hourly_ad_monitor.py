@@ -74,7 +74,7 @@ def _morning_sales_status(db, sid, day):
 
 def _collect_store(client, db, settings, record, target, *, morning=False, now=None):
     from jx_alert.lingxing.campaign_collector import collect_campaigns
-    from jx_alert.lingxing.collector import collect_ads_for_day
+    from jx_alert.lingxing.collector import SPPartitionBusy, collect_ads_for_day
     from jx_alert.lingxing.ad_currency import account_currencies
     from jx_alert.lingxing.intraday_observation import run_observation
     from jx_alert.reporting.archive import archive_partitions
@@ -160,13 +160,8 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
             db.rollback()
             if on in {target, mature}:
                 primary_ready = False
-            cov = db.scalar(select(DataCoverage).where(DataCoverage.store_id == sid,
-                DataCoverage.metric_date == on, DataCoverage.dimension == 'campaign_sp'))
-            if cov is not None:
-                cov.status = 'FAILED'
-                db.commit()
             errors.append({'step': 'sp_report', 'date': on.isoformat(), 'error_type': type(exc).__name__})
-            reports[on.isoformat()] = {'status': 'FAILED'}
+            reports[on.isoformat()] = {'status': 'BUSY' if isinstance(exc, SPPartitionBusy) else 'FAILED'}
     try:
         clock = now or _utcnow()
         day = clock.astimezone(ZoneInfo(store.timezone)).date().isoformat()

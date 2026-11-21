@@ -592,3 +592,42 @@ def test_existing_night_summary_does_not_wait_for_new_ad_analysis_and_survives_r
         assert job.metadata_json['error_phase'] == 'advertising_evidence'
     recovered = run(warehouse, now=morning + timedelta(minutes=5))
     assert recovered['status'] == 'SUCCEEDED' and recovered['outbox_ids'][0] == 123
+
+
+def test_hourly_failed_sp_attempt_preserves_daily_coverage_without_reporting_success(warehouse, monkeypatch):
+    from jx_alert.lingxing import campaign_collector, intraday_observation
+    from jx_alert.lingxing.collector import collect_ads_for_day
+    from jx_alert.storage.models import DataCoverage
+
+    class API:
+        def seller_ad_accounts(self):
+            return {"data": []}
+
+        def iter_advertising_report(self, kind, payload):
+            return iter([{"campaign_id": "active", "report_date": payload["report_date"],
+                          "cost": 17, "orders": 2, "sales": 50, "units": 2,
+                          "clicks": 12, "impressions": 1200}])
+
+    class FailedAPI(API):
+        def iter_advertising_report(self, kind, payload):
+            raise RuntimeError("Simulated SP provider failure")
+
+    settings, factory, _, _ = warehouse
+    target = (CLOCK - timedelta(days=2)).date()
+    record = Source().get_stores()["data"][0]
+    monkeypatch.setattr(campaign_collector, "collect_campaigns", lambda *a, **kw: None)
+    monkeypatch.setattr(intraday_observation, "run_observation", lambda *a, **kw: {"status": "COMPLETE"})
+    with factory() as db:
+        collect_ads_for_day(API(), db, {"5174": target.isoformat()},
+                            stores_response={"data": [record]}, report_types=("sp",))
+        query = select(DataCoverage).where(DataCoverage.dimension == "campaign_sp",
+                                          DataCoverage.metric_date == target)
+        prior = db.scalar(query)
+        expected = (prior.status, prior.row_count, prior.completed_at)
+
+    with factory() as db:
+        status = real_collect_store(FailedAPI(), db, settings, record, target, now=CLOCK)
+        assert status["status"] == "PARTIAL" and not status["ad_ready"]
+        assert status["reports"][target.isoformat()] == {"status": "FAILED"}
+        coverage = db.scalar(query)
+        assert (coverage.status, coverage.row_count, coverage.completed_at) == expected

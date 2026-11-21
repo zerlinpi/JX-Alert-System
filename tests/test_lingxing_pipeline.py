@@ -219,3 +219,51 @@ def test_daily_pipeline_refreshes_configured_ad_attribution_window(tmp_path):
         assert result["steps"]["product_ad_reports"]["rows"] == {
             "sp": 2, "sd": 2,
         }
+
+
+def test_dual_source_daily_sp_failure_does_not_downgrade_verified_partition(tmp_path):
+    from datetime import date
+
+    from jx_alert.config import Settings
+    from jx_alert.lingxing.source_gateway import CollectionSources
+
+    class FailedSP(FakeDailyClient):
+        def iter_advertising_report(self, report_type, payload, **kwargs):
+            if report_type == "sp":
+                raise LingxingError("Simulated SP provider failure")
+            return super().iter_advertising_report(report_type, payload, **kwargs)
+
+    class Shadow:
+        def sales(self, *args):
+            return [], {"code": 1}
+
+        def campaign_ads(self, *args):
+            return [], {"code": 1}
+
+    settings = Settings(_env_file=None, lingxing_performance_enabled=False,
+        sb_sd_detail_reports_enabled=False, raw_dir=str(tmp_path / "raw"),
+        store_controls_file=str(tmp_path / "controls.json"),
+        lingxing_business_credentials_file=str(tmp_path / "missing-business.json"),
+        lingxing_sources_file=str(tmp_path / "missing-sources.json"))
+    engine = create_engine(f"sqlite:///{tmp_path / 'warehouse.sqlite'}")
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(engine)
+    target = "2026-11-10"
+    with sessions() as db:
+        collect_daily_snapshot(FakeDailyClient(), db, target,
+            ad_attribution_refresh_days=1, settings=settings)
+        previous = db.scalar(select(DataCoverage).where(DataCoverage.dimension == "campaign_sp"))
+        expected = (previous.status, previous.row_count, previous.completed_at)
+
+    api = FailedSP()
+    with sessions() as db:
+        dual = CollectionSources(api, settings, reader=Shadow(), db=db)
+        result = collect_daily_snapshot(dual, db, target, stores_response=api.get_stores(),
+            ad_attribution_refresh_days=1, settings=settings)
+        assert result["status"] == "PARTIAL_FAILED"
+        assert {"step": "campaign_report_sp", "error_type": "LingxingError"} in result["steps"]["source_failures"]
+        current = db.scalar(select(DataCoverage).where(
+            DataCoverage.metric_date == date.fromisoformat(target),
+            DataCoverage.dimension == "campaign_sp"))
+        assert (current.status, current.row_count, current.completed_at) == expected
+    engine.dispose()

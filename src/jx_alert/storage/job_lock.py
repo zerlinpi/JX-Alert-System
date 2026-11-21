@@ -41,8 +41,12 @@ def _unlock_file(fd: int):
 
 
 @contextmanager
-def database_job_lock(engine, name: str = "daily_pipeline"):
-    """Fail immediately if another process is running this warehouse job."""
+def database_job_lock(engine, name: str = "daily_pipeline", *, pin_connection: bool = False):
+    """Fail immediately on contention; optionally yield the locked MySQL connection.
+
+    A writer using the yielded connection cannot commit on a different physical
+    session if the lock holder disconnects. SQLite locks are process/file scoped.
+    """
     if not name or len(name) > 40 or not all(c.isalnum() or c == "_" for c in name):
         raise ValueError("Job lock name must be 1-40 letters, digits or underscores")
     if engine.dialect.name in {"mysql", "mariadb"}:
@@ -55,14 +59,21 @@ def database_job_lock(engine, name: str = "daily_pipeline"):
             if acquired != 1:
                 raise JobAlreadyRunning(f"Job is already running: {name}")
             try:
-                yield
+                if pin_connection:
+                    # GET_LOCK starts an implicit transaction. The advisory lock
+                    # is connection-scoped; commit lets the caller own its transaction.
+                    connection.commit()
+                yield connection if pin_connection else None
             finally:
-                try:
-                    connection.execute(text("SELECT RELEASE_LOCK(:key)"), {"key": key})
-                except Exception:
-                    # Never return a still-locked physical connection to the pool.
-                    connection.invalidate()
-                    raise
+                # A disconnected physical session already lost the lock. Do
+                # not let SQLAlchemy reconnect solely to issue RELEASE_LOCK.
+                if not getattr(connection, "invalidated", False):
+                    try:
+                        connection.execute(text("SELECT RELEASE_LOCK(:key)"), {"key": key})
+                    except Exception:
+                        # Never return a still-locked physical connection to the pool.
+                        connection.invalidate()
+                        raise
         return
     if engine.dialect.name != "sqlite":
         raise RuntimeError("Job locking supports MariaDB/MySQL and SQLite only")

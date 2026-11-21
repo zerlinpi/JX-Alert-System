@@ -54,3 +54,41 @@ def test_mysql_uses_connection_scoped_advisory_lock():
         assert len(calls) == 1
     assert "GET_LOCK" in calls[0]
     assert "RELEASE_LOCK" in calls[1]
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_pinned_mysql_lock_leaves_transaction_to_caller_and_does_not_reconnect(disconnect):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Connection:
+        invalidated = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def scalar(self, statement, params):
+            calls.append(str(statement))
+            return 1
+
+        def execute(self, statement, params):
+            assert not self.invalidated
+            calls.append(str(statement))
+
+        def commit(self):
+            calls.append("commit")
+
+    connection = Connection()
+    engine = SimpleNamespace(
+        dialect=SimpleNamespace(name="mysql"), url=SimpleNamespace(database="jxalert"),
+        connect=lambda: connection,
+    )
+    with database_job_lock(engine, "campaign_sp_example", pin_connection=True) as locked:
+        assert locked is connection
+        assert calls == ["SELECT GET_LOCK(:key, 0)", "commit"]
+        locked.invalidated = disconnect
+    assert calls[2:] == ([] if disconnect else ["SELECT RELEASE_LOCK(:key)"])

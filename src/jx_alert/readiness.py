@@ -182,7 +182,7 @@ def _collection_job_snapshot(job):
             if isinstance(reports, dict):
                 partitions.update(report["status"] for report in reports.values()
                                   if isinstance(report, dict)
-                                  and report.get("status") in ("AVAILABLE", "EMPTY", "FAILED"))
+                                  and report.get("status") in ("AVAILABLE", "EMPTY", "BUSY", "FAILED"))
         result["store_count"] = len(stores)
         result["sp_report_partition_counts"] = dict(partitions)
     return result
