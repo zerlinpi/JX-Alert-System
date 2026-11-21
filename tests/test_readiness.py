@@ -64,11 +64,19 @@ def test_collection_status_tracks_the_active_schedule_and_separates_report_cover
             }})
         backfilled = SyncJob(job_type="hourly_ad_monitor", status="SUCCEEDED", started_at=timestamp(4),
                              finished_at=timestamp(4, 6))
-        db.add_all([hourly, daily, failed, backfilled])
+        scheduled = SyncJob(job_type="manual_collection", status="PENDING", started_at=timestamp(10, 30),
+            metadata_json={"idempotency_key": "scheduled-collection:2026-11-19"})
+        user_backfill = SyncJob(job_type="manual_collection", status="SUCCEEDED", started_at=timestamp(11),
+            metadata_json={"idempotency_key": "ordinary-backfill"})
+        db.add_all([hourly, daily, failed, backfilled, scheduled, user_backfill])
         db.flush()
         current = configuration_status(db, settings)
         assert current["collection_mode"] == "hourly_ad_monitor"
         assert current["cron"] == "5 * * * *"
+        assert current["scheduled_collection_cron"] == "30 18 * * *"
+        assert current["scheduled_collection_timezone"] == "Asia/Shanghai"
+        assert current["last_scheduled_collection_attempt"]["job_id"] == scheduled.id
+        assert current["last_scheduled_collection_attempt"]["status"] == "PENDING"
         assert current["last_successful_collection"] == {
             "job_id": hourly.id, "job_type": "hourly_ad_monitor", "status": "SUCCEEDED",
             "started_at_utc": "2026-11-19 06:00:00", "finished_at_utc": "2026-11-19 06:04:00",
@@ -81,6 +89,7 @@ def test_collection_status_tracks_the_active_schedule_and_separates_report_cover
         current = configuration_status(db, settings)
         assert current["collection_mode"] == "daily_collection"
         assert current["cron"] == "0 8 * * *"
+        assert current["scheduled_collection_cron"] == "0 8 * * *"
         assert current["last_successful_collection"]["job_id"] == daily.id
         assert current["last_collection_attempt"]["store_count"] == 3
         assert "sp_report_partition_counts" not in current["last_collection_attempt"]

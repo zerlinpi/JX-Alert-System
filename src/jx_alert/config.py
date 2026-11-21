@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = False
     daily_sync_cron: str = "0 8 * * *"
     feishu_daily_report_cron: str = "0 9 * * *"
+    # In hourly mode, keep the broad collection outside the existing 08:00 sweep.
+    hourly_mode_daily_sync_cron: str = "30 18 * * *"
     hourly_ad_monitor_enabled: bool = False
     hourly_ad_monitor_cron: str = "0 * * * *"
     feishu_daily_report_start_date: str = ""
@@ -172,6 +174,13 @@ class Settings(BaseSettings):
         return ids
 
 
+def effective_daily_sync_cron(settings: Settings) -> str:
+    """The broad sales/ads queue remains independent of hourly SP collection."""
+    if getattr(settings, "hourly_ad_monitor_enabled", False):
+        return getattr(settings, "hourly_mode_daily_sync_cron", "30 18 * * *")
+    return settings.daily_sync_cron
+
+
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
@@ -180,7 +189,7 @@ def get_settings() -> Settings:
         runtime = json.loads(path.read_text(encoding="utf-8"))
         allowed = {
             "app_dry_run", "scheduler_enabled", "daily_sync_cron",
-            "hourly_ad_monitor_enabled", "hourly_ad_monitor_cron",
+            "hourly_ad_monitor_enabled", "hourly_ad_monitor_cron", "hourly_mode_daily_sync_cron",
             "feishu_daily_report_cron", "feishu_daily_report_start_date",
             "feishu_daily_report_group_digest",
             "sb_sd_detail_reports_enabled",

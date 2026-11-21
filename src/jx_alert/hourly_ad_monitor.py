@@ -13,7 +13,8 @@ from jx_alert.notifications.ad_repeat import (
     campaign_identity, incident_already_recorded, load_incident_history, repeat_eligible_signals,
 )
 from jx_alert.notifications.hourly_ads import queue_hourly_findings, queue_overnight_digest
-from jx_alert.storage.models import Campaign, DataCoverage, RawSnapshot, Store, SyncJob
+from jx_alert.storage.coverage import store_sales_data_status
+from jx_alert.storage.models import Campaign, DailyMetric, DataCoverage, RawSnapshot, Store, SyncJob
 from jx_alert.store_controls import collection_states
 
 
@@ -50,6 +51,27 @@ def _ready_partition(db, sid, day, zone, *, maturity=0):
                 and row.completed_at.replace(tzinfo=timezone.utc) >= deadline.astimezone(timezone.utc))
 
 
+def _morning_sales_status(db, sid, day):
+    dimensions = ("store", "sku_asin", "sku_msku")
+    partitions = {row.dimension: row for row in db.scalars(select(DataCoverage).where(
+        DataCoverage.store_id == sid, DataCoverage.metric_date == day,
+        DataCoverage.dimension.in_(dimensions),
+    ))}
+    facts = db.scalars(select(DailyMetric).where(
+        DailyMetric.store_id == sid, DailyMetric.metric_date == day,
+        DailyMetric.dimension == "store", DailyMetric.entity_id == sid,
+    )).all()
+    store_status = store_sales_data_status(1, partitions.get("store"), facts,
+        partitions.get("sku_asin"), partitions.get("sku_msku"))
+    partition_status = {
+        dim: partitions[dim].status if dim in partitions else "NOT_COLLECTED"
+        for dim in dimensions
+    }
+    return {"store_sales": store_status, "partitions": partition_status,
+            "ready": store_status in {"AVAILABLE", "ZERO", "EMPTY"}
+            and all(state == "COMPLETE" for state in partition_status.values())}
+
+
 def _collect_store(client, db, settings, record, target, *, morning=False, now=None):
     from jx_alert.lingxing.campaign_collector import collect_campaigns
     from jx_alert.lingxing.collector import collect_ads_for_day
@@ -60,14 +82,30 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
     sid, errors = str(record['sid']), []
     one = {'data': [record]}
     morning_ready = False
+    sales_coverage = {}
     if morning:
         from jx_alert.lingxing.sales_collector import collect_sales_for_day
         from jx_alert.lingxing.api_business import collect_api_business_for_day
         from jx_alert.lingxing.business_dashboard import collect_business_for_day
         from jx_alert.lingxing.performance_openapi import collect_store_performance
+        for day in (target, target - timedelta(days=1)):
+            if not collection_states(settings, [sid]).get(sid):
+                return {'status': 'DISABLED', 'errors': errors, 'sales_coverage': sales_coverage}
+            local_day = day.isoformat()
+            try:
+                collect_sales_for_day(client, db, {sid: local_day}, stores_response=one)
+                sales = _morning_sales_status(db, sid, day)
+            except Exception as exc:
+                db.rollback()
+                sales = {'ready': False, 'collection': 'FAILED'}
+                errors.append({'step': 'sales', 'date': local_day, 'error_type': type(exc).__name__})
+            else:
+                if not sales['ready']:
+                    errors.append({'step': 'sales', 'date': local_day, 'error_type': 'IncompleteCoverage'})
+                if day == target and sales['ready']:
+                    morning_ready = True
+            sales_coverage[local_day] = sales
         steps = [
-            ('sales', lambda: [collect_sales_for_day(client, db, {sid: day.isoformat()}, stores_response=one)
-                               for day in (target - timedelta(days=1), target)]),
             ('api_business', lambda: collect_api_business_for_day(client, db, settings, one, {sid: target.isoformat()})),
             ('business_dashboard', lambda: collect_business_for_day(db, settings, one, {sid: target.isoformat()})),
         ]
@@ -83,19 +121,19 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
                     errors.append({'step': name, 'error_type': 'PartialSource'})
                 if isinstance(outcome, dict) and outcome.get('status') in {'COMPLETE', 'SUCCEEDED', 'SUCCEEDED_WITH_WARNINGS'}:
                     morning_ready = True
-                if name == 'sales' and any(item.get('sales_rows', 0) > 0 for item in outcome):
-                    morning_ready = True
             except Exception as exc:
                 db.rollback()
                 errors.append({'step': name, 'error_type': type(exc).__name__})
+    sales_detail = {'sales_coverage': sales_coverage} if morning else {}
     if int(record.get('has_ads_setting') or 0) != 1:
         return {'status': 'PARTIAL' if errors else 'COMPLETE', 'errors': errors,
-                'ads': 'UNAVAILABLE', 'ad_ready': False, 'intraday_ready': False, 'morning_ready': morning_ready}
+                'ads': 'UNAVAILABLE', 'ad_ready': False, 'intraday_ready': False,
+                'morning_ready': morning_ready, **sales_detail}
     try:
         collect_campaigns(client, db, stores_response=one, report_types=('sp',))
     except Exception as exc:
         db.rollback()
-        return {'status': 'PARTIAL', 'morning_ready': morning_ready,
+        return {'status': 'PARTIAL', 'morning_ready': morning_ready, **sales_detail,
                 'errors': [*errors, {'step': 'campaigns', 'error_type': type(exc).__name__}]}
     try:
         currencies = account_currencies(client.seller_ad_accounts())
@@ -142,7 +180,7 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
     return {'status': 'PARTIAL' if errors else 'COMPLETE', 'errors': errors,
             'ad_ready': primary_ready, 'intraday_ready': observed.get('status') == 'COMPLETE',
             'observation': observed, 'excel': archive, 'morning_ready': morning_ready or primary_ready,
-            'reports': reports}
+            'reports': reports, **sales_detail}
 
 
 def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehouse_engine=None,
