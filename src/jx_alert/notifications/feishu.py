@@ -1,13 +1,34 @@
 """Feishu group custom-bot webhook client (not an app bot)."""
 import base64
+from contextvars import ContextVar
 import hashlib
 import hmac
 import html
+import logging
 import re
 import time
 from urllib.parse import urlparse
 
 import httpx
+
+from jx_alert.notifications.receipt import strict_response_json
+
+
+# HTTPX logs the URL before response hooks run. Keep the status line, but
+# remove this call's token-bearing path without disabling any other client's logs.
+_active_webhook_path = ContextVar("jx_active_feishu_webhook_path", default=None)
+
+
+def _redact_active_webhook(record):
+    path = _active_webhook_path.get()
+    if path:
+        rendered = record.getMessage()
+        if path in rendered:
+            record.msg, record.args = rendered.replace(path, "/[Feishu webhook redacted]"), ()
+    return True
+
+
+logging.getLogger("httpx").addFilter(_redact_active_webhook)
 
 
 class FeishuWebhookError(RuntimeError):
@@ -60,7 +81,7 @@ class FeishuClient:
             payload["sign"] = build_feishu_signature(timestamp, self.sign_secret)
         return payload
 
-    def send_text(self, text: str, open_ids: list[str] | None = None) -> dict:
+    def send_text(self, text: str, open_ids: list[str] | None = None, *, before_submit=None) -> dict:
         if not text.strip():
             raise ValueError("Feishu message text cannot be empty")
         payload = self._payload(text, open_ids)
@@ -69,6 +90,17 @@ class FeishuClient:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if len(encoded) > 20 * 1024:
             raise ValueError("Feishu custom-bot message exceeds the 20 KB payload limit")
+        if before_submit is not None:
+            # Signatures and webhook URLs are credentials. Retain only a digest
+            # of the rendered message and an opaque fingerprint of the endpoint.
+            message = {k: payload[k] for k in ("msg_type", "content")}
+            before_submit({
+                "operation": "webhook",
+                "body_sha256": hashlib.sha256(json.dumps(message, ensure_ascii=False,
+                    sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                "endpoint_sha256": hashlib.sha256(self.webhook_url.encode()).hexdigest(),
+            })
+        active = _active_webhook_path.set(urlparse(self.webhook_url).path)
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 response = client.post(
@@ -77,26 +109,26 @@ class FeishuClient:
                     headers={"Content-Type": "application/json; charset=utf-8"},
                 )
                 response.raise_for_status()
-                data = response.json()
+                data = strict_response_json(response)
         except httpx.HTTPError as exc:
             # Do not include the URL: it contains the secret webhook token.
             raise FeishuWebhookError(f"Feishu webhook HTTP request failed: {type(exc).__name__}") from None
         except ValueError:
             raise FeishuWebhookError("Feishu webhook returned invalid JSON") from None
+        finally:
+            _active_webhook_path.reset(active)
         if not isinstance(data, dict):
             raise FeishuWebhookError("Feishu webhook returned an unexpected response")
-        if "code" in data:
-            code = data["code"]
-        elif "StatusCode" in data:
-            code = data["StatusCode"]
-        else:
+        # Some custom bots include both old and new status fields. Do not
+        # cherry-pick a success when either status is malformed or nonzero.
+        codes = [data[key] for key in ("code", "StatusCode") if key in data]
+        if not codes:
             raise FeishuWebhookError("Feishu webhook response did not contain a status code")
-        if isinstance(code, bool) or not isinstance(code, (int, str)) or (
-            isinstance(code, str) and not re.fullmatch(r"-?\d+", code)
-        ):
-            raise FeishuWebhookError("Feishu webhook returned an invalid status code")
-        if code not in (0, "0"):
-            raise FeishuWebhookError(
-                f"Feishu webhook rejected message: code={code}"
-            )
+        for code in codes:
+            if isinstance(code, bool) or not isinstance(code, (int, str)) or (
+                isinstance(code, str) and not re.fullmatch(r"-?\d+", code)
+            ):
+                raise FeishuWebhookError("Feishu webhook returned an invalid status code")
+            if code not in (0, "0"):
+                raise FeishuWebhookError(f"Feishu webhook rejected message: code={code}")
         return data

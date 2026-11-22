@@ -70,10 +70,10 @@ Use `@机器人 实时采集 5174`, then query the returned task number with
 `@机器人 采集任务 <任务号> 状态`. Group status queries accept only tasks with a
 collection receipt from that group; an MCP-created task has no such receipt.
 
-The outbox retries with a persistent delay, records provider message IDs, and
-prevents a stale worker from overwriting a newer result. API UUIDs are reused
-for retries. Delivery remains at-least-once across a crash after provider
-acceptance but before the database commit; exact-once delivery is not claimed.
+The outbox retries known pre-submit failures. An ambiguous submission stops
+automatic delivery and needs manual verification; it is not a receipt. Stop
+all sending processes together before upgrading or rolling back. See the
+[receipt and rollback runbook](FEISHU_DELIVERY_RECEIPTS.md).
 `process_outbox_batch(outbox_ids=[...])` can isolate a test delivery from other
 pending messages. Repairing a failed route does not resend successful recipients.
 

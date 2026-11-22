@@ -22,7 +22,7 @@ from jx_alert.analysis.comparison import metric_comparison
 from jx_alert.storage.collection_attempts import collection_issue_for_date
 from jx_alert.storage.coverage import SALES_DATA_LABELS, store_sales_data_status
 from jx_alert.storage.db import SessionLocal, engine, init_db
-from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.notifications.outbox import CLAIMABLE, NotificationOutbox
 from jx_alert.storage.models import (
     AdProduct,
     AnomalyEvent,
@@ -991,7 +991,7 @@ def get_notification_logs(store_id: str | None = None,
                           start_date: str | None = None,
                           end_date: str | None = None,
                           limit: int = 200, outbox_id: int | None = None) -> list[dict]:
-    """Inspect Feishu delivery attempts and persistent outbox state."""
+    """Inspect attempts: DELIVERY_UNKNOWN needs manual reconciliation, not replay."""
     start = date.fromisoformat(start_date) if start_date else None
     end = date.fromisoformat(end_date) if end_date else None
     if start and end and end < start:
@@ -1031,11 +1031,18 @@ def get_notification_logs(store_id: str | None = None,
             NotificationOutbox.idempotency_key.in_(keys)
         )).all() if keys else []
         outbox_by_key = {row.idempotency_key: row for row in outbox_rows}
+        # Only verification fields from the latest outbox submission. Do not
+        # export raw message bodies, webhook endpoints, headers or credentials.
+        intent_fields = ("operation", "started_at_utc", "attempt", "body_sha256",
+                         "destination_type", "reply_to_message_id", "provider_uuid", "aborted_before_post")
+        submissions = {job.idempotency_key: {key: intent[key] for key in intent_fields if key in intent}
+                       for job in outbox_rows if isinstance(intent := job.payload.get("delivery_intent"), dict)}
         return [{
             "outbox_id": outbox_by_key[row.dedupe_key].id if row.dedupe_key in outbox_by_key else None,
             "dedupe_key": row.dedupe_key,
             "channel": row.channel,
             "attempt_status": row.status,
+            "outbox_submission": submissions.get(row.dedupe_key),
             "message_id": row.message_id,
             "error": row.error,
             "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -1050,7 +1057,8 @@ def get_notification_logs(store_id: str | None = None,
             ),
             "next_attempt_at": (
                 outbox_by_key[row.dedupe_key].next_attempt_at.isoformat()
-                if row.dedupe_key in outbox_by_key and outbox_by_key[row.dedupe_key].next_attempt_at
+                if row.dedupe_key in outbox_by_key and outbox_by_key[row.dedupe_key].status in CLAIMABLE
+                and outbox_by_key[row.dedupe_key].next_attempt_at
                 else None
             ),
             "last_error": (

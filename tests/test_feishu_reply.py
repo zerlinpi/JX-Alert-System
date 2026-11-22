@@ -114,7 +114,8 @@ def pending(sessions, *, role="group_question", with_card=True, original="om_ori
 def test_worker_question_delivery_replies_in_thread_and_records_confirmed_message(warehouse, monkeypatch):
     calls = []
     class Client:
-        def reply_card(self, message_id, value, **kwargs):
+        def reply_card(self, message_id, value, before_submit, **kwargs):
+            before_submit({})
             calls.append((message_id, value, kwargs))
             return {"message_id": "om_confirmed_reply"}
         def send_card(self, *args, **kwargs):
@@ -149,25 +150,26 @@ def test_nonquestion_or_noncard_delivery_cannot_reply(warehouse, monkeypatch, ro
     result = worker.process_outbox_batch(outbox_ids=[row_id])
     assert result["sent"] == 0 and result["failed"] == 1
     with warehouse() as db:
-        assert db.get(NotificationOutbox, row_id).status == "RETRY"
+        assert db.get(NotificationOutbox, row_id).status == "PRE_SEND_RETRY"
         log = db.scalar(select(NotificationLog))
-        assert log.status == "RETRY" and log.message_id is None
+        assert log.status == "PRE_SEND_RETRY" and log.message_id is None
 
 
 def test_retry_retains_original_question_and_key_without_exposing_provider_error(warehouse, monkeypatch):
     calls = []
     class Client:
-        def reply_card(self, message_id, value, **kwargs):
+        def reply_card(self, message_id, value, before_submit, **kwargs):
             calls.append((message_id, kwargs))
             if len(calls) == 1:
-                raise FeishuAppError("private-provider-content")
+                raise FeishuAppError("private-token-service-content")
+            before_submit({})
             return {"message_id": "om_confirmed_reply"}
     monkeypatch.setattr(FeishuAppClient, "from_settings", lambda settings: Client())
     row_id = pending(warehouse)
     assert worker.process_outbox_batch(outbox_ids=[row_id])["failed"] == 1
     with warehouse() as db:
         row = db.get(NotificationOutbox, row_id)
-        assert row.status == "RETRY" and "private-provider-content" not in row.last_error
+        assert row.status == "PRE_SEND_RETRY" and "private-token-service-content" not in row.last_error
         row.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
         db.commit()
     assert worker.process_outbox_batch(outbox_ids=[row_id])["sent"] == 1

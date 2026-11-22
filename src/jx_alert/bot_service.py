@@ -1192,7 +1192,7 @@ def run_question_worker():
     from jx_alert.config import get_settings
     from jx_alert.storage.db import SessionLocal, engine
     from jx_alert.notifications.worker import process_outbox_batch
-    from jx_alert.notifications.outbox import NotificationOutbox
+    from jx_alert.notifications.outbox import CLAIMABLE, NotificationOutbox
     import logging
     logger = logging.getLogger("jx_alert.bot")
     while True:
@@ -1202,7 +1202,7 @@ def run_question_worker():
             with SessionLocal() as db:
                 pending = db.scalars(select(NotificationOutbox.id).where(
                     NotificationOutbox.idempotency_key.startswith("group-question:"),
-                    NotificationOutbox.status.in_(["PENDING", "RETRY"])).order_by(NotificationOutbox.id).limit(5)).all()
+                    NotificationOutbox.status.in_(CLAIMABLE)).order_by(NotificationOutbox.id).limit(5)).all()
                 ids = list(dict.fromkeys(ids + pending))
             for offset in range(0, len(ids), 5):
                 process_outbox_batch(batch_size=5, outbox_ids=ids[offset:offset + 5])

@@ -87,6 +87,7 @@ def test_recent_history_includes_held_and_daily_reservations_and_has_a_seven_day
 
 @pytest.mark.parametrize(('status', 'receipt', 'reserved'), [
     ('PENDING', None, True), ('RETRY', None, True), ('SENDING', None, True),
+    ('PRE_SEND_RETRY', None, True), ('PREPARING', None, True), ('SUBMITTING', None, True), ('DELIVERY_UNKNOWN', None, True),
     ('DEAD', None, False), ('SKIPPED', None, False), ('EXPIRED', None, False),
     ('DELIVERED', None, True),    # Acknowledged legacy per-campaign card.
     ('DELIVERED', 'included', True),

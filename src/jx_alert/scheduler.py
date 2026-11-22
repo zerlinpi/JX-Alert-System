@@ -82,7 +82,7 @@ def hourly_ad_monitor_job():
 def outbox_job():
     from jx_alert.notifications.worker import process_outbox_batch
     result = process_outbox_batch(batch_size=5)
-    if result.get("claimed"):
+    if result.get("claimed") or result.get("unknown"):
         logger.info("Feishu outbox batch: %s", result)
 
 

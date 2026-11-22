@@ -45,11 +45,13 @@ def delivery_runtime(tmp_path, monkeypatch):
     sent = []
 
     class Client:
-        def send_card(self, value, **kwargs):
+        def send_card(self, value, before_submit, **kwargs):
+            before_submit({})
             sent.append(("send", kwargs))
             return {"message_id": "om_sent"}
 
-        def reply_card(self, message_id, value, **kwargs):
+        def reply_card(self, message_id, value, before_submit, **kwargs):
+            before_submit({})
             sent.append(("reply", {"message_id": message_id, **kwargs}))
             return {"message_id": "om_reply"}
 

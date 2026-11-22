@@ -436,9 +436,9 @@ OAuth访问令牌默认15分钟；刷新令牌默认30日并轮换，正常刷�
 
 ### 12.3 通知重试与真实送达
 
-通知先入`notification_outbox`，然后`PENDING/RETRY → SENDING → DELIVERED`；失败最多8次，前七次失败后的等待为30/60/120/240/480/960/1920秒，退避算法上限3600秒，耗尽为`DEAD`。暂停为`SKIPPED`，过投递日日报为`EXPIRED`。发送结果按领取时间和次数做并发比较，旧worker不能覆盖新结果，旧结果另记`STALE_*`。
+通知先入 `notification_outbox`。领取后先进入 `PREPARING`；校验与获取 token 等发送前失败记 `PRE_SEND_RETRY`。默认最多 8 次，前七次的退避时间为 30/60/120/240/480/960/1920 秒，耗尽为 `DEAD`。暂停、过期仍分别为 `SKIPPED`、`EXPIRED`。
 
-SENDING租约超时会恢复；租约为`max(300, feishu_timeout×20×5+60)`秒，默认20秒超时对应2060秒。复用飞书消息UUID降低重复；飞书已接收但数据库提交前崩溃仍可能重投，因此不是绝对恰好一次。
+实际消息 POST 前，按领取时间与次数核实本次所有权，并提交 `SUBMITTING` 意图。只有可验证的回执和成功的本地事务才能记 `DELIVERED`。回执不明或 `SUBMITTING` 租约超时记 `DELIVERY_UNKNOWN`，不自动重发；明确的 token 过期拒绝记 `REJECTED`。发送前 `PREPARING` 租约超时可以恢复。租约为 `max(300, feishu_timeout×20×5+60)` 秒。见[核对与回滚](FEISHU_DELIVERY_RECEIPTS.md)。
 
 自建应用模式只有接口成功返回有效`message_id`，并持久记录`DELIVERED`，才可说消息已送达。配置正常、权限存在、入队或尝试发送均不算送达。
 

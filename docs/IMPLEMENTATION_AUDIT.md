@@ -3,7 +3,7 @@
 ## Implemented and CI-verified
 
 - Sales, SP/SB/SD campaign reports, SP/SD product-ad reports, campaign/product master data, coverage-aware evaluation and daily scheduling are integrated.
-- Feishu routing, persistent outbox, retry handling and delivery logs are implemented. Custom-bot delivery is at-least-once.
+- Feishu routing, persistent outbox, retry handling and delivery logs are implemented. For the new no-replay policy and its verification limits, see [receipt reconciliation](FEISHU_DELIVERY_RECEIPTS.md).
 - Store performance list/detail and performance notice collection use the three read-only Lingxing OpenAPI paths.
 - Performance scores, source indicators, provider standards, breaches, notice states and source freshness are persisted.
 - Missing, stale, future, failed or timezone-unconfigured performance data is not classified as healthy.

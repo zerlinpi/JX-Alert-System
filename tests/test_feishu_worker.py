@@ -29,7 +29,8 @@ def test_reenabled_notifications_skip_old_queued_pages_and_send_other_store(monk
         def __init__(self, **kwargs):
             pass
 
-        def send_text(self, message, open_ids=None):
+        def send_text(self, message, open_ids=None, *, before_submit):
+            before_submit({})
             sent.append(message)
             return {"code": 0}
 
@@ -52,7 +53,7 @@ def test_reenabled_notifications_skip_old_queued_pages_and_send_other_store(monk
         assert db.scalar(select(NotificationLog.status).where(NotificationLog.dedupe_key == "old-page")) == "SKIPPED"
 
 
-def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_path):
+def test_worker_recovers_preparing_row_without_claim_timestamp(monkeypatch, tmp_path):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, expire_on_commit=False)
@@ -77,7 +78,7 @@ def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_pa
                 "text": "test alert", "open_ids": [],
                 "store_id": "store-1", "entity_id": "B000000001",
             },
-            status="SENDING",
+            status="PREPARING",
             attempts=1,
             next_attempt_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10),
             claimed_at=None,
@@ -90,7 +91,8 @@ def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_pa
         def __init__(self, **kwargs):
             pass
 
-        def send_text(self, message, open_ids=None):
+        def send_text(self, message, open_ids=None, *, before_submit):
+            before_submit({})
             sent.append((message, open_ids))
             return {"code": 0}
 
@@ -143,7 +145,8 @@ def test_stale_worker_never_calls_provider_after_another_worker_recovers_claim(
         def __init__(self, **_kwargs):
             pass
 
-        def send_text(self, message, **_kwargs):
+        def send_text(self, message, before_submit, **_kwargs):
+            before_submit({})
             submissions.append(message)
             return {"message_id": "om_test"}
 
@@ -167,7 +170,7 @@ def test_stale_worker_never_calls_provider_after_another_worker_recovers_claim(
             recovered.append(None)
             with sessions.begin() as db:
                 item = db.get(NotificationOutbox, row_id)
-                assert item.status == "SENDING" and item.attempts == 1
+                assert item.status == "PREPARING" and item.attempts == 1
                 item.claimed_at -= timedelta(hours=2)
             recovered[0] = worker.process_outbox_batch(outbox_ids=[row_id])
         return None
@@ -236,7 +239,8 @@ def test_worker_sends_to_store_specific_group_and_mentions_group_admin(
         def __init__(self, **kwargs):
             clients.append(kwargs)
 
-        def send_text(self, message, open_ids=None):
+        def send_text(self, message, open_ids=None, *, before_submit):
+            before_submit({})
             sent.append((message, open_ids))
             return {"code": 0}
 
