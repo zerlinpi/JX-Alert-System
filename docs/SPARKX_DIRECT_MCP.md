@@ -66,6 +66,7 @@ python -m jx_alert.sparkx_feishu < /private/approved-query.json
 - 有面向用户的原生报告文本时，**本地预览**以原文为主体，不另做摘要或翻译。纯文字保留换行；支持简单且安全的标题/粗体/列表等 Markdown。含链接、@、HTML、代码等内容一律按字面显示，不执行、不激活；图片、附件、仅面向助手的内容和不识别的结果不转发。SparkX 的周/月报 Skill 本身不是接口成品报告。
 - **允许发群的只有账户、币种、分页等都可核验的结构化结果**。官方协议未把单独返回的自由文本绑定到这些字段，因此即使同次响应既有文本又有数据，也绝不把这段文本发到群；本地预览的 `eligible_result=false` 表示原文不可发送，另列 `delivery_preview` 时才是可入队的精确卡片。只有原文而没有已核实数据时，不入队。
 - 数据表识别[官方查询返回](https://github.com/SparkXAI/SparkXAI-MCP/blob/main/skills/sparkx-query-ads-performance/SKILL.md#response-structure)（包括仅通过 MCP 文本返回的 JSON）里的 `data.rows`，使用[飞书原生纯文本表格](https://open.feishu.cn/document/feishu-cards/card-json-v2-components/content-components/table)。保留行序、字段原名、数值、ID、原始比率与币种；`0`、`null`、缺项分开显示。不推算指标，不从领星补数。请求日期、profile、第几页、行数、是否还有下一页与供应端提示单独显示。
+- [SparkX 小时数据](https://github.com/SparkXAI/SparkXAI-MCP/blob/b72b914b891ad9ed357dd0a36ab0da53152aae85/skills/sparkx-query-ads-performance/SKILL.md#hourly--ams-data)在 `campaign` 的 `hourly` 及默认小时源的 `keywordPlacement` 中不提供 AI 实绩。卡片在相应字段实际返回时标注 `AISpend` / `AISales` 的数字 `0`、`AIACOS` / `AIROAS` 的 `null` 是占位；普通 `Spend` 和供应端提示照常保留。结构化结果中的整数 `0` 可核验；只有单独返回 JSON 文本时，才用精确十进制解析核验小数零。SDK 可能把结构化的极小非零值解码成小数零，所以即使同页文本也显示为零，仍不能证实结构化原值。出现无法核实的小数零或格式冲突时，表格只在本地预览，不入队；实际 AI 表现须另查日粒度，本命令不会替换或追加查询。
 - `asin` 查询的 [Vendor 维度规则](https://github.com/SparkXAI/SparkXAI-MCP/blob/main/skills/sparkx-query-ads-performance/references/field-reference.md#vendor-dimension-auto-locking-distributorview_-sellingprogram_)与 Seller 不同。仅在已核实单一账户和币种的成功返回中接受 `meta.appliedDefaults`，且只接受未显式选取/筛选维度的实际默认值：`distributorView=MANUFACTURING`、`sellingProgram=RETAIL`。飞书卡片标注 SparkX 默认、请求筛选或按值分组；不把各口径相加。涉及 `SOURCING` 时，若查询或页面涉及 Ordered 指标，原样显示数值并标明该口径没有实际 Ordered 数据、0 可能是占位；该口径内非零或非数值的 Ordered 返回与文档冲突，不入队。显式筛选仅识别裸字段 `distributorView_` / `sellingProgram_` 的顶层单值等值条件；嵌套、别名、复合或多值条件不自动解释。当两维度均有显式约束、没有默认元数据时，卡片须在每行确认 `storeType_` 为 Vendor，否则只供本地预览；可以在 `select` 加上该字段。发现未知默认键值或返回行与选取、筛选或默认冲突时不发群。请求 Vendor 专用指标即使未返回，也不能在口径缺证时投递。直接 MCP 仍原样中转，不加工返回值。
 - `campaignAudience` 支持 `search`（受众名模糊匹配，JX 限 1–200 个可打印字符）且可**省略** `metrics`；只有这个实体适用这两个例外。不补默认指标或改写查询。省略会使上游默认返回全部指标及期间对比列；飞书表格请用裸字段 `select`（如 `["audienceName", "Spend", "prevSpend"]`）明确保留需要的列。供应端忽略无效的请求列不算错误，但实际返回未请求列或大小写不一致时，飞书不入队；超限也不入队、不自动截断。此实体不接收 `groupBy` 或 `queryType`，且最多一个 `orderBy` 规则。该实体的[专用分页](https://github.com/SparkXAI/SparkXAI-MCP/blob/main/skills/sparkx-query-ads-performance/SKILL.md#factentity-campaignaudience--audience-performance)默认每页 50 行，最多 200 行。须将 `meta.total` 与页码、页大小、返回行数及下一页标记核对一致；总行数不等于本页展示行数。
 - 每条命令只处理所请求的一页；`hasNextPage=true` 时明确标出，由操作员另选下一页，不拼成全量报表。不返回数据并不证明业务为零。空行集、裸原文或未明确返回实际账户、币种、行数、分页状态等凭据，只能预览。服务端错误、数据矛盾、新的不识别字段/嵌套单元格不生成投递结果。
@@ -76,6 +77,8 @@ python -m jx_alert.sparkx_feishu < /private/approved-query.json
 从领星采集范围移除店铺，不会撤销独立的 SparkX 手动投递试点；要停发，请删除对应的 SparkX 账户绑定、关闭该店铺的通知，或关闭 SparkX 飞书投递开关。
 
 本步骤仅用于**已单独批准的群和账户**。不要把飞书凭据、队列数据库或路由文件挂进原有只读 MCP 容器。使用受控发布进程和同一受控 outbox 的匹配版本 worker；先以一条小查询核对预览。不要与旧 worker 混跑：旧 worker 不识别 SparkX 专用的投递前复核。不要因为试点而关闭现有生产的静默策略。
+
+小时 AI 护栏只核验新渲染的卡片，不改写已存在的导出。切换版本前应停止试点发布与派发、核对既有待发及未决记录；有尚未核实的旧卡片时保持停发，不自动重新入队或批量重放。
 
 1. 在用于试点的管理员私有路由配置中建立显式绑定。运营台核验测试群成员后，`groups[日报群别名].verified_member_open_ids` 必须有记录、`stores[JX SID].chat_id` 必须显式指向这个日报群别名。以下仅示意新增的**顶级**字段（不要用示例替换现有路由文件）。经管理员核实目标群实际 ID、店铺和币种，填入不可复用的 32 位小写十六进制绑定版本；撤销后重新授权必须换新版本。
 

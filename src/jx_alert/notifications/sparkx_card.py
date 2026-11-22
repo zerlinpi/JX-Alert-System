@@ -1,7 +1,7 @@
 """Render one get_ads_perf result page, not a new report. No IO or model calls."""
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import json
 import re
 
@@ -65,7 +65,7 @@ def _parse(raw):
     try:
         return json.loads(raw, parse_float=Decimal, object_pairs_hook=_unique,
                           parse_constant=lambda _: _reject())
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError, InvalidOperation):
         _reject()
 
 
@@ -275,6 +275,44 @@ def _vendor_basis(query, rows, meta):
     return notes, True
 
 
+_HOURLY_AI_PLACEHOLDERS = {"AISpend": 0, "AISales": 0, "AIACOS": None, "AIROAS": None}
+
+
+def _hourly_ai_basis(query, rows, *, has_structured):
+    """Qualify only the exact SparkX AI columns on the two documented hourly paths."""
+    fact = query["factEntity"]
+    if not (fact == "campaign" and query.get("timeGranularity", "").lower() == "hourly"
+            or fact == "keywordPlacement" and "timeGranularity" not in query):
+        return [], True
+    present, conflicts, unproven_zeros = [], [], []
+    for name, placeholder in _HOURLY_AI_PLACEHOLDERS.items():
+        cells = [row[name] for row in rows if name in row]
+        if not cells:
+            continue
+        present.append(name)
+        if any(cell is not None if placeholder is None else type(cell) not in {int, Decimal} or cell != 0
+               for cell in cells):
+            conflicts.append(name)
+        elif has_structured and any(type(cell) is Decimal for cell in cells):
+            # The SDK already decoded structured decimal tokens as binary64.
+            # Even a matching JSON TextContent mirror only agrees with the
+            # rounded result. Structured integers and text-only decimals are exact.
+            unproven_zeros.append(name)
+    holds = []
+    if conflicts:
+        holds.append(_div("小时 AI 字段 " + "、".join(conflicts) + " 与 SparkX 占位格式不符，仅供本地预览；"
+                          "请核对供应端，不作为 AI 实绩。", "notation"))
+    if unproven_zeros:
+        holds.append(_div("小时 AI 字段 " + "、".join(unproven_zeros) + " 的结构化小数零无法核实解码前的值，"
+                          "仅供本地预览；即使 JSON 文本一致，也无法确认是 SparkX 占位。", "notation"))
+    if holds:
+        return holds, False
+    if present:
+        return [_div("小时数据不提供 AI 实绩；" + "、".join(present) + " 的 0 / null 为 SparkX 占位。"
+                     "AI 表现请查日粒度。", "notation")], True
+    return [], True
+
+
 def render_page(result: CallToolResult, query: dict) -> PagePreview:
     """The caller validated the exact request before calling get_ads_perf."""
     envelope, prose = _sources(result)
@@ -287,6 +325,7 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
     audience_selection = set(query.get("select", [])) if audience else set()
     status = f"请求第 {page} 页 · 供应端未确认分页状态，仅供预览"
     eligible, currency, notes, rows = False, None, [], []
+    hourly_ai_verified = True
     if envelope is not None:
         if "errorType" in envelope or envelope.get("isError", False) is not False:
             _reject("SparkX 查询失败，未生成飞书报告")
@@ -355,6 +394,9 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
                 _reject("SparkX Vendor ASIN 默认维度缺少账户或币种核验")
             vendor_notes, vendor_verified = _vendor_basis(query, rows, meta)
             notes.extend(vendor_notes)
+        hourly_notes, hourly_ai_verified = _hourly_ai_basis(
+            query, rows, has_structured=result.structuredContent is not None)
+        notes.extend(hourly_notes)
         if "hint" in meta:
             if not isinstance(meta["hint"], str):
                 _reject()
@@ -368,7 +410,8 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
         status = f"仅第 {page} 页，返回 {len(rows)} 行 · {progress} · 币种：{currency or '未返回'}"
         if total is not None:
             status += f" · 供应端总行数：{total}"
-        eligible = bool(rows and vendor_verified and (not audience or total is not None) and envelope.get("toolName") == "get_ads_perf"
+        eligible = bool(rows and vendor_verified and hourly_ai_verified and (not audience or total is not None)
+                        and envelope.get("toolName") == "get_ads_perf"
                         and envelope.get("isError") is False and ids and currency and "rowCount" in data
                         and {"page", "pageSize", "hasNextPage"} <= meta.keys() and meta.get("hint", "").strip())
     if not prose and envelope is None:
@@ -388,6 +431,8 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
     # The vendor scopes the structured envelope, not neighbouring prose. A mixed result
     # may preview native text locally, but only the independently verified table can travel.
     scoped = card([_table(rows)]) if rows else None
-    preview = (card([_text_block(text) for text in prose]) if prose else
+    # Keep the suspect table, rather than its sibling prose, available locally
+    # for review of the contradictory hourly placeholders.
+    preview = (card([_text_block(text) for text in prose]) if prose and hourly_ai_verified else
                scoped or card([_div("本页没有返回记录；不表示业务值为零。")]))
     return PagePreview(card=preview, delivery_card=scoped if eligible else None, currency=currency)

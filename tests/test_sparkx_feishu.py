@@ -6,7 +6,7 @@ import json
 
 import httpx
 import pytest
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, JSONRPCMessage, TextContent
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -235,6 +235,220 @@ def test_enqueue_one_fixed_no_mention_card_and_verify_mock_delivery_receipt(pilo
         assert db.scalar(select(NotificationLog.message_id)) == "om_fixture"
     assert _prepare(pilot)["status"] == "DELIVERED"
     assert worker.process_outbox_batch()["sent"] == 0
+
+
+_HOURLY_QUERIES = [
+    {"factEntity": "campaign", "timeGranularity": "HoUrLy"},
+    {"factEntity": "keywordPlacement"},
+]
+_AI_NUMBERS = {"Spend": 18.125, "AISpend": 0, "AISales": 0, "AIACOS": None, "AIROAS": None}
+_AI_QUERY = {**QUERY, "metrics": list(_AI_NUMBERS)}
+
+
+def _ai_result(*rows, prose=None):
+    return result({**ENVELOPE, "data": {"rows": list(rows), "rowCount": len(rows)}},
+                  *([prose] if prose is not None else []))
+
+
+def _wire_ai_result(literal, *, include_structured=True, text_literal=None):
+    """Use the SDK's JSON-RPC decoder, not hand-built Python floats, for wire numbers."""
+    source = {**ENVELOPE, "data": {"rows": [{**_AI_NUMBERS, "AISpend": "NUMBER"}], "rowCount": 1}}
+    envelope = json.dumps(source).replace('"NUMBER"', literal)
+    blocks = [] if text_literal is None else [
+        {"type": "text", "text": json.dumps(source).replace('"NUMBER"', text_literal)}]
+    payload = '{"content":' + json.dumps(blocks)
+    if include_structured:
+        payload += ',"structuredContent":' + envelope
+    message = JSONRPCMessage.model_validate_json('{"jsonrpc":"2.0","id":4,"result":' + payload + '}}')
+    return CallToolResult.model_validate(message.root.result)
+
+
+def _table_and_notes(card):
+    elements = card["body"]["elements"]
+    table = next(e for e in elements if e["tag"] == "table")
+    notes = [e["text"]["content"] for e in elements[1:] if e["tag"] == "div"]
+    return table, notes
+
+
+@pytest.mark.parametrize("mode", _HOURLY_QUERIES)
+def test_hourly_ai_placeholders_are_labelled_in_exact_outgoing_page(pilot, mode):
+    _, sessions, _, source, posts, calls = pilot
+    query = {**_AI_QUERY, **mode}
+    source["page"] = _ai_result(_AI_NUMBERS)
+    before = source["page"].model_dump_json()
+    preview = _prepare(pilot, query, enqueue=False)
+    assert preview["eligible_result"] is True
+    table, notes = _table_and_notes(preview["card"])
+    assert [column["display_name"] for column in table["columns"]] == list(_AI_NUMBERS)
+    assert table["rows"] == [dict(c0="18.125", c1="0", c2="0", c3="null", c4="null")]
+    note, = [value for value in notes if "小时数据不提供 AI 实绩" in value]
+    assert "AISpend、AISales、AIACOS、AIROAS" in note and "SparkX 占位" in note and "日粒度" in note
+    assert ENVELOPE["meta"]["hint"] in notes
+    queued = _prepare(pilot, query)
+    assert calls == [("get_user_authorized_context", {}), ("get_ads_perf", query)] * 2
+    assert source["page"].model_dump_json() == before and not posts
+    with sessions() as db:
+        assert db.get(NotificationOutbox, queued["outbox_id"]).payload["card"] == preview["card"]
+    assert worker.process_outbox_batch(outbox_ids=[queued["outbox_id"]])["sent"] == 1
+    assert json.loads(posts[0]["content"]) == preview["card"]
+
+
+@pytest.mark.parametrize("mode", _HOURLY_QUERIES)
+@pytest.mark.parametrize("field,bad", [
+    ("AISpend", 1.75), ("AISpend", False), ("AISales", "0"),
+    ("AISales", None), ("AIACOS", 0), ("AIROAS", "null"),
+])
+def test_hourly_ai_contract_conflicts_stay_in_scoped_local_preview(pilot, mode, field, bad):
+    _, sessions, _, source, posts, _ = pilot
+    query = {**_AI_QUERY, **mode}
+    source["page"] = _ai_result(_AI_NUMBERS, {**_AI_NUMBERS, field: bad},
+                                prose="本地原文不能作为结构化数据的证据。")
+    source["at_auth"] = lambda: pytest.fail("Hourly AI contradiction must not authenticate for sending")
+    preview = _prepare(pilot, query, enqueue=False)
+    assert preview["status"] == "PREVIEW" and preview["eligible_result"] is False
+    assert "delivery_preview" not in preview
+    table, notes = _table_and_notes(preview["card"])
+    assert len(table["rows"]) == 2 and table["rows"][1]["c0"] == "18.125"
+    field_column, = [c["name"] for c in table["columns"] if c["display_name"] == field]
+    display = "null" if bad is None else str(bad).lower()
+    assert table["rows"][1][field_column] == display
+    assert any("占位格式不符" in n and "仅供本地预览" in n and field in n for n in notes)
+    assert not any("为 SparkX 占位" in n for n in notes)
+    assert ENVELOPE["meta"]["hint"] in notes
+    with pytest.raises(SparkXDirectError, match="仅可预览；未入队"):
+        _prepare(pilot, query)
+    with sessions() as db:
+        assert db.scalars(select(NotificationOutbox)).all() == []
+        assert db.scalars(select(NotificationLog)).all() == []
+    assert worker.process_outbox_batch()["claimed"] == 0 and not posts
+
+
+def test_hourly_ai_note_only_mentions_exact_present_columns_and_accepts_numeric_zero():
+    query = {**_AI_QUERY, "timeGranularity": "hourly"}
+    raw = _ai_result({"Spend": 18.125, "aispend": 42, "AISpend_": 9})
+    _, notes = _table_and_notes(render_page(raw, query).card)
+    assert not any("小时数据不提供 AI 实绩" in note for note in notes)
+    raw = _ai_result({"Spend": 18.125, "AISales": 0}, {"Spend": 2})
+    page = render_page(raw, query)
+    table, notes = _table_and_notes(page.card)
+    assert page.eligible and table["rows"] == [dict(c0="18.125", c1="0"), dict(c0="2", c1="（未返回）")]
+    note, = [value for value in notes if "小时数据不提供 AI 实绩" in value]
+    assert "AISales" in note and not any(key in note for key in ("AISpend", "AIACOS", "AIROAS"))
+
+
+@pytest.mark.parametrize("mode", _HOURLY_QUERIES)
+@pytest.mark.parametrize("wire", ["1e-400", "-1e-400", "0.0"])
+def test_structured_hourly_ai_float_zero_without_wire_proof_is_local_only(pilot, mode, wire):
+    _, sessions, _, source, posts, _ = pilot
+    query = {**_AI_QUERY, **mode}
+    source["page"] = _wire_ai_result(wire)
+    observed = source["page"].structuredContent["data"]["rows"][0]["AISpend"]
+    assert type(observed) is float and observed == 0.0
+    source["at_auth"] = lambda: pytest.fail("Unproved zero must not authorize a Feishu POST")
+
+    preview = _prepare(pilot, query, enqueue=False)
+    assert preview["status"] == "PREVIEW" and preview["eligible_result"] is False
+    assert "delivery_preview" not in preview
+    table, notes = _table_and_notes(preview["card"])
+    assert table["rows"] == [dict(c0="18.125", c1=str(observed), c2="0", c3="null", c4="null")]
+    assert any("AISpend" in note and "解码前" in note for note in notes)
+    assert ENVELOPE["meta"]["hint"] in notes
+    with pytest.raises(SparkXDirectError, match="仅可预览；未入队"):
+        _prepare(pilot, query)
+    assert worker.process_outbox_batch()["claimed"] == 0 and not posts
+    with sessions() as db:
+        assert not db.scalars(select(NotificationOutbox)).all()
+        assert not db.scalars(select(NotificationLog)).all()
+
+
+@pytest.mark.parametrize("mode", _HOURLY_QUERIES)
+@pytest.mark.parametrize("wire,include_structured,text,display", [
+    ("0", True, None, "0"),
+    ("0", True, "0", "0"),
+    ("0.0", False, "0.00", "0.00"),
+])
+def test_hourly_ai_well_proved_zero_can_go_to_feishu(pilot, mode, wire, include_structured, text, display):
+    _, _, _, source, posts, _ = pilot
+    query = {**_AI_QUERY, **mode}
+    source["page"] = _wire_ai_result(wire, include_structured=include_structured, text_literal=text)
+    item = _prepare(pilot, query)
+    assert item["status"] == "PENDING" and not posts
+    assert worker.process_outbox_batch(outbox_ids=[item["outbox_id"]])["sent"] == 1
+    table, notes = _table_and_notes(json.loads(posts[0]["content"]))
+    assert table["rows"][0]["c0"] == "18.125" and table["rows"][0]["c1"] == display
+    assert any("为 SparkX 占位" in note for note in notes)
+
+
+@pytest.mark.parametrize("mode", _HOURLY_QUERIES)
+@pytest.mark.parametrize("wire", ["1e-400", "-1e-400", "0.0"])
+def test_hourly_ai_structured_float_zero_cannot_borrow_proof_from_matching_text(pilot, mode, wire):
+    _, sessions, _, source, posts, _ = pilot
+    query = {**_AI_QUERY, **mode}
+    mirror = "-0.000" if wire.startswith("-") else "0.000"
+    source["page"] = _wire_ai_result(wire, text_literal=mirror)
+    observed = source["page"].structuredContent["data"]["rows"][0]["AISpend"]
+    assert type(observed) is float and observed == 0.0
+    source["at_auth"] = lambda: pytest.fail("An ambiguous structured mirror cannot authorize a Feishu POST")
+    preview = _prepare(pilot, query, enqueue=False)
+    assert preview["status"] == "PREVIEW" and preview["eligible_result"] is False
+    assert "delivery_preview" not in preview
+    table, notes = _table_and_notes(preview["card"])
+    assert table["rows"][0]["c0"] == "18.125" and table["rows"][0]["c1"] == mirror
+    assert any("AISpend" in note and "解码前" in note for note in notes)
+    assert ENVELOPE["meta"]["hint"] in notes
+    with pytest.raises(SparkXDirectError, match="仅可预览；未入队"):
+        _prepare(pilot, query)
+    assert worker.process_outbox_batch()["claimed"] == 0 and not posts
+    with sessions() as db:
+        assert not db.scalars(select(NotificationOutbox)).all()
+        assert not db.scalars(select(NotificationLog)).all()
+
+
+@pytest.mark.parametrize("wire", ["1e-400", "-1e-400"])
+def test_hourly_ai_exact_nonzero_text_contradicts_placeholder_and_rounded_mirror(wire):
+    query = {**_AI_QUERY, "timeGranularity": "hourly"}
+    page = render_page(_wire_ai_result(wire, include_structured=False, text_literal=wire), query)
+    assert page.delivery_card is None
+    table, notes = _table_and_notes(page.card)
+    assert table["rows"][0]["c1"] == wire.upper()
+    assert any("占位格式不符" in note for note in notes)
+    with pytest.raises(SparkXDirectError, match="两种结果不一致"):
+        render_page(_wire_ai_result(wire, text_literal=wire), query)
+
+
+@pytest.mark.parametrize("literal", ["1e99999999999999999999999999", "-1e-99999999999999999999999999"])
+def test_hourly_ai_unrepresentable_json_exponent_fails_with_safe_error(pilot, literal):
+    _, sessions, _, source, posts, _ = pilot
+    query = {**_AI_QUERY, "timeGranularity": "hourly"}
+    source["page"] = _wire_ai_result("0", include_structured=False, text_literal=literal)
+    for enqueue in (False, True):
+        with pytest.raises(SparkXDirectError, match="SparkX 结果格式不支持"):
+            _prepare(pilot, query, enqueue=enqueue)
+    with sessions() as db:
+        assert not db.scalars(select(NotificationOutbox)).all()
+    assert not posts
+
+
+@pytest.mark.parametrize("daily", [{}, {"timeGranularity": "DAILY"}])
+def test_daily_ai_values_are_not_checked_as_hourly_placeholders(pilot, daily):
+    _, _, _, source, posts, _ = pilot
+    query = {**_AI_QUERY, **daily}
+    source["page"] = _ai_result({**_AI_NUMBERS, "AISpend": 3, "AISales": 9, "AIACOS": 33.33, "AIROAS": 3})
+    item = _prepare(pilot, query)
+    assert worker.process_outbox_batch(outbox_ids=[item["outbox_id"]])["sent"] == 1
+    table, notes = _table_and_notes(json.loads(posts[0]["content"]))
+    assert table["rows"] == [dict(c0="18.125", c1="3", c2="9", c3="33.33", c4="3")]
+    assert ENVELOPE["meta"]["hint"] in notes
+    assert not any("小时" in note or "占位" in note for note in notes)
+
+
+def test_structured_daily_decimal_zero_keeps_prior_rendering_without_hourly_proof():
+    query = {**_AI_QUERY, "timeGranularity": "DaIlY"}
+    page = render_page(_wire_ai_result("0.0"), query)
+    assert page.eligible
+    table, notes = _table_and_notes(page.card)
+    assert table["rows"][0]["c0"] == "18.125" and table["rows"][0]["c1"] == "0.0"
+    assert not any("小时" in note or "占位" in note for note in notes)
 
 
 @pytest.mark.parametrize("change", [
