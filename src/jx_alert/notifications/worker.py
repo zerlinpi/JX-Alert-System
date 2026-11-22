@@ -313,6 +313,14 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                             payload['card'] = value
                     else:
                         skip_reason = _proactive_delivery_reason(db, settings, dedupe_key, payload, now)
+            if skip_reason is None and payload.get('morning_message_kind') == 'owner_daily':
+                from jx_alert.notifications.owner_daily import owner_daily_delivery_card
+
+                value = owner_daily_delivery_card(settings, dedupe_key, payload)
+                if value is None:
+                    skip_reason = '负责人日报已停用或通知群有变更，旧消息保留记录'
+                else:
+                    payload['card'] = value
             if skip_reason is None and (payload.get('delivery') or {}).get('role') == 'ad_alert_subscriber':
                 from jx_alert.notifications.recipient_policy import subscriber_delivery_blocked
                 if subscriber_delivery_blocked(settings, payload):

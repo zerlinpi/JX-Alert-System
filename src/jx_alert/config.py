@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     hourly_ad_monitor_cron: str = "0 * * * *"
     feishu_daily_report_start_date: str = ""
     feishu_daily_report_group_digest: bool = False
+    feishu_owner_daily_report_enabled: bool = False
     # Requested daily health/violation brief plus material SP exceptions only.
     feishu_morning_focus_enabled: bool = False
     feishu_quiet_delivery_enabled: bool = False

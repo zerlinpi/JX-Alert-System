@@ -23,9 +23,11 @@ FINANCE = "api_business_finance"
 SOURCE = "lingxing_api_business"
 FIELDS = {
     PRODUCT: {"volume": "volume", "netAmount": "net_amount", "adSpend": "spend",
-              "refundCount": "return_count", "orders": "order_items"},
+              "refundCount": "return_count", "returnGoodsCount": "return_goods_count",
+              "orders": "order_items"},
     FINANCE: {"volume": "totalSalesQuantity", "platformIncome": "platformIncome",
-              "grossProfit": "grossProfit", "grossRate": "grossRate", "refundsRate": "refundsRate"},
+              "grossProfit": "grossProfit", "grossRate": "grossRate", "refundsRate": "refundsRate",
+              "totalSalesRefunds": "totalSalesRefunds"},
 }
 
 
@@ -33,7 +35,7 @@ def _number(value, key):
     if isinstance(value, bool):
         raise LingxingError("Invalid business metric")
     result = float(value)
-    if not math.isfinite(result) or (key in {"volume", "orders", "refundCount"}
+    if not math.isfinite(result) or (key in {"volume", "orders", "refundCount", "returnGoodsCount"}
             and (result < 0 or not result.is_integer())):
         raise LingxingError("Invalid business metric")
     return result

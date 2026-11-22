@@ -297,3 +297,64 @@ def test_metadata_record_without_metric_fields_cannot_be_reported_as_available(w
     assert context['availability']['product'] == 'FIELDS_UNAVAILABLE'
     assert context['product'] == {}
     assert context['availability']['settlement'] == 'AVAILABLE'
+
+
+class ReturnedGoodsClient(PagedProductClient):
+    def product_performance_daily(self, sid, day, *, offset, length):
+        response = super().product_performance_daily(sid, day, offset=offset, length=length)
+        row = response["data"]["list"][0]
+        row["return_goods_count"] = [0, 2, 5][offset]
+        # The vendor rate is a separate observation and is not additive.
+        row["return_goods_rate"] = [0, 0.2, 0.5][offset]
+        return response
+
+    def profit_report_daily(self, sid, day, **kwargs):
+        response = super().profit_report_daily(sid, day, **kwargs)
+        row = response["data"]["records"][0]
+        row["totalSalesRefunds"] = -27.50 if day == DAY else 0
+        row["totalFeeRefunds"] = 11
+        return response
+
+
+def test_physical_return_units_and_signed_settlement_refunds_are_independent(warehouse):
+    db, store, settings = warehouse
+    assert collect(db, settings, ReturnedGoodsClient())["status"] == "COMPLETE"
+    context = api.api_business_context(db, store.sid, DAY)
+    product, settlement = context["product"]["metrics"], context["settlement"]["metrics"]
+    assert product["volume"] == 30 and product["returnGoodsCount"] == 7
+    assert product["refundCount"] == 3
+    assert "returnGoodsRate" not in product and "totalSalesRefunds" not in product
+    assert settlement["totalSalesRefunds"] == -27.50 and "totalFeeRefunds" not in settlement
+    assert "returnGoodsCount" not in settlement
+    prior = api.api_business_context(db, store.sid, "2026-11-15")
+    assert prior["settlement"]["metrics"]["totalSalesRefunds"] == 0
+
+
+def test_missing_physical_count_in_one_row_is_not_treated_as_zero(warehouse):
+    class MissingCount(ReturnedGoodsClient):
+        def product_performance_daily(self, sid, day, *, offset, length):
+            response = super().product_performance_daily(sid, day, offset=offset, length=length)
+            if offset == 1:
+                del response["data"]["list"][0]["return_goods_count"]
+            return response
+
+    db, store, settings = warehouse
+    assert collect(db, settings, MissingCount())["status"] == "COMPLETE"
+    metrics = api.api_business_context(db, store.sid, DAY)["product"]["metrics"]
+    assert metrics["volume"] == 30 and "returnGoodsCount" not in metrics
+
+
+@pytest.mark.parametrize("invalid", [True, -1, 1.5, "Infinity"])
+def test_nonintegral_or_negative_physical_counts_cannot_form_complete_facts(warehouse, invalid):
+    class InvalidCount(ReturnedGoodsClient):
+        def product_performance_daily(self, sid, day, *, offset, length):
+            response = super().product_performance_daily(sid, day, offset=offset, length=length)
+            response["data"]["list"][0]["return_goods_count"] = invalid
+            return response
+
+    db, store, settings = warehouse
+    assert collect(db, settings, InvalidCount())["status"] == "PARTIAL_FAILED"
+    context = api.api_business_context(db, store.sid, DAY)
+    assert context["availability"]["product"] == "FAILED"
+    assert context["product"] == {}
+    assert context["settlement"]["metrics"]["totalSalesRefunds"] == -27.50
