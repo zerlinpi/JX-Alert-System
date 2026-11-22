@@ -193,9 +193,13 @@ def morning_health_row(db, settings, store, *, now=None, proactive=False):
         if not observed:
             return None
     summary = ' · '.join(observed) or '评级未提供'
-    if health['status'] != 'HEALTHY':
+    if health['status'] != 'HEALTHY' or health['freshness_status'] != 'FRESH':
         summary += '（观测）'
     attention = [notice] if notice else []
+    if proactive and health['freshness_status'] != 'FRESH':
+        # A recent pull is not a current provider timestamp. Keep the numeric
+        # observation, but do not present it as a verified action/risk.
+        return store.name, summary, '\n'.join([*attention, '绩效更新时间未核实；不判定当前异常'])
     for indicator in health['indicators']:
         if indicator['status'] in {'BREACHED', 'AT_THRESHOLD'}:
             boundary = '，达到边界' if indicator['status'] == 'AT_THRESHOLD' else ''
@@ -217,7 +221,7 @@ def _health_chunks(db, settings, stores, send_day, now, *, proactive=False):
             notes = []
             if not proactive and any('（观测）' in row[1] for row in batch):
                 notes.append('观测值未确认当前健康；违规仅列已归档待处理项。')
-            value = card(f'店铺绩效与违规快报 · {send_day}', subtitle='账户绩效与需处理事项',
+            value = card(f'店铺绩效与违规快报 · {send_day}', subtitle='区分已采集的观测、已归档通知和待核实问题',
                 sections=[('店铺绩效', ['店铺', '绩效观测', '待办与风险'],
                     batch)], notes=notes)
             if card_fits(value):
@@ -369,17 +373,33 @@ def enqueue_morning_digest(db, settings, stores, dates, warnings, *, send_day, d
         return {'queued': len(existing), 'skipped': False, 'outbox_ids': [r.id for r in existing]}
     prefix = 'scheduled-daily:morning:' + hashlib.sha256(f'{send_day}:{chat_id}'.encode()).hexdigest() + ':'
     actual, warnings = select_morning_dates(db, stores, dates, warnings, history_allowed)
-    incident_pages, business_pages = [], []
+    incident_pages, business_pages, owner_pages = [], [], []
+    if getattr(settings, 'feishu_owner_daily_report_enabled', False):
+        from jx_alert.notifications.owner_daily import owner_daily_rows
+        from jx_alert.notifications.owner_daily_card import build_owner_daily_pages
+
+        days = {_date(dates[s.sid]) for s in stores}
+        # Do not combine different store local report dates in one total.
+        if len(days) == 1:
+            report_day = next(iter(days))
+            rows, provisional = owner_daily_rows(db, stores, report_day, now=now)
+            if rows and any(any(row[k] is not None for k in
+                    ('ad_spend', 'sales', 'return_units', 'refund_amount')) for row in rows):
+                owner_pages = build_owner_daily_pages(rows, report_date=report_day,
+                    as_of=now.astimezone(timezone.utc), provisional=provisional)
     chunks = morning_cards(db, settings, stores, actual, send_day=send_day, now=now,
         warnings=warnings, target_dates=dates, include_quality=False, proactive=True, incident_pages=incident_pages,
-        business_pages=business_pages)
+        business_pages=business_pages, include_business=not owner_pages)
+    owner_count = len(owner_pages)
+    chunks = [*owner_pages, *chunks]
     incident_pages, business_pages = iter(incident_pages), iter(business_pages)
     ids = []
     try:
         with db.begin_nested():
             for index, (value, store_ids) in enumerate(chunks):
                 title = plain(value['header']['title']['content'])
-                kind = ('health' if title.startswith('店铺绩效与违规快报') else
+                kind = ('owner_daily' if index < owner_count else
+                        'health' if title.startswith('店铺绩效与违规快报') else
                         'ad_exception' if title == '商品推广活动待复核' else
                         'business_daily' if '经营日报' in title else 'data_quality')
                 incident_pairs = next(incident_pages, ()) if kind == 'ad_exception' else ()

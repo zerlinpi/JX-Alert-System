@@ -19,6 +19,8 @@ const state = {
   bulkCollection: null, bulkBusy: false, bulkTimer: null,
   groups: { current: null, chats: [], preview: null, saving: false, loading: false, seq: 0 },
   sources: { data: null, loading: false, saving: false },
+  deepseek: { data: null, loading: false, saving: false },
+  reviewSkills: null,
   adSubscribers: { data: null, members: null, selected: new Set(), loading: false, saving: false },
 };
 
@@ -694,13 +696,15 @@ function renderView() {
   const owners = state.view === "owners";
   const groups = state.view === "notification-group";
   const sources = state.view === "data-sources";
-  $("page-title").textContent = sources ? "领星数据源" : groups ? "通知群设置" : owners ? "负责人映射" : "经营概览";
-  $("page-description").textContent = sources ? "管理接口与 MCP 凭据、更换日期及操作记录。" : groups ? "管理接收日报和默认提醒的飞书群聊。" : owners ? "按店铺管理接收异常提醒的飞书负责人。" : "查看各店铺的销售、广告与账户绩效。";
+  const analysisSettings = state.view === "analysis-settings";
+  $("page-title").textContent = analysisSettings ? "分析设置" : sources ? "领星数据源" : groups ? "通知群设置" : owners ? "负责人映射" : "经营概览";
+  $("page-description").textContent = analysisSettings ? "管理 DeepSeek 模型与广告分析技能。" : sources ? "管理接口与 MCP 凭据、更换日期及操作记录。" : groups ? "管理接收日报和默认提醒的飞书群聊。" : owners ? "按店铺管理接收异常提醒的飞书负责人。" : "查看各店铺的销售、广告与账户绩效。";
   $("notification-group-panel").hidden = !groups;
   $("data-sources-panel").hidden = !sources;
-  $("store-stats").hidden = groups || sources;
-  $("store-board").hidden = groups || sources;
-  $("bulk-sync-panel").hidden = groups || sources;
+  $("analysis-settings-panel").hidden = !analysisSettings;
+  $("store-stats").hidden = groups || sources || analysisSettings;
+  $("store-board").hidden = groups || sources || analysisSettings;
+  $("bulk-sync-panel").hidden = groups || sources || analysisSettings;
   for (const tab of document.querySelectorAll("[data-view]")) {
     if (tab.dataset.view === state.view) tab.setAttribute("aria-current", "page");
     else tab.removeAttribute("aria-current");
@@ -711,12 +715,90 @@ function renderView() {
 }
 
 async function setView(view) {
+  if (view !== "analysis-settings") $("deepseek-key").value = "";
   state.view = view;
   renderView();
   if (view === "owners" && state.data && !state.members) await loadMembers();
   if (view === "notification-group" && !state.groups.current) await loadGroups();
   if (view === "notification-group" && !state.adSubscribers.data) await loadAdSubscribers();
   if (view === "data-sources" && !state.sources.data) await loadSources();
+  if (view === "analysis-settings") {
+    if (!state.reviewSkills && window.JxReviewSkills) {
+      state.reviewSkills = window.JxReviewSkills.mount($("review-skills-panel"), { api, csrf: () => state.csrf });
+    }
+    if (!state.deepseek.data) await loadDeepSeek();
+  }
+}
+
+function setDeepSeekBusy() {
+  const settings = state.deepseek;
+  $("deepseek-fields").disabled = settings.loading || settings.saving || !settings.data?.revision || !state.csrf;
+}
+
+function renderDeepSeek() {
+  const data = state.deepseek.data;
+  const label = { CONFIGURED: "已配置（未检测可用性）", NOT_CONFIGURED: "未配置", INVALID_CONFIGURATION: "配置待核对" }[data?.status];
+  $("deepseek-state").replaceChildren(...(label ? [badge(label)] : []));
+  const meta = $("deepseek-meta");
+  meta.replaceChildren();
+  if (data?.updated_at) {
+    const when = new Date(data.updated_at);
+    if (Number.isFinite(when.getTime())) {
+      const entry = node("div");
+      entry.append(node("dt", "最后更新"), node("dd", when.toLocaleString("zh-CN")));
+      meta.append(entry);
+    }
+  }
+  $("deepseek-model").replaceChildren(...(data?.models || []).map((model) => {
+    const option = node("option", model);
+    option.value = model;
+    return option;
+  }));
+  if (data?.model) $("deepseek-model").value = data.model;
+  $("deepseek-timeout").value = data?.timeout ?? "";
+  $("deepseek-key").required = data?.status === "NOT_CONFIGURED" || data?.status === "INVALID_CONFIGURATION";
+  setDeepSeekBusy();
+}
+
+async function loadDeepSeek() {
+  const settings = state.deepseek;
+  if (settings.loading || settings.saving) return;
+  settings.loading = true;
+  $("deepseek-key").value = "";
+  setDeepSeekBusy();
+  try {
+    settings.data = await api("deepseek");
+    notice("deepseek-status");
+  } catch (error) {
+    settings.data = null;
+    notice("deepseek-status", error.message, "error");
+  } finally {
+    settings.loading = false;
+    renderDeepSeek();
+  }
+}
+
+async function saveDeepSeek() {
+  const settings = state.deepseek;
+  if (settings.loading || settings.saving || !settings.data?.revision || !state.csrf) return;
+  settings.saving = true;
+  setDeepSeekBusy();
+  try {
+    settings.data = await api("deepseek", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf,
+    }, body: JSON.stringify({
+      revision: settings.data.revision, api_key: $("deepseek-key").value,
+      model: $("deepseek-model").value, timeout: Number($("deepseek-timeout").value),
+    }) });
+    notice("deepseek-status", "DeepSeek 设置已保存，后续分析会读取新设置。", "success");
+  } catch (error) {
+    if (error.status === 409) settings.data = null;
+    notice("deepseek-status", error.message, "error");
+  } finally {
+    $("deepseek-key").value = "";
+    settings.saving = false;
+    renderDeepSeek();
+  }
 }
 
 function sourceTime(value) {
@@ -1120,11 +1202,19 @@ $("stores").addEventListener("click", (event) => {
 });
 $("store-search").addEventListener("input", renderStoreList);
 $("reload-sources").addEventListener("click", () => void loadSources());
+$("deepseek-form").addEventListener("submit", (event) => { event.preventDefault(); void saveDeepSeek(); });
 for (const kind of ["api", "mcp"]) {
   $("source-" + kind + "-form").addEventListener("submit", (event) => { event.preventDefault(); void saveSource(kind); });
 }
 $("store-filter").addEventListener("change", renderStoreList);
-$("refresh").addEventListener("click", () => state.view === "data-sources" ? loadSources() : state.view === "notification-group" ? loadGroups() : loadStores());
+$("refresh").addEventListener("click", () => {
+  if (state.view === "analysis-settings") {
+    void loadDeepSeek();
+    void state.reviewSkills?.refresh();
+  } else if (state.view === "data-sources") void loadSources();
+  else if (state.view === "notification-group") void loadGroups();
+  else void loadStores();
+});
 $("reload-groups").addEventListener("click", loadGroups);
 $("notification-group-select").addEventListener("change", () => { clearGroupPreview(); notice("group-settings-status"); });
 $("preview-group").addEventListener("click", previewGroup);

@@ -1,13 +1,18 @@
 """Read-only daily Amazon ads collection using verified Lingxing report contracts."""
+from contextlib import nullcontext
 from datetime import date
+from hashlib import sha256
 
 from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
 from jx_alert.lingxing.ad_currency import advertising_currency, is_ad_money
+from jx_alert.lingxing.client import LingxingCollectionPaused
 from jx_alert.lingxing.report_dates import normalize_store_report_dates
 from jx_alert.lingxing.report_metrics import AD_REPORT_METRICS
 from jx_alert.storage.coverage import mark_coverage
-from jx_alert.storage.models import Campaign, DailyMetric, RawSnapshot
+from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
+from jx_alert.storage.models import Campaign, DailyMetric, DataCoverage, RawSnapshot
 
 
 AD_METRICS = AD_REPORT_METRICS
@@ -44,89 +49,19 @@ def collect_ads_for_day(client, db,
         profiles = {(row.campaign_type, row.campaign_id): row.profile_id for row in db.scalars(
             select(Campaign).where(Campaign.store_id == store_id)
         )} if ad_currencies else {}
+        if ad_currencies:
+            # Never carry a MariaDB repeatable-read snapshot from the profile
+            # lookup into a newly acquired partition lock.
+            db.commit()
 
         for local_report_date in local_report_dates:
             metric_date = date.fromisoformat(local_report_date)
             for report_type in report_types:
-                payload = {
-                    "sid": sid,
-                    "report_date": local_report_date,
-                    "length": 100,
-                }
-                if report_type in {"sp", "sd"}:
-                    payload["show_detail"] = 1
-                rows = list(client.iter_advertising_report(report_type, payload))
-
-                normalized = []
-                for row in rows:
-                    campaign_id = row.get("campaign_id")
-                    if campaign_id is None:
-                        raise RuntimeError(
-                            f"{report_type.upper()} report row is missing campaign_id"
-                        )
-                    if row.get("report_date") != local_report_date:
-                        raise RuntimeError(
-                            f"{report_type.upper()} report returned an unexpected report_date"
-                        )
-                    values = {}
-                    for source_field, metric_name in AD_METRICS.items():
-                        value = row.get(source_field)
-                        if value is None:
-                            if source_field in {
-                                "cost", "orders", "sales", "units", "clicks", "impressions"
-                            }:
-                                raise RuntimeError(
-                                    f"{report_type.upper()} report row is missing required "
-                                    f"metric {source_field}"
-                                )
-                            continue
-                        try:
-                            values[metric_name] = float(value)
-                        except (TypeError, ValueError) as exc:
-                            raise RuntimeError(
-                                f"Invalid {source_field} value in {report_type.upper()} report"
-                            ) from exc
-                    code = advertising_currency(ad_currencies or {}, store_id, row,
-                        campaign_profile=profiles.get((report_type, str(campaign_id))))
-                    normalized.append((str(campaign_id), values, code))
-
-                dimension = f"campaign_{report_type}"
-                db.execute(delete(DailyMetric).where(
-                    DailyMetric.store_id == store_id,
-                    DailyMetric.metric_date == metric_date,
-                    DailyMetric.dimension == dimension,
-                ))
-                db.add(RawSnapshot(
-                    source=f"lingxing_ads_{report_type}_campaign_report",
-                    store_id=store_id,
-                    payload={
-                        "report_type": report_type,
-                        "report_date": local_report_date,
-                        "rows": rows,
-                    },
-                ))
-
-                for campaign_id, values, code in normalized:
-                    for metric_name, numeric_value in values.items():
-                        db.add(DailyMetric(
-                            store_id=store_id,
-                            metric_date=metric_date,
-                            dimension=dimension,
-                            entity_id=campaign_id,
-                            metric_name=metric_name,
-                            value=numeric_value,
-                            currency=code if is_ad_money(metric_name) else None,
-                            source=f"lingxing_ads_{report_type}",
-                        ))
-                mark_coverage(
-                    db,
-                    store_id=store_id,
-                    metric_date=metric_date,
-                    dimension=dimension,
-                    row_count=len(rows),
-                )
-                db.commit()
-                report_counts[report_type] += len(rows)
+                if report_type == "sp":
+                    count = _collect_sp_partition(client, db, store, metric_date, ad_currencies, profiles)
+                else:
+                    count = _collect_partition(client, db, store, metric_date, report_type, ad_currencies, profiles)
+                report_counts[report_type] += count
 
     return {
         "report_date": report_date if isinstance(report_date, str) else "per-store date window",
@@ -137,3 +72,144 @@ def collect_ads_for_day(client, db,
         ),
         "rows": report_counts,
     }
+
+
+class SPPartitionBusy(JobAlreadyRunning):
+    def __init__(self, store_id: str, metric_date: date):
+        super().__init__("Another worker is collecting this SP report partition")
+        self.store_id = store_id
+        self.metric_date = metric_date
+
+
+def _collect_sp_partition(client, db, store, metric_date, ad_currencies, profiles):
+    store_id = str(store["sid"])
+    # All primary campaign-SP ingestions share this store/date lock, including
+    # across scheduler processes. Different dates/stores remain independent.
+    key = "campaign_sp_" + sha256(f"{store_id}:{metric_date}".encode()).hexdigest()[:24]
+    try:
+        with database_job_lock(db.get_bind(), key, pin_connection=True) as connection:
+            # A MySQL session bound to the lock holder cannot write on a new
+            # physical connection if the old one dies during the provider call.
+            session = Session(bind=connection) if connection is not None else nullcontext(db)
+            with session as partition_db:
+                if connection is not None:
+                    # Establish the SQLAlchemy transaction before fetching. It
+                    # must error rather than revalidate an invalidated socket.
+                    partition_db.connection()
+                try:
+                    return _collect_partition(client, partition_db, store, metric_date, "sp", ad_currencies, profiles)
+                except LingxingCollectionPaused:
+                    raise
+                except Exception as exc:
+                    partition_db.rollback()
+                    if connection is not None and connection.invalidated:
+                        raise  # Reconnecting here would write outside the lock.
+                    try:
+                        _record_failed_sp_attempt(partition_db, store_id, metric_date)
+                    except Exception as coverage_error:
+                        partition_db.rollback()
+                        raise exc from coverage_error
+                    raise
+    except JobAlreadyRunning as exc:
+        raise SPPartitionBusy(store_id, metric_date) from exc
+
+
+def _record_failed_sp_attempt(db, store_id, metric_date):
+    # The caller already records the actual failed attempt in its job result.
+    # Preserve a committed validated primary report (including empty reports).
+    row = db.scalar(select(DataCoverage).where(
+        DataCoverage.store_id == store_id,
+        DataCoverage.metric_date == metric_date,
+        DataCoverage.dimension == "campaign_sp",
+    ))
+    if row is None:
+        row = mark_coverage(db, store_id=store_id, metric_date=metric_date,
+                            dimension="campaign_sp", row_count=0)
+        row.status = "FAILED"
+    elif row.status != "COMPLETE":
+        row.status = "FAILED"
+    db.commit()
+
+
+def _collect_partition(client, db, store, metric_date, report_type, ad_currencies, profiles):
+    sid, store_id = store["sid"], str(store["sid"])
+    local_report_date = metric_date.isoformat()
+    payload = {
+        "sid": sid,
+        "report_date": local_report_date,
+        "length": 100,
+    }
+    if report_type in {"sp", "sd"}:
+        payload["show_detail"] = 1
+    rows = list(client.iter_advertising_report(report_type, payload))
+
+    normalized = []
+    for row in rows:
+        campaign_id = row.get("campaign_id")
+        if campaign_id is None:
+            raise RuntimeError(
+                f"{report_type.upper()} report row is missing campaign_id"
+            )
+        if row.get("report_date") != local_report_date:
+            raise RuntimeError(
+                f"{report_type.upper()} report returned an unexpected report_date"
+            )
+        values = {}
+        for source_field, metric_name in AD_METRICS.items():
+            value = row.get(source_field)
+            if value is None:
+                if source_field in {
+                    "cost", "orders", "sales", "units", "clicks", "impressions"
+                }:
+                    raise RuntimeError(
+                        f"{report_type.upper()} report row is missing required "
+                        f"metric {source_field}"
+                    )
+                continue
+            try:
+                values[metric_name] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid {source_field} value in {report_type.upper()} report"
+                ) from exc
+        code = advertising_currency(ad_currencies or {}, store_id, row,
+            campaign_profile=profiles.get((report_type, str(campaign_id))))
+        normalized.append((str(campaign_id), values, code))
+
+    dimension = f"campaign_{report_type}"
+    db.execute(delete(DailyMetric).where(
+        DailyMetric.store_id == store_id,
+        DailyMetric.metric_date == metric_date,
+        DailyMetric.dimension == dimension,
+    ))
+    db.add(RawSnapshot(
+        source=f"lingxing_ads_{report_type}_campaign_report",
+        store_id=store_id,
+        payload={
+            "report_type": report_type,
+            "report_date": local_report_date,
+            "rows": rows,
+        },
+    ))
+
+    for campaign_id, values, code in normalized:
+        for metric_name, numeric_value in values.items():
+            db.add(DailyMetric(
+                store_id=store_id,
+                metric_date=metric_date,
+                dimension=dimension,
+                entity_id=campaign_id,
+                metric_name=metric_name,
+                value=numeric_value,
+                currency=code if is_ad_money(metric_name) else None,
+                source=f"lingxing_ads_{report_type}",
+            ))
+    mark_coverage(
+        db,
+        store_id=store_id,
+        metric_date=metric_date,
+        dimension=dimension,
+        row_count=len(rows),
+    )
+    db.commit()
+    return len(rows)

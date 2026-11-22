@@ -6,15 +6,14 @@ No tools, web access, conversation history, or advertising mutation is exposed.
 import hashlib
 import json
 import math
-from pathlib import Path
 import re
 import time
 
 import httpx
 
+from jx_alert.ai.deepseek_config import MODELS, DeepSeekConfigError, client_settings
 
 ENDPOINT = "https://api.deepseek.com/chat/completions"
-MODELS = frozenset({"deepseek-flash", "deepseek-v4-pro"})
 MAX_CONTEXT_BYTES = 128 * 1024
 MAX_QUESTION_CHARS = 1200
 MAX_OUTPUT_CHARS = 6000
@@ -310,24 +309,11 @@ class DeepSeekClient:
 
     @classmethod
     def from_settings(cls, settings):
-        key = _secret_value(getattr(settings, "deepseek_api_key", ""))
-        if not key:
-            filename = getattr(settings, "deepseek_credentials_file", "")
-            if filename:
-                try:
-                    path = Path(filename)
-                    if path.stat().st_size > 64 * 1024:
-                        raise DeepSeekError("DeepSeek私有凭据文件格式无效。")
-                    credentials = json.loads(path.read_text(encoding="utf-8"))
-                except FileNotFoundError:
-                    credentials = {}
-                except (OSError, ValueError, TypeError):
-                    raise DeepSeekError("DeepSeek私有凭据文件无法读取。") from None
-                if not isinstance(credentials, dict):
-                    raise DeepSeekError("DeepSeek私有凭据文件格式无效。")
-                key = credentials.get("api_key", "")
-        return cls(key, model=getattr(settings, "deepseek_model", "deepseek-flash"),
-                   timeout=getattr(settings, "deepseek_request_timeout", 45.0))
+        try:
+            key, model, timeout = client_settings(settings)
+        except DeepSeekConfigError as exc:
+            raise DeepSeekError(exc.detail) from None
+        return cls(key, model=model, timeout=timeout)
 
     def analyze(self, context, question):
         frozen = _input_json(context, question)

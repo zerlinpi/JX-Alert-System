@@ -196,6 +196,42 @@ def test_every_candidate_is_reviewed_in_bounded_batches_without_top_n_truncation
     assert client.calls == [str(i) for i in range(25)]
 
 
+def test_duplicate_evidence_id_across_batches_is_rejected_before_calling_model():
+    class Unexpected:
+        def analyze(self, *_args):
+            pytest.fail('A conflicting frozen scope must not reach the model')
+
+    with pytest.raises(DeepSeekError):
+        review_advertising(Unexpected(), {'campaigns': [row(i) for i in range(13)] + [row()]}, QUESTION)
+
+
+@pytest.mark.parametrize('result', [
+    '{"findings":[{"evidence_id":"inaccessible","evidence_id":"0","signals":["zero_conversion"]}]}',
+    '{"findings":[null],"findings":[]}',
+    '{"findings":[{"evidence_id":"0","signals":["CTR"],"signals":["zero_conversion"]}]}',
+])
+def test_ambiguous_duplicate_json_fields_do_not_resolve_to_the_last_field(result):
+    with pytest.raises(DeepSeekError):
+        parse_findings(result, [row()], selection_only=True)
+
+
+@pytest.mark.parametrize('evidence', [
+    {'material_signals': ['zero_conversion', 'orders']},
+    {'material_signals': ['CTR'], 'intraday': True},
+    {'material_signals': ['intraday_budget']},
+    {'material_signals': ['ad_pause']},
+])
+def test_even_server_candidates_cannot_bind_conflicting_or_wrong_period_signals(evidence):
+    with pytest.raises(DeepSeekError):
+        parse_findings('{"findings":[]}', [row() | evidence])
+
+
+def test_model_explanation_cannot_invent_a_zero_conversion_finding():
+    finding = {'evidence_id': '0', 'signals': ['CTR'], 'analysis': '这项活动没有产生任何归因订单。'}
+    with pytest.raises(DeepSeekError):
+        parse_findings(json.dumps({'findings': [finding]}), [row() | {'material_signals': ['CTR']}])
+
+
 def test_one_format_retry_preserves_original_question_and_never_publishes_unverified_numbers():
     class Retrying:
         calls = []

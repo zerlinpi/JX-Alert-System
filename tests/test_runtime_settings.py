@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from jx_alert.config import get_settings
+from jx_alert.config import effective_daily_sync_cron, get_settings
 
 
 @pytest.fixture
@@ -37,3 +37,14 @@ def test_health_observation_only_is_default_and_explicit_runtime_mode(runtime):
                                   "lingxing_performance_observation_only": True}))
     settings = get_settings()
     assert settings.lingxing_performance_enabled and settings.lingxing_performance_observation_only
+
+
+def test_hourly_mode_broad_cron_can_be_overridden_independently(runtime):
+    runtime.write_text(json.dumps({"daily_sync_cron": "0 8 * * *",
+                                  "hourly_ad_monitor_enabled": True,
+                                  "hourly_mode_daily_sync_cron": "45 18 * * *",
+                                  "feishu_daily_report_cron": "0 9 * * *"}))
+    settings = get_settings()
+    assert effective_daily_sync_cron(settings) == "45 18 * * *"
+    assert settings.daily_sync_cron == "0 8 * * *"
+    assert settings.feishu_daily_report_cron == "0 9 * * *"

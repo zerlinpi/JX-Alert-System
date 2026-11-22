@@ -30,7 +30,7 @@ def unsolicited_quality_message(key, payload):
     # New focused reports and hourly alerts have source gates before queuing.
     # Their names and archived notice subjects can contain legacy status words.
     if (payload.get('quiet_verified') is True and key.startswith('scheduled-daily:morning:')
-            and payload.get('morning_message_kind') in {'health', 'business_daily', 'ad_exception'}):
+            and payload.get('morning_message_kind') in {'health', 'business_daily', 'ad_exception', 'owner_daily'}):
         return False
     if payload.get('hourly_ad_monitor') is True and payload.get('material_ad_alert') is True and key.startswith('app:'):
         return False
@@ -60,7 +60,7 @@ def quiet_blocks(settings, key, payload):
     if key.startswith("scheduled-daily:"):
         kind = payload.get("morning_message_kind")
         if kind is not None:
-            return kind not in {"health", "business_daily", "ad_exception"}
+            return kind not in {"health", "business_daily", "ad_exception", "owner_daily"}
         # Legacy focused pages have no kind. Preserve today's health and ad pages.
         if key.startswith("scheduled-daily:morning:"):
             title = value.get("header", {}).get("title", {}).get("content", "")

@@ -57,7 +57,7 @@ def _transport_security(settings):
 _MCP_TRANSPORT_SECURITY, _MCP_ALLOWED_ORIGINS = _transport_security(_MCP_SETTINGS)
 _OAUTH_PROVIDER = None
 _AUTH_OPTIONS = {}
-if _MCP_SETTINGS.mcp_auth_mode == "oauth":
+if _MCP_SETTINGS.mcp_output_mode == "jx" and _MCP_SETTINGS.mcp_auth_mode == "oauth":
     from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
     from jx_alert.mcp_oauth import SqliteOAuthProvider, SCOPES
     issuer = _MCP_SETTINGS.mcp_public_url.rstrip("/")
@@ -140,16 +140,23 @@ class BearerTokenMiddleware:
 def create_http_app(settings=None):
     """Build the authenticated Streamable HTTP ASGI app for remote MCP clients."""
     settings = settings or get_settings()
+    if settings.mcp_output_mode != _MCP_SETTINGS.mcp_output_mode:
+        raise RuntimeError("MCP output mode changed; restart the process")
+    if settings.mcp_path != _MCP_SETTINGS.mcp_path:
+        raise RuntimeError(
+            "MCP_PATH is loaded when the MCP server module is imported; restart "
+            "the process after changing MCP_PATH."
+        )
+    if settings.mcp_output_mode == "sparkx_direct":
+        return BearerTokenMiddleware(
+            build_sparkx_mcp(settings).streamable_http_app(), _sparkx_relay_token(settings),
+            settings.mcp_path,
+        )
     if settings.mcp_auth_mode != _MCP_SETTINGS.mcp_auth_mode:
         raise RuntimeError("MCP authentication mode changed; restart the process")
     if settings.mcp_auth_mode == "bearer" and not settings.mcp_bearer_token:
         raise RuntimeError(
             "MCP_BEARER_TOKEN is required before starting the remote MCP service"
-        )
-    if settings.mcp_path != _MCP_SETTINGS.mcp_path:
-        raise RuntimeError(
-            "MCP_PATH is loaded when the MCP server module is imported; restart "
-            "the process after changing MCP_PATH."
         )
 
     app = mcp.streamable_http_app()
@@ -432,13 +439,15 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
     target_records = {row.dimension: row for row in coverage_rows if row.metric_date == target_date}
     current_sales = [row for row in metric_rows if row.metric_date == target_date
                      and row.dimension == "store" and row.entity_id == str(store_id)]
-    issue = collection_issue_for_date(db, str(store_id), target_date) if store.status == 1 else None
+    issue = (collection_issue_for_date(db, str(store_id), target_date, sales_only=True)
+             if store.status == 1 else None)
     sales_status = store_sales_data_status(store.status, target_records.get("store"), current_sales,
         target_records.get("sku_asin"), target_records.get("sku_msku"), issue=issue)
-    unavailable = sales_status in {"AUTHORIZATION_FAILED", "STORE_UNAVAILABLE", "COLLECTION_FAILED"}
+    unavailable = sales_status in {"AUTHORIZATION_FAILED", "STORE_UNAVAILABLE"}
 
     def is_complete(dimension: str, day: date) -> bool:
-        if day == target_date and unavailable:
+        if day == target_date and (unavailable or
+                (sales_status == "COLLECTION_FAILED" and dimension in {"store", "sku_asin", "sku_msku"})):
             return False
         return coverage.get((dimension, day), False)
 
@@ -1317,6 +1326,62 @@ def send_chat_report_to_feishu(title: str, markdown: str, store_ids: list[str] |
         result = enqueue_chat_report(db, settings, title=title, markdown=markdown, store_ids=store_ids)
         db.commit()
         return result
+
+
+def _sparkx_relay_token(settings) -> str:
+    from jx_alert.sparkx_direct import parse_profile_ids, validate_token
+
+    if settings.mcp_auth_mode != "bearer":
+        raise ValueError("SparkX direct mode requires isolated inbound bearer authentication")
+    parse_profile_ids(settings.sparkx_profile_ids)
+    upstream = settings.sparkx_ai_token.get_secret_value()
+    inbound = settings.sparkx_relay_bearer_token.get_secret_value()
+    validate_token(upstream)
+    validate_token(inbound)
+    if len(inbound) < 32 or inbound in {upstream, settings.mcp_bearer_token}:
+        raise ValueError("Use a distinct SparkX relay bearer token of at least 32 characters")
+    return inbound
+
+
+def build_sparkx_mcp(settings) -> FastMCP:
+    """Expose one scoped vendor read and no legacy JX tools or send actions."""
+    from jx_alert.sparkx_direct import (
+        SparkXDirectError, call_sparkx, parse_profile_ids, validate_performance_query,
+    )
+
+    _sparkx_relay_token(settings)
+    profiles = parse_profile_ids(settings.sparkx_profile_ids)
+    upstream = settings.sparkx_ai_token.get_secret_value()
+    security, _ = _transport_security(settings)
+    server = FastMCP(
+        "JX • SparkXAI direct",
+        host=settings.mcp_host,
+        port=settings.mcp_port,
+        streamable_http_path=settings.mcp_path,
+        transport_security=security,
+    )
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                                openWorldHint=True),
+                 structured_output=False)
+    async def get_ads_perf(arguments: dict) -> CallToolResult:
+        """Forward a SparkXAI performance query and return its native content and structure.
+
+        Use SparkX profileIds (one approved profile), factEntity, dateStart, dateEnd,
+        metrics and a minimal userContext (no secrets). Vendor field names, dates
+        and pagination are preserved; no local report is generated.
+        """
+        try:
+            validate_performance_query(arguments, profiles)
+            return await call_sparkx("get_ads_perf", arguments, token=upstream)
+        except SparkXDirectError as exc:
+            return CallToolResult(isError=True, content=[TextContent(type="text", text=str(exc))])
+
+    return server
+
+
+if _MCP_SETTINGS.mcp_output_mode == "sparkx_direct":
+    mcp = build_sparkx_mcp(_MCP_SETTINGS)
 
 
 if __name__ == "__main__":

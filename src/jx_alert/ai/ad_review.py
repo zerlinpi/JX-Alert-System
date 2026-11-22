@@ -57,6 +57,9 @@ _METRICS = {'CTR': '点击率下降', 'CPC': '点击花费上升', 'CDR': '点�
             'CPS': '单件转化花费上升', 'ROAS': '广告投入产出下降', 'CPA': '单均花费上升',
             'zero_conversion': '成熟广告有花费但无归因订单', 'orders': '成熟归因订单下降',
             'spend': '广告花费上升'}
+_INTRADAY_SIGNALS = {'intraday_budget', 'intraday_no_clicks'}
+_MATURE_NONZERO_SIGNALS = {'orders', 'CDR', 'ROAS', 'CPA', 'CPS'}
+_EVIDENCE_ERROR = '广告分析结果未通过证据核对，请稍后重试。'
 
 
 def review_cache_key(context, question, model):
@@ -70,13 +73,56 @@ def review_cache_key(context, question, model):
         raise DeepSeekError('广告证据格式无效，请重新获取数据。') from None
 
 
+def _unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('Duplicate model response key')
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite(_value):
+    raise ValueError('Non-finite model response value')
+
+
+def _evidence_index(campaigns):
+    # Validate the entire scope before batching. dict-comprehension overwrite
+    # would silently bind a model-selected ID to whichever row appeared last.
+    index, identities = {}, set()
+    for row in campaigns:
+        key = row['evidence_id']
+        signals = row['material_signals']
+        if (not isinstance(key, str) or not key or key in index
+                or not isinstance(signals, list)
+                or any(not isinstance(signal, str) for signal in signals)
+                or len(set(signals)) != len(signals)):
+            raise ValueError
+        supported = _INTRADAY_SIGNALS if row.get('intraday') is True else _METRICS.keys()
+        if not set(signals) <= supported:
+            raise ValueError
+        if ('zero_conversion' in signals and _MATURE_NONZERO_SIGNALS.intersection(signals)
+                or _INTRADAY_SIGNALS <= set(signals)):
+            raise ValueError
+        identity = tuple(row.get(k) for k in ('store_id', 'ad_type', 'campaign_id', 'report_date'))
+        if all(value is not None for value in identity):
+            identity += (row.get('intraday') is True,)
+            if identity in identities:
+                raise ValueError
+            identities.add(identity)
+        index[key] = row
+    return index
+
+
 def parse_findings(text, campaigns, *, selection_only=False):
     """Bind model choices to this exact evidence; malformed results fail closed."""
     try:
-        value = json.loads(text)
+        if not isinstance(text, str):
+            raise ValueError
+        value = json.loads(text, object_pairs_hook=_unique_object, parse_constant=_reject_nonfinite)
         if not isinstance(value, dict) or set(value) != {'findings'} or not isinstance(value['findings'], list):
             raise ValueError
-        evidence = {row['evidence_id']: row for row in campaigns}
+        evidence = _evidence_index(campaigns)
         seen, result = set(), []
         for finding in value['findings']:
             required = {'evidence_id', 'signals'} if selection_only else {'evidence_id', 'signals', 'analysis'}
@@ -102,21 +148,30 @@ def parse_findings(text, campaigns, *, selection_only=False):
                                  r'[零一二三四五六七八九十百千万亿两]+\s*(?:美元|美金|元|倍|个|次|单|天)', analysis)):
                 raise ValueError
             budget = row.get('verified_daily_budget')
-            if ('预算' in analysis and not (row.get('intraday') is True and type(budget) in (int, float)
+            if ('预算' in analysis and not ('intraday_budget' in signals and type(budget) in (int, float)
                     and math.isfinite(budget) and budget > 0)):
                 raise ValueError
-            if row.get('intraday') and re.search(r'无转化|零转化|零订单|无订单|没有.{0,5}订单|获客|ROAS|CPA|CDR|CPS|转化率|归因订单', analysis, re.I):
+            if 'zero_conversion' not in signals and re.search(
+                    r'无转化|零转化|零订单|无订单|没有.{0,8}(?:订单|转化)|未带来.{0,5}订单', analysis):
+                raise ValueError
+            if row.get('intraday') and re.search(
+                    r'无转化|零转化|零订单|无订单|没有.{0,5}订单|获客|ROAS|CPA|CDR|CPS|转化率|归因订单|违规',
+                    analysis, re.I):
                 raise ValueError
             seen.add(key)
             result.append({'evidence': row, 'signals': signals, 'analysis': analysis.strip()})
         return result
-    except (ValueError, TypeError, KeyError):
-        raise DeepSeekError('广告分析结果未通过证据核对，请稍后重试。') from None
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError):
+        raise DeepSeekError(_EVIDENCE_ERROR) from None
 
 
 def review_advertising(client, context, question):
     """Bound each request; review every candidate without silently taking top N."""
-    candidates = [r for r in context['campaigns'] if r['material_signals']]
+    try:
+        evidence = _evidence_index(context['campaigns'])
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise DeepSeekError(_EVIDENCE_ERROR) from None
+    candidates = [r for r in evidence.values() if r['material_signals']]
     selection_only = context.get('hourly_delivery') is True
     findings, batches, requests, usage = [], 0, 0, {}
     # Small batches leave room for concrete explanations without truncating JSON.

@@ -622,6 +622,35 @@ def test_identical_frozen_question_reuses_model_but_changed_evidence_does_not(wa
     assert len(FakeClient.calls) == 2
 
 
+@pytest.mark.parametrize("question", ["5174 店铺广告和绩效情况", "CPC是什么意思"])
+def test_deepseek_rotation_during_question_discards_old_model_reply(warehouse, question):
+    from jx_alert.ai.deepseek_config import configuration, save_configuration
+
+    settings, sessions, _ = warehouse
+
+    class RotatingClient(FakeClient):
+        def analyze(self, context, question):
+            save_configuration(settings, {
+                "revision": configuration(settings)["revision"],
+                "api_key": "synthetic-test-key-after-owner-rotation",
+                "model": "deepseek-v4-pro",
+                "timeout": 30,
+            })
+            return "旧模型未复核的摘要，不应出现在飞书。"
+
+    enqueue(warehouse, event("@_user_1 " + question))
+    result = process(warehouse, factory=RotatingClient.from_settings)
+    with sessions() as db:
+        job = db.get(SyncJob, result["job_id"])
+        outbox = [db.get(NotificationOutbox, row_id).payload["card"] for row_id in result["outbox_ids"]]
+        content = json.dumps(outbox, ensure_ascii=False)
+    assert "旧模型未复核的摘要" not in content
+    assert "暂不可用" in content
+    assert job.metadata_json["analysis_provider"] == "unavailable"
+    assert "analysis_text" not in job.metadata_json
+    assert "analysis_cache_key" not in job.metadata_json
+
+
 def test_compact_prompt_preserves_all_kpis_values_dates_and_gaps(warehouse):
     from jx_alert.ai.deepseek import _input_json, compact_context
     with warehouse[1]() as db:
@@ -1248,28 +1277,82 @@ def test_private_natural_ad_requests_scope_refresh_without_extra_store_prompt(wa
         assert ('请确认店铺' in json.dumps(value, ensure_ascii=False)) is not bool(expected)
 
 
-def test_private_question_lists_only_recent_scoped_confirmed_ad_alerts(warehouse, monkeypatch):
+@pytest.mark.parametrize('private', [False, True])
+def test_question_lists_only_recent_scoped_confirmed_ad_alerts(warehouse, monkeypatch, private):
     _enable_collection(warehouse, monkeypatch)
     item = {'store_id': '5174', 'ad_type': 'sp', 'campaign_id': 'budget-campaign', 'store': '测试店铺',
         'campaign': '看到的活动', 'signal': '盘中花费超出复核线',
         'numbers': '花费 美元 50.08\n日预算 美元 1.00', 'detected_at': NOW.isoformat()}
+    from jx_alert.bot_service import _route, validate_question_delivery
+
+    current = _route(warehouse[0])
     with warehouse[1]() as db:
         db.add(NotificationOutbox(idempotency_key='existing:alert', status='DELIVERED',
             created_at=NOW.replace(tzinfo=None), payload={'hourly_ad_monitor': True,
-                'delivery': {'receive_id_type': 'chat_id'}, 'hourly_items': [item, {
+                'delivery': current, 'hourly_items': [item, {
                     **item, 'store_id': '9999', 'campaign': '无权查看活动'}]}))
         db.commit()
-    queued = enqueue(warehouse, private_event('最近有没有已发送的广告异常记录，一次性列举'))
+    question = '最近有没有已发送的广告异常记录，一次性列举'
+    queued = enqueue(warehouse, private_event(question) if private else event('@_user_1 ' + question))
     result = process(warehouse)
     assert result['status'] == 'QUEUED' and FakeClient.calls == []
     with warehouse[1]() as db:
         assert db.get(SyncJob, queued['job_id']).metadata_json['analysis_provider'] == 'recorded_ad_alerts'
         payload = db.get(NotificationOutbox, result['outbox_ids'][0]).payload
-        assert payload['delivery']['role'] == 'private_question'
-        assert payload['delivery']['reply_to_message_id'] == 'om_private'
+        assert payload['delivery']['role'] == ('private_question' if private else 'group_question')
+        assert payload['delivery']['reply_to_message_id'] == ('om_private' if private else 'om_question')
         output = json.dumps(payload['card'], ensure_ascii=False)
         assert all(s in output for s in ('看到的活动', '当时的花费远超平均日预算', '50.08', '平均日预算 美元 1.00'))
         assert '无权查看活动' not in output and '复核线' not in output
+        delivery = payload['delivery']
+        assert delivery['history_report_route']['receive_id'] == current['receive_id']
+        assert validate_question_delivery(warehouse[0], delivery)
+        rotated = {**delivery, 'history_report_route': {**delivery['history_report_route'],
+                   'routing_changed_at': '2026-11-18T00:00:00+00:00'}}
+        assert not validate_question_delivery(warehouse[0], rotated)
+        assert set(delivery['history_store_ids']) == {'5174', '5175'}
+        Path(warehouse[0].collection_scope_file).write_text(json.dumps({'store_ids': [5175]}))
+        assert not validate_question_delivery(warehouse[0], delivery)
+        Path(warehouse[0].collection_scope_file).unlink()
+        assert not validate_question_delivery(warehouse[0], delivery)
+
+
+@pytest.mark.parametrize('private,status', [(False, 'PENDING'), (True, 'RETRY')])
+def test_worker_skips_unscoped_frozen_history_but_not_other_legacy_replies(warehouse, monkeypatch, private, status):
+    from jx_alert.notifications import worker, feishu_app
+    from jx_alert.notifications.cards import card
+    from jx_alert.storage.models import NotificationLog
+
+    _enable_collection(warehouse, monkeypatch)
+    settings, sessions, _ = warehouse
+    monkeypatch.setattr(worker, 'SessionLocal', sessions)
+    monkeypatch.setattr(worker, 'get_settings', lambda: settings)
+    sent = []
+
+    class Transport:
+        def reply_card(self, _message, value, **_kwargs):
+            sent.append(value['header']['title']['content'])
+            return {'message_id': 'om_mock'}
+
+    monkeypatch.setattr(feishu_app.FeishuAppClient, 'from_settings', lambda _: Transport())
+    # Base main froze these titles without recording the authorization scope of the read.
+    titles = ['最近 7 天已记录的广告异常', '普通回复']
+    ids = []
+    with sessions.begin() as db:
+        for index, title in enumerate(titles):
+            meta = {'message_id': 'om_legacy' + str(index), 'chat_type': 'p2p' if private else 'group',
+                    'chat_id': 'oc_private' if private else 'oc_reports', 'sender_id': 'ou_member',
+                    'question_route': bot_service._route(settings)}
+            value = card(title, subtitle='历史回复', sections=[])
+            outbox_id, = bot_service._reply(db, settings, meta['message_id'], meta['chat_id'], [value],
+                                             question_meta=meta)
+            db.get(NotificationOutbox, outbox_id).status = status
+            ids.append(outbox_id)
+    outcome = worker.process_outbox_batch(outbox_ids=ids)
+    assert (outcome['sent'], outcome['failed'], sent) == (1, 0, ['普通回复'])
+    with sessions() as db:
+        assert [db.get(NotificationOutbox, i).status for i in ids] == ['SKIPPED', 'DELIVERED']
+        assert list(db.scalars(select(NotificationLog.status).order_by(NotificationLog.id))) == ['SKIPPED', 'DELIVERED']
 
 
 def test_private_question_exhausting_retries_gets_one_failure_reply(warehouse, monkeypatch):

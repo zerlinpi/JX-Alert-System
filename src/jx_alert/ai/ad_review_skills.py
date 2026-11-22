@@ -4,8 +4,10 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 
 
 DEFAULT_SKILL = {
@@ -96,29 +98,42 @@ def _unique_object(pairs):
     return result
 
 
+def read_ad_review_skills_file(path):
+    """Read the bounded operator policy; reject links and non-regular files."""
+    if path.is_symlink():
+        raise ValueError
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError
+        data = stream.read(_MAX_BYTES + 1)
+    if len(data) > _MAX_BYTES:
+        raise ValueError
+    return data
+
+
+def parse_ad_review_skills(data):
+    """Return the validated policy document and effective layer model."""
+    value = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
+    if (not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1
+            or value.keys() - {"version", "defaults", "ad_types", "campaigns"}):
+        raise ValueError
+    types, campaigns = value.get("ad_types", {}), value.get("campaigns", {})
+    if (not isinstance(types, dict) or types.keys() - _TYPE_KEYS or not isinstance(campaigns, dict)
+            or len(campaigns) > 300 or not all(_CAMPAIGN_KEY.fullmatch(k) for k in campaigns)):
+        raise ValueError
+    return value, AdReviewSkills("configured", _profile(value.get("defaults", {})),
+        {key: _profile(row) for key, row in types.items()}, {key: _profile(row) for key, row in campaigns.items()})
+
+
 def load_ad_review_skills(settings):
     """Read once per analysis pass. Invalid files never widen or broadcast policy."""
     raw_path = getattr(settings, "ad_review_skills_file", None)
     if not raw_path:
         return AdReviewSkills()
-    path = Path(raw_path)
     try:
-        if path.is_symlink():
-            raise ValueError
-        with path.open("rb") as stream:
-            data = stream.read(_MAX_BYTES + 1)
-        if len(data) > _MAX_BYTES:
-            raise ValueError
-        value = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
-        if (not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1
-                or value.keys() - {"version", "defaults", "ad_types", "campaigns"}):
-            raise ValueError
-        types, campaigns = value.get("ad_types", {}), value.get("campaigns", {})
-        if (not isinstance(types, dict) or types.keys() - _TYPE_KEYS or not isinstance(campaigns, dict)
-                or len(campaigns) > 300 or not all(_CAMPAIGN_KEY.fullmatch(k) for k in campaigns)):
-            raise ValueError
-        return AdReviewSkills("configured", _profile(value.get("defaults", {})),
-            {key: _profile(row) for key, row in types.items()}, {key: _profile(row) for key, row in campaigns.items()})
+        return parse_ad_review_skills(read_ad_review_skills_file(Path(raw_path)))[1]
     except FileNotFoundError:
         return AdReviewSkills()
     except (OSError, ValueError, RecursionError):

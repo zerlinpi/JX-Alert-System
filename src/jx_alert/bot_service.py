@@ -49,6 +49,9 @@ def _explicit_private_readers(settings, routing):
             if isinstance(uid, str) and re.fullmatch(r"ou_[A-Za-z0-9_-]+", uid)}
 
 
+_HISTORY_ROUTE_FIELDS = ('receive_id', 'routing_alias', 'routing_changed_at')
+
+
 def validate_question_delivery(settings, delivery):
     """Fail closed on removed access; propagate sanitized lookup failures for retry."""
     if (not getattr(settings, "feishu_bot_enabled", False) or settings.app_dry_run
@@ -57,6 +60,16 @@ def validate_question_delivery(settings, delivery):
         return False
     routing = _load_routing(settings.feishu_routing_file)
     current = report_group_delivery(settings, routing, role="group_question")
+    # Receipt history is authorized for one group generation and an explicit
+    # set of stores, not just a reader or the chat that asked the question.
+    if "history_report_route" in delivery or "history_store_ids" in delivery:
+        from jx_alert.notifications.store_policy import frozen_scope_current
+
+        route = delivery.get("history_report_route")
+        if (not isinstance(route, dict) or set(route) != set(_HISTORY_ROUTE_FIELDS)
+                or any(route[field] != current.get(field) for field in _HISTORY_ROUTE_FIELDS)
+                or not frozen_scope_current(settings, delivery.get("history_store_ids"))):
+            return False
     if delivery.get("role") == "group_question":
         return (delivery.get("receive_id") == current["receive_id"]
                 and delivery.get("routing_alias", current.get("routing_alias")) == current.get("routing_alias")
@@ -79,8 +92,11 @@ def validate_question_delivery(settings, delivery):
 
 def _question_delivery(settings, meta):
     kind = meta.get("chat_type", "group")
+    history = ({"history_report_route": meta["history_report_route"],
+                "history_store_ids": meta.get("reply_store_ids")}
+               if "history_report_route" in meta else {})
     if kind == "p2p":
-        return {"role": "private_question", "receive_id_type": "chat_id", "open_ids": [],
+        return {**history, "role": "private_question", "receive_id_type": "chat_id", "open_ids": [],
                 "receive_id": meta["chat_id"], "sender_open_id": meta["sender_id"],
                 "reply_to_message_id": meta["message_id"]}
     if kind != "group":
@@ -90,7 +106,7 @@ def _question_delivery(settings, meta):
         # Questions already queued before generation tracking belong to the
         # original route, not to a newer group that happens to reuse its ID.
         saved = {**_route(settings), "routing_changed_at": None}
-    return {**saved, "role": "group_question", "receive_id": meta["chat_id"],
+    return {**saved, **history, "role": "group_question", "receive_id": meta["chat_id"],
             "reply_to_message_id": meta["message_id"]}
 
 
@@ -941,7 +957,8 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
         meta['ad_review_audit'] = {'eligible_campaigns': len(context['campaigns']), 'candidate_campaigns': 0, 'batches': 0}
         return _complete_question(db, settings, job_id, meta, review_cards([]), 'ad_review_no_findings')
     # A fingerprint includes exact facts, dates and policy, not just shop names.
-    key = review_cache_key(context, question, settings.deepseek_model)
+    from jx_alert.ai.deepseek_config import cache_identity
+    key = review_cache_key(context, question, cache_identity(settings))
     cached = db.scalar(select(SyncJob).where(SyncJob.job_type == 'feishu_question',
         SyncJob.status == 'SUCCEEDED', SyncJob.finished_at >= clock.replace(tzinfo=None) - timedelta(minutes=10),
         SyncJob.metadata_json['chat_id'].as_string() == meta['chat_id'],
@@ -976,7 +993,7 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
         # An invalidated snapshot cannot be delivered as a current finding.
         current_stores = list(db.scalars(select(Store).where(Store.sid.in_([s.sid for s in stores]), Store.status == 1)))
         if {s.sid for s in current_stores} != {s.sid for s in stores} or review_cache_key(
-                evidence(), question, settings.deepseek_model) != key:
+                evidence(), question, cache_identity(settings)) != key:
             raise DeepSeekError('广告证据已更新，请重新提问。')
         if not audit.get('model_failures'):
             meta['ad_review_cache_key'] = key
@@ -1030,6 +1047,7 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
     if not settings.feishu_bot_enabled or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
     from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError, analysis_cache_key
+    from jx_alert.ai.deepseek_config import cache_identity
     factory = client_factory or DeepSeekClient.from_settings
     with database_job_lock(warehouse_engine, "feishu_question_worker"):
         with session_factory() as db:
@@ -1072,7 +1090,10 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                 if recorded_alert_lookup(meta['question']):
                     from jx_alert.bot_alert_history import recent_alert_cards
                     meta['reply_store_ids'] = [store.sid for store in review_stores]
-                    cards = recent_alert_cards(db, review_stores, meta['question'], _utcnow())
+                    route = _route(settings) if meta.get('chat_type') == 'p2p' else _question_delivery(settings, meta)
+                    meta['history_report_route'] = {field: route.get(field) for field in _HISTORY_ROUTE_FIELDS}
+                    cards = recent_alert_cards(db, review_stores, meta['question'], _utcnow(),
+                        report_delivery=route)
                     return _complete_question(db, settings, job_id, meta, cards, 'recorded_ad_alerts')
                 return _review_ad_question(db, settings, job_id, meta, review_stores, factory)
             if ad_review_request(meta['question']):
@@ -1096,7 +1117,10 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                 context = general_context(allowed)
                 db.rollback()
                 try:
+                    selected_config = cache_identity(settings)
                     analysis = factory(settings).analyze(context, meta['question'])
+                    if cache_identity(settings) != selected_config:
+                        raise DeepSeekError("DeepSeek 设置已更新，请重新提问。")
                     provider = 'deepseek_general'
                 except DeepSeekError:
                     analysis, provider = '智能问答暂不可用，请稍后重试。', 'unavailable'
@@ -1119,8 +1143,9 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                     provider = "date_clarification"
                 else:
                     meta.update({key: context[key] for key in ("report_date", "requested_report_date", "date_selection")})
+                    selected_config = cache_identity(settings)
                     try:
-                        cache_key = analysis_cache_key(context, meta["question"], settings.deepseek_model)
+                        cache_key = analysis_cache_key(context, meta["question"], selected_config)
                     except DeepSeekError:
                         # Preserve the ordinary data-card fallback when model
                         # input is too large or rejected; never cache this case.
@@ -1144,6 +1169,11 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                             client = factory(settings)
                             analysis = client.analyze(context, meta["question"])
                             provider = "deepseek"
+                        # Do not publish or cache a reply under a superseded
+                        # owner configuration, including a concurrently loaded hit.
+                        if cache_identity(settings) != selected_config:
+                            raise DeepSeekError("DeepSeek 设置已更新，请重新提问。")
+                        if provider == "deepseek":
                             meta["model_usage"] = getattr(client, "last_usage", {})
                         meta.update(analysis_cache_key=cache_key, analysis_text=analysis,
                             analysis_created_at=cached_at if provider == "deepseek_cache" else _utcnow().isoformat())

@@ -4,10 +4,12 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
+from jx_alert.config import effective_daily_sync_cron
 from jx_alert.storage.collection_attempts import collection_issue_for_date
 from jx_alert.storage.coverage import SALES_DATA_LABELS, store_sales_data_status
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store, SyncJob
@@ -23,16 +25,27 @@ def _json_file(path):
 
 def group_bot_status(settings):
     """Read activation flags without resetting MCP's cached OAuth configuration."""
+    from jx_alert.ai.deepseek_config import DeepSeekConfigError, configuration
+
     runtime = _json_file(getattr(settings, "runtime_settings_file", ""))
     def value(key, fallback):
         configured = getattr(settings, key, fallback)
         latest = runtime.get(key, configured)
         return latest if type(latest) is type(fallback) else configured
-    key_file = value("deepseek_credentials_file", "/app/data/secrets/deepseek.json")
+    model = value("deepseek_model", "deepseek-flash")
+    try:
+        deepseek = configuration(SimpleNamespace(
+            deepseek_credentials_file=value("deepseek_credentials_file", "/app/data/secrets/deepseek.json"),
+            deepseek_api_key=getattr(settings, "deepseek_api_key", ""),
+            deepseek_model=model,
+            deepseek_request_timeout=getattr(settings, "deepseek_request_timeout", 45.0),
+        ))
+    except DeepSeekConfigError:
+        deepseek = {"configured": False, "model": None}
     return {
         "feishu_bot_enabled": value("feishu_bot_enabled", False),
-        "deepseek_credentials_present": bool(getattr(settings, "deepseek_api_key", "")) or Path(key_file).is_file(),
-        "deepseek_model": value("deepseek_model", "deepseek-flash"),
+        "deepseek_credentials_present": deepseek["configured"],
+        "deepseek_model": deepseek["model"] or model,
         "excel_archive_enabled": value("excel_archive_enabled", False),
         "excel_archive_directory": value("excel_archive_dir", "/app/data/excel"),
         "bot_status_check_scope": "configuration_only",
@@ -140,7 +153,7 @@ def analysis_plan(db, settings, *, now=None):
                 DailyMetric.dimension == "store", DailyMetric.entity_id == store.sid,
                 DailyMetric.metric_date.in_(dates), DailyMetric.metric_name.in_(METRICS))).all()
             current = [row for row in rows if row.metric_date == last]
-            issue = collection_issue_for_date(db, store.sid, last)
+            issue = collection_issue_for_date(db, store.sid, last, sales_only=True)
             sales_status = store_sales_data_status(store.status, coverage_rows.get(("store", last)), current,
                 coverage_rows.get(("sku_asin", last)), coverage_rows.get(("sku_msku", last)), issue=issue)
             if sales_status == "COLLECTION_FAILED":
@@ -181,7 +194,7 @@ def _collection_job_snapshot(job):
             if isinstance(reports, dict):
                 partitions.update(report["status"] for report in reports.values()
                                   if isinstance(report, dict)
-                                  and report.get("status") in ("AVAILABLE", "EMPTY", "FAILED"))
+                                  and report.get("status") in ("AVAILABLE", "EMPTY", "BUSY", "FAILED"))
         result["store_count"] = len(stores)
         result["sp_report_partition_counts"] = dict(partitions)
     return result
@@ -244,10 +257,20 @@ def configuration_status(db, settings):
     latest_success = db.scalar(collection_jobs.where(SyncJob.status.in_(["SUCCEEDED", "SUCCEEDED_WITH_WARNINGS"]),
                                                      SyncJob.finished_at.is_not(None))
                                .order_by(SyncJob.finished_at.desc(), SyncJob.id.desc()).limit(1))
+    # The durable dispatcher uses manual_collection for scheduled and manual work.
+    # Only scheduled jobs have the Beijing-day key.
+    scheduled_jobs = select(SyncJob).where(
+        SyncJob.job_type == "manual_collection",
+        SyncJob.metadata_json["idempotency_key"].as_string().like("scheduled-collection:%"),
+    )
+    latest_scheduled = db.scalar(scheduled_jobs.order_by(SyncJob.id.desc()).limit(1))
     report = {"stores": stores, "manager_count": len(managers), "manual_mapping_required": missing,
             "scheduler_enabled": settings.scheduler_enabled, "collection_mode": collection_mode,
             "cron": getattr(settings, "hourly_ad_monitor_cron", "0 * * * *") if hourly else settings.daily_sync_cron,
             "cron_timezone": "Asia/Shanghai", "mcp_auth_mode": settings.mcp_auth_mode,
+            "scheduled_collection_cron": effective_daily_sync_cron(settings),
+            "scheduled_collection_timezone": "Asia/Shanghai",
+            "last_scheduled_collection_attempt": _collection_job_snapshot(latest_scheduled),
             "daily_report_cron": getattr(settings, "feishu_daily_report_cron", "0 8 * * *"),
             "daily_report_timezone": "Asia/Shanghai",
             "daily_report_start_date": getattr(settings, "feishu_daily_report_start_date", ""),

@@ -124,7 +124,7 @@ def _sample_passes(observed, on, prior, signal, skill):
 
 
 def _zero_outcome(row):
-    return row["orders"] == 0 and row["sales"] == 0 and row.get("units", 0) == 0
+    return row["orders"] == 0 and row["sales"] == 0 and row["units"] == 0
 
 
 def _mature_signals(observed, day, baseline, prior, skill):
@@ -178,7 +178,7 @@ def _store_campaigns(db, settings, store, target, kinds, clock, skills):
             key = snapshot.source, payload.get("report_date")
             if key not in snapshots:
                 snapshots[key] = snapshot
-    partitions, entities = {}, {}
+    partitions, entities, raw_partitions = {}, {}, {}
     for row in facts:
         key = row.dimension, row.metric_date
         partitions.setdefault((*key, row.entity_id), []).append(row)
@@ -194,26 +194,46 @@ def _store_campaigns(db, settings, store, target, kinds, clock, skills):
                 or captured is None or captured < _end(on, zone, delay) or captured > clock):
             return None
         rows = partitions.get((dimension, on, campaign.campaign_id), [])
-        required = _CORE if mature else _CURRENT
+        # Units are a required provider field, and a missing or conflicting
+        # units fact is not an observed zero-conversion outcome.
+        required = _FIELDS if mature else _CURRENT
         by_metric = {row.metric_name: row for row in rows}
-        if (not all(metric in by_metric and _valid(by_metric[metric].value) for metric in required)
+        if (len(by_metric) != len(rows)
+                or not all(metric in by_metric and _valid(by_metric[metric].value) for metric in required)
+                or by_metric["clicks"].value > by_metric["impressions"].value
                 or any(row.source != "lingxing_ads_" + campaign.campaign_type for row in rows)):
             return None
         snapshot = snapshots.get(("lingxing_ads_" + campaign.campaign_type + "_campaign_report", on.isoformat()))
         observed = _utc(snapshot.captured_at) if snapshot else None
         if observed is None or observed < _end(on, zone, delay) or observed > clock:
             return None
-        payload = snapshot.payload
-        raw_rows = payload.get("rows")
-        if (payload.get("status") not in (None, "COMPLETE", "SUCCEEDED")
-                or payload.get("report_type") != campaign.campaign_type or not isinstance(raw_rows, list)
-                or len(raw_rows) != cov.row_count):
+        partition = dimension, on
+        if partition not in raw_partitions:
+            payload = snapshot.payload
+            raw_rows = payload.get("rows")
+            indexed = {}
+            if (payload.get("status") in (None, "COMPLETE", "SUCCEEDED")
+                    and payload.get("report_type") == campaign.campaign_type
+                    and isinstance(raw_rows, list) and len(raw_rows) == cov.row_count):
+                for row in raw_rows:
+                    identifier = row.get("campaign_id") if isinstance(row, dict) else None
+                    if type(identifier) not in (str, int) or not str(identifier).strip():
+                        break
+                    indexed[str(identifier)] = row
+                else:
+                    if len(indexed) == len(raw_rows) and indexed.keys() == entities[partition]:
+                        raw_partitions[partition] = indexed
+            raw_partitions.setdefault(partition, {})
+        raw = raw_partitions[partition].get(campaign.campaign_id)
+        if raw is None:
             return None
-        matches = [row for row in raw_rows if isinstance(row, dict)
-                   and str(row.get("campaign_id")) == campaign.campaign_id]
-        if len(matches) != 1:
+        if ((raw.get("report_date") is not None and raw["report_date"] != on.isoformat())
+                or (raw.get("sid") is not None and str(raw["sid"]) != str(store.sid))
+                or (raw.get("profile_id") is not None and campaign.profile_id is not None
+                    and str(raw["profile_id"]) != str(campaign.profile_id))
+                or raw.get("_source") == "official_mcp_observation"
+                or raw.get("_attribution_unconfirmed") is True):
             return None
-        raw = matches[0]
         try:
             if any(isinstance(raw.get(_RAW_FIELDS[key]), bool)
                     or float(raw[_RAW_FIELDS[key]]) != by_metric[key].value for key in required):
@@ -221,15 +241,10 @@ def _store_campaigns(db, settings, store, target, kinds, clock, skills):
         except (KeyError, ValueError, TypeError, OverflowError):
             return None
         money = [by_metric[key].currency for key in ("spend", "sales") if key in required]
-        if len(set(money)) != 1 or money[0] != "USD":
+        if (len(set(money)) != 1 or money[0] != "USD"
+                or raw.get("confirmed_currency") not in (None, money[0])):
             return None
         values = {key: by_metric[key].value for key in required}
-        if "units" in by_metric and _valid(by_metric["units"].value) and mature:
-            try:
-                if not isinstance(raw.get("units"), bool) and float(raw["units"]) == by_metric["units"].value:
-                    values["units"] = by_metric["units"].value
-            except (KeyError, ValueError, TypeError, OverflowError):
-                pass
         values.update(currency=money[0], sales_currency=money[0])
         return values, observed.isoformat(), {"snapshot": [snapshot.id, observed.isoformat()],
             "coverage": [cov.id, captured.isoformat()],
