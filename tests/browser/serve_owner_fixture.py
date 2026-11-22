@@ -1,4 +1,5 @@
-"""Run only OwnerConsole against disposable synthetic data on loopback TLS."""
+"""Run only OwnerConsole against disposable synthetic data on loopback."""
+import argparse
 from datetime import datetime, timedelta, timezone
 import ipaddress
 import json
@@ -15,6 +16,7 @@ from cryptography.x509.oid import NameOID
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 import uvicorn
 
 
@@ -40,7 +42,25 @@ def _tls_files(root):
     return cert_path, key_path
 
 
+class _ProxyProbe:
+    """Tag responses made by the app so tests can identify edge-only rejection."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def stamped(message):
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [*message["headers"], (b"x-jx-upstream-fixture", b"1")]}
+            await send(message)
+
+        await self.app(scope, receive, stamped)
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--behind-loopback-proxy", action="store_true")
+    behind = parser.parse_args().behind_loopback_proxy
     root = Path.cwd()
     if any(root.iterdir()):
         raise SystemExit("Provide an empty temporary working directory for the owner fixture")
@@ -79,22 +99,27 @@ def main():
 
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
-        origin = f"https://127.0.0.1:{listener.getsockname()[1]}"
+        port = listener.getsockname()[1]
+        # The checked-in proxy forwards $host (no port). Model the production
+        # canonical HTTPS origin independently of disposable listener ports.
+        origin = "https://127.0.0.1" if behind else f"https://127.0.0.1:{port}"
         provider = SimpleNamespace(
             issuer_url=origin + "/", database_path=root / "oauth_unused.sqlite",
             _password_valid=lambda value: value == "test-fixture-only-password",
         )
-        app = Starlette(routes=OwnerConsole(settings, provider, session_factory=sessions).routes())
+        app = Starlette(routes=OwnerConsole(settings, provider, session_factory=sessions).routes(),
+                        middleware=[Middleware(_ProxyProbe)] if behind else [])
         cert, key = _tls_files(root)
 
         class FixtureServer(uvicorn.Server):
             async def startup(self, sockets=None):
                 await super().startup(sockets=sockets)
                 if self.started:
-                    print(json.dumps({"origin": origin}), flush=True)
+                    print(json.dumps({"origin": origin, "listen_port": port}), flush=True)
 
-        server = FixtureServer(uvicorn.Config(app, ssl_certfile=str(cert), ssl_keyfile=str(key),
-                                              access_log=False, proxy_headers=False, log_level="warning"))
+        tls = {} if behind else {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
+        server = FixtureServer(uvicorn.Config(app, **tls, access_log=False, proxy_headers=behind,
+                                              forwarded_allow_ips="127.0.0.1", log_level="warning"))
         server.run(sockets=[listener])
     engine.dispose()
 

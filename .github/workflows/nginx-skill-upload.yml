@@ -1,0 +1,62 @@
+name: Nginx Skills upload acceptance
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/nginx-skill-upload.yml
+      - deploy/nginx-mcp.conf.example
+      - deploy/nginx-owner-skill-library.location.example
+      - src/jx_alert/admin_console.py
+      - src/jx_alert/admin_skill_library.py
+      - src/jx_alert/agent_skill_package.py
+      - tests/browser/serve_owner_fixture.py
+      - tests/integration/test_nginx_skill_upload.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  loopback-nginx:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ".[dev]"
+      - name: Unpack Ubuntu's signed Nginx package without installing it
+        shell: bash
+        run: |
+          work="$(mktemp -d "$RUNNER_TEMP/jx-nginx.XXXXXX")"
+          mkdir -p "$work/lists" "$work/archives" "$work/empty" "$work/logs"
+          touch "$work/empty.conf"
+          cat > "$work/apt.conf" <<EOF
+          Dir::Etc::Parts "$work/empty";
+          Dir::Etc::Main "$work/empty.conf";
+          Dir::Etc::sourcelist "$work/sources.list";
+          Dir::Etc::sourceparts "$work/empty";
+          Dir::State::lists "$work/lists";
+          Dir::Cache "$work";
+          Dir::Cache::archives "$work/archives";
+          Dir::Log "$work/logs";
+          Acquire::Languages "none";
+          Acquire::Retries "2";
+          EOF
+          printf '%s\n' \
+            'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu/ noble main' \
+            'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu/ noble-updates main' \
+            'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu/ noble-security main' \
+            > "$work/sources.list"
+          export APT_CONFIG="$work/apt.conf"
+          apt-get update
+          cd "$work"
+          apt-get download nginx
+          dpkg-deb -x nginx_*.deb extracted
+          "$work/extracted/usr/sbin/nginx" -v
+          printf 'JX_NGINX_BIN=%s\n' "$work/extracted/usr/sbin/nginx" >> "$GITHUB_ENV"
+      - name: Validate the exact Skills exception over disposable loopback TLS
+        run: JX_NGINX_ACCEPTANCE=1 python -m pytest -q tests/integration/test_nginx_skill_upload.py
