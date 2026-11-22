@@ -24,6 +24,8 @@ from sqlalchemy.orm import sessionmaker
 from jx_alert import sparkx_feishu
 from jx_alert.notifications import worker
 from jx_alert.notifications.outbox import DELIVERY_UNKNOWN, NotificationOutbox
+from jx_alert.notifications.sparkx_export import ExportHistory
+from jx_alert.sparkx_direct import SparkXDirectError
 from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
 from jx_alert.storage.models import NotificationLog, Store
 
@@ -205,22 +207,22 @@ def test_expired_worker_cannot_post_after_same_second_takeover(transport, monkey
         assert row.delivered_at and _logs(db, key) == [("DELIVERED", "om_ci_receipt")]
 
 
-def test_sparkx_scope_and_wire_body_survive_lost_response_without_replay(transport, monkeypatch):
+def _configure_sparkx(transport, monkeypatch, *, sid, profile):
     cfg = transport.settings
     cfg.sparkx_feishu_enabled = True
-    cfg.sparkx_profile_ids = str(profile := 9007199254740993)
+    cfg.sparkx_profile_ids = str(profile)
     cfg.sparkx_ai_token = SimpleNamespace(get_secret_value=lambda: "ci-fixture-only")
     cfg.feishu_daily_report_chat_id = "acceptance"
 
     Path(cfg.feishu_routing_file).write_text(json.dumps({
         "default_chat_id": "acceptance",
         "groups": {"acceptance": {"chat_id": "oc_fixture", "verified_member_open_ids": ["ou_ci"]}},
-        "stores": {"101": {"chat_id": "acceptance"}},
-        "sparkx_profile_routes": {str(profile): {"store_id": "101", "chat_id": "oc_fixture",
+        "stores": {sid: {"chat_id": "acceptance"}},
+        "sparkx_profile_routes": {str(profile): {"store_id": sid, "chat_id": "oc_fixture",
                                                  "currency": "USD", "generation": "a" * 32}},
     }), encoding="utf-8")
     with transport.db.begin() as db:
-        db.add(Store(sid="101", name="CI-only", status=1, currency_code="USD"))
+        db.add(Store(sid=sid, name="CI-only", status=1, currency_code="USD"))
     scope = {"profileIds": [profile], "factEntity": "campaign", "dateStart": "2026-10-01",
              "dateEnd": "2026-10-01", "metrics": ["Spend"], "pageSize": 1, "userContext": "fixture"}
     remote = SimpleNamespace(spend=0)
@@ -232,7 +234,9 @@ def test_sparkx_scope_and_wire_body_survive_lost_response_without_replay(transpo
         if name == "get_user_authorized_context":
             assert arguments == {}
             return CallToolResult(content=[], structuredContent={"profiles": [{"profileId": profile}]})
-        assert name == "get_ads_perf" and arguments == scope
+        page_arguments = dict(arguments)
+        assert page_arguments.pop("timeGranularity", "daily") in ("daily", "DaIlY")
+        assert name == "get_ads_perf" and page_arguments == scope
         return CallToolResult(content=[TextContent(type="text", text="Not bound to this report's scope")],
             structuredContent={"isError": False, "toolName": name,
                 "data": {"rows": [{"date": "20261001", "Spend": remote.spend}], "rowCount": 1},
@@ -241,19 +245,30 @@ def test_sparkx_scope_and_wire_body_survive_lost_response_without_replay(transpo
 
     monkeypatch.setattr(sparkx_feishu, "call_sparkx", mock_sparkx)
 
-    def enqueue():
-        return asyncio.run(sparkx_feishu.prepare(cfg, deepcopy(scope), enqueue=True, session_factory=transport.db))
+    def publish(query=None, **options):
+        return asyncio.run(sparkx_feishu.prepare(cfg, deepcopy(scope if query is None else query),
+                                                session_factory=transport.db, **options))
 
-    item = enqueue()
+    return SimpleNamespace(cfg=cfg, scope=scope, remote=remote, call_names=call_names, publish=publish)
+
+
+def _clock_from_row(transport, row):
+    # Derive due time from committed DATETIME(0) columns; fixture setup can
+    # cross a real clock second before switching to the fixed worker clock.
+    transport.instant[0] = max(row.next_attempt_at, row.created_at).replace(tzinfo=timezone.utc) + timedelta(seconds=2)
+
+
+def test_sparkx_scope_and_wire_body_survive_lost_response_without_replay(transport, monkeypatch):
+    pilot = _configure_sparkx(transport, monkeypatch, sid="101", profile=9007199254740993)
+
+    item = pilot.publish(enqueue=True)
     assert item["status"] == "PENDING" and not transport.auths and not transport.posts
     row_id = item["outbox_id"]
     with transport.db() as db:
         row = db.get(NotificationOutbox, row_id)
         planned, key = row.payload["card"], row.idempotency_key
         assert "Not bound" not in str(planned)
-        # Derive the worker clock from committed DATETIME(0) values; fixture
-        # setup may otherwise span a real wall-clock second and race due time.
-        transport.instant[0] = max(row.next_attempt_at, row.created_at).replace(tzinfo=timezone.utc) + timedelta(seconds=2)
+        _clock_from_row(transport, row)
     transport.receipt.lose = True
     first = worker.process_outbox_batch(outbox_ids=[row_id])
     assert (first["sent"], first["unknown"], first["failed"]) == (0, 1, 0)
@@ -264,15 +279,102 @@ def test_sparkx_scope_and_wire_body_survive_lost_response_without_replay(transpo
 
     transport.instant[0] += timedelta(hours=2)
     transport.receipt.lose = False
-    remote.spend = 500
-    assert enqueue() == {**item, "status": DELIVERY_UNKNOWN}
-    assert call_names == ["get_user_authorized_context", "get_ads_perf"] * 2
+    pilot.remote.spend = 500
+    assert pilot.publish(enqueue=True) == {**item, "status": DELIVERY_UNKNOWN}
+    assert pilot.call_names == ["get_user_authorized_context", "get_ads_perf"] * 2
+    assert pilot.publish(inspect=True)["predecessor_proof"] == "UNVERIFIED"
+    assert len(pilot.call_names) == 4  # Local inspection never calls either provider.
+    with pytest.raises(SparkXDirectError, match="禁止创建新版"):
+        pilot.publish(enqueue=True, fresh_after=row_id, ack_delivered=True)
     assert worker.process_outbox_batch(outbox_ids=[row_id])["claimed"] == 0
     assert len(transport.posts) == len(transport.auths) == 1
     with transport.db() as db:
         row = db.get(NotificationOutbox, row_id)
         assert row.status == DELIVERY_UNKNOWN and row.attempts == 1 and row.delivered_at is None
         assert row.payload["card"] == planned and _logs(db, key) == [(DELIVERY_UNKNOWN, None)]
+
+
+def test_sparkx_publishers_share_pinned_lease_and_preserve_legacy_receipt(transport, monkeypatch):
+    profile, sid = 9007199254740995, "102"
+    pilot = _configure_sparkx(transport, monkeypatch, sid=sid, profile=profile)
+    first = pilot.publish(enqueue=True)
+    old_id = first["outbox_id"]
+    with transport.db.begin() as db:
+        row = db.get(NotificationOutbox, old_id)
+        # Recreate the exact previous writer's v1 key and payload in this
+        # disposable DB. The upgraded worker must use the original POST UUID.
+        dest, _ = sparkx_feishu._route(db, pilot.cfg, profile)
+        identity = {k: v for k, v in pilot.scope.items() if k != "userContext"}
+        identity["page"] = 1
+        raw = json.dumps([identity, dest, sid], ensure_ascii=False, sort_keys=True)
+        old_key = "sparkx-page:v1:" + hashlib.sha256(raw.encode()).hexdigest()
+        row.idempotency_key = old_key
+        row.payload = {k: v for k, v in row.payload.items() if k != "sparkx_export"}
+        _clock_from_row(transport, row)
+    assert worker.process_outbox_batch(outbox_ids=[old_id])["sent"] == 1
+    assert transport.posts[0][2]["uuid"] == hashlib.sha256(old_key.encode()).hexdigest()[:40]
+    alias = {**pilot.scope, "timeGranularity": "DaIlY"}
+    checked = pilot.publish(alias, inspect=True)
+    assert (checked["outbox_id"], checked["predecessor_proof"]) == (old_id, "VERIFIED_DELIVERED")
+    with transport.db() as db:
+        original = deepcopy(db.get(NotificationOutbox, old_id).payload)
+
+    key_data = json.dumps([str(profile), "oc_fixture"]).encode()
+    schema = hashlib.sha256(b"jx_ci_acceptance").hexdigest()[:16]
+    lock_key = f"jxalert:{schema}:sparkx_{hashlib.sha256(key_data).hexdigest()[:32]}"
+    entered, release = Event(), Event()
+    pinned_ids = []
+    create = ExportHistory.create_or_reuse
+
+    def pause(self, *args, **kwargs):
+        if not entered.is_set():
+            writer, owner = self.db.execute(text("SELECT CONNECTION_ID(), IS_USED_LOCK(:lock)"),
+                                           {"lock": lock_key}).one()
+            assert writer == owner
+            pinned_ids.append(writer)
+            entered.set()
+            if not release.wait(15):
+                pytest.fail("competing publisher did not finish while the writer held its lock")
+        return create(self, *args, **kwargs)
+
+    def revise(query=pilot.scope):
+        return pilot.publish(query, enqueue=True, fresh_after=old_id, ack_delivered=True)
+
+    pilot.remote.spend = 735
+    monkeypatch.setattr(ExportHistory, "create_or_reuse", pause)
+    with ThreadPoolExecutor(max_workers=1) as executors:
+        winning = executors.submit(revise)
+        try:
+            assert entered.wait(15)
+            with transport.db() as verifier:
+                reader, owner = verifier.execute(text("SELECT CONNECTION_ID(), IS_USED_LOCK(:lock)"),
+                                                 {"lock": lock_key}).one()
+                assert owner == pinned_ids[0] != reader  # Another physical connection sees the held lock.
+            pilot.remote.spend = 420
+            with pytest.raises(SparkXDirectError, match="正在处理"):
+                revise(alias)
+        finally:
+            release.set()
+        next_page = winning.result(timeout=15)
+
+    assert next_page["status"] == "PENDING" and next_page["outbox_id"] != old_id
+    assert revise(alias) == pilot.publish(enqueue=True) == next_page
+    assert len(transport.posts) == len(transport.auths) == 1  # All publishing calls enqueue only.
+    new_id = next_page["outbox_id"]
+    with transport.db() as db:
+        assert db.scalar(text("SELECT IS_USED_LOCK(:lock)"), {"lock": lock_key}) is None
+        old, new = db.get(NotificationOutbox, old_id), db.get(NotificationOutbox, new_id)
+        assert old.idempotency_key == old_key and old.payload == original and old.status == "DELIVERED"
+        assert _logs(db, old_key) == [("DELIVERED", "om_ci_receipt")]
+        assert new.payload["sparkx_export"]["previous_outbox_id"] == old_id
+        assert '"735"' in json.dumps(new.payload["card"]) and '"420"' not in json.dumps(new.payload["card"])
+        assert list(db.scalars(select(NotificationOutbox.id)
+                              .where(NotificationOutbox.idempotency_key.startswith("sparkx-page:"),
+                                     NotificationOutbox.payload["store_id"].as_string() == sid)
+                              .order_by(NotificationOutbox.id))) == [old_id, new_id]
+        _clock_from_row(transport, new)
+    assert worker.process_outbox_batch(outbox_ids=[new_id])["sent"] == 1
+    assert len(transport.posts) == 2 and transport.posts[0][2]["uuid"] != transport.posts[1][2]["uuid"]
 
 
 def test_provider_receipt_plus_local_commit_failure_holds_after_lease(transport):

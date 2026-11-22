@@ -67,7 +67,7 @@ const click = async label => {
   const doc="---\r\nname: ad-check\r\ndescription: 核对\r\n---\r\n<b>literal</b>";
   assert.match(find("pre").textContent, /^---\nname: daily-review\ndescription: .+\n---\n#/);
   assert.equal(find("button","上传到资料库").disabled,true);
-  await select("archive.zip",doc); await click("上传到资料库"); assert.deepEqual(actions,[]);
+  await select("script.py",doc); await click("上传到资料库"); assert.deepEqual(actions,[]);
   await select("SKILL.md",doc); await click("上传到资料库");await click("ad-check · v1 · 停用");
   assert.equal(find("textarea").value,doc);
   await click("审阅完成");assert.deepEqual(actions,["upload"]);
@@ -82,5 +82,40 @@ const click = async label => {
   blocked=true;await click("审阅完成");assert.equal(find("textarea"),undefined);
   assert.equal(find("button","上传到资料库").disabled,true);await panel.refresh();assert.ok(find("button","ad-check · v1 · 停用"));
   assert.deepEqual(actions,["upload","enable","upload","upload","rollback","enable","disable"]);
-  console.log("PASS: isolated DOM upload, inspect, cancel/confirm, download bytes, rollback, disable, stale-write recovery.");
+  // Large typed-array encoding must not depend on a browser's maximum argument
+  // count. Archive validation belongs to the real server integration tests.
+  const bundleRoot = new Element("section");
+  let revision = 0;
+  const big = Buffer.alloc(275 * 1024, 0x61);
+  const name = "package-check";
+  const fixtureAPI = async (url, req) => {
+    if (req) {
+      const fields = JSON.parse(req.body);
+      assert.equal(fields.action, "upload_package");
+      assert.equal(fields.revision, 0);
+      assert.deepEqual(Buffer.from(fields.content_base64, "base64"), big);
+      revision++;
+    }
+    if (url === "skill-library") return {can_upload:true, max_bytes:131072, max_archive_bytes:589824, revision,
+      skills: revision ? [{name,version:1,enabled:false,description:"zip"}] : []};
+    return {name,current_version:1,revision,enabled:false,local_preview:null,audit:[],
+      versions:[{version:1,digest:"abc",created:"2026-01-01"}],
+      document:{version:1,digest:"abc",source:"main",declared_version:"1.2.3"},
+      references:{"references/a.md":"Aa","references/b.md":"<b>literal</b>"},
+      missing_text_links:[["SKILL.md","../other/SKILL.md"]]};
+  };
+  g.window.JxSkillLibrary.mount(bundleRoot,{api:fixtureAPI,csrf:()=>"test-only"});
+  await tick();
+  const findIn = (tag,txt) => bundleRoot.querySelectorAll(tag).find(x => !txt || x.textContent.includes(txt));
+  const input = findIn("input");
+  input.files = [{ name:"fixture.zip", size:big.length, arrayBuffer: async()=>big }];
+  await input.fire("change");
+  await findIn("button","上传到资料库").fire("click"); await tick();
+  await findIn("button","package-check").fire("click"); await tick();
+  const ref = bundleRoot.querySelectorAll("select").find(x => x.id === "skill-library-reference");
+  ref.value = "1"; await ref.fire("change");
+  assert.equal(bundleRoot.querySelectorAll("textarea").at(-1).value, "<b>literal</b>");
+  assert.ok(findIn("li","../other/SKILL.md"));
+  assert.equal(findIn("a","导出完整版本").href, "/console/api/skill-library/package-check/package.zip?version=1");
+  console.log("PASS: single-file lifecycle, ZIP encoding, inert references, missing-link notice and versioned export.");
 })().catch(e=>{console.error(e);process.exitCode=1;});

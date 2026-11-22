@@ -17,7 +17,7 @@ _ENTITIES = frozenset({
 })
 _QUERY_KEYS = frozenset({
     "profileIds", "factEntity", "dateStart", "dateEnd", "metrics", "userContext", "select",
-    "groupBy", "filters", "orderBy", "page", "pageSize", "language", "queryType", "timeGranularity",
+    "groupBy", "filters", "orderBy", "page", "pageSize", "language", "queryType", "timeGranularity", "search",
 })
 
 
@@ -68,10 +68,21 @@ def validate_performance_query(arguments: dict, allowed_profile_ids: frozenset[i
     if not isinstance(fact, str) or fact not in _ENTITIES:
         raise SparkXDirectError("Choose a documented SparkX factEntity")
     start, end = _day(arguments.get("dateStart")), _day(arguments.get("dateEnd"))
-    metrics = arguments.get("metrics")
-    if (not isinstance(metrics, list) or not metrics
-            or any(not isinstance(metric, str) or not metric.strip() for metric in metrics)):
-        raise SparkXDirectError("Provide non-empty SparkX metric names")
+    audience = fact == "campaignAudience"
+    if audience:
+        if arguments.keys() & {"groupBy", "queryType"}:
+            raise SparkXDirectError("Omit groupBy and queryType for campaignAudience; its row scope is fixed")
+        if "orderBy" in arguments and (not isinstance(arguments["orderBy"], list) or len(arguments["orderBy"]) > 1):
+            raise SparkXDirectError("SparkX campaignAudience accepts at most one orderBy rule")
+    if "search" in arguments:
+        search = arguments["search"]
+        if not audience or not isinstance(search, str) or not search.isprintable() or not search.strip() or len(search) > 200:
+            raise SparkXDirectError("SparkX search requires campaignAudience and 1–200 printable characters")
+    if "metrics" in arguments or not audience:
+        metrics = arguments.get("metrics")
+        if (not isinstance(metrics, list) or not metrics
+                or any(not isinstance(metric, str) or not metric.strip() for metric in metrics)):
+            raise SparkXDirectError("Provide non-empty SparkX metric names")
     context = arguments.get("userContext")
     if not isinstance(context, str) or not context.strip() or len(context) > 100:
         raise SparkXDirectError("userContext must be a short non-empty string of at most 100 characters")
@@ -94,7 +105,7 @@ def validate_performance_query(arguments: dict, allowed_profile_ids: frozenset[i
         raise SparkXDirectError("SparkX query requires valid JSON") from None
     if len(encoded) > 32_768:
         raise SparkXDirectError("SparkX query exceeds the request size limit")
-    for key, maximum in (("page", None), ("pageSize", 200 if fact == "campaignAudience" else 500)):
+    for key, maximum in (("page", None), ("pageSize", 200 if audience else 500)):
         if key in arguments:
             val = arguments[key]
             if type(val) is not int or val < 1 or (maximum is not None and val > maximum):

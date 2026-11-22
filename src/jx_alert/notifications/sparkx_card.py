@@ -135,6 +135,146 @@ def _matches_profile(value, expected):
     return (type(value) is int or type(value) is str) and str(value) == str(expected)
 
 
+# The public ASIN field reference documents exactly two auto-lock dimensions.
+# The first enum value for each is the *only* approved service-applied default.
+_VENDOR_DIMENSIONS = {
+    "distributorView": ("MANUFACTURING", "SOURCING"),
+    "sellingProgram": ("RETAIL", "BUSINESS"),
+}
+_VENDOR_ORDERED_NAMES = frozenset({"orderedrevenue", "orderedtacos", "orderedunits", "orderedaverageproductprice"})
+_VENDOR_RESULT_NAMES = _VENDOR_ORDERED_NAMES | {
+    "distributorview", "sellingprogram", "shippedrevenue", "shippedtacos", "shippedunits", "shippedcogs",
+    "shippedaverageproductprice",
+}
+_VENDOR_REFERENCE = re.compile(r"\b(?:distributor_?view|selling_?program)_?\b", re.IGNORECASE)
+
+
+def _field_name(key):
+    return key.split(".")[-1].replace("_", "").casefold()
+
+
+def _query_references_vendor_field(value, *, filter_tree=False):
+    pending = [value]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, str):
+            if not filter_tree and _VENDOR_REFERENCE.search(node):
+                return True
+        elif isinstance(node, dict):
+            if any(isinstance(key, str) and _VENDOR_REFERENCE.search(key) for key in node):
+                return True
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+    return False
+
+
+def _filter_keys(filters):
+    pending = [filters]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            yield from (key for key in node if isinstance(key, str))
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+
+
+def _single_equality(value):
+    if isinstance(value, dict) and value.keys() == {"="}:
+        return value["="]
+    return value
+
+
+def _store_type_intent(filters, filter_keys):
+    scopes = [key for key in filter_keys if _field_name(key) == "storetype"]
+    if not scopes:
+        return None
+    if scopes == ["storeType_"] and isinstance(filters, dict) and "storeType_" in filters:
+        value = _single_equality(filters["storeType_"])
+        if isinstance(value, str) and value.casefold() in {"seller", "vendor"}:
+            return value.casefold()
+    return "unverified"
+
+
+def _vendor_basis(query, rows, meta):
+    """Validate scopes against the documented ASIN lock contract. Return inert notes and an assurance flag."""
+    has_defaults = "appliedDefaults" in meta
+    types_by_row = [{value.casefold() if isinstance(value, str) else None
+                     for key, value in row.items() if _field_name(key) == "storetype"} for row in rows]
+    store_types = set().union(*types_by_row)
+    filters = query.get("filters", {})
+    filter_keys = list(_filter_keys(filters))
+    store_type_intent = _store_type_intent(filters, filter_keys)
+    query_fields = {_field_name(metric) for metric in query.get("metrics", [])}
+    query_fields.update(_field_name(key) for key in filter_keys)
+    order = query.get("orderBy", [])
+    if isinstance(order, list):
+        query_fields.update(_field_name(rule["field"]) for rule in order
+                            if isinstance(rule, dict) and isinstance(rule.get("field"), str))
+    row_fields = {_field_name(key) for row in rows for key in row}
+    vendor_fields = (query_fields | row_fields) & _VENDOR_RESULT_NAMES
+    if store_type_intent == "seller" and (has_defaults or "vendor" in store_types):
+        _reject("SparkX 返回 Vendor ASIN 口径与请求的 Seller 不一致")
+    if store_type_intent == "unverified" or (store_type_intent == "seller" and vendor_fields):
+        return [_div("未确认 Vendor ASIN 口径，仅供预览", "notation")], False
+
+    candidate = (has_defaults or store_type_intent == "vendor" or "vendor" in store_types
+                 or bool(vendor_fields) or any(
+        _query_references_vendor_field(query.get(section), filter_tree=section == "filters")
+        for section in ("select", "groupBy", "filters")))
+    if not candidate:
+        return [], True
+    if (has_defaults or "vendor" in store_types) and store_types - {"vendor"}:
+        _reject("SparkX Vendor ASIN 口径与结果行店铺类型不一致")
+    if not has_defaults and (not rows or any(types != {"vendor"} for types in types_by_row)):
+        return [_div("未确认 Vendor ASIN 口径，仅供预览", "notation")], False
+
+    explicit_fields = {name + "_" for name in _VENDOR_DIMENSIONS}
+    select = query.get("select", [])
+    # Never interpret nested, aliased, OR, IN, or non-equality filters as known single slices.
+    if (not isinstance(filters, dict) or _query_references_vendor_field(query.get("groupBy"))
+            or any(field not in explicit_fields and _query_references_vendor_field(field) for field in select)
+            or any((key not in explicit_fields and _query_references_vendor_field(key))
+                   or _query_references_vendor_field(value, filter_tree=True) for key, value in filters.items())):
+        _reject("SparkX Vendor ASIN 只核验裸字段分组或顶层单值等值筛选")
+
+    defaults = meta.get("appliedDefaults", {})
+    expected = {}
+    labels = []
+    sourcing = False
+    for name, options in _VENDOR_DIMENSIONS.items():
+        key = name + "_"
+        selected = key in select
+        filtered = key in filters
+        value = _single_equality(filters.get(key))
+        if filtered and (not isinstance(value, str) or value not in options):
+            _reject("SparkX Vendor ASIN 维度筛选不受支持")
+        if not selected and not filtered:
+            expected[name] = options[0]
+        observed = (value,) if filtered else options if selected else (options[0],)
+        for row in rows:
+            matching = [cell for field, cell in row.items() if _field_name(field) == name.casefold()]
+            if (len(matching) > 1 or selected and not matching or matching and matching[0] not in observed):
+                _reject("SparkX Vendor ASIN 结果行与请求口径不一致")
+            if name == "distributorView" and (matching == ["SOURCING"] or filtered and value == "SOURCING"):
+                sourcing = True
+                for field, cell in row.items():
+                    if (_field_name(field) in _VENDOR_ORDERED_NAMES and cell is not None
+                            and (type(cell) not in {int, Decimal} or cell != 0)):
+                        _reject("SparkX SOURCING 行返回与口径冲突的 Ordered 数据")
+        label = f"{name}={value}（请求筛选）" if filtered else (
+            f"{name} 按值分组" if selected else f"{name}={options[0]}（SparkX 默认）")
+        labels.append(label)
+    if not isinstance(defaults, dict) or defaults != expected or has_defaults and not defaults:
+        _reject("SparkX Vendor ASIN 默认维度未核实或与请求冲突")
+    notes = [_div("Vendor ASIN 口径：" + "；".join(labels) + "。不同口径不相加。", "notation")]
+    if sourcing and vendor_fields & _VENDOR_ORDERED_NAMES:
+        notes.append(_div("SOURCING 行不提供 Ordered 指标的实际数据；原样保留的 0 可能是占位，"
+                          "不代表真实订单为零。", "notation"))
+    return notes, True
+
+
 def render_page(result: CallToolResult, query: dict) -> PagePreview:
     """The caller validated the exact request before calling get_ads_perf."""
     envelope, prose = _sources(result)
@@ -142,6 +282,9 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
     page = query.get("page", 1)
     page_size = page_size_for(query)
     audience = query["factEntity"] == "campaignAudience"
+    # Only campaignAudience gives select exact, case-sensitive projection semantics.
+    # Unknown requested names may be omitted by the vendor; unrequested values may not be shared.
+    audience_selection = set(query.get("select", [])) if audience else set()
     status = f"请求第 {page} 页 · 供应端未确认分页状态，仅供预览"
     eligible, currency, notes, rows = False, None, [], []
     if envelope is not None:
@@ -154,6 +297,8 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
         meta_keys = {"page", "pageSize", "hasNextPage", "effectiveProfileIds", "currency", "hint"}
         if audience:
             meta_keys.add("total")
+        if query["factEntity"] == "asin":
+            meta_keys.add("appliedDefaults")
         if (not isinstance(data, dict) or data.keys() - {"rows", "rowCount"}
                 or not isinstance(meta, dict) or meta.keys() - meta_keys):
             _reject()
@@ -181,8 +326,10 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
         for row in rows:
             if not isinstance(row, dict) or not row:
                 _reject()
+            if audience_selection and row.keys() - audience_selection:
+                _reject("SparkX 受众返回未请求的字段，未生成可投递报告")
             for key, value in row.items():
-                field = key.split(".")[-1].replace("_", "").casefold()
+                field = _field_name(key)
                 if field == "profileid" and not _matches_profile(value, profile):
                     _reject("SparkX 结果行的账户与请求不符")
                 if field in {"currency", "currencycode"} and "currency" in meta and value != meta["currency"]:
@@ -201,6 +348,13 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
             currency = meta["currency"]
             if not isinstance(currency, str) or not re.fullmatch("[A-Z]{3}", currency):
                 _reject("SparkX 返回币种无法确认")
+        vendor_verified = True
+        if query["factEntity"] == "asin":
+            if "appliedDefaults" in meta and not (ids and currency and envelope.get("toolName") == "get_ads_perf"
+                                                  and envelope.get("isError") is False):
+                _reject("SparkX Vendor ASIN 默认维度缺少账户或币种核验")
+            vendor_notes, vendor_verified = _vendor_basis(query, rows, meta)
+            notes.extend(vendor_notes)
         if "hint" in meta:
             if not isinstance(meta["hint"], str):
                 _reject()
@@ -214,7 +368,7 @@ def render_page(result: CallToolResult, query: dict) -> PagePreview:
         status = f"仅第 {page} 页，返回 {len(rows)} 行 · {progress} · 币种：{currency or '未返回'}"
         if total is not None:
             status += f" · 供应端总行数：{total}"
-        eligible = bool(rows and (not audience or total is not None) and envelope.get("toolName") == "get_ads_perf"
+        eligible = bool(rows and vendor_verified and (not audience or total is not None) and envelope.get("toolName") == "get_ads_perf"
                         and envelope.get("isError") is False and ids and currency and "rowCount" in data
                         and {"page", "pageSize", "hasNextPage"} <= meta.keys() and meta.get("hint", "").strip())
     if not prose and envelope is None:

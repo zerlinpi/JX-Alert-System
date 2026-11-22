@@ -11,7 +11,7 @@ import yaml
 from yaml.nodes import MappingNode, ScalarNode
 
 
-MAX_BYTES = 16 * 1024
+MAX_BYTES = 128 * 1024
 NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*", re.ASCII)
 _OBJECTIVES = frozenset({"balanced", "reach", "efficiency", "discovery"})
 _STRING = "tag:yaml.org,2002:str"
@@ -32,6 +32,7 @@ class SkillDocument:
     objective: str | None
     digest: str
     source: str
+    declared_version: str | None
 
 
 def valid_name(value):
@@ -62,17 +63,29 @@ def _unsafe_text(text):
     return any(c not in "\t\r\n" and unicodedata.category(c) in {"Cc", "Cs", "Cf"} for c in text)
 
 
-def parse_upload(filename, encoded):
-    if filename != "SKILL.md" or not isinstance(encoded, str):
-        raise LibraryError("只接受单个名为 SKILL.md 的 UTF-8 文本文件；不支持压缩包、脚本或链接。")
-    if len(encoded) > ((MAX_BYTES + 2) // 3) * 4:
-        raise LibraryError("SKILL.md 最大为 16 KiB。", 413)
+def decode_file(encoded, limit):
+    if not isinstance(encoded, str):
+        raise LibraryError("文件编码无效。")
+    if len(encoded) > ((limit + 2) // 3) * 4:
+        raise LibraryError("文件超过大小限制。", 413)
     try:
         raw = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError):
         raise LibraryError("文件编码无效。") from None
+    if len(raw) > limit:
+        raise LibraryError("文件超过大小限制。", 413)
+    return raw
+
+
+def parse_upload(filename, encoded):
+    if filename != "SKILL.md":
+        raise LibraryError("单文档上传只接受 SKILL.md；带参考文档请使用技能包上传。")
+    return parse_document(decode_file(encoded, MAX_BYTES))
+
+
+def parse_document(raw):
     if len(raw) > MAX_BYTES:
-        raise LibraryError("SKILL.md 最大为 16 KiB。", 413)
+        raise LibraryError("SKILL.md 最大为 128 KiB。", 413)
     try:
         source = raw.decode("utf-8")
         if _unsafe_text(source):
@@ -120,4 +133,4 @@ def parse_upload(filename, encoded):
         raise
     except (UnicodeError, ValueError, IndexError, KeyError, yaml.YAMLError, RecursionError):
         raise LibraryError("技能格式无效。需要 YAML 的 name、description 和非空 Markdown 正文。") from None
-    return SkillDocument(name, description, objective, sha256(raw).hexdigest(), source)
+    return SkillDocument(name, description, objective, sha256(raw).hexdigest(), source, metadata.get("version"))

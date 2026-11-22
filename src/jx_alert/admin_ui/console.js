@@ -71,7 +71,12 @@ async function api(path, options) {
     throw Object.assign(new Error("登录已过期，请重新登录。"), { status: 401 });
   }
   let json;
-  try { json = await response.json(); } catch { throw new Error("服务暂时不可用，请刷新重试。"); }
+  try { json = await response.json(); } catch {
+    if (path === "skill-library" && options?.method === "POST" && response.status === 413) {
+      throw Object.assign(new Error("代理拒绝了大文件。请核对管理台技能上传路径的大小限制。"), { status: 413 });
+    }
+    throw new Error("服务暂时不可用，请刷新重试。");
+  }
   if (!response.ok) {
     const error = new Error(typeof json.error === "string" ? json.error : "请求失败，请稍后重试。");
     error.status = response.status;

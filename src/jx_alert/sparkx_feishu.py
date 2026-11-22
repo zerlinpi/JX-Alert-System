@@ -1,20 +1,19 @@
 """Operator-only manual bridge. A normal SparkX MCP read never queues a message."""
 import argparse
-import hashlib
 import json
 import re
 import sys
 from datetime import timedelta
+from hashlib import sha256
 
 import anyio
 
 from jx_alert.notifications.sparkx_card import render_page
 from jx_alert.sparkx_direct import (
     SparkXDirectError, call_sparkx, check_authorized_profiles, parse_profile_ids,
-    page_size_for, validate_performance_query,
+    validate_performance_query,
 )
 
-PREFIX = "sparkx-page:v1:"
 ROLE = "sparkx_performance_page"
 CONTENT_CONTRACT = "scoped-structured-page-v1"
 
@@ -55,13 +54,14 @@ def page_fresh(created_at, now):
 
 def delivery_blocked(db, settings, key, payload, created_at, now):
     """Revalidate the frozen scope at dispatch, including revocation or generation change."""
+    from jx_alert.notifications.sparkx_export import valid_export_key
     from jx_alert.notifications.store_policy import paused_delivery
 
     try:
         dest = payload["delivery"]
         profile, = parse_profile_ids(dest["sparkx_profile_id"])
         expected, sid = _route(db, settings, profile)
-        return (not re.fullmatch(re.escape(PREFIX) + "[0-9a-f]{64}", key)
+        return (not valid_export_key(key, payload)
                 or payload.get("transport") != "app" or payload.get("store_id") != sid
                 or payload.get("open_ids") != [] or not payload.get("card")
                 or not payload.get("fixed_route") or dest != {**expected, "sparkx_content_contract": CONTENT_CONTRACT}
@@ -71,19 +71,29 @@ def delivery_blocked(db, settings, key, payload, created_at, now):
         return True
 
 
-async def prepare(settings, query, *, enqueue=False, session_factory=None):
+async def prepare(settings, query, *, enqueue=False, inspect=False, fresh_after=None,
+                  ack_delivered=False, session_factory=None):
     """Only a fixed upstream call can produce cards for the durable outbox."""
+    from jx_alert.notifications.sparkx_export import ExportHistory
+
+    if ((inspect and enqueue) or fresh_after is not None and (
+            not enqueue or type(fresh_after) is not int or not 0 < fresh_after < 2**63)
+            or ack_delivered and fresh_after is None):
+        raise SparkXDirectError("仅 --enqueue 可用 --fresh-after 有效编号；确认送达仅用于显式新导出")
     if not isinstance(query, dict):
         raise SparkXDirectError("需要单个 SparkX 查询对象")
     allowed = parse_profile_ids(settings.sparkx_profile_ids)
     validate_performance_query(query, allowed)
     profile, = query["profileIds"]
-    if enqueue:
+    if enqueue or inspect:
         if session_factory is None:
             from jx_alert.storage.db import SessionLocal
             session_factory = SessionLocal
         with session_factory() as db:
             frozen = _route(db, settings, profile)
+            if inspect:
+                return ExportHistory(db, query, *frozen, CONTENT_CONTRACT).view()
+            engine = db.get_bind()
     token = settings.sparkx_ai_token.get_secret_value()
     context = await call_sparkx("get_user_authorized_context", {}, token=token)
     check_authorized_profiles(context, frozenset({profile}))
@@ -94,33 +104,38 @@ async def prepare(settings, query, *, enqueue=False, session_factory=None):
         if page.delivery_card is not None and not page.eligible:
             preview["delivery_preview"] = page.delivery_card
         return preview
-    from jx_alert.notifications.outbox import enqueue_notification
     from jx_alert.notifications.quiet_policy import quiet_blocks
+    from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
 
-    with session_factory.begin() as db:
-        dest, sid = _route(db, settings, profile)
-        if frozen != (dest, sid) or page.delivery_card is None or page.currency != dest["sparkx_currency"]:
-            raise SparkXDirectError("结果或接收范围未核实，仅可预览；未入队")
-        # Retries reuse the same logical page. A new upstream requestId,
-        # differently ordered keys, or a new wording of userContext is not a new report.
-        identity = {**query, "page": query.get("page", 1), "pageSize": page_size_for(query)}
-        del identity["userContext"]
-        material = json.dumps([identity, dest, sid], ensure_ascii=False, sort_keys=True)
-        key = PREFIX + hashlib.sha256(material.encode()).hexdigest()
-        if quiet_blocks(settings, key, {"card": page.delivery_card}):
-            raise SparkXDirectError("当前通知策略禁止投递此页")
-        row = enqueue_notification(db, idempotency_key=key, chat_id=dest["receive_id"],
-                                   store_id=sid, delivery={**dest, "sparkx_content_contract": CONTENT_CONTRACT},
-                                   card=page.delivery_card, fixed_route=True,
-                                   text="SparkX 广告表现（单页原生结果）")
-        return {"status": row.status, "outbox_id": row.id}
+    # Serialize publishers for the same actual recipient/profile across routing
+    # generations. No vendor I/O, HTTP send or FEISHU token request under this lock.
+    lock_name = "sparkx_" + sha256(json.dumps(
+        [frozen[0]["sparkx_profile_id"], frozen[0]["receive_id"]]).encode()).hexdigest()[:32]
+    try:
+        with database_job_lock(engine, lock_name, pin_connection=True) as connection:
+            options = {"bind": connection} if connection is not None else {}
+            with session_factory(**options) as db, db.begin():
+                dest, sid = _route(db, settings, profile)
+                if frozen != (dest, sid) or page.delivery_card is None or page.currency != dest["sparkx_currency"]:
+                    raise SparkXDirectError("结果或接收范围未核实，仅可预览；未入队")
+                if quiet_blocks(settings, "sparkx-page:", {"card": page.delivery_card}):
+                    raise SparkXDirectError("当前通知策略禁止投递此页")
+                row = ExportHistory(db, query, dest, sid, CONTENT_CONTRACT).create_or_reuse(
+                    dest, sid, page.delivery_card, fresh_after=fresh_after, ack_delivered=ack_delivered)
+                return {"status": row.status, "outbox_id": row.id}
+    except JobAlreadyRunning:
+        raise SparkXDirectError("同一 SparkX 账户与群的导出正在处理；稍后用同一请求重试") from None
 
 
 def main():
     from jx_alert.config import get_settings
 
     parser = argparse.ArgumentParser(description="预览一个 SparkX 查询页；不自动翻页或发送。")
-    parser.add_argument("--enqueue", action="store_true", help="操作员明确要求把此页加入已核验的群队列")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--enqueue", action="store_true", help="操作员明确要求把此页加入已核验的群队列")
+    mode.add_argument("--inspect", action="store_true", help="仅核对本地导出状态，不调用 SparkX 或飞书")
+    parser.add_argument("--fresh-after", type=int, metavar="OUTBOX_ID", help="显式请求同一查询页的新导出")
+    parser.add_argument("--ack-delivered", action="store_true", help="确认前一版已送达，而不是重试旧投递")
     args = parser.parse_args()
     try:
         raw = sys.stdin.buffer.read(32_769)
@@ -131,7 +146,8 @@ def main():
         raise SystemExit("请通过标准输入提供有效的 SparkX 查询 JSON（最多 32 KiB）") from None
 
     async def run():
-        return await prepare(get_settings(), query, enqueue=args.enqueue)
+        return await prepare(get_settings(), query, enqueue=args.enqueue, inspect=args.inspect,
+                             fresh_after=args.fresh_after, ack_delivered=args.ack_delivered)
 
     try:
         print(json.dumps(anyio.run(run), ensure_ascii=False))

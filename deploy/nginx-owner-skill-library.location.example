@@ -1,0 +1,14 @@
+# Place inside the existing HTTPS server block that already serves OwnerConsole.
+# Keep client_max_body_size 64k (or the site's normal limit) everywhere else.
+# 769 KiB = 4 * ceil(576 KiB / 3) + 1 KiB of bounded JSON framing.
+location = /console/api/skill-library {
+    client_max_body_size 769k;
+    access_log off;
+    proxy_pass http://127.0.0.1:8002;
+    proxy_http_version 1.1;
+    proxy_request_buffering off;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}

@@ -24,6 +24,7 @@ from sqlalchemy.orm import aliased
 
 from jx_alert import admin_ad_subscribers, admin_data, admin_groups, admin_mapping, admin_sources, store_controls
 from jx_alert import admin_review_skills, admin_skill_library
+from jx_alert.agent_skill_package import MAX_REQUEST as SKILL_UPLOAD_LIMIT
 from jx_alert.ai import deepseek_config
 from jx_alert.lingxing.source_credentials import SourceCredentialsError
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
@@ -420,9 +421,11 @@ class OwnerConsole:
     def _write_skill_library(self, token, payload):
         # Receiving a streamed body or waiting for a worker can outlive the session.
         # Check again immediately before admitting the library write.
-        if not self._session(token):
-            raise ConsoleError("登录已过期，请重新登录。", 401)
-        return admin_skill_library.update_skills(self.settings, payload)
+        def authorize():
+            if not self._session(token):
+                raise ConsoleError("登录已过期，请重新登录。", 401)
+        authorize()
+        return admin_skill_library.update_skills(self.settings, payload, authorize=authorize)
 
     async def api(self, request):
         if not self._valid_host(request):
@@ -453,7 +456,7 @@ class OwnerConsole:
                 if path == "/console/api/skill-library" and not self._rate_allowed(
                         request, "skill-library-write", per_ip=12, total=20):
                     raise ConsoleError("技能资料库操作太频繁，请稍后重试。", 429)
-                body_limit = {"/console/api/data-sources": 16384, "/console/api/skill-library": 24 * 1024}
+                body_limit = {"/console/api/data-sources": 16384, "/console/api/skill-library": SKILL_UPLOAD_LIMIT}
                 payload = await _body(request, "application/json", limit=body_limit.get(path, 8192))
                 if path == '/console/api/ad-alert-subscribers':
                     if set(payload) != {'open_ids', 'revision'}:
@@ -528,6 +531,15 @@ class OwnerConsole:
                 if (set(params) - {"version"} or (raw is not None and
                         (len(params.getlist("version")) != 1 or not re.fullmatch(r"[1-9][0-9]?", raw)))):
                     raise ConsoleError("版本查询无效。", 400)
+                if path.endswith("/package.zip"):
+                    if raw is None:
+                        raise ConsoleError("导出时必须指定资料库版本。", 400)
+                    name = request.path_params["name"]
+                    package = await asyncio.to_thread(admin_skill_library.export_skill, self.settings, name, int(raw))
+                    if not await asyncio.to_thread(self._session, token):
+                        raise ConsoleError("登录已过期，请重新登录。", 401)
+                    return Response(package, media_type="application/zip", headers={**_HEADERS,
+                        "Content-Disposition": f'attachment; filename="{name}-v{raw}.zip"'})
                 data = await asyncio.to_thread(admin_skill_library.inspect_skill, self.settings,
                                               request.path_params["name"], int(raw) if raw else None)
             elif path.startswith("/console/api/notification-group"):
@@ -550,6 +562,9 @@ class OwnerConsole:
             else:
                 data = await asyncio.to_thread(self._stores_data)
                 data["csrf"] = _csrf(token)
+            if (request.method == "GET" and path.startswith("/console/api/skill-library")
+                    and not await asyncio.to_thread(self._session, token)):
+                raise ConsoleError("登录已过期，请重新登录。", 401)
             return JSONResponse(data, headers=_HEADERS)
         except ConsoleError as exc:
             return _error(exc.detail, exc.status)
@@ -573,6 +588,7 @@ class OwnerConsole:
                 Route("/console/api/review-skills", self.api, methods=["GET", "POST"]),
                 Route("/console/api/skill-library", self.api, methods=["GET", "POST"]),
                 Route("/console/api/skill-library/{name}", self.api),
+                Route("/console/api/skill-library/{name}/package.zip", self.api),
                 Route('/console/api/ad-alert-subscribers', self.api, methods=['GET', 'POST']),
                 Route('/console/api/ad-alert-subscribers/members', self.api),
                 Route("/console/api/notification-group", self.api, methods=["GET", "POST"]),

@@ -83,7 +83,7 @@ def test_lifecycle_inert_versions_audit_and_reopen(settings):
 
 @pytest.mark.parametrize("payload", [
     upload(filename="skill.zip"), upload(filename="scripts/skill.py"), upload(filename="../SKILL.md"),
-    upload(b"\x00not text"), upload(b"\xff"), upload("x" * (16 * 1024 + 1)), upload("name: missing"),
+    upload(b"\x00not text"), upload(b"\xff"), upload("x" * (128 * 1024 + 1)), upload("name: missing"),
     upload(TEXT.replace("name: ad-advice", "name: ../outside")),
     upload(TEXT.replace("name: ad-advice", "name: bad--name")),
     upload(TEXT.replace("description: >", "name: duplicate\ndescription: >")),

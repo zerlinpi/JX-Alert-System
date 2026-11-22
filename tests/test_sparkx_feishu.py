@@ -468,3 +468,238 @@ def test_known_sent_boundary_uses_time_after_policy_io_and_intent_commit(pilot, 
         assert "未发起消息 POST" in row.last_error
         assert db.execute(select(NotificationLog.status, NotificationLog.message_id)).all() == [("SKIPPED", None)]
     assert worker.process_outbox_batch()["claimed"] == 0
+
+
+VENDOR_QUERY = {**QUERY, "factEntity": "asin", "metrics": ["ShippedRevenue", "OrderedRevenue"]}
+VENDOR_DEFAULTS = {"distributorView": "MANUFACTURING", "sellingProgram": "RETAIL"}
+
+
+def _vendor_result(*, rows=None, defaults=VENDOR_DEFAULTS, meta=None):
+    rows = [{"asin": "B000000001", "ShippedRevenue": 1.21, "OrderedRevenue": None}] if rows is None else rows
+    metadata = {**ENVELOPE["meta"], **(meta or {})}
+    if defaults is not None:
+        metadata["appliedDefaults"] = defaults
+    return {**ENVELOPE, "meta": metadata, "data": {"rows": rows, "rowCount": len(rows)}}
+
+
+def test_vendor_defaults_are_visibly_labelled_and_same_card_survives_mock_delivery(pilot):
+    _, sessions, _, response, sent, calls = pilot
+    data = _vendor_result()
+    response["page"] = result(data, json.dumps(data))
+    preview = _prepare(pilot, VENDOR_QUERY, enqueue=False)
+    assert preview["eligible_result"] is True
+    card = preview["card"]
+    text = json.dumps(card, ensure_ascii=False)
+    assert "distributorView=MANUFACTURING（SparkX 默认）" in text
+    assert "sellingProgram=RETAIL（SparkX 默认）" in text and "不同口径不相加" in text
+    assert card["body"]["elements"][1]["rows"] == [dict(c0="B000000001", c1="1.21", c2="null")]
+    queued = _prepare(pilot, VENDOR_QUERY)
+    assert calls[-1] == ("get_ads_perf", VENDOR_QUERY)
+    assert worker.process_outbox_batch(outbox_ids=[queued["outbox_id"]])["sent"] == 1
+    assert len(sent) == 1 and json.loads(sent[0]["content"]) == card
+
+
+@pytest.mark.parametrize("query,defaults,values,label", [
+    ({"filters": {"distributorView_": "SOURCING"}}, {"sellingProgram": "RETAIL"},
+     {"distributorView": "SOURCING"}, "distributorView=SOURCING（请求筛选）"),
+    ({"filters": {"sellingProgram_": {"=": "BUSINESS"}}}, {"distributorView": "MANUFACTURING"},
+     {"sellingProgram_": "BUSINESS"}, "sellingProgram=BUSINESS（请求筛选）"),
+    ({"select": ["distributorView_"]}, {"sellingProgram": "RETAIL"},
+     {"distributorView_": "MANUFACTURING"}, "distributorView 按值分组"),
+    ({"select": ["distributorView_", "sellingProgram_", "storeType_"]}, None,
+     {"distributorView_": "MANUFACTURING", "sellingProgram_": "BUSINESS", "storeType": "vendor"},
+     "sellingProgram 按值分组"),
+])
+def test_vendor_explicit_dimensions_reconcile_without_summing(query, defaults, values, label):
+    page = render_page(result(_vendor_result(rows=[{"ShippedRevenue": 0, **values}], defaults=defaults)),
+                       {**VENDOR_QUERY, **query})
+    assert page.eligible and label in json.dumps(page.card, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("query,defaults,values", [
+    ({}, {}, {}),
+    ({}, [], {}),
+    ({}, {"distributorView": "SOURCING", "sellingProgram": "RETAIL"}, {}),
+    ({}, {**VENDOR_DEFAULTS, "storeType": "Vendor"}, {}),
+    ({}, {"sellingProgram": "RETAIL"}, {}),
+    ({}, VENDOR_DEFAULTS, {"storeType_": "Seller"}),
+    ({}, VENDOR_DEFAULTS, {"distributorView_": "SOURCING"}),
+    ({}, VENDOR_DEFAULTS, {"sellingProgram_": ["RETAIL"]}),
+    ({"filters": {"distributorView_": "SOURCING"}}, VENDOR_DEFAULTS, {}),
+    ({"filters": {"distributorView_": {"in": ["SOURCING"]}}}, {"sellingProgram": "RETAIL"}, {}),
+    ({"filters": {"AND": [{"distributorView_": "SOURCING"}]}}, {"sellingProgram": "RETAIL"}, {}),
+    ({"filters": {"asin.distributorView_": "SOURCING"}}, {"sellingProgram": "RETAIL"}, {}),
+    ({"select": ["distributorView_"]}, {"sellingProgram": "RETAIL"}, {}),
+    ({"select": ["asin.distributorView_"]}, {"sellingProgram": "RETAIL"}, {}),
+    ({"select": ["sellingProgram_"]}, {"distributorView": "MANUFACTURING"},
+     {"sellingProgram": "BUSINESS", "sellingProgram_": "BUSINESS"}),
+    ({}, None, {"storeType": "VENDOR"}),  # no evidence of necessary locks
+    ({"factEntity": "campaign"}, VENDOR_DEFAULTS, {}),
+])
+def test_unverified_vendor_defaults_or_conflicts_are_never_deliverable(query, defaults, values):
+    with pytest.raises(SparkXDirectError):
+        render_page(result(_vendor_result(rows=[{"ShippedRevenue": 0, **values}], defaults=defaults)),
+                    {**VENDOR_QUERY, **query})
+
+
+def test_vendor_scope_and_json_mirror_still_fail_closed():
+    data = _vendor_result()
+    for missing in ("effectiveProfileIds", "currency"):
+        broken = deepcopy(data)
+        del broken["meta"][missing]
+        with pytest.raises(SparkXDirectError):
+            render_page(result(broken), VENDOR_QUERY)
+    changed = _vendor_result(defaults={"sellingProgram": "RETAIL"})
+    with pytest.raises(SparkXDirectError):
+        render_page(result(data, json.dumps(changed)), VENDOR_QUERY)
+    assert render_page(result(_vendor_result(defaults=None, rows=[{"storeType": "seller", "Sessions": 0}])),
+                       {**VENDOR_QUERY, "metrics": ["Sessions"]}).eligible
+
+
+def test_undocumented_or_unconfirmed_vendor_slices_cannot_be_sent(pilot):
+    _, sessions, _, response, sent, _ = pilot
+    query = {**VENDOR_QUERY, "filters": {"distributorView_": "SOURCING", "sellingProgram_": "BUSINESS"}}
+    response["page"] = result(_vendor_result(defaults=None))
+    assert _prepare(pilot, query, enqueue=False)["eligible_result"] is False
+    with pytest.raises(SparkXDirectError):
+        _prepare(pilot, query)
+    with sessions() as db:
+        assert not db.scalars(select(NotificationOutbox)).all()
+    assert sent == []
+
+
+def test_vendor_only_cells_with_no_metadata_or_store_type_can_only_be_previewed():
+    for cells in ({"ShippedRevenue": 1}, {"distributorView": "SOURCING"}):
+        page = render_page(result(_vendor_result(defaults=None, rows=[cells])), VENDOR_QUERY)
+        assert not page.eligible and page.delivery_card is None
+
+
+def test_ordinary_filter_text_is_not_a_vendor_dimension_reference():
+    query = {**VENDOR_QUERY, "filters": {"asin.asinTitle_": {"like": "Book explains sellingProgram_"}}}
+    assert render_page(result(_vendor_result()), query).eligible
+
+
+def test_audience_search_with_optional_metrics_keeps_scope_and_bounds(pilot):
+    _, sessions, _, response, sent, calls = pilot
+    query = {**QUERY, "factEntity": "campaignAudience", "search": "Synthetic families",
+             "select": ["audienceName", "Spend"]}
+    del query["metrics"]
+    meta = {**ENVELOPE["meta"], "pageSize": 50, "hasNextPage": False, "total": 2}
+    rows = [{"audienceName": "Synthetic family A", "Spend": 0},
+            {"audienceName": "Synthetic family B", "Spend": 1.21}]
+    response["page"] = result({**ENVELOPE, "meta": meta, "data": {"rows": rows, "rowCount": 2}})
+    queued = _prepare(pilot, query)
+    assert calls[-1] == ("get_ads_perf", query)
+    assert worker.process_outbox_batch(outbox_ids=[queued["outbox_id"]])["sent"] == 1
+    assert len(sent) == 1
+    table = json.loads(sent[0]["content"])["body"]["elements"][1]
+    assert [col["display_name"] for col in table["columns"]] == ["audienceName", "Spend"]
+    assert table["rows"] == [dict(c0="Synthetic family A", c1="0"), dict(c0="Synthetic family B", c1="1.21")]
+    wide = {str(i): 0 for i in range(80)}
+    response["page"] = result({**ENVELOPE, "meta": {**meta, "total": 1}, "data": {"rows": [wide], "rowCount": 1}})
+    with pytest.raises(SparkXDirectError, match="表格限制"):
+        _prepare(pilot, {k: v for k, v in query.items() if k != "select"})
+    with sessions() as db:
+        assert len(db.scalars(select(NotificationOutbox)).all()) == 1
+
+
+@pytest.mark.parametrize("meta", [{"currency": "JPY"}, {"effectiveProfileIds": [PROFILE + 1]}])
+def test_vendor_defaults_do_not_bypass_original_profile_and_route_currency(pilot, meta):
+    _, sessions, _, response, sent, _ = pilot
+    response["page"] = result(_vendor_result(meta=meta))
+    with pytest.raises(SparkXDirectError):
+        _prepare(pilot, VENDOR_QUERY)
+    with sessions() as db:
+        assert not db.scalars(select(NotificationOutbox)).all()
+    assert sent == []
+
+@pytest.mark.parametrize("cells", [{"Clicks": 1}, {"spend": 0}, {"campaignId": 123}, {"audienceName": "test", "prevSpend": 1}])
+def test_audience_outbox_rejects_columns_outside_the_exact_projection(pilot, cells):
+    _, sessions, _, response, sent, _ = pilot
+    query = {**QUERY, "factEntity": "campaignAudience", "select": ["audienceName", "Spend"]}
+    meta = {**ENVELOPE["meta"], "pageSize": 50, "hasNextPage": False, "total": 1}
+    response["page"] = result({**ENVELOPE, "meta": meta, "data": {"rows": [{**cells, "Spend": 0}], "rowCount": 1}})
+    with pytest.raises(SparkXDirectError, match="未请求的字段"):
+        _prepare(pilot, query)
+    with sessions() as db:
+        assert not db.scalars(select(NotificationOutbox)).all()
+    assert sent == []
+
+
+def test_audience_projection_can_omit_unknown_requested_names():
+    query = {**QUERY, "factEntity": "campaignAudience", "select": ["audienceName", "Spend", "invented"]}
+    meta = {**ENVELOPE["meta"], "pageSize": 50, "hasNextPage": False, "total": 1}
+    raw = {**ENVELOPE, "meta": meta, "data": {"rows": [{"audienceName": "Fixture", "Spend": 0}], "rowCount": 1}}
+    page = render_page(result(raw), query)
+    assert page.eligible
+    assert [c["display_name"] for c in page.card["body"]["elements"][1]["columns"]] == ["audienceName", "Spend"]
+
+
+def test_missing_requested_vendor_metrics_do_not_erase_the_vendor_scope_gate(pilot):
+    _, sessions, _, response, sent, _ = pilot
+    query = {**VENDOR_QUERY, "metrics": ["ShippedRevenue", "Spend"]}
+    response["page"] = result(_vendor_result(defaults=None, rows=[{"Spend": 0}]))
+    preview = _prepare(pilot, query, enqueue=False)
+    assert preview["eligible_result"] is False and "未确认 Vendor ASIN 口径" in str(preview["card"])
+    with pytest.raises(SparkXDirectError):
+        _prepare(pilot, query)
+    with sessions() as db:
+        assert not db.scalars(select(NotificationOutbox)).all()
+    assert sent == []
+
+
+@pytest.mark.parametrize("slicing", [{"filters": {"distributorView_": "SOURCING"}},
+                                     {"select": ["distributorView_"]}])
+def test_vendor_sourcing_preserves_ordered_source_zero_but_labels_it_unavailable(slicing):
+    raw = _vendor_result(defaults={"sellingProgram": "RETAIL"},
+                         rows=[{"distributorView": "SOURCING", "OrderedRevenue": 0, "ShippedRevenue": 8}])
+    page = render_page(result(raw), {**VENDOR_QUERY, **slicing})
+    elements = page.card["body"]["elements"]
+    assert page.eligible
+    assert elements[1]["rows"] == [dict(c0="SOURCING", c1="0", c2="8")]
+    assert any("SOURCING 行不提供 Ordered" in str(note) and "不代表真实订单为零" in str(note) for note in elements[2:])
+    default = render_page(result(_vendor_result(rows=[{"OrderedRevenue": 0}])), VENDOR_QUERY)
+    assert default.eligible and "可能是占位" not in str(default.card)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"filters": {"storeType_": {"=": "VENDOR"}}},
+    {"filters": {"OR": [{"storeType_": "Vendor"}, {"storeType_": "Seller"}]}},
+    {"filters": {"ShippedRevenue": {">": 9}}},
+    {"orderBy": [{"field": "OrderedRevenue", "direction": "DESC"}]},
+])
+def test_vendor_scope_in_filters_and_sort_requires_evidence(overrides):
+    raw = _vendor_result(defaults=None, rows=[{"Spend": 9}])
+    page = render_page(result(raw), {**VENDOR_QUERY, "metrics": ["Spend"], **overrides})
+    assert page.delivery_card is None and "未确认 Vendor ASIN 口径" in str(page.card)
+
+
+def test_explicit_seller_scope_does_not_accept_vendor_default_metadata():
+    query = {**VENDOR_QUERY, "metrics": ["Spend"], "filters": {"storeType_": "SELLER"}}
+    with pytest.raises(SparkXDirectError, match="Seller 不一致"):
+        render_page(result(_vendor_result()), query)
+    raw = _vendor_result(defaults=None, rows=[{"Spend": 0, "storeType": "seller"}])
+    assert render_page(result(raw), query).eligible
+
+
+@pytest.mark.parametrize("value", [1, -1.25, "1", False])
+def test_non_placeholder_ordered_cells_contradict_confirmed_sourcing(value):
+    query = {**VENDOR_QUERY, "filters": {"distributorView_": "SOURCING"}}
+    raw = _vendor_result(defaults={"sellingProgram": "RETAIL"},
+                         rows=[{"OrderedRevenue": value, "ShippedRevenue": 8}])
+    with pytest.raises(SparkXDirectError, match="SOURCING 行返回与口径冲突"):
+        render_page(result(raw), query)
+
+
+def test_ordered_caveat_only_changes_assurance_for_sourcing_rows_in_mixed_projection():
+    query = {**VENDOR_QUERY, "select": ["distributorView_"]}
+    rows = [{"distributorView": "MANUFACTURING", "OrderedRevenue": 6},
+            {"distributorView": "SOURCING", "OrderedRevenue": None}]
+    page = render_page(result(_vendor_result(defaults={"sellingProgram": "RETAIL"}, rows=rows)), query)
+    assert page.eligible
+    assert page.card["body"]["elements"][1]["rows"] == [
+        dict(c0="MANUFACTURING", c1="6"), dict(c0="SOURCING", c1="null")]
+    assert "不代表真实订单为零" in str(page.card)
+    rows[1]["OrderedRevenue"] = 6
+    with pytest.raises(SparkXDirectError, match="SOURCING 行返回与口径冲突"):
+        render_page(result(_vendor_result(defaults={"sellingProgram": "RETAIL"}, rows=rows)), query)

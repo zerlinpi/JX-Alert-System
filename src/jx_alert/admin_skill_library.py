@@ -2,12 +2,14 @@
 
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
+from hashlib import sha256
 import os
 from pathlib import Path
 import sqlite3
 import stat
 
 from jx_alert.agent_skill_document import LibraryError, MAX_BYTES, parse_upload, valid_name
+from jx_alert.agent_skill_package import MAX_ARCHIVE, SkillPackage, export_zip, missing_text_links, parse_package
 from jx_alert.mcp_oauth import _private_file
 
 MAX_SKILLS = 32
@@ -28,8 +30,15 @@ _SCHEMA = (
 )
 
 
+# V2 is additive. Reads of existing V1 libraries do not mutate them. The first
+# successful write migrates under the same transaction as that write.
+_REFERENCES = """CREATE TABLE skill_reference (
+  name TEXT NOT NULL, version INTEGER NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL,
+  PRIMARY KEY(name,version,path), FOREIGN KEY(name,version) REFERENCES skill_version(name,version))"""
+
+
 @contextmanager
-def _database(settings, *, write=False):
+def _database(settings, *, write=False, authorize=None):
     raw_dir = getattr(settings, "agent_skill_library_dir", "")
     if not raw_dir:
         if write:
@@ -73,9 +82,18 @@ def _database(settings, *, write=False):
                     db.execute(statement)
                 db.execute(f"PRAGMA application_id={_APPLICATION_ID}")
                 db.execute("PRAGMA user_version=1")
-            elif app_id != _APPLICATION_ID or db.execute("PRAGMA user_version").fetchone()[0] != 1:
+            elif app_id != _APPLICATION_ID:
                 raise LibraryError("无法识别技能资料库，未覆盖。", 409)
+            schema = db.execute("PRAGMA user_version").fetchone()[0]
+            if schema not in (1, 2):
+                raise LibraryError("无法识别技能资料库版本，未覆盖。", 409)
+            if write and schema == 1:
+                db.execute("ALTER TABLE skill_version ADD COLUMN declared_version TEXT")
+                db.execute(_REFERENCES)
+                db.execute("PRAGMA user_version=2")
             yield db
+            if authorize:
+                authorize()  # a revoked session must not commit a prepared write
             db.commit()
     except LibraryError:
         raise
@@ -100,7 +118,7 @@ def _state(db):
 def list_skills(settings):
     with _database(settings) as db:
         return {**_state(db), "can_upload": bool(getattr(settings, "agent_skill_library_dir", "")),
-                "max_bytes": MAX_BYTES}
+                "max_bytes": MAX_BYTES, "max_archive_bytes": MAX_ARCHIVE}
 
 
 def _version_number(value):
@@ -118,6 +136,11 @@ def inspect_skill(settings, name, version=None):
             WHERE name=? AND version=?""", (name, version or head["version"])).fetchone()
         if not row:
             raise LibraryError("未找到该版本。", 404)
+        modern = db.execute("PRAGMA user_version").fetchone()[0] == 2
+        refs = (dict(db.execute("""SELECT path,source FROM skill_reference
+            WHERE name=? AND version=? ORDER BY path""", (name, row["version"]))) if modern else {})
+        declared = (db.execute("SELECT declared_version FROM skill_version WHERE name=? AND version=?",
+                               (name, row["version"])).fetchone()[0] if modern else None)
         history = db.execute("""SELECT version,digest,created FROM skill_version
             WHERE name=? ORDER BY version DESC""", (name,))
         audit = db.execute("""SELECT sequence,action,from_version,to_version,enabled,at
@@ -127,37 +150,55 @@ def inspect_skill(settings, name, version=None):
         preview = ({"schema": "jx.review-objective.v1", "objective": row["objective"]}
                    if available and row["version"] == head["version"] and row["objective"] else None)
         return {"name": name, "revision": _revision(db), "current_version": head["version"],
-                "enabled": available, "applied_to_model": False, "document": dict(row),
+                "enabled": available, "applied_to_model": False, "document": {**dict(row), "declared_version": declared,
+                    "source_digest": sha256(row["source"].encode()).hexdigest()},
+                "references": refs, "missing_text_links": missing_text_links(row["source"], refs),
                 "versions": [dict(v) for v in history],
                 "audit": [{"actor": "console_owner", **dict(e)} for e in audit],
                 "local_preview": preview}
 
 
-def update_skills(settings, payload):
+def export_skill(settings, name, version):
+    info = inspect_skill(settings, name, version)
+    return export_zip(name, info["document"]["source"], info["references"])
+
+
+def update_skills(settings, payload, *, authorize=None):
     if not isinstance(payload, dict):
         raise LibraryError("操作格式无效。")
     action = payload.get("action")
-    fields = {"upload": {"filename", "content_base64"}, "enable": {"name"},
+    fields = {"upload": {"filename", "content_base64"}, "upload_package": {"content_base64"},
+              "enable": {"name"},
               "disable": {"name"}, "rollback": {"name", "version"}}
     if not isinstance(action, str) or action not in fields or set(payload) != (fields[action] | {"action", "revision"}):
         raise LibraryError("不支持的技能操作或参数。")
     revision = payload["revision"]
     if type(revision) is not int or not 0 <= revision < 2**63:
         raise LibraryError("资料库版本无效。")
-    doc = parse_upload(payload["filename"], payload["content_base64"]) if action == "upload" else None
-    name = doc.name if doc else payload["name"]
+    package = None
+    if action == "upload_package":
+        package = parse_package(payload["content_base64"])
+    elif action == "upload":
+        doc = parse_upload(payload["filename"], payload["content_base64"])
+        package = SkillPackage(doc, {}, doc.digest)
+    name = package.document.name if package else payload["name"]
     if not valid_name(name) or (action == "rollback" and not _version_number(payload["version"])):
         raise LibraryError("技能名称或版本号无效。")
-    with _database(settings, write=True) as db:
+    if authorize:
+        authorize()  # parsing may outlive the upload session
+    with _database(settings, write=True, authorize=authorize) as db:
+        if authorize:
+            authorize()  # include time spent waiting for a database writer
         if revision != _revision(db):
             raise LibraryError("资料库已变更，请刷新后重试。", 409)
         head = db.execute("SELECT version,enabled FROM skill_current WHERE name=?", (name,)).fetchone()
         previous, enabled = (tuple(head) if head else (None, 0))
         version = previous
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        if doc:
+        if package:
+            doc = package.document
             known = db.execute("SELECT version FROM skill_version WHERE name=? AND digest=?",
-                               (name, doc.digest)).fetchone()
+                               (name, package.digest)).fetchone()
             if known:
                 if known[0] != previous:
                     raise LibraryError("文件与历史版本相同；如需恢复，请在版本记录中回滚。", 409)
@@ -168,8 +209,13 @@ def update_skills(settings, payload):
                                      (name,)).fetchone()[0]
                 if version > MAX_VERSIONS:
                     raise LibraryError("该技能版本数量已达上限，未覆盖历史。", 409)
-                db.execute("INSERT INTO skill_version VALUES(?,?,?,?,?,?,?)",
-                           (name, version, doc.digest, doc.description, doc.objective, doc.source, now))
+                db.execute("""INSERT INTO skill_version
+                    (name,version,digest,description,objective,source,created,declared_version)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (name, version, package.digest, doc.description, doc.objective, doc.source, now,
+                     doc.declared_version))
+                db.executemany("INSERT INTO skill_reference(name,version,path,source) VALUES(?,?,?,?)",
+                               ((name, version, path, text) for path, text in package.references.items()))
                 enabled = 0  # Review every new version separately, including updates.
         elif not head:
             raise LibraryError("未找到该技能。", 404)
@@ -187,4 +233,4 @@ def update_skills(settings, payload):
                 DO UPDATE SET version=excluded.version,enabled=excluded.enabled""", (name, version, enabled))
             db.execute("""INSERT INTO skill_audit(name,action,from_version,to_version,enabled,at)
                 VALUES(?,?,?,?,?,?)""", (name, action, previous, version, enabled, now))
-        return {**_state(db), "can_upload": True, "max_bytes": MAX_BYTES}
+        return {**_state(db), "can_upload": True, "max_bytes": MAX_BYTES, "max_archive_bytes": MAX_ARCHIVE}

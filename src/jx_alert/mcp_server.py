@@ -1376,8 +1376,9 @@ def build_sparkx_mcp(settings) -> FastMCP:
         """Forward a SparkXAI performance query and return its native content and structure.
 
         Use SparkX profileIds (one approved profile), factEntity, dateStart, dateEnd,
-        metrics and a minimal userContext (no secrets). Vendor field names, dates
-        and pagination are preserved; no local report is generated.
+        and a minimal userContext (no secrets). Provide metrics except for campaignAudience,
+        which can omit metrics and use its own audience-name search. Vendor field names,
+        dates and pagination are preserved; no local report is generated.
         """
         try:
             validate_performance_query(arguments, profiles)

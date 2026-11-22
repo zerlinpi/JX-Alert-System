@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 const { once } = require("node:events");
 const { mkdtempSync, rmSync } = require("node:fs");
 const { tmpdir } = require("node:os");
@@ -136,6 +136,37 @@ test("Owner console renders and uploads a disabled Skill in Chromium", { timeout
         await library.getByText("第一次上传？查看文件格式与示例").press("Enter");
         await library.locator("pre").waitFor();
         await layout("Skills detail");
+
+        // Preserve the original single-file path above. Exercise real owner-only
+        // ZIP import/export on the desktop and reopen the same references on mobile.
+        const fixture = path.resolve(__dirname, "../fixtures/owner-skills/portable-review");
+        if (width === 1280) {
+          const zip = path.join(cwd, "portable-review.zip");
+          execFileSync("python", ["-m", "zipfile", "-c", zip, fixture]);
+          await library.getByLabel("选择本地技能文档").setInputFiles(zip);
+          await library.getByRole("button", { name: "上传到资料库" }).click();
+        }
+        await library.getByRole("button", { name: "portable-review · v1 · 停用" }).click();
+        const docs = library.getByLabel("查看包内参考文档");
+        await docs.selectOption({ label: "references/nested/清单.txt" });
+        const ref = library.getByLabel("参考文档原文（只读）");
+        assert.match(await ref.inputValue(), /<b>本行是纯文本/);
+        assert.equal(await ref.evaluate(element => element.readOnly), true);
+        await library.getByText(/这些本地文档链接不在此版本中/).waitFor();
+        await layout("Skills package");
+        if (width === 1280) {
+          const download = page.waitForEvent("download");
+          await library.getByRole("link", { name: "导出完整版本 ZIP（含参考文档）" }).click();
+          const result = await download;
+          assert.equal(result.suggestedFilename(), "portable-review-v1.zip");
+          const saved = path.join(cwd, "download.zip");
+          await result.saveAs(saved);
+          execFileSync("python", ["-c", [
+            "from pathlib import Path; import sys, zipfile",
+            "p=Path(sys.argv[2]); z=zipfile.ZipFile(sys.argv[1])",
+            "assert {k:z.read(k) for k in z.namelist()} == {f.relative_to(p.parent).as_posix():f.read_bytes() for f in p.rglob('*') if f.is_file()}",
+          ].join("\n"), saved, fixture]);
+        }
 
         assert.deepEqual(errors, []);
         assert.deepEqual(blocked, []);

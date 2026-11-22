@@ -14,7 +14,7 @@ window.JxSkillLibrary = (() => {
     return b;
   };
   const objectiveLabels = { balanced: "均衡", efficiency: "效率优先", reach: "曝光优先", discovery: "探索优先" };
-  const auditLabels = { upload: "上传", enable: "设为可用", disable: "停用", rollback: "恢复版本" };
+  const auditLabels = { upload: "上传", upload_package: "导入技能包", enable: "设为可用", disable: "停用", rollback: "恢复版本" };
 
   function mount(root, { api, csrf }) {
     if (!root) return null;
@@ -22,17 +22,17 @@ window.JxSkillLibrary = (() => {
     let catalog, selected, busy = false;
     const title = node("h2", "自定义 Skills 资料库");
     title.id = "skill-library-title";
-    const intro = node("p", "把自己的 SKILL.md 保存到管理台，再审阅、恢复或导出版本。入库不会运行文件、调用模型或发送飞书通知。", "muted");
+    const intro = node("p", "选择 SKILL.md 或带有参考文档的 ZIP，审阅后可导出整个版本。入库不会运行文件、调用模型或发送飞书通知。", "muted");
     const guide = node("details", undefined, "skill-format");
     guide.append(node("summary", "第一次上传？查看文件格式与示例"),
-      node("p", "将下方示例保存为 UTF-8 文本 SKILL.md（最大 16 KiB），再替换名称、简介和正文。名称只用小写英文字母、数字和连字符。"),
+      node("p", "将下方示例保存为 UTF-8 文本 SKILL.md（单文件最大 128 KiB），再替换名称、简介和正文。名称只用小写英文字母、数字和连字符。"),
       node("pre", "---\nname: daily-review\ndescription: 核对店铺日报中的数据日期。\n---\n# 日报复核\n先确认统计日期，再区分缺失数据和真实零值。"),
-      node("p", "不接受 ZIP、脚本或工具权限声明。可把原始文档导出到支持此格式的其他工具；导入后的权限和效果由该工具决定。"));
+      node("p", "打包时，只保留一个技能的 SKILL.md 和 references/ 中的 UTF-8 .md、.txt 文件。ZIP 最大 576 KiB，最多 32 份文档、解压后共 512 KiB。脚本、素材、工具权限声明不支持；外部链接、其他技能及 MCP 依赖不会自动获取。"));
     const fileLabel = node("label", "选择本地技能文档");
     const file = node("input");
     file.type = "file";
     file.id = fileLabel.htmlFor = "skill-library-file";
-    file.accept = ".md,text/markdown,text/plain";
+    file.accept = ".md,.zip,text/markdown,application/zip";
     const upload = button("上传到资料库");
     upload.className = "button primary";
     const reload = button("刷新");
@@ -89,7 +89,37 @@ window.JxSkillLibrary = (() => {
       source.rows = 9;
       source.readOnly = true;
       source.value = info.document.source;
-      const checksum = node("p", `SHA-256：${info.document.digest}`, "skill-library-digest muted");
+      const references = Object.entries(info.references || {});
+      const manifest = node("div");
+      manifest.append(node("p", `主文档：SKILL.md；参考文档：${references.length} 份；源文件声明版本：${info.document.declared_version || "未记录"}。`));
+      if (references.length) {
+        const refLabel = node("label", "查看包内参考文档");
+        const ref = node("select");
+        ref.id = refLabel.htmlFor = "skill-library-reference";
+        const contentsLabel = node("label", "参考文档原文（只读）");
+        const contents = node("textarea");
+        contents.id = contentsLabel.htmlFor = "skill-library-reference-source";
+        contents.readOnly = true;
+        contents.rows = 6;
+        for (const [i, [path]] of references.entries()) {
+          const option = node("option", path);
+          option.value = String(i);
+          ref.append(option);
+        }
+        contents.value = references[0][1];
+        ref.addEventListener("change", () => { contents.value = references[Number(ref.value)][1]; });
+        manifest.append(refLabel, ref, contentsLabel, contents);
+      }
+      if (info.missing_text_links?.length) {
+        const note = node("details");
+        note.append(node("summary", "这些本地文档链接不在此版本中（最多显示 20 处）"));
+        const missing = node("ul");
+        for (const [from, target] of info.missing_text_links)
+          missing.append(node("li", `${from} → ${target}`));
+        note.append(missing);
+        manifest.append(note);
+      }
+      const checksum = node("p", `版本内容 SHA-256：${info.document.digest}`, "skill-library-digest muted");
       const choose = node("select");
       const chooseLabel = node("label", "查看版本");
       choose.id = chooseLabel.htmlFor = "skill-library-version";
@@ -122,13 +152,16 @@ window.JxSkillLibrary = (() => {
         link.click();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       });
+      const bundle = node("a", "导出完整版本 ZIP（含参考文档）", "button secondary");
+      bundle.href = `/console/api/skill-library/${encodeURIComponent(info.name)}/package.zip?version=${info.document.version}`;
+      bundle.download = `${info.name}-v${info.document.version}.zip`;
       const audit = node("details");
       audit.append(node("summary", "最近操作记录（最多 30 条）"));
       const events = node("ol");
       for (const e of info.audit) events.append(node("li",
         `${dateLabel(e.at)} · 管理员 · ${auditLabels[e.action]} v${e.to_version} · ${e.enabled ? "可用" : "停用"}`));
       audit.append(events);
-      detail.replaceChildren(heading, state, preview, chooseLabel, choose, view, textLabel, source, checksum, change, download, audit);
+      detail.replaceChildren(heading, state, preview, chooseLabel, choose, view, textLabel, source, manifest, checksum, change, download, bundle, audit);
     }
     function dateLabel(raw) {
       const date = new Date(raw);
@@ -149,7 +182,8 @@ window.JxSkillLibrary = (() => {
         method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf() },
         body: JSON.stringify({ ...fields, revision }),
       });
-      if (fields.action === "upload" && value.revision === revision) {
+      const uploading = fields.action === "upload" || fields.action === "upload_package";
+      if (uploading && value.revision === revision) {
         status.textContent = "文件与当前版本相同，未创建新版本；原审阅状态不变。";
         return;
       }
@@ -157,7 +191,7 @@ window.JxSkillLibrary = (() => {
       detail.replaceChildren();
       renderList(value);
       if (name) await inspect(name);
-      status.textContent = fields.action === "upload" ? "已入库。新版本保持停用，点击名称可审阅。" : "资料库已更新；没有应用到模型。";
+      status.textContent = uploading ? "已入库。新版本保持停用，点击名称可审阅。" : "资料库已更新；没有应用到模型。";
     }
     async function run(fn) {
       if (busy) return;
@@ -183,10 +217,17 @@ window.JxSkillLibrary = (() => {
     upload.addEventListener("click", () => run(async () => {
       const chosen = file.files?.[0];
       if (!chosen || !catalog?.can_upload || !csrf()) return;
-      if (chosen.name !== "SKILL.md" || chosen.size > catalog.max_bytes)
-        throw new Error("请选择名为 SKILL.md 且不超过 16 KiB 的文件。");
+      const zip = /\.zip$/i.test(chosen.name);
+      if (!(zip || chosen.name === "SKILL.md"))
+        throw new Error("请选择 SKILL.md，或仅含单个技能和参考文档的 ZIP。");
+      if (chosen.size > (zip ? catalog.max_archive_bytes : catalog.max_bytes))
+        throw new Error("文件过大。SKILL.md 最大 128 KiB，ZIP 最大 576 KiB。");
       const bytes = new Uint8Array(await chosen.arrayBuffer());
-      await mutate({ action: "upload", filename: chosen.name, content_base64: btoa(String.fromCharCode(...bytes)) });
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 8192)
+        binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+      await mutate({ ...(zip ? { action: "upload_package" } : { action: "upload", filename: chosen.name }),
+        content_base64: btoa(binary) });
       file.value = "";
     }));
     const panel = { refresh };
