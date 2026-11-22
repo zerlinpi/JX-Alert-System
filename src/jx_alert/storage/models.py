@@ -1,7 +1,7 @@
 from datetime import datetime, date, timezone
 from sqlalchemy import String, Integer, Float, Date, DateTime, Text, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
-from jx_alert.storage.db import Base
+from jx_alert.storage.base import Base
 
 class DailyMetric(Base):
     __tablename__ = "daily_metrics"
