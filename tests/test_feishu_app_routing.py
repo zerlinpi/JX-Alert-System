@@ -43,12 +43,14 @@ def setup(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(service, "get_settings", lambda: settings)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    monkeypatch.setattr(worker, "load_runtime_settings", lambda: settings)
     monkeypatch.setattr(worker, "SessionLocal", Session)
     return Session, settings, config, path
 
 
 def enqueue(Session):
     with Session() as db:
+        db.add(Store(sid="s", name="test", status=1))
         event = AnomalyEvent(
             store_id="s", entity_id="SKU-1", dedupe_key="s:SKU-1:orders_decrease",
             rule="orders_decrease", severity="P1", status="NEW",
@@ -432,6 +434,7 @@ def test_enabling_fallback_does_not_replay_history_and_explicit_repair_reuses_de
 
 def _enqueue_sku_card(Session, *, sku="SKU-1", scope="s:sales:sku_msku", metrics=None):
     with Session.begin() as db:
+        db.add(Store(sid="s", name="test", status=1))
         event = AnomalyEvent(
             store_id="s", entity_id=sku, dedupe_key=f"{scope}:subject", rule="orders_decrease",
             severity="P1", status="NEW", evaluation_scope=scope, reason="订单下降",
@@ -443,12 +446,14 @@ def _enqueue_sku_card(Session, *, sku="SKU-1", scope="s:sales:sku_msku", metrics
             service.enqueue_anomaly_notifications(db, [event])
 
 
-def _capture_sku_wire(monkeypatch):
+def _capture_sku_wire(monkeypatch, while_getting_token=None):
     """Use real message serialization, write-ahead fence and receipt validation, no network."""
     calls = []
 
     def post(client, path, payload, **kwargs):
         if path == client._TOKEN_PATH:
+            if while_getting_token:
+                while_getting_token()
             return {"code": 0, "tenant_access_token": "synthetic", "expire": 7200}
         assert path == client._MESSAGE_PATH
         assert kwargs["params"] == {"receive_id_type": "chat_id"}
@@ -679,3 +684,373 @@ def test_exact_ad_card_retains_incident_asin_if_product_has_since_changed(setup,
     identity = json.dumps(card, ensure_ascii=False)
     assert "商品编码 SKU-1 / 商品编号 B0ORIGINAL" in identity
     assert "B0NEW" not in identity
+
+
+@pytest.mark.parametrize("change", [
+    "owner", "added_owner", "member", "roster_removed", "entity_group", "group_generation",
+    "catalog_removed", "store_removed", "store_disabled", "malformed_controls", "quiet", "runtime_quiet",
+    "ambiguous_entity",
+])
+def test_exact_sku_holds_changed_route_at_real_pre_post_fence(setup, monkeypatch, change):
+    Session, settings, config, path = setup
+    config.update(stores={}, management={"severities": []},
+                  entities={"s:SKU-1": ["ou_exact_route"]})
+    config["groups"]["operations"]["verified_member_open_ids"] = [
+        "ou_admin", "ou_old", "ou_new", "ou_exact_route"]
+    path.write_text(json.dumps(config))
+    settings.store_controls_file = str(path.with_name("switches.json"))
+    with Session.begin() as db:
+        db.add(Product(store_id="s", seller_sku="SKU-1", owner_open_ids=["ou_old"]))
+    _enqueue_sku_card(Session)
+    with Session() as db:
+        row = db.scalar(select(NotificationOutbox))
+        original = row.payload
+        assert original["rule_scope"]["group"]["catalog_id"] is not None
+
+    def change_scope():
+        if change in ("owner", "added_owner", "catalog_removed", "store_removed", "store_disabled", "ambiguous_entity"):
+            with Session.begin() as db:
+                if change == "catalog_removed":
+                    db.delete(db.scalar(select(Product)))
+                elif change == "store_removed":
+                    db.delete(db.get(Store, "s"))
+                elif change == "store_disabled":
+                    db.get(Store, "s").status = 0
+                elif change == "ambiguous_entity":
+                    db.add(Product(store_id="s", seller_sku="SIBLING", asin="SKU-1"))
+                else:
+                    db.scalar(select(Product)).owner_open_ids = ["ou_new"] if change == "owner" else ["ou_old", "ou_new"]
+        elif change == "member":
+            config["groups"]["operations"]["verified_member_open_ids"].remove("ou_old")
+        elif change == "roster_removed":
+            del config["groups"]["operations"]["verified_member_open_ids"]
+        elif change == "entity_group":
+            config["entities"]["s:SKU-1"] = {"chat_id": "test", "open_ids": ["ou_old"]}
+        elif change == "group_generation":
+            config["groups"]["operations"]["notifications_changed_at"] = datetime.now(timezone.utc).isoformat()
+        elif change == "malformed_controls":
+            from pathlib import Path
+            Path(settings.store_controls_file).write_text("{")
+        elif change == "quiet":
+            settings.feishu_quiet_delivery_enabled = True
+        else:
+            from jx_alert.config import load_runtime_settings
+            runtime = path.with_name("runtime.json")
+            monkeypatch.setenv("RUNTIME_SETTINGS_FILE", str(runtime))
+            runtime.write_text(json.dumps(dict(app_dry_run=False, feishu_enabled=True,
+                feishu_transport="app", feishu_routing_file=str(path), feishu_quiet_delivery_enabled=True)))
+            monkeypatch.setattr(worker, "load_runtime_settings", load_runtime_settings)
+        path.write_text(json.dumps(config))
+
+    calls = _capture_sku_wire(monkeypatch, while_getting_token=change_scope)
+    assert worker.process_outbox_batch()["sent"] == 0 and not calls
+    assert worker.process_outbox_batch()["claimed"] == 0
+    with Session() as db:
+        [row] = db.scalars(select(NotificationOutbox)).all()
+        [log] = db.scalars(select(NotificationLog)).all()
+        assert row.status == log.status == "SKIPPED" and not log.message_id
+        assert row.payload == original and row.chat_id == "oc_operations"
+
+
+def test_exact_group_uses_its_own_mode_not_the_merged_management_fallback_flag(setup, monkeypatch):
+    Session, settings, config, path = setup
+    config["management"] = {}
+    settings.feishu_group_fallback_enabled = True
+    settings.feishu_daily_report_chat_id = "operations"
+    path.write_text(json.dumps(config))
+    _enqueue_sku_card(Session)
+    with Session() as db:
+        [row] = db.scalars(select(NotificationOutbox)).all()
+        assert row.payload["delivery"]["group_fallback"]
+        assert row.payload["rule_scope"]["group"]["mode"] == "mapped"
+
+    def change():
+        config["stores"] = {}
+        path.write_text(json.dumps(config))
+
+    wire = _capture_sku_wire(monkeypatch, change)
+    assert worker.process_outbox_batch()["sent"] == 0 and wire == []
+    with Session() as db:
+        assert db.scalar(select(NotificationOutbox.status)) == "SKIPPED"
+
+
+@pytest.mark.parametrize("mutate", ["unchanged", "paused_campaign", "relinked_sku", "relinked_campaign",
+                                    "stale_ad", "case_mismatch", "missing_identity", "lost_ads_auth",
+                                    "revoked_manager", "paused_store"])
+def test_generic_material_copies_use_frozen_ad_not_a_campaign_named_like_the_sku(setup, monkeypatch, mutate):
+    from jx_alert.notifications.routing import enqueue_application_deliveries
+    from jx_alert.storage.models import Campaign
+    from jx_alert.store_controls import get_store_controls, save_store_controls
+
+    Session, settings, config, path = setup
+    settings.store_controls_file = str(path.with_name("switches.json"))
+    config["stores"] = {"101": {"open_ids": ["ou_operator"]}}
+    path.write_text(json.dumps(config))
+    context = dict(store_id="101", entity_id="SKU-1", scope="101:product_ad:sp",
+        metrics={"ad_id": "ad-1", "campaign_id": "actual", "seller_sku": "SKU-1"},
+        severity="P1", status="NEW")
+    if mutate == "missing_identity":
+        del context["metrics"]["campaign_id"]
+    with Session.begin() as db:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.add(Store(sid="101", name="fixture", status=1, has_ads_setting=1))
+        for identity in ("actual", "SKU-1"):
+            db.add(Campaign(store_id="101", campaign_type="sp", campaign_id=identity, state="enabled", updated_at=now))
+        db.add(AdProduct(store_id="101", campaign_type="sp", ad_id="ad-1", campaign_id="actual",
+                         seller_sku="SKU-1", state="enabled", updated_at=now))
+        enqueue_application_deliveries(db, settings, event_key="product-rule", text="fixture",
+                                       context=context, material_ad_alert=True)
+        rows = db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)).all()
+        assert len(rows) == 2 and all(row.payload["rule_scope"]["kind"] == "product_ad" for row in rows)
+        assert all(row.payload["rule_scope"]["sku"] == "SKU-1" for row in rows)
+        keys = {row.chat_id: row.idempotency_key for row in rows}
+
+    calls = []
+
+    def post(client, url, payload, **kw):
+        if url == client._TOKEN_PATH:
+            with Session.begin() as db:
+                campaign = db.scalar(select(Campaign).where(Campaign.campaign_id == "actual"))
+                ad = db.scalar(select(AdProduct))
+                if mutate == "paused_campaign":
+                    campaign.state = "paused"
+                elif mutate == "relinked_sku":
+                    ad.seller_sku = "SIBLING"
+                elif mutate == "relinked_campaign":
+                    ad.campaign_id = "SKU-1"
+                elif mutate == "case_mismatch":
+                    ad.seller_sku = "sku-1"
+                elif mutate == "stale_ad":
+                    ad.updated_at = now - timedelta(hours=2)
+                elif mutate == "lost_ads_auth":
+                    db.get(Store, "101").has_ads_setting = 0
+                elif mutate == "revoked_manager":
+                    config["management"]["open_ids"] = ["ou_new"]
+                    path.write_text(json.dumps(config))
+                elif mutate == "paused_store":
+                    first = get_store_controls(settings, "101")
+                    paused = save_store_controls(settings, "101", True, False, first["revision"])
+                    save_store_controls(settings, "101", True, True, paused["revision"])
+            return {"code": 0, "tenant_access_token": "synthetic", "expire": 7200}
+        assert url == client._MESSAGE_PATH
+        from hashlib import sha256
+        recipient = payload["receive_id"]
+        assert payload["uuid"] == sha256(keys[recipient].encode()).hexdigest()[:40]
+        with Session() as db:
+            row = db.scalar(select(NotificationOutbox).where(NotificationOutbox.chat_id == recipient))
+            assert row.status == "SUBMITTING"
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            assert row.payload["delivery_intent"]["body_sha256"] == sha256(body.encode()).hexdigest()
+        calls.append(recipient)
+        return {"code": 0, "data": {"message_id": "om_mock"}}
+
+    monkeypatch.setattr(app_module.FeishuAppClient, "_post_json", post)
+    expected = (["oc_operations", "ou_manager"] if mutate == "unchanged" else
+                ["oc_operations"] if mutate == "revoked_manager" else [])
+    assert worker.process_outbox_batch()["sent"] == len(expected)
+    assert calls == expected and worker.process_outbox_batch()["claimed"] == 0
+    with Session() as db:
+        for row in db.scalars(select(NotificationOutbox)):
+            assert row.status == ("DELIVERED" if row.chat_id in calls else "SKIPPED")
+            assert ("delivery_intent" in row.payload) == (row.chat_id in calls)
+
+
+@pytest.mark.parametrize("proof", [None, {"v": True, "kind": "other"}, {"v": 27}, {"v": 1, "kind": "sales_sku"}])
+def test_unproven_generic_group_held_without_hash_or_rendered_scope_guess(setup, monkeypatch, proof):
+    Session, _, config, path = setup
+    config["management"] = {"severities": []}
+    path.write_text(json.dumps(config))
+    _enqueue_sku_card(Session)
+    with Session.begin() as db:
+        row = db.scalar(select(NotificationOutbox))
+        payload = dict(row.payload)
+        del payload["rule_scope"]
+        if proof is not None:
+            payload["rule_scope"] = proof
+        row.payload = payload
+    monkeypatch.setattr(app_module.FeishuAppClient, "_post_json", lambda *a, **kw: pytest.fail("no auth/POST"))
+    assert worker.process_outbox_batch()["claimed"] == 1
+    with Session() as db:
+        assert db.scalar(select(NotificationOutbox.status)) == "SKIPPED"
+        assert db.scalar(select(NotificationLog.status)) == "SKIPPED"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_insert_loser_cannot_retrofit_winners_proof_or_rearm_receipt(setup, monkeypatch, legacy):
+    from sqlalchemy import event
+    from jx_alert.notifications.routing import enqueue_application_deliveries
+
+    Session, settings, config, path = setup
+    config["management"] = {"severities": []}
+    path.write_text(json.dumps(config))
+    context = dict(store_id="s", entity_id="FIRST", scope="s:sales:sku_msku",
+                   metrics={}, severity="P1", status="NEW")
+    inputs = dict(event_key="one-logical-delivery", text="original")
+    with Session.begin() as db:
+        result = enqueue_application_deliveries(db, settings, context=context, **inputs)
+        row = db.get(NotificationOutbox, result["outbox_ids"][0])
+        payload = dict(row.payload)
+        if legacy:
+            del payload["rule_scope"]
+        row.payload = {**payload, "delivery_intent": {"attempt": 1}}
+        row.status, row.attempts = "DELIVERY_UNKNOWN", 1
+        expected_payload, key = row.payload, row.idempotency_key
+
+    attempted = []
+
+    def before_insert(_mapper, _conn, row):
+        attempted.append(row.payload["rule_scope"]["subject"])
+
+    event.listen(NotificationOutbox, "before_insert", before_insert)
+    try:
+        with Session.begin() as db:
+            # Simulate the loser having read an empty SELECT before the other
+            # transaction committed. The actual UNIQUE constraint rejects its INSERT.
+            scalar = db.scalar
+            first = [True]
+
+            def miss_then_read(*args, **kwargs):
+                if first:
+                    first.pop()
+                    return None
+                return scalar(*args, **kwargs)
+            monkeypatch.setattr(db, "scalar", miss_then_read)
+            retry = enqueue_application_deliveries(db, settings, context={**context, "entity_id": "SECOND"},
+                                                   **inputs)
+            assert retry["outbox_ids"] == result["outbox_ids"] and not first
+    finally:
+        event.remove(NotificationOutbox, "before_insert", before_insert)
+    assert attempted == ["SECOND"]
+    with Session() as db:
+        [row] = db.scalars(select(NotificationOutbox)).all()
+        assert row.idempotency_key == key and row.payload == expected_payload
+        assert (row.status, row.attempts) == ("DELIVERY_UNKNOWN", 1)
+    assert worker.process_outbox_batch()["claimed"] == 0
+
+
+def test_new_non_exact_rule_with_same_display_id_keeps_its_separate_policy(setup, monkeypatch):
+    Session, _, config, path = setup
+    config["management"] = {"severities": []}
+    path.write_text(json.dumps(config))
+    _enqueue_sku_card(Session, scope="s:sales:sku_asin")
+    with Session() as db:
+        [row] = db.scalars(select(NotificationOutbox)).all()
+        assert row.payload["rule_scope"] == {"v": 1, "kind": "other"}
+    wire = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == 1 and wire[0][0] == "oc_operations"
+
+
+@pytest.mark.parametrize("mutation", ["revoke", "severity", "row_destination"])
+def test_exact_sku_manager_has_independent_late_authorization_and_original_destination(setup, monkeypatch, mutation):
+    Session, _, config, path = setup
+    _enqueue_sku_card(Session)
+    with Session() as db:
+        private = db.scalar(select(NotificationOutbox).where(NotificationOutbox.chat_id == "ou_manager"))
+        assert private.payload["rule_scope"]["kind"] == "sales_sku" and "group" not in private.payload["rule_scope"]
+        oid, frozen = private.id, private.payload
+
+    def change():
+        if mutation == "row_destination":
+            with Session.begin() as db:
+                db.get(NotificationOutbox, oid).chat_id = "ou_changed_in_db"
+        elif mutation == "revoke":
+            config["management"]["open_ids"] = ["ou_new"]
+        else:
+            config["management"]["severities"] = ["P0"]
+        path.write_text(json.dumps(config))
+
+    wire = _capture_sku_wire(monkeypatch, change)
+    assert worker.process_outbox_batch(outbox_ids=[oid])["sent"] == 0 and not wire
+    with Session() as db:
+        row = db.get(NotificationOutbox, oid)
+        assert row.status == "SKIPPED" and row.payload == frozen
+        assert row.chat_id == ("ou_changed_in_db" if mutation == "row_destination" else "ou_manager")
+
+
+@pytest.mark.parametrize("crossing", ["campaign_freshness", "active_window"])
+def test_slow_intent_commit_cannot_outlive_material_proof_or_applicable_window(setup, monkeypatch, crossing):
+    from jx_alert.notifications.routing import enqueue_application_deliveries
+    from jx_alert.storage.models import Campaign
+
+    Session, settings, config, path = setup
+    clock = [datetime(2026, 11, 23, 9, 59, 59, tzinfo=timezone.utc)]  # 17:59:59 Beijing
+    stamp = clock[0].replace(tzinfo=None)
+    config["management"] = {"severities": []}
+    path.write_text(json.dumps(config))
+    with Session.begin() as db:
+        db.add(Store(sid="s", name="fixture", has_ads_setting=1, status=1))
+        observed = stamp - timedelta(minutes=90) + timedelta(seconds=1) if crossing == "campaign_freshness" else stamp
+        db.add(Campaign(store_id="s", campaign_type="sp", campaign_id="actual", state="enabled", updated_at=observed))
+        result = enqueue_application_deliveries(db, settings, text="fixture", event_key="material-scope",
+            context=dict(store_id="s", entity_id="actual", scope="s:campaign:sp",
+                         metrics={}, severity="P1", status="NEW"), material_ad_alert=True)
+        row = db.get(NotificationOutbox, result["outbox_ids"][0])
+        row.next_attempt_at = row.created_at = stamp
+        if crossing == "active_window":
+            # Exercise an absolute per-row delivery constraint when one applies;
+            # generic rules do not acquire a new hourly policy from this fence.
+            row.payload = {**row.payload, "material_ad_delivery_window": True,
+                           "hourly_delivery_date": "2026-11-23"}
+        frozen = row.payload
+    original = worker._record_submission
+
+    def slow_commit(*args):
+        reservation = original(*args)
+        clock[0] += timedelta(seconds=2)
+        return reservation
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz) if tz else clock[0].replace(tzinfo=None)
+
+    monkeypatch.setattr(worker, "_record_submission", slow_commit)
+    monkeypatch.setattr(worker, "datetime", Clock)
+    wire = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == 0 and not wire
+    assert worker.process_outbox_batch()["claimed"] == 0
+    with Session() as db:
+        row = db.scalar(select(NotificationOutbox))
+        intent = row.payload["delivery_intent"]
+        assert row.payload == {**frozen, "delivery_intent": intent}
+        assert intent["aborted_before_post"] is True and row.status == "SKIPPED"
+        assert db.scalar(select(NotificationLog)).message_id is None
+
+
+def test_cutover_unproven_group_held_independently_of_legacy_nonmaterial_manager(setup, monkeypatch):
+    Session, _, _, _ = setup
+    _enqueue_sku_card(Session)
+    with Session.begin() as db:
+        for row in db.scalars(select(NotificationOutbox)):
+            row.payload = {k: v for k, v in row.payload.items() if k != "rule_scope"}
+    posts = []
+
+    def post(client, url, body, **kwargs):
+        if url == client._TOKEN_PATH:
+            return {"code": 0, "tenant_access_token": "fixture", "expire": 7200}
+        assert kwargs["params"] == {"receive_id_type": "open_id"}
+        posts.append(body["receive_id"])
+        return {"code": 0, "data": {"message_id": "om_mock"}}
+
+    monkeypatch.setattr(app_module.FeishuAppClient, "_post_json", post)
+    assert worker.process_outbox_batch()["sent"] == 1
+    assert posts == ["ou_manager"]
+    with Session() as db:
+        assert dict(db.execute(select(NotificationOutbox.chat_id, NotificationOutbox.status)).all()) == {
+            "oc_operations": "SKIPPED", "ou_manager": "DELIVERED"}
+
+
+@pytest.mark.parametrize("metrics", [
+    {"seller_sku": "SKU-1", "campaign_id": "actual"},  # ad id missing
+    {"ad_id": "ad", "seller_sku": "different", "campaign_id": "actual"},
+])
+def test_invalid_typed_product_identity_never_degrades_to_other_route(setup, monkeypatch, metrics):
+    Session, _, config, path = setup
+    config["management"] = {"severities": []}
+    path.write_text(json.dumps(config))
+    _enqueue_sku_card(Session, scope="s:product_ad:sp", metrics=metrics)
+    monkeypatch.setattr(app_module.FeishuAppClient, "_post_json", lambda *a, **kw: pytest.fail("no auth/POST"))
+    assert worker.process_outbox_batch()["claimed"] == 1
+    with Session() as db:
+        row = db.scalar(select(NotificationOutbox))
+        assert row.status == "SKIPPED" and row.payload["rule_scope"]["kind"] == "unproven"

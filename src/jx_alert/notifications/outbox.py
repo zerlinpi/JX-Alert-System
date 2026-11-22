@@ -39,7 +39,9 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
                          card: dict | None = None,
                          fixed_route: bool = False,
                          store_ids: list[str] | None = None,
-                         material_ad_alert: bool = False) -> NotificationOutbox:
+                         material_ad_alert: bool = False,
+                         rule_scope: dict | None = None,
+                         failed_route: dict | None = None) -> NotificationOutbox:
     """Insert once per idempotency key, safely handling concurrent producers."""
     existing = db.scalar(
         select(NotificationOutbox).where(
@@ -66,17 +68,29 @@ def enqueue_notification(db, *, idempotency_key: str, text: str,
         row.payload = {**row.payload, "material_ad_alert": True}
     if delivery is not None:
         row.payload = {**row.payload, "transport": "app", "delivery": delivery}
+    # Producer provenance is insert-only, including a concurrent insert loser.
+    if rule_scope is not None:
+        row.payload = {**row.payload, "rule_scope": rule_scope}
+    if failed_route is not None:
+        row.payload = {**row.payload, **failed_route}
+        row.status = "ROUTING_FAILED"
+        row.last_error = delivery["routing_failure"]
     try:
         with db.begin_nested():
             db.add(row)
             db.flush()
+            if failed_route is not None:
+                from jx_alert.storage.models import NotificationLog
+                db.add(NotificationLog(dedupe_key=idempotency_key, channel="feishu_app",
+                                       status=row.status, error=row.last_error))
         return row
     except IntegrityError:
-        # A concurrent producer may have inserted the unique key after our SELECT.
+        # MariaDB REPEATABLE READ: the old snapshot may still miss the winner.
+        # Only after a unique-key collision use a current read, never a gap lock on the initial miss.
         existing = db.scalar(
             select(NotificationOutbox).where(
                 NotificationOutbox.idempotency_key == idempotency_key
-            )
+            ).with_for_update()
         )
         if existing:
             return existing

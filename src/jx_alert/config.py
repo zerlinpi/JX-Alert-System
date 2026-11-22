@@ -191,6 +191,18 @@ def effective_daily_sync_cron(settings: Settings) -> str:
 
 @lru_cache
 def get_settings() -> Settings:
+    settings = load_runtime_settings()
+    if not settings.mcp_bearer_token and Path(settings.mcp_auth_file).is_file():
+        auth = json.loads(Path(settings.mcp_auth_file).read_text(encoding="utf-8"))
+        token = auth.get("bearer_token") if isinstance(auth, dict) else None
+        if not isinstance(token, str) or len(token) < 32:
+            raise ValueError("MCP authentication file is invalid")
+        settings = settings.model_copy(update={"mcp_bearer_token": token})
+    return settings
+
+
+def load_runtime_settings() -> Settings:
+    """Read the effective process configuration, including the current runtime JSON."""
     settings = Settings()
     path = Path(settings.runtime_settings_file)
     if path.is_file():
@@ -225,10 +237,4 @@ def get_settings() -> Settings:
         if not isinstance(runtime, dict) or set(runtime) - allowed:
             raise ValueError("Runtime settings contain unsupported fields")
         settings = Settings(_env_file=None, **{**settings.model_dump(), **runtime})
-    if not settings.mcp_bearer_token and Path(settings.mcp_auth_file).is_file():
-        auth = json.loads(Path(settings.mcp_auth_file).read_text(encoding="utf-8"))
-        token = auth.get("bearer_token") if isinstance(auth, dict) else None
-        if not isinstance(token, str) or len(token) < 32:
-            raise ValueError("MCP authentication file is invalid")
-        settings = settings.model_copy(update={"mcp_bearer_token": token})
     return settings

@@ -314,3 +314,48 @@ def test_duplicate_json_members_are_unknown_receipts_and_never_replayed(rig, kin
         assert db.get(NotificationOutbox, row_id).status == DELIVERY_UNKNOWN
         assert db.execute(select(NotificationLog.status, NotificationLog.message_id)).all() == [(DELIVERY_UNKNOWN, None)]
     assert worker.process_outbox_batch()["claimed"] == 0 and len(rig.posts) == 1
+
+
+def test_typed_sku_lost_receipt_preserves_original_intent_and_never_replays(rig, monkeypatch):
+    from pathlib import Path
+    from jx_alert.notifications.routing import enqueue_application_deliveries
+    from jx_alert.storage.models import Store
+
+    Path(rig.settings.feishu_routing_file).write_text(json.dumps({"default_chat_id": "report",
+        "groups": {"report": {"chat_id": "oc_fixture", "admin_open_ids": ["ou_admin"]}},
+        "stores": {"101": ["ou_owner"]}, "management": {"severities": []}}))
+    monkeypatch.setattr(worker, "load_runtime_settings", lambda: rig.settings)
+    with rig.db.begin() as db:
+        db.add(Store(sid="101", name="mock", status=1))
+        result = enqueue_application_deliveries(db, rig.settings, text="fixture", event_key="rule",
+            context=dict(store_id="101", entity_id="SKU", scope="101:sales:sku_msku",
+                         metrics={}, severity="P1", status="NEW"))
+        row = db.get(NotificationOutbox, result["outbox_ids"][0])
+        row.next_attempt_at = rig.clock[0].replace(tzinfo=None)
+        key, oid = row.idempotency_key, row.id
+    rig.provider.respond = timeout
+    assert worker.process_outbox_batch()["unknown"] == 1
+    rig.clock[0] += timedelta(hours=2)
+    assert worker.process_outbox_batch()["claimed"] == 0 and len(rig.posts) == 1
+    [(posted_id, intent, body)] = rig.posts
+    assert (posted_id, body["receive_id"], intent["provider_uuid"]) == (
+        oid, "oc_fixture", hashlib.sha256(key.encode()).hexdigest()[:40])
+    with rig.db() as db:
+        row = db.get(NotificationOutbox, oid)
+        assert row.status == DELIVERY_UNKNOWN and row.payload["delivery_intent"] == intent
+        assert row.payload["rule_scope"]["kind"] == "sales_sku" and not row.delivered_at
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("SENDING", DELIVERY_UNKNOWN), ("SUBMITTING", DELIVERY_UNKNOWN), ("RETRY", DELIVERY_UNKNOWN),
+    ("DELIVERED", "DELIVERED"), ("REJECTED", "REJECTED"), ("SKIPPED", "SKIPPED"),
+    ("DEAD", "DEAD"), ("EXPIRED", "EXPIRED"), (DELIVERY_UNKNOWN, DELIVERY_UNKNOWN),
+])
+def test_untyped_generic_history_is_not_reclassified_as_a_safe_retry(rig, status, expected):
+    oid = rig.add(key="app:" + "3" * 64, status=status, attempts=1)
+    assert worker.process_outbox_batch()["sent"] == 0
+    assert worker.process_outbox_batch()["claimed"] == 0 and not rig.posts and not rig.auth
+    with rig.db() as db:
+        row = db.get(NotificationOutbox, oid)
+        assert row.status == expected and row.attempts == 1
+        assert "rule_scope" not in row.payload

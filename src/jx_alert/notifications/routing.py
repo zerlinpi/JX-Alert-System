@@ -491,14 +491,22 @@ def application_deliveries(db, settings, *, store_id: str, entity_id: str,
     Malformed configuration stays a failure, and valid manager messages remain
     independent. This planner never rearms persisted notifications.
     """
-    routing_failed = False
+    return _application_plan(db, settings, store_id=store_id, entity_id=entity_id, metrics=metrics,
+                             scope=scope, severity=severity, status=status)[0]
+
+
+def _read_application_routing(settings):
     try:
-        routing = json.loads(Path(settings.feishu_routing_file).read_text(encoding="utf-8"))
-        if not isinstance(routing, dict):
-            routing_failed = True
-            routing = {}
+        return json.loads(Path(settings.feishu_routing_file).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        routing_failed = True
+        return None
+
+
+def _application_plan(db, settings, *, store_id, entity_id, metrics, scope, severity, status, routing=None):
+    if routing is None:
+        routing = _read_application_routing(settings)
+    routing_failed = not isinstance(routing, dict)
+    if routing_failed:
         routing = {}
     try:
         if routing_failed:
@@ -535,17 +543,20 @@ def application_deliveries(db, settings, *, store_id: str, entity_id: str,
                 except ApplicationRoutingError as exc:
                     managers[index] = {"role": "management", "routing_failure": str(exc)}
     deliveries.extend(managers)
-    return _merge_same_destinations(deliveries)
+    # Freeze the operations mode BEFORE merging. Management can independently
+    # fall back to the same physical chat as a normally mapped operations group.
+    mode = "fallback" if group.get("group_fallback") else "mapped"
+    return _merge_same_destinations(deliveries), routing, mode
 
 
 def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
                                    context: dict, roles: set[str] | None = None,
                                    card: dict | None = None, material_ad_alert: bool = False) -> dict:
     """Persist each destination or unresolved role once, in the event transaction."""
-    from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
-    from jx_alert.storage.models import NotificationLog
+    from jx_alert.notifications.outbox import enqueue_notification
+    from jx_alert.notifications.rule_scope import freeze_scope
 
-    planned = application_deliveries(db, settings, **context)
+    planned, routing, operations_mode = _application_plan(db, settings, **context)
     if roles is not None:
         planned = [item for item in planned if roles.intersection(item.get("covered_roles", [item["role"]]))]
     if material_ad_alert and roles is None:
@@ -571,23 +582,16 @@ def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
             key = "app:" + hashlib.sha256(
                 f"{event_key}:{delivery['receive_id_type']}:{delivery['receive_id']}".encode()
             ).hexdigest()
-        existing = db.scalar(select(NotificationOutbox).where(NotificationOutbox.idempotency_key == key))
         row = enqueue_notification(
             db, idempotency_key=key, text=text,
             store_id=context["store_id"], entity_id=context["entity_id"] or None,
             chat_id=delivery.get("receive_id", f"routing:{delivery['role']}"), delivery=delivery,
             card=card, material_ad_alert=material_ad_alert,
+            rule_scope=None if failure else freeze_scope(
+                db, context, delivery, material_ad_alert, routing, operations_mode),
+            failed_route={"event_key": event_key, "routing_context": context,
+                          "routing_role": delivery["role"]} if failure else None,
         )
-        if failure and existing is None:
-            row.status = "ROUTING_FAILED"
-            row.last_error = failure
-            row.payload = {
-                **row.payload, "event_key": event_key,
-                "routing_context": context, "routing_role": delivery["role"],
-            }
-            db.add(NotificationLog(
-                dedupe_key=key, channel="feishu_app", status="ROUTING_FAILED", error=failure,
-            ))
         outbox_ids.append(row.id)
     db.flush()
     return {"outbox_ids": outbox_ids, "routing_failed": unresolved, "planned": len(planned)}

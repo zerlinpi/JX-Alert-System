@@ -6,7 +6,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from sqlalchemy import or_, select, update
 
 from jx_alert.ai.ad_review_skills import frozen_ad_skills_current
-from jx_alert.config import get_settings
+from jx_alert.config import get_settings, load_runtime_settings
+from jx_alert.notifications import rule_scope
 from jx_alert.notifications.business_daily import select_business_stores
 from jx_alert.notifications.feishu import FeishuClient
 from jx_alert.notifications.routing import (
@@ -102,6 +103,8 @@ def _proactive_delivery_reason(db, settings, key, payload, now):
         return None
     if len(ids) != 1:
         return '广告告警缺少唯一店铺，旧消息保留记录'
+    if rule_scope.generic_key(key):
+        return None if rule_scope.material_deadline(db, payload, now) is not None else rule_scope.BLOCKED
     context = payload.get('routing_context') or {}
     metrics = context.get('metrics') or {}
     campaign_id = payload.get('ad_campaign_id') or metrics.get('campaign_id') or payload.get('entity_id')
@@ -144,6 +147,10 @@ class _SparkXScopeChanged(RuntimeError):
     """The page is no longer permitted; no message POST has been attempted."""
 
 
+class _RuleScopeChanged(RuntimeError):
+    """The final generic alert route is not proven; the message was not posted."""
+
+
 class _UnfencedResponse(RuntimeError):
     """A transport returned without its write-ahead boundary; do not resubmit."""
 
@@ -169,13 +176,13 @@ def _hold_unknown(db, row, reason):
     return 0
 
 
-def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, payload, evidence, sparkx_scope=None):
+def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, payload, evidence, submission_scope=None):
     instant = datetime.now(timezone.utc).replace(tzinfo=None)
-    fresh = instant.replace(microsecond=0)
     # A future adapter must not accidentally persist headers or a secret URL.
     intent = {key: evidence[key] for key in ("operation", "body_sha256", "provider_uuid", "endpoint_sha256")
               if key in evidence}
-    intent.update(attempt=attempts, started_at_utc=fresh.isoformat() + "Z", destination=chat_id)
+    intent.update(attempt=attempts, destination=chat_id)
+    material_deadline = None
     route = payload.get("delivery") or {}
     if route.get("receive_id_type"):
         intent["destination_type"] = route["receive_id_type"]
@@ -184,11 +191,47 @@ def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, pay
     with SessionLocal() as db:
         # Token acquisition / earlier jobs can outlive the initial scope or freshness check.
         # Resolve the original binding again at the write-ahead boundary, not after POST.
-        if sparkx_scope is not None:
-            from jx_alert.sparkx_feishu import delivery_blocked
-            key, created_at = sparkx_scope
-            if delivery_blocked(db, get_settings(), key, payload, created_at, instant):
-                raise _SparkXScopeChanged
+        if submission_scope is not None:
+            key, created_at = submission_scope
+            if rule_scope.generic_key(key):
+                # Fence the actual original row, not a newer attempt or a stale
+                # claim snapshot. Never overwrite a changed payload with intent.
+                row = db.scalar(select(NotificationOutbox).where(
+                    NotificationOutbox.id == row_id, NotificationOutbox.status == "PREPARING",
+                    NotificationOutbox.claimed_at == claimed_at, NotificationOutbox.attempts == attempts,
+                ).with_for_update())
+                if row is None:
+                    raise _LostOutboxClaim
+                if row.payload != payload or row.chat_id != chat_id or row.idempotency_key != key:
+                    raise _RuleScopeChanged
+                try:
+                    settings = load_runtime_settings()  # get_settings() caches the runtime JSON.
+                    instant = datetime.now(timezone.utc).replace(tzinfo=None)
+                    if payload.get("material_ad_alert") is True:
+                        material_deadline = rule_scope.material_deadline(db, payload, instant)
+                    eligible = (settings.feishu_enabled and not settings.app_dry_run
+                        and settings.feishu_transport == "app"
+                        and getattr(settings, "business_alert_delivery_mode", "rules") == "rules"
+                        and not quiet_blocks(settings, key, payload)
+                        and not paused_delivery(settings, payload, created_at)
+                        and (not getattr(settings, "hourly_ad_monitor_enabled", False)
+                             or not payload.get("material_ad_alert"))
+                        and (not payload.get("material_ad_alert") or material_deadline is not None)
+                        and rule_scope.route_current(db, settings, payload))
+                except (ValueError, TypeError, KeyError, RuntimeError, OSError):
+                    eligible = False  # Unreadable local configuration is not authorization.
+                if not eligible:
+                    raise _RuleScopeChanged
+            else:
+                from jx_alert.sparkx_feishu import delivery_blocked
+                if delivery_blocked(db, get_settings(), key, payload, created_at, instant):
+                    raise _SparkXScopeChanged
+        # Policy reads can take time; do not revive an expired claim with an old timestamp.
+        checked = datetime.now(timezone.utc).replace(tzinfo=None)
+        if material_deadline is not None and not instant <= checked <= material_deadline:
+            raise _RuleScopeChanged
+        fresh = checked.replace(microsecond=0)
+        intent["started_at_utc"] = fresh.isoformat() + "Z"
         changed = db.execute(update(NotificationOutbox).where(
             NotificationOutbox.id == row_id,
             NotificationOutbox.status == "PREPARING",
@@ -200,7 +243,7 @@ def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, pay
         if changed.rowcount != 1:
             raise _LostOutboxClaim
         db.commit()  # Absolutely no message POST until this succeeds.
-    return fresh, intent
+    return fresh, intent, (instant, material_deadline) if material_deadline is not None else None
 
 
 def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
@@ -302,11 +345,24 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
         sparkx_page = (dedupe_key.startswith("sparkx-page:") or isinstance(destination, dict)
                        and destination.get("role") == "sparkx_performance_page")
 
+        guarded_rule = rule_scope.generic_key(dedupe_key) and rule_scope.guarded(payload)
+
         def fence_send(evidence):
             nonlocal claim_time, intent
-            claim_time, intent = _record_submission(row_id, claim_time, attempts, lease_seconds,
+            claim_time, intent, material_window = _record_submission(row_id, claim_time, attempts, lease_seconds,
                                                      chat_id, payload, evidence,
-                                                     (dedupe_key, created_at) if sparkx_page else None)
+                                                     (dedupe_key, created_at) if sparkx_page or guarded_rule else None)
+            if guarded_rule:
+                # The DB commit itself may consume the last seconds of the
+                # applicable delivery window or ad freshness. No I/O after this clock check.
+                checked = datetime.now(timezone.utc)
+                instant = checked.replace(tzinfo=None)
+                if (not timedelta() <= instant - claim_time <= timedelta(seconds=lease_seconds)
+                        or material_window is not None and not material_window[0] <= instant <= material_window[1]
+                        or _scheduled_window(dedupe_key, payload, checked, hourly_mode=hourly_mode,
+                                             created_at=created_at)[0] != "READY"):
+                    intent = {**intent, "aborted_before_post": True}
+                    raise _RuleScopeChanged
             if sparkx_page:
                 from jx_alert.sparkx_feishu import page_fresh
                 # Scope reads, a DB lock or the intent COMMIT itself may cross the expiry.
@@ -334,7 +390,11 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                              next_attempt_at=now + timedelta(seconds=30)))
                     db.commit()
                     continue
-            skip_reason = QUIET_REASON if quiet_blocks(settings, dedupe_key, payload) else None
+            skip_reason = rule_scope.BLOCKED if (
+                guarded_rule and not rule_scope.valid_shape(payload)
+                or "rule_scope" in payload and not rule_scope.generic_key(dedupe_key)) else None
+            if skip_reason is None and quiet_blocks(settings, dedupe_key, payload):
+                skip_reason = QUIET_REASON
             if (skip_reason is None and dedupe_key.startswith('scheduled-daily:')
                     and payload.get('morning_message_kind') == 'ad_exception'
                     and not frozen_ad_skills_current(settings, payload.get('ad_skill_checks'))):
@@ -470,6 +530,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             status = "DELIVERED"
             error = None
             delivered_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        except _RuleScopeChanged:
+            status, error, delivered_at = "SKIPPED", rule_scope.BLOCKED, None
         except _SparkXScopeChanged:
             status, error, delivered_at = "SKIPPED", _SPARKX_BLOCK_REASON, None
         except _LostOutboxClaim:
@@ -495,6 +557,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
         with SessionLocal() as db:
             values = dict(chat_id=chat_id, status=status, last_error=error,
                           claimed_at=None, delivered_at=delivered_at)
+            if status == "SKIPPED" and guarded_rule:
+                values.pop("chat_id")  # Retain the original destination even for a malformed row.
             if status == "SKIPPED" and intent is not None and intent.get("aborted_before_post") is True:
                 values["payload"] = {**payload, "delivery_intent": intent}
             if status == "DELIVERED" and hourly_delivered_items is not None:

@@ -27,7 +27,7 @@ from jx_alert.notifications.outbox import DELIVERY_UNKNOWN, NotificationOutbox
 from jx_alert.notifications.sparkx_export import ExportHistory
 from jx_alert.sparkx_direct import SparkXDirectError
 from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
-from jx_alert.storage.models import NotificationLog, Store
+from jx_alert.storage.models import NotificationLog, Product, Store
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("JX_MARIADB_ACCEPTANCE") != "1", reason="requires disposable CI MariaDB 11"
@@ -48,7 +48,7 @@ def engine():
                 "refusing to test with a nonempty or unexpected schema"
             )
         print(f"Isolated acceptance database: MariaDB {version}, schema={schema}", flush=True)
-        for model in (NotificationOutbox, NotificationLog, Store):
+        for model in (NotificationOutbox, NotificationLog, Store, Product):
             model.__table__.create(db)
         yield db
     finally:
@@ -146,13 +146,32 @@ def _logs(db, key):
                       .where(NotificationLog.dedupe_key == key).order_by(NotificationLog.id)).all()
 
 
-def test_expired_worker_cannot_post_after_same_second_takeover(transport, monkeypatch):
+@pytest.mark.parametrize("typed_sku", [False, True])
+def test_expired_worker_cannot_post_after_same_second_takeover(transport, monkeypatch, typed_sku):
     sessions = transport.db
     # Age the original lease in the database, but keep process clocks frozen:
     # MariaDB DATETIME(0) then gives both PREPARING claims the same timestamp.
     stamp = transport.instant[0].replace(tzinfo=None, microsecond=0)
     key = "ci-expired-claim"
-    row_id = _insert(transport, key)
+    if typed_sku:
+        from jx_alert.notifications.routing import enqueue_application_deliveries
+
+        cfg = transport.settings
+        cfg.feishu_at_ids = lambda: []
+        monkeypatch.setattr(worker, "load_runtime_settings", lambda: cfg)
+        Path(cfg.feishu_routing_file).write_text(json.dumps({"default_chat_id": "ops",
+            "groups": {"ops": {"chat_id": "oc_fixture", "admin_open_ids": ["ou_admin"]}},
+            "stores": {"103": ["ou_owner"]}, "management": {"severities": []}}))
+        with sessions.begin() as db:
+            db.add(Store(sid="103", name="CI", status=1))
+            [row_id] = enqueue_application_deliveries(db, cfg, event_key="typed-ci-rule", text="fixture",
+                context=dict(store_id="103", entity_id="MSKU", metrics={}, scope="103:sales:sku_msku",
+                             severity="P1", status="NEW"))["outbox_ids"]
+            row = db.get(NotificationOutbox, row_id)
+            row.next_attempt_at = stamp - timedelta(minutes=1)
+            key = row.idempotency_key
+    else:
+        row_id = _insert(transport, key)
     first_paused, resume_first = Event(), Event()
     observations = []
     real_policy = worker._proactive_delivery_reason
@@ -199,7 +218,9 @@ def test_expired_worker_cannot_post_after_same_second_takeover(transport, monkey
     assert observations[0][0] != observations[1][0]
     assert (successor["claimed"], successor["sent"], successor["failed"], successor["unknown"]) == (1, 1, 0, 0)
     assert len(transport.posts) == 1 and transport.posts[0][:2] == (row_id, 2)
-    assert json.loads(transport.posts[0][2]["content"])["text"] == "fixture"
+    actual_text = json.loads(transport.posts[0][2]["content"])["text"]
+    assert actual_text == ('<at user_id="ou_admin">提醒</at> <at user_id="ou_owner">提醒</at> fixture'
+                           if typed_sku else "fixture")
     assert run_worker()["claimed"] == 0
     with sessions() as db:
         row = db.get(NotificationOutbox, row_id)
@@ -404,3 +425,33 @@ def test_provider_receipt_plus_local_commit_failure_holds_after_lease(transport)
         row = db.get(NotificationOutbox, row_id)
         assert row.status == DELIVERY_UNKNOWN and row.attempts == 1 and row.delivered_at is None
         assert _logs(db, key) == [(DELIVERY_UNKNOWN, None)]
+
+
+def test_generic_rule_insert_loser_reads_unchanged_committed_winner(transport):
+    """Real REPEATABLE READ snapshot: plain retry SELECT cannot observe this winner."""
+    from jx_alert.notifications.routing import enqueue_application_deliveries
+
+    cfg = transport.settings
+    cfg.feishu_at_ids = lambda: []
+    Path(cfg.feishu_routing_file).write_text(json.dumps({"default_chat_id": "ops",
+        "groups": {"ops": {"chat_id": "oc_fixture", "admin_open_ids": ["ou_admin"]}},
+        "stores": {"104": ["ou_owner"]}, "management": {"severities": []}}))
+    inputs = dict(event_key="generic-winner", text="CI")
+    ctx = dict(store_id="104", entity_id="FIRST", scope="104:sales:sku_msku", metrics={}, severity="P1", status="NEW")
+    with transport.db.begin() as loser:
+        assert loser.scalar(text("SELECT @@tx_isolation")).upper() == "REPEATABLE-READ"
+        before = set(loser.scalars(select(NotificationOutbox.id)))
+        with transport.db.begin() as winner:
+            first = enqueue_application_deliveries(winner, cfg, context=ctx, **inputs)["outbox_ids"]
+            row = winner.get(NotificationOutbox, first[0])
+            row.status, row.attempts = "DELIVERY_UNKNOWN", 1
+            row.payload = {**row.payload, "delivery_intent": {"attempt": 1}}
+            original = row.payload
+        assert first[0] not in before and loser.scalar(select(NotificationOutbox.id)
+            .where(NotificationOutbox.id == first[0])) is None
+        second = enqueue_application_deliveries(loser, cfg, context={**ctx, "entity_id": "SECOND"}, **inputs)
+        assert second["outbox_ids"] == first
+    with transport.db() as db:
+        row = db.get(NotificationOutbox, first[0])
+        assert (row.status, row.attempts, row.payload) == ("DELIVERY_UNKNOWN", 1, original)
+        assert row.payload["rule_scope"]["subject"] == "FIRST"
