@@ -63,6 +63,14 @@ def validate_question_delivery(settings, delivery):
                 and delivery.get("routing_changed_at") == current.get("routing_changed_at"))
     if delivery.get("role") != "private_question":
         return False
+    # A history reply is scoped to the specific report group it read. Do not
+    # release it on retry after a group switch, even for an authorized reader.
+    if "history_report_route" in delivery:
+        history_route = delivery["history_report_route"]
+        if (not isinstance(history_route, dict)
+                or any(history_route.get(field) != current.get(field)
+                       for field in ("receive_id", "routing_alias", "routing_changed_at"))):
+            return False
     chat, sender = delivery.get("receive_id"), delivery.get("sender_open_id")
     if (not isinstance(chat, str) or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat)
             or any(group.get("chat_id") == chat for group in routing.get("groups", {}).values())
@@ -80,9 +88,12 @@ def validate_question_delivery(settings, delivery):
 def _question_delivery(settings, meta):
     kind = meta.get("chat_type", "group")
     if kind == "p2p":
-        return {"role": "private_question", "receive_id_type": "chat_id", "open_ids": [],
-                "receive_id": meta["chat_id"], "sender_open_id": meta["sender_id"],
-                "reply_to_message_id": meta["message_id"]}
+        delivery = {"role": "private_question", "receive_id_type": "chat_id", "open_ids": [],
+                    "receive_id": meta["chat_id"], "sender_open_id": meta["sender_id"],
+                    "reply_to_message_id": meta["message_id"]}
+        if "history_report_route" in meta:
+            delivery["history_report_route"] = meta["history_report_route"]
+        return delivery
     if kind != "group":
         raise ValueError("Question conversation type is invalid")
     saved = meta.get("question_route")
@@ -1074,7 +1085,12 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                 if recorded_alert_lookup(meta['question']):
                     from jx_alert.bot_alert_history import recent_alert_cards
                     meta['reply_store_ids'] = [store.sid for store in review_stores]
-                    cards = recent_alert_cards(db, review_stores, meta['question'], _utcnow())
+                    route = _route(settings) if meta.get('chat_type') == 'p2p' else _question_delivery(settings, meta)
+                    if meta.get('chat_type') == 'p2p':
+                        meta['history_report_route'] = {field: route.get(field) for field in
+                            ('receive_id', 'routing_alias', 'routing_changed_at')}
+                    cards = recent_alert_cards(db, review_stores, meta['question'], _utcnow(),
+                        report_delivery=route)
                     return _complete_question(db, settings, job_id, meta, cards, 'recorded_ad_alerts')
                 return _review_ad_question(db, settings, job_id, meta, review_stores, factory)
             if ad_review_request(meta['question']):
@@ -1098,7 +1114,10 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                 context = general_context(allowed)
                 db.rollback()
                 try:
+                    selected_config = cache_identity(settings)
                     analysis = factory(settings).analyze(context, meta['question'])
+                    if cache_identity(settings) != selected_config:
+                        raise DeepSeekError("DeepSeek 设置已更新，请重新提问。")
                     provider = 'deepseek_general'
                 except DeepSeekError:
                     analysis, provider = '智能问答暂不可用，请稍后重试。', 'unavailable'
@@ -1121,8 +1140,9 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                     provider = "date_clarification"
                 else:
                     meta.update({key: context[key] for key in ("report_date", "requested_report_date", "date_selection")})
+                    selected_config = cache_identity(settings)
                     try:
-                        cache_key = analysis_cache_key(context, meta["question"], cache_identity(settings))
+                        cache_key = analysis_cache_key(context, meta["question"], selected_config)
                     except DeepSeekError:
                         # Preserve the ordinary data-card fallback when model
                         # input is too large or rejected; never cache this case.
@@ -1146,6 +1166,11 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                             client = factory(settings)
                             analysis = client.analyze(context, meta["question"])
                             provider = "deepseek"
+                        # Do not publish or cache a reply under a superseded
+                        # owner configuration, including a concurrently loaded hit.
+                        if cache_identity(settings) != selected_config:
+                            raise DeepSeekError("DeepSeek 设置已更新，请重新提问。")
+                        if provider == "deepseek":
                             meta["model_usage"] = getattr(client, "last_usage", {})
                         meta.update(analysis_cache_key=cache_key, analysis_text=analysis,
                             analysis_created_at=cached_at if provider == "deepseek_cache" else _utcnow().isoformat())

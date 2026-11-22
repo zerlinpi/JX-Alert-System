@@ -57,7 +57,8 @@ def _legacy_item(db, payload, stores, kinds):
             'signal': '；'.join(signals) or '广告异常', 'numbers': '\n'.join(dict.fromkeys(metrics))}
 
 
-def recent_alert_cards(db, stores, question, now):
+def recent_alert_cards(db, stores, question, now, *, report_delivery):
+    """Read only receipts from the currently authorized report-group generation."""
     explicit_period = re.search(r'(?:最近|过去|近)\s*(?:\d+|[一二三四五六七八九十两]+)\s*[天日]', question)
     parsed = period_length(question)
     days = parsed if explicit_period or parsed == 0 else 7
@@ -65,16 +66,28 @@ def recent_alert_cards(db, stores, question, now):
         return [card('请确认查询范围', subtitle='可以查询最近 1 到 14 天的广告异常记录。', sections=[])]
     scope = {store.sid: store.name for store in stores}
     kinds = set(ad_types(question)) or {'sp', 'sb', 'sd'}
-    threshold = (now - timedelta(days=days)).astimezone(timezone.utc).replace(tzinfo=None)
+    clock = now.astimezone(timezone.utc).replace(tzinfo=None)
+    threshold = clock - timedelta(days=days)
+    current_chat = report_delivery.get('receive_id') if isinstance(report_delivery, dict) else None
+    if (not isinstance(current_chat, str) or not re.fullmatch(r'oc_[A-Za-z0-9_-]+', current_chat)
+            or report_delivery.get('receive_id_type') != 'chat_id'):
+        return [card('通知群范围未确认', subtitle='未读取历史告警。', sections=[])]
     sent_at = func.coalesce(NotificationOutbox.delivered_at, NotificationOutbox.created_at)
     batches = db.execute(select(NotificationOutbox.payload, NotificationOutbox.delivered_at,
         NotificationOutbox.created_at).where(
-        NotificationOutbox.status == 'DELIVERED', sent_at >= threshold,
+        NotificationOutbox.status == 'DELIVERED', sent_at.between(threshold, clock),
         NotificationOutbox.payload['hourly_ad_monitor'].as_boolean() == True,  # noqa: E712
         NotificationOutbox.payload['delivery']['receive_id_type'].as_string() == 'chat_id',
+        NotificationOutbox.payload['delivery']['receive_id'].as_string() == current_chat,
     ).order_by(sent_at.desc(), NotificationOutbox.id.desc()))
     items = {}
     for batch, delivered_at, created_at in batches:
+        previous = batch['delivery']
+        generation = report_delivery.get('routing_changed_at')
+        if (previous.get('routing_changed_at') != generation
+                or previous.get('routing_alias', report_delivery.get('routing_alias'))
+                != report_delivery.get('routing_alias')):
+            continue
         if 'hourly_delivered_items' in batch:
             rows = batch['hourly_delivered_items']
         elif 'hourly_items' in batch:

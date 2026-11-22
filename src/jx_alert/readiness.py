@@ -152,7 +152,7 @@ def analysis_plan(db, settings, *, now=None):
                 DailyMetric.dimension == "store", DailyMetric.entity_id == store.sid,
                 DailyMetric.metric_date.in_(dates), DailyMetric.metric_name.in_(METRICS))).all()
             current = [row for row in rows if row.metric_date == last]
-            issue = collection_issue_for_date(db, store.sid, last)
+            issue = collection_issue_for_date(db, store.sid, last, sales_only=True)
             sales_status = store_sales_data_status(store.status, coverage_rows.get(("store", last)), current,
                 coverage_rows.get(("sku_asin", last)), coverage_rows.get(("sku_msku", last)), issue=issue)
             if sales_status == "COLLECTION_FAILED":

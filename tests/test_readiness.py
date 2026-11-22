@@ -1,13 +1,14 @@
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from jx_alert.readiness import analysis_plan, configuration_status
 from jx_alert.storage.db import Base
-from jx_alert.storage.models import Store, SyncJob
+from jx_alert.storage.models import DailyMetric, DataCoverage, Store, SyncJob
 
 
 def test_manual_roles_are_reported_without_identifiers_or_secrets(tmp_path):
@@ -111,4 +112,60 @@ def test_unsynced_stores_and_unknown_hourly_timezones_are_not_collection_ready(t
         assert not rows["5175"]["collection_ready"]
         assert rows["5176"]["date_basis"] == "global_complete_unknown_timezone"
         assert not rows["5176"]["collection_ready"]
+    engine.dispose()
+
+
+@pytest.mark.parametrize("attempts,expected", [
+    (("ad_history_only",), "AVAILABLE"),
+    (("sales_succeeded_before_ads_failed",), "AVAILABLE"),
+    (("sales_failed",), "COLLECTION_FAILED"),
+    (("sales_failed", "ad_history_only"), "COLLECTION_FAILED"),
+])
+def test_sales_readiness_resolves_the_exact_sales_attempt(tmp_path, attempts, expected):
+    from jx_alert.mcp_server import _daily_summary
+
+    sid = "101"
+    target = date(2026, 11, 20)
+    scope = tmp_path / "scope.json"
+    scope.write_text(json.dumps({"store_ids": [sid]}))
+    zones = tmp_path / "zones.json"
+    zones.write_text(json.dumps({"stores": {sid: {"timezone": "America/Los_Angeles"}}}))
+    settings = SimpleNamespace(collection_scope_file=str(scope), store_timezones_file=str(zones),
+                               store_controls_file=str(tmp_path / "controls.json"))
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Store(sid=sid, name="Store", status=1, has_ads_setting=1,
+                     timezone="America/Los_Angeles", currency_code="USD"))
+        for on, orders in ((target - timedelta(days=1), 5), (target, 7)):
+            for dimension in ("store", "sku_asin", "sku_msku", "campaign_sp"):
+                db.add(DataCoverage(store_id=sid, metric_date=on, dimension=dimension,
+                                    status="COMPLETE", row_count=1))
+            for metric, value in (("orders", orders), ("units", orders + 1), ("sales", orders * 10)):
+                db.add(DailyMetric(store_id=sid, entity_id=sid, metric_date=on,
+                                   dimension="store", metric_name=metric, value=value, currency="USD"))
+        db.add(DailyMetric(store_id=sid, entity_id="sp1", metric_date=target, dimension="campaign_sp",
+                           metric_name="spend", value=12.5, currency="USD"))
+        for attempt in attempts:
+            report_day = target + timedelta(days=int(attempt == "ad_history_only"))
+            completed = ["store_status"]
+            if attempt != "sales_failed":
+                completed.append("sales")
+            db.add(SyncJob(job_type="daily_collection", status="PARTIAL_FAILED", metadata_json={
+                "report_dates": {sid: report_day.isoformat()},
+                "ad_report_dates": {sid: [target.isoformat(), report_day.isoformat()]},
+                "completed_steps": completed,
+            }))
+        db.commit()
+        now = datetime(2026, 11, 21, 12, tzinfo=timezone.utc)
+        plan = analysis_plan(db, settings, now=now)["stores"][0]
+        actual = _daily_summary(db, sid, target)
+        ready = expected == "AVAILABLE"
+        assert plan["report_date"] == target.isoformat()
+        assert plan["sales_data_status"] == actual["sales_data_status"] == expected
+        assert plan["analysis_ready"] is ready
+        assert actual["sales"]["orders"]["current"] == (7 if ready else None)
+        assert actual["sales"]["orders"]["previous_day"] == 5
+        assert actual["coverage"]["campaign_sp"] is True
+        assert actual["campaign_ads"]["by_type"]["sp"]["totals"]["spend"] == 12.5
     engine.dispose()

@@ -432,13 +432,15 @@ def _daily_summary(db, store_id: str, target_date: date) -> dict:
     target_records = {row.dimension: row for row in coverage_rows if row.metric_date == target_date}
     current_sales = [row for row in metric_rows if row.metric_date == target_date
                      and row.dimension == "store" and row.entity_id == str(store_id)]
-    issue = collection_issue_for_date(db, str(store_id), target_date) if store.status == 1 else None
+    issue = (collection_issue_for_date(db, str(store_id), target_date, sales_only=True)
+             if store.status == 1 else None)
     sales_status = store_sales_data_status(store.status, target_records.get("store"), current_sales,
         target_records.get("sku_asin"), target_records.get("sku_msku"), issue=issue)
-    unavailable = sales_status in {"AUTHORIZATION_FAILED", "STORE_UNAVAILABLE", "COLLECTION_FAILED"}
+    unavailable = sales_status in {"AUTHORIZATION_FAILED", "STORE_UNAVAILABLE"}
 
     def is_complete(dimension: str, day: date) -> bool:
-        if day == target_date and unavailable:
+        if day == target_date and (unavailable or
+                (sales_status == "COLLECTION_FAILED" and dimension in {"store", "sku_asin", "sku_msku"})):
             return False
         return coverage.get((dimension, day), False)
 

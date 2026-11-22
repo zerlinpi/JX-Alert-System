@@ -2,7 +2,7 @@
 from datetime import datetime, time, timedelta, timezone
 import hashlib
 import json
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, tuple_
 
@@ -11,6 +11,7 @@ from jx_alert.ai.ad_review_skills import load_ad_review_skills, skill_fingerprin
 from jx_alert.notifications.ad_repeat import (
     INCIDENT, campaign_identity, incident_already_recorded, incident_metadata,
     load_incident_history, repeat_eligible_signals, subscriber_reservations,
+    live_observation_current as _live_observation_current,
 )
 from jx_alert.notifications.cards import card, number, plain, with_mentions
 from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
@@ -214,21 +215,6 @@ def _write_batch(db, bucket, destination, items, day, *, group, routing, overnig
                    'hourly_delivery_date': day.isoformat(), 'hourly_overnight': overnight,
                    'hourly_group_delivery': group}
     return row.id
-
-
-def _live_observation_current(item, campaign, store, now):
-    evidence = item.get('live_observation')
-    if evidence is None:
-        return True  # Frozen drafts from earlier versions have no new observation metadata.
-    try:
-        captured = datetime.fromisoformat(evidence['captured_at'])
-        report_day = now.astimezone(ZoneInfo(store.timezone)).date().isoformat()
-    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
-        return False
-    if captured.tzinfo is None or not timedelta(0) <= now - captured <= timedelta(minutes=75):
-        return False
-    budget = evidence.get('daily_budget')
-    return evidence.get('day') == report_day and (budget is None or budget == campaign.budget)
 
 
 def eligible_items(db, settings, items, now, *, refreshed_since=None):

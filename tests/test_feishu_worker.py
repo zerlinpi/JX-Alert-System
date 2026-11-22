@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -119,6 +120,68 @@ def test_worker_recovers_sending_row_without_claim_timestamp(monkeypatch, tmp_pa
         log = db.scalar(select(NotificationLog))
         assert log.status == "DELIVERED"
 
+
+
+@pytest.mark.parametrize("transport", ["webhook", "app"])
+def test_stale_worker_never_calls_provider_after_another_worker_recovers_claim(
+        monkeypatch, tmp_path, transport):
+    from jx_alert.notifications import feishu_app
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'outbox.db'}")
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(engine)
+    settings = SimpleNamespace(app_dry_run=False, feishu_enabled=True,
+        feishu_transport=transport, feishu_timeout=10,
+        feishu_routing_file=str(tmp_path / "no-routing.json"),
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        feishu_sign_secret="", feishu_keyword="", feishu_at_ids=lambda: [])
+    monkeypatch.setattr(worker, "SessionLocal", sessions)
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    submissions = []
+
+    class Provider:
+        def __init__(self, **_kwargs):
+            pass
+
+        def send_text(self, message, **_kwargs):
+            submissions.append(message)
+            return {"message_id": "om_test"}
+
+    monkeypatch.setattr(worker, "FeishuClient", Provider)
+    monkeypatch.setattr(feishu_app.FeishuAppClient, "from_settings", lambda _: Provider())
+    payload = {"text": "synthetic alert"}
+    if transport == "app":
+        payload.update(transport="app", delivery={"receive_id": "oc_test", "receive_id_type": "chat_id"})
+    with sessions.begin() as db:
+        row = NotificationOutbox(idempotency_key="expired-claim-while-validating", payload=payload)
+        db.add(row)
+        db.flush()
+        row_id = row.id
+
+    recovered = []
+
+    def simulate_pause(*_args):
+        # A long policy check or paused process lets its lease expire before
+        # reaching the provider. A second worker sends on the recovered lease.
+        if not recovered:
+            recovered.append(None)
+            with sessions.begin() as db:
+                item = db.get(NotificationOutbox, row_id)
+                assert item.status == "SENDING" and item.attempts == 1
+                item.claimed_at -= timedelta(hours=2)
+            recovered[0] = worker.process_outbox_batch(outbox_ids=[row_id])
+        return None
+
+    monkeypatch.setattr(worker, "_proactive_delivery_reason", simulate_pause)
+    expired = worker.process_outbox_batch(outbox_ids=[row_id])
+    assert recovered[0]["sent"] == 1
+    assert (expired["claimed"], expired["sent"], expired["failed"]) == (1, 0, 0)
+    assert submissions == ["synthetic alert"]
+    with sessions() as db:
+        row = db.get(NotificationOutbox, row_id)
+        assert (row.status, row.attempts, row.claimed_at) == ("DELIVERED", 2, None)
+        assert list(db.scalars(select(NotificationLog.status))) == ["DELIVERED"]
+    engine.dispose()
 
 
 def test_worker_sends_to_store_specific_group_and_mentions_group_admin(

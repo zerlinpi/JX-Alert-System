@@ -10,7 +10,7 @@ from jx_alert.notifications.ad_repeat import (
 )
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.storage.db import Base
-from jx_alert.storage.models import SyncJob
+from jx_alert.storage.models import Campaign, Store, SyncJob
 
 
 CLOCK = datetime(2026, 11, 19, 8, tzinfo=timezone.utc)
@@ -209,3 +209,36 @@ def test_repeat_zero_clicks_requires_new_day_and_materially_more_impressions():
     assert not repeat_eligible_signals(_intraday('2026-11-14', impressions=63000), signals, history, now)
     assert not repeat_eligible_signals(_intraday(spend=10, impressions=63000), signals, history, now)
     assert repeat_eligible_signals(_intraday(impressions=63000), signals, history, now) == signals
+
+
+@pytest.mark.parametrize(("age", "day", "budget", "zone", "reserved"), [
+    (180, "2026-11-21", 10, "America/Los_Angeles", False),
+    (75, "2026-11-21", 10, "America/Los_Angeles", True),
+    (20, "2026-11-20", 10, "America/Los_Angeles", False),
+    (20, "2026-11-21", 11, "America/Los_Angeles", False),
+    (20, "2026-11-21", 10, None, False),
+    (20, "2026-11-21", 10, "Unknown/Timezone", False),
+    (-1, "2026-11-21", 10, "America/Los_Angeles", False),
+])
+def test_held_live_incident_reserves_only_while_it_can_still_be_delivered(age, day, budget, zone, reserved):
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    open_at = datetime(2026, 11, 22, 0, tzinfo=timezone.utc)  # 08:00 Beijing; still Nov 21 in LA
+    signal = ["intraday_budget"]
+    fresh = _intraday("2026-11-21", spend=100, clicks=11)
+    capture = open_at - timedelta(minutes=age)
+    with Session(engine) as db:
+        db.add(Store(sid="5174", name="GETEEN", timezone=zone, status=1))
+        db.add(Campaign(store_id="5174", campaign_type="sp", campaign_id="seven", state="enabled", budget=10))
+        db.add(SyncJob(job_type=INCIDENT, status="HELD",
+            started_at=(open_at - timedelta(minutes=70)).replace(tzinfo=None),
+            metadata_json={**incident_metadata(fresh, signal), "release_day": "2026-11-22",
+                "hourly_item": {"live_observation": {
+                    "day": day, "captured_at": capture.isoformat(), "daily_budget": budget}}}))
+        db.commit()
+
+        assert incident_already_recorded(db, fresh, now=open_at) is reserved
+        history = load_incident_history(db, open_at)
+        assert (campaign_identity(fresh) in history) is reserved
+        assert repeat_eligible_signals(fresh, signal, history, open_at) == ([] if reserved else signal)
+    engine.dispose()
