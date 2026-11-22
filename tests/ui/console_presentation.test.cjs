@@ -5,9 +5,17 @@ const { test } = require("node:test");
 const vm = require("node:vm");
 
 class Element {
-  constructor() { this.children = []; this.dataset = {}; this.hidden = false; this.textContent = ""; }
-  addEventListener() {}
-  setAttribute() {}
+  constructor() {
+    this.children = []; this.dataset = {}; this.hidden = false; this.textContent = "";
+    this.attributes = new Map(); this.listeners = new Map();
+  }
+  addEventListener(name, handler) { this.listeners.set(name, handler); }
+  dispatch(name, extra = {}) { return this.listeners.get(name)?.({preventDefault() {}, ...extra}); }
+  setAttribute(name, value) { this.attributes.set(name, value); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  removeAttribute(name) { this.attributes.delete(name); }
+  getClientRects() { return this.hidden ? [] : [{}]; }
+  focus() { this.focused = true; }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
 }
@@ -198,4 +206,65 @@ test("private recipient save uses CSRF and sends no report subscription flag", a
   assert.equal(request.headers['X-CSRF-Token'], 'a'.repeat(64));
   assert.deepEqual(JSON.parse(request.body), {open_ids:['ou_first'],revision:'b'.repeat(64)});
   assert.match(scope.elements.get('ad-subscriber-status').textContent, /不会补发旧告警/);
+});
+
+test("compact navigation only exposes links: Escape restores focus, repeated toggles do not reload", () => {
+  const { context, elements } = consoleScope();
+  let requests = 0;
+  context.fetch = () => { requests++; return new Promise(() => {}); };
+  const menu = elements.get("workspace-menu"), panel = elements.get("workspace-navigation");
+  menu.dispatch("click");
+  assert.equal(menu.getAttribute("aria-expanded"), "true");
+  assert.equal(panel.dataset.expanded, "true");
+  menu.dispatch("click");
+  assert.equal(panel.dataset.expanded, "false");
+  menu.dispatch("click");
+  let prevented = false;
+  panel.dispatch("keydown", { key: "Escape", preventDefault: () => { prevented = true; } });
+  assert.ok(prevented && menu.focused);
+  assert.equal(menu.getAttribute("aria-expanded"), "false");
+  assert.equal(requests, 0);
+});
+
+test("each compact navigation choice opens the right view and moves focus to its title", async () => {
+  const { context, elements, evaluate } = consoleScope();
+  const views = ["analysis-settings", "notification-group", "data-sources", "owners", "overview"];
+  const tabs = views.map((view) => Object.assign(new Element(), { dataset: {view} }));
+  context.document.querySelectorAll = (selector) => selector === "[data-view]" ? tabs : [];
+  let requests = 0;
+  context.fetch = () => { requests++; return new Promise(() => {}); };
+  evaluate("state.groups.current={}; state.adSubscribers.data={}; state.sources.data={}; state.deepseek.data={}; state.reviewSkills={}; state.skillLibrary={};");
+  for (const [index, view] of views.entries()) {
+    elements.get("workspace-menu").dispatch("click");
+    await evaluate(`setView(${JSON.stringify(view)})`);
+    assert.equal(elements.get("workspace-navigation").dataset.expanded, "false");
+    assert.equal(elements.get("page-title").focused, true);
+    assert.deepEqual(tabs.map((t) => t.getAttribute("aria-current")), tabs.map((_,i) => i === index ? "page" : null));
+    assert.equal(elements.get("store-board").hidden, !["overview","owners"].includes(view));
+    assert.equal(elements.get("fleet-strip").hidden, elements.get("store-board").hidden);
+    assert.equal(elements.get("ownership").hidden, view !== "owners");
+    for (const page of views.slice(0,3)) assert.equal(elements.get(page+"-panel").hidden, page !== view);
+  }
+  assert.equal(requests, 0);
+});
+
+test("compact store picker preserves search on dismissal and collapses on actual selection", () => {
+  const { context, elements } = consoleScope();
+  const button = elements.get("store-picker-toggle"), panel = elements.get("store-picker-panel");
+  const search = elements.get("store-search");
+  search.value = "北"; elements.get("store-filter").value = "all";
+  const requests = [];
+  context.clearTimeout = () => {};
+  context.fetch = (url, options) => { requests.push({url, options}); return new Promise(() => {}); };
+  button.dispatch("click");
+  panel.dispatch("keydown", {key:"Escape"});
+  assert.equal(panel.dataset.expanded, "false");
+  assert.equal(search.value, "北");
+  assert.equal(button.focused, true);
+  assert.equal(requests.length, 0);
+  button.dispatch("click");
+  elements.get("stores").dispatch("click", { target:{ closest:() => ({dataset:{sid:"123"}}) } });
+  assert.equal(button.getAttribute("aria-expanded"), "false");
+  assert.deepEqual(requests.map((r) => r.url), ["/console/api/stores/123"]);
+  assert.equal(requests[0].options.method, undefined);
 });

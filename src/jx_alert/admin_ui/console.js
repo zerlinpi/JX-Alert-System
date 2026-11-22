@@ -21,6 +21,7 @@ const state = {
   sources: { data: null, loading: false, saving: false },
   deepseek: { data: null, loading: false, saving: false },
   reviewSkills: null,
+  skillLibrary: null,
   adSubscribers: { data: null, members: null, selected: new Set(), loading: false, saving: false },
 };
 
@@ -67,7 +68,7 @@ async function api(path, options) {
   });
   if (response.status === 401 || response.redirected) {
     location.assign("/console/login");
-    throw new Error("登录已过期，请重新登录。");
+    throw Object.assign(new Error("登录已过期，请重新登录。"), { status: 401 });
   }
   let json;
   try { json = await response.json(); } catch { throw new Error("服务暂时不可用，请刷新重试。"); }
@@ -702,6 +703,7 @@ function renderView() {
   $("notification-group-panel").hidden = !groups;
   $("data-sources-panel").hidden = !sources;
   $("analysis-settings-panel").hidden = !analysisSettings;
+  $("fleet-strip").hidden = groups || sources || analysisSettings;
   $("store-stats").hidden = groups || sources || analysisSettings;
   $("store-board").hidden = groups || sources || analysisSettings;
   $("bulk-sync-panel").hidden = groups || sources || analysisSettings;
@@ -714,15 +716,50 @@ function renderView() {
   $("edit-owners").hidden = owners;
 }
 
+// The same navigation and store list serve both layouts. CSS changes their placement;
+// only disclosure state is UI-local. Opening these must never start a request.
+function bindCompactPanel(triggerId, panelId) {
+  const trigger = $(triggerId), panel = $(panelId);
+  const isOpen = () => trigger.getAttribute("aria-expanded") === "true";
+  function setOpen(open) {
+    trigger.setAttribute("aria-expanded", String(open));
+    panel.dataset.expanded = String(open);
+  }
+  function close(restoreFocus = false) {
+    if (!isOpen()) return false;
+    setOpen(false);
+    const visible = trigger.getClientRects().length > 0;
+    if (restoreFocus && visible) trigger.focus();
+    return visible;
+  }
+  trigger.addEventListener("click", () => setOpen(!isOpen()));
+  const onKey = (event) => {
+    if (event.key === "Escape" && isOpen()) { close(true); event.preventDefault(); }
+  };
+  trigger.addEventListener("keydown", onKey);
+  panel.addEventListener("keydown", onKey);
+  return { close };
+}
+const compactNavigation = bindCompactPanel("workspace-menu", "workspace-navigation");
+const compactStoreList = bindCompactPanel("store-picker-toggle", "store-picker-panel");
+
 async function setView(view) {
+  const fromMenu = compactNavigation.close();
+  const fromStore = document.activeElement === $("edit-owners");
+  compactStoreList.close();
   if (view !== "analysis-settings") $("deepseek-key").value = "";
   state.view = view;
   renderView();
+  if (fromMenu) $("page-title").focus();
+  else if (fromStore && view === "owners") $("owners-title").focus();
   if (view === "owners" && state.data && !state.members) await loadMembers();
   if (view === "notification-group" && !state.groups.current) await loadGroups();
   if (view === "notification-group" && !state.adSubscribers.data) await loadAdSubscribers();
   if (view === "data-sources" && !state.sources.data) await loadSources();
   if (view === "analysis-settings") {
+    if (!state.skillLibrary && window.JxSkillLibrary) {
+      state.skillLibrary = window.JxSkillLibrary.mount($("skill-library-panel"), { api, csrf: () => state.csrf });
+    }
     if (!state.reviewSkills && window.JxReviewSkills) {
       state.reviewSkills = window.JxReviewSkills.mount($("review-skills-panel"), { api, csrf: () => state.csrf });
     }
@@ -1198,7 +1235,10 @@ async function saveOwners() {
 
 $("stores").addEventListener("click", (event) => {
   const btn = event.target.closest("[data-sid]");
-  if (btn) void selectStore(btn.dataset.sid);
+  if (btn) {
+    compactStoreList.close(true);
+    void selectStore(btn.dataset.sid);
+  }
 });
 $("store-search").addEventListener("input", renderStoreList);
 $("reload-sources").addEventListener("click", () => void loadSources());
@@ -1211,6 +1251,7 @@ $("refresh").addEventListener("click", () => {
   if (state.view === "analysis-settings") {
     void loadDeepSeek();
     void state.reviewSkills?.refresh();
+    void state.skillLibrary?.refresh();
   } else if (state.view === "data-sources") void loadSources();
   else if (state.view === "notification-group") void loadGroups();
   else void loadStores();
