@@ -9,14 +9,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, tuple_
 
-from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.notifications.outbox import NotificationOutbox, RESERVING
 from jx_alert.storage.models import Campaign, Store, SyncJob
 
 
 INCIDENT = 'hourly_ad_incident'
 COOLDOWN = timedelta(hours=72)
 REVIEW_INTERVAL = timedelta(days=7)
-_RESERVING_OUTBOX_STATES = {'PENDING', 'RETRY', 'SENDING'}
 _ABSOLUTE_INTRADAY_SIGNALS = frozenset({'intraday_budget', 'intraday_no_clicks'})
 
 _FAMILIES = {
@@ -56,7 +55,7 @@ def _group_outboxes(db, incident_items):
         select(NotificationOutbox.id, NotificationOutbox.status, NotificationOutbox.payload).where(
             NotificationOutbox.id.in_(ids),
             NotificationOutbox.payload['delivery']['receive_id_type'].as_string() == 'chat_id',
-            NotificationOutbox.status.in_((*_RESERVING_OUTBOX_STATES, 'DELIVERED')),
+            NotificationOutbox.status.in_((*RESERVING, 'DELIVERED')),
     ))} if ids else {}
 
 
@@ -65,7 +64,7 @@ def _stored_identity(item):
 
 
 def _outbox_reserves(state, payload, item):
-    if state in _RESERVING_OUTBOX_STATES:
+    if state in RESERVING:
         return True
     if state != 'DELIVERED':
         return False
@@ -150,7 +149,7 @@ def subscriber_reservations(db, incident_keys, destination):
     outboxes = {oid: (status, payload) for oid, status, payload in db.execute(
         select(NotificationOutbox.id, NotificationOutbox.status, NotificationOutbox.payload).where(
             NotificationOutbox.id.in_(ids), NotificationOutbox.chat_id == destination['receive_id'],
-            NotificationOutbox.status.in_((*_RESERVING_OUTBOX_STATES, 'DELIVERED'))))
+            NotificationOutbox.status.in_((*RESERVING, 'DELIVERED'))))
         if payload.get('delivery') == destination}
     return {item['incident_key'] for item in incidents
             if any(_outbox_reserves(*outboxes.get(oid, (None, {})), item) for oid in _outbox_ids(item))}

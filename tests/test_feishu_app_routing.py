@@ -68,7 +68,8 @@ def test_targeted_worker_does_not_send_other_pending_messages(setup, monkeypatch
     sent = []
 
     class Client:
-        def send_text(self, text, **kwargs):
+        def send_text(self, text, before_submit, **kwargs):
+            before_submit({})
             sent.append(text)
             return {"message_id": "test-message"}
 
@@ -99,10 +100,11 @@ def test_delivery_cas_survives_second_precision_database_timestamp(setup, monkey
             # parameters untouched. SQLite otherwise preserves microseconds.
             cursor.execute("UPDATE notification_outbox SET claimed_at = "
                            "strftime('%Y-%m-%d %H:%M:%S', claimed_at) || '.000000' "
-                           "WHERE status = 'SENDING' AND claimed_at IS NOT NULL")
+                           "WHERE status IN ('PREPARING', 'SUBMITTING') AND claimed_at IS NOT NULL")
 
     class Client:
-        def send_text(self, text, **kwargs):
+        def send_text(self, text, before_submit, **kwargs):
+            before_submit({})
             return {"message_id": "confirmed-message"}
 
     monkeypatch.setattr(app_module.FeishuAppClient, "from_settings", lambda _: Client())
@@ -128,10 +130,11 @@ def test_one_bot_separate_group_mentions_and_manager_delivery_with_independent_r
         def from_settings(cls, settings):
             return cls()
 
-        def send_text(self, text, **kwargs):
+        def send_text(self, text, before_submit, **kwargs):
             sent.append(kwargs)
             if kwargs["receive_id"] == "ou_manager" and len(sent) == 2:
-                raise RuntimeError("provider accidentally echoed test-secret")
+                raise RuntimeError("token acquisition echoed test-secret")
+            before_submit({})
             return {"message_id": "om_confirmed"}
 
         send_card = send_text
@@ -147,7 +150,7 @@ def test_one_bot_separate_group_mentions_and_manager_delivery_with_independent_r
         jobs = db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)).all()
         assert len(jobs) == 2
         assert jobs[0].status == "DELIVERED"
-        assert jobs[1].status == "RETRY" and jobs[1].attempts == 1
+        assert jobs[1].status == "PRE_SEND_RETRY" and jobs[1].attempts == 1
         assert "test-secret" not in jobs[1].last_error
         jobs[1].next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
         db.commit()
@@ -314,7 +317,8 @@ def test_approved_fallback_sends_missing_roles_to_report_group_without_mentions(
     sent = []
 
     class Client:
-        def send_card(self, card, **kwargs):
+        def send_card(self, card, before_submit, **kwargs):
+            before_submit({})
             sent.append(kwargs)
             return {"message_id": "synthetic-message"}
 

@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-flash"
     deepseek_request_timeout: float = Field(default=45.0, ge=1, le=120)
     ad_review_skills_file: str = "/app/data/ad-review-skills.json"
+    agent_skill_library_dir: str = "/app/data/owner-skill-library"
     excel_archive_enabled: bool = False
     excel_archive_dir: str = "/app/data/excel"
     excel_daily_snapshot_enabled: bool = True
@@ -74,6 +75,7 @@ class Settings(BaseSettings):
     mcp_output_mode: Literal["jx", "sparkx_direct"] = "jx"
     sparkx_ai_token: SecretStr = SecretStr("")
     sparkx_profile_ids: str = ""
+    sparkx_feishu_enabled: bool = False  # server-only, never set by relay input
     sparkx_relay_bearer_token: SecretStr = SecretStr("")
 
     def mcp_allowed_host_list(self) -> list[str]:

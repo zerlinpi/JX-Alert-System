@@ -5,8 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal
 import re
 
-from jx_alert.notifications.cards import card, plain
-from jx_alert.notifications.store_health import card_fits
+from jx_alert.notifications.cards import card, card_fits, plain
 
 
 _AD_TYPES = ("SP", "SB", "SBV", "SD", "共享分摊")
@@ -54,7 +53,8 @@ def _units(value):
     return int(number) if number is not None and number == number.to_integral_value() else None
 
 
-def _row(data):
+def normalize_owner_row(data):
+    """Normalize once by the same display and evidence rules used by coverage checks."""
     raw_id = data["store_id"]
     if type(raw_id) not in {str, int} or not _IDENTITY.fullmatch(str(raw_id).strip()):
         raise ValueError("Owner report requires a store identity")
@@ -182,7 +182,8 @@ def _bounded_pages(rows, maximum, render):
 
 
 def build_owner_daily_pages(rows, *, report_date: date, as_of: str | datetime | None = None,
-                            provisional: bool = False) -> list[tuple[dict, list[str]]]:
+                            provisional: bool = False,
+                            preview_scope: tuple[str, int] | None = None) -> list[tuple[dict, list[str]]]:
     """Return summary pages with their entire scope, then scoped detail pages.
 
     Caller supplies exactly one row per authorized store for the selected report
@@ -191,12 +192,20 @@ def build_owner_daily_pages(rows, *, report_date: date, as_of: str | datetime | 
     """
     if type(report_date) is not date:
         raise ValueError("An explicit owner report date is required")
-    items = [_row(row) for row in rows]
+    items = [normalize_owner_row(row) for row in rows]
     if len({item.sid for item in items}) != len(items):
         raise ValueError("Owner report stores must be unique")
     subtitle = f"店铺当地报表日 {report_date}"
     if provisional:
-        subtitle += "（未结束，仅供参考）"
+        subtitle += "（未结束，仅供参考）｜来源更新时间未验证"
+    if preview_scope is not None:
+        zone_name, requested = preview_scope
+        # Kept inside each card (including pagination size checks), not just in the outer audit JSON.
+        if (not provisional or not isinstance(zone_name, str)
+                or not re.fullmatch(r"[A-Za-z0-9_+./-]{1,100}", zone_name)
+                or type(requested) is not int or requested < len(items)):
+            raise ValueError("Invalid owner preview scope")
+        subtitle += f"｜{zone_name} 日期组 {len(items)} 店 / 指定范围 {requested} 店"
     if isinstance(as_of, datetime):
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("Owner report observation timestamp must include a timezone")
@@ -216,6 +225,6 @@ def build_owner_daily_pages(rows, *, report_date: date, as_of: str | datetime | 
 
 
 def build_owner_daily_cards(rows, *, report_date: date, as_of: str | datetime | None = None,
-                            provisional: bool = False) -> list[dict]:
+                            provisional: bool = False, preview_scope: tuple[str, int] | None = None) -> list[dict]:
     return [value for value, _ in build_owner_daily_pages(
-        rows, report_date=report_date, as_of=as_of, provisional=provisional)]
+        rows, report_date=report_date, as_of=as_of, provisional=provisional, preview_scope=preview_scope)]

@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 import httpx
 import pytest
 
@@ -68,3 +69,16 @@ def test_webhook_provider_errors_do_not_reveal_response_contents(monkeypatch, bo
     with pytest.raises(FeishuWebhookError) as error:
         FeishuClient("https://open.feishu.cn/open-apis/bot/v2/hook/test").send_text("test")
     assert "private-webhook-token" not in str(error.value)
+
+def test_httpx_info_redacts_only_the_active_webhook_without_disabling_diagnostics(monkeypatch, caplog):
+    original = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"code": 0})), **kwargs))
+    caplog.set_level(logging.INFO, logger="httpx")
+    secret = "private-synthetic-sentinel"
+    FeishuClient("https://OPEN.FEISHU.CN/open-apis/bot/v2/hook/" + secret).send_text("fixture")
+    with httpx.Client() as other:
+        other.get("https://example.invalid/unrelated")
+    assert secret not in caplog.text and not any(secret in str(r.args) for r in caplog.records)
+    assert "Feishu webhook redacted" in caplog.text and "200 OK" in caplog.text
+    assert "https://example.invalid/unrelated" in caplog.text

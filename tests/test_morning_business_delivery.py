@@ -191,8 +191,12 @@ def test_scheduled_business_sends_only_still_eligible_store_sections(tmp_path, m
     monkeypatch.setattr(business_daily, 'business_daily_card', lambda db, store, day, **kw:
         _store_business_card(store.name, day))
     sent = []
-    monkeypatch.setattr(FeishuAppClient, 'from_settings', lambda s: SimpleNamespace(
-        send_card=lambda value, **kw: sent.append(value) or {'message_id': 'om_test'}))
+    def send(value, *, before_submit, **kwargs):
+        before_submit({})
+        sent.append(value)
+        return {'message_id': 'om_test'}
+
+    monkeypatch.setattr(FeishuAppClient, 'from_settings', lambda s: SimpleNamespace(send_card=send))
     delivery = {'role': 'daily_snapshot', 'receive_id': 'oc_test', 'receive_id_type': 'chat_id', 'open_ids': []}
     with sessions() as db:
         stores = [Store(sid=sid, name=name, status=1) for sid, name in [

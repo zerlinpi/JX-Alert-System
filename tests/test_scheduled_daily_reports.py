@@ -470,7 +470,8 @@ def test_missing_data_report_is_skipped_and_repeated_delivery_does_not_resend(se
         assert jobs[0].payload["store_id"] == "5174"
     sent = []
 
-    def send(*args, **kwargs):
+    def send(*args, before_submit, **kwargs):
+        before_submit({})
         sent.append(kwargs)
         return {"message_id": "test-message"}
 

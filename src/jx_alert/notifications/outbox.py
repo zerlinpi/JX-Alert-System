@@ -6,6 +6,15 @@ from sqlalchemy.orm import Mapped, mapped_column
 from jx_alert.storage.db import Base
 
 
+QUESTION_REPLY_PREFIX = "group-question:"  # group and private replies share the namespace
+PRE_SEND_RETRY = "PRE_SEND_RETRY"
+CLAIMABLE = frozenset({"PENDING", "RETRY", PRE_SEND_RETRY})
+# SENDING is the legacy phase: it did not distinguish preparation from POST.
+IN_FLIGHT = CLAIMABLE | {"SENDING", "PREPARING", "SUBMITTING"}
+DELIVERY_UNKNOWN = "DELIVERY_UNKNOWN"
+RESERVING = IN_FLIGHT | {DELIVERY_UNKNOWN}
+
+
 class NotificationOutbox(Base):
     __tablename__ = "notification_outbox"
 

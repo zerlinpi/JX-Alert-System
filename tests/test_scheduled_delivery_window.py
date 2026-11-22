@@ -24,8 +24,12 @@ def test_expired_report_backlog_does_not_block_today_or_send_before_nine(tmp_pat
     monkeypatch.setattr(worker, "SessionLocal", sessions)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
     sent = []
-    monkeypatch.setattr(FeishuAppClient, "from_settings", lambda _: SimpleNamespace(
-        send_text=lambda text, **kw: sent.append(text) or {"message_id": "om_test"}))
+    def send(text, *, before_submit, **kw):
+        before_submit({})
+        sent.append(text)
+        return {"message_id": "om_test"}
+
+    monkeypatch.setattr(FeishuAppClient, "from_settings", lambda _: SimpleNamespace(send_text=send))
     instant = datetime(2026, 11, 13, 23, 30, tzinfo=timezone.utc)  # 14th 07:30 Beijing
 
     class Clock(datetime):
@@ -108,7 +112,7 @@ def test_focused_daily_retry_rechecks_cutoff_before_feishu_and_never_resends(tmp
 
     def send(text, **kwargs):
         attempts.append(text)
-        raise RuntimeError("simulated temporary error")
+        raise RuntimeError("simulated pre-submit token service error")
 
     monkeypatch.setattr(FeishuAppClient, "from_settings", lambda _: SimpleNamespace(send_text=send))
     instant = datetime(2026, 11, 14, 9, 59, 20, tzinfo=timezone.utc)
@@ -136,7 +140,7 @@ def test_focused_daily_retry_rechecks_cutoff_before_feishu_and_never_resends(tmp
 
     worker.process_outbox_batch()
     with sessions() as db:
-        assert db.get(NotificationOutbox, row_id).status == "RETRY"
+        assert db.get(NotificationOutbox, row_id).status == "PRE_SEND_RETRY"
     instant = instant.replace(second=59)
     jump_after_claim = datetime(2026, 11, 14, 10, tzinfo=timezone.utc)
     assert worker.process_outbox_batch()["sent"] == 0

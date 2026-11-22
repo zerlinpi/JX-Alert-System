@@ -51,6 +51,10 @@ def _day(value) -> date:
     raise SparkXDirectError("Dates must use YYYY-MM-DD")
 
 
+def page_size_for(query):
+    return query.get("pageSize", 50 if query["factEntity"] == "campaignAudience" else 100)
+
+
 def validate_performance_query(arguments: dict, allowed_profile_ids: frozenset[int]) -> None:
     profiles = arguments.get("profileIds")
     if (not isinstance(profiles, list) or len(profiles) != 1 or type(profiles[0]) is not int
@@ -90,7 +94,7 @@ def validate_performance_query(arguments: dict, allowed_profile_ids: frozenset[i
         raise SparkXDirectError("SparkX query requires valid JSON") from None
     if len(encoded) > 32_768:
         raise SparkXDirectError("SparkX query exceeds the request size limit")
-    for key, maximum in (("page", None), ("pageSize", 500)):
+    for key, maximum in (("page", None), ("pageSize", 200 if fact == "campaignAudience" else 500)):
         if key in arguments:
             val = arguments[key]
             if type(val) is not int or val < 1 or (maximum is not None and val > maximum):
@@ -130,26 +134,48 @@ async def call_sparkx(tool_name: str, arguments: dict, *, token: str,
 
 def check_authorized_profiles(result: CallToolResult, profile_ids: frozenset[int]) -> None:
     """Verify only the expected shop subset without returning the tenant's directory."""
-    data = result.structuredContent
-    if data is None and len(result.content) == 1 and result.content[0].type == "text":
-        try:
-            data = json.loads(result.content[0].text)
-        except (ValueError, TypeError):
-            pass
-    if result.isError or not isinstance(data, dict) or data.get("isError") is True:
+    def unique(pairs):
+        data = dict(pairs)
+        if len(data) != len(pairs):
+            raise ValueError
+        return data
+
+    def roster(data):
+        if (not isinstance(data, dict) or data.get("isError", False) is not False or "errorType" in data
+                or data.get("toolName", "get_user_authorized_context") != "get_user_authorized_context"
+                or not isinstance(data.get("profiles"), list)):
+            raise ValueError
+        ids = set()
+        for row in data["profiles"]:
+            value = row.get("profileId") if isinstance(row, dict) else None
+            if type(value) is str and value.isascii() and value.isdecimal() and len(value) <= 20:
+                value = int(value)
+            if type(value) is not int or not 0 < value <= 2**63 - 1:
+                raise ValueError
+            ids.add(value)
+        return ids
+
+    if result.isError:
         raise SparkXDirectError("SparkX did not confirm upstream authorization")
-    rows = data.get("profiles")
-    if not isinstance(rows, list):
-        raise SparkXDirectError("SparkX did not return an authorized profile list")
-    ids = set()
-    for row in rows:
-        if isinstance(row, dict):
-            value = row.get("profileId")
-            if type(value) is int:
-                ids.add(value)
-            elif isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 20:
-                ids.add(int(value))
-    if not profile_ids or not profile_ids.issubset(ids):
+    try:
+        views = [roster(result.structuredContent)] if result.structuredContent is not None else []
+        for block in result.content:
+            if block.type != "text":
+                continue
+            raw = block.text.strip()
+            if raw.startswith("```json"):
+                if not raw.endswith("```"):
+                    raise ValueError
+                raw = raw[len("```json"):-3].strip()
+                if not raw.startswith("{"):
+                    raise ValueError
+            if raw.startswith(("{", "[")):
+                views.append(roster(json.loads(raw, object_pairs_hook=unique)))
+        if not views or any(ids != views[0] for ids in views[1:]):
+            raise ValueError
+    except (ValueError, TypeError, RecursionError):
+        raise SparkXDirectError("SparkX did not confirm consistent upstream authorization") from None
+    if not profile_ids or not profile_ids.issubset(views[0]):
         raise SparkXDirectError("One or more configured SparkX profiles are not authorized")
 
 
