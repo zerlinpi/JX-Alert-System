@@ -1,5 +1,6 @@
 """Read an isolated, complete SQLite copy; never connect to a configured warehouse."""
 import argparse
+from contextlib import nullcontext
 from datetime import date, datetime, timezone
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
+from jx_alert.reporting.owner_pilot import PilotBlocked, load_pilot, verify_sealed_copy
 from jx_alert.reporting.owner_today import prepare_owner_today
 
 
@@ -32,10 +34,16 @@ def _parse_as_of(value):
     return result
 
 
-def audit(sqlite_copy, scope_file, *, now=None, as_of=None):
-    scope = json.loads(Path(scope_file).read_text(encoding="utf-8"))
-    if not isinstance(scope, dict) or not isinstance(scope.get("store_ids"), list):
-        raise ValueError("Explicit store scope required")
+def audit(sqlite_copy, scope_file, *, now=None, as_of=None, pilot_capture=None, timezone_evidence=None):
+    pilot = None
+    if pilot_capture is not None or timezone_evidence is not None:
+        pilot = load_pilot(scope_file, pilot_capture, timezone_evidence, as_of, now=now)
+        ids, as_of = [pilot.sid], pilot.cutoff
+    else:
+        scope = json.loads(Path(scope_file).read_text(encoding="utf-8"))
+        if not isinstance(scope, dict) or not isinstance(scope.get("store_ids"), list):
+            raise ValueError("Explicit store scope required")
+        ids = scope["store_ids"]
     path = Path(sqlite_copy).resolve(strict=True)
     if not path.is_file() or any(Path(str(path) + ext).exists() for ext in ("-wal", "-shm", "-journal")):
         raise ValueError("Use a standalone, completed SQLite backup, not a running database")
@@ -44,25 +52,45 @@ def audit(sqlite_copy, scope_file, *, now=None, as_of=None):
     engine = create_engine("sqlite://", poolclass=NullPool, creator=lambda:
         sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True))
     try:
-        with Session(engine, autoflush=False) as db:
-            return prepare_owner_today(db, scope["store_ids"], now=now, as_of=as_of)
+        seal = verify_sealed_copy(path, pilot.sqlite_sha256) if pilot else nullcontext()
+        with seal:
+            with Session(engine, autoflush=False) as db:
+                if pilot:
+                    pilot.check_inventory_and_sources(db)
+                report = prepare_owner_today(db, ids, now=now, as_of=as_of)
+        if pilot:
+            report["pilot_gate"] = "MATCHED_OPERATOR_CAPTURE"
+        return report
+    except (TypeError, OverflowError):
+        if pilot:  # e.g. an unreadable timestamp type in a malformed SQLite copy.
+            raise PilotBlocked("UNUSABLE_INPUT") from None
+        raise
     finally:
         engine.dispose()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="核验库内当日分区，只读离线副本，不采集、不发送。")
+    parser = argparse.ArgumentParser(description="默认仅作未核验时区来源的离线预览或回放；单店截点验收需封存记录与独立证据。不采集、不发送。")
     parser.add_argument("--sqlite-copy", required=True, help="已校验的独立 SQLite 离线副本（非生产数据库）")
     parser.add_argument("--scope-file", required=True, help="明确授权的店铺范围 JSON（store_ids）")
     parser.add_argument("--as-of", type=_parse_as_of, metavar="TIMESTAMP",
                         help="可选离线回放参考时刻，格式 YYYY-MM-DDTHH:MM[:SS[.ffffff]]Z 或带 ±HH:MM；不能晚于执行时刻")
+    parser.add_argument("--pilot-capture", metavar="FILE", help="单店试点：截点封存记录，须配合 --as-of 和独立时区证据")
+    parser.add_argument("--timezone-evidence", metavar="FILE", help="单店试点：同截点存档的时区及两个来源采集窗口证据")
     args = parser.parse_args()
+    pilot = args.pilot_capture is not None or args.timezone_evidence is not None
     executed_at = datetime.now(timezone.utc) if args.as_of is not None else None
     if args.as_of is not None and args.as_of > executed_at:
         parser.error("--as-of 不能晚于实际执行时刻")
     try:
-        report = audit(args.sqlite_copy, args.scope_file, now=executed_at, as_of=args.as_of)
+        report = audit(args.sqlite_copy, args.scope_file, now=executed_at, as_of=args.as_of,
+                       pilot_capture=args.pilot_capture, timezone_evidence=args.timezone_evidence)
     except (OSError, ValueError, SQLAlchemyError) as exc:
+        if pilot:
+            print(json.dumps({"status": "PILOT_BLOCKED",
+                              "reason": str(exc) if isinstance(exc, PilotBlocked) else "UNUSABLE_INPUT",
+                              "groups": [], "provider_updated_at": None, "delivery_enabled": False}))
+            return 1
         hint = ("核对副本是否含同一快照的 stores、data_coverage 及 daily_metrics 表。"
                 if isinstance(exc, SQLAlchemyError) else
                 "核对两个文件是否可读、store_ids 是否有效；仅使用已完成且无活动日志的独立副本。")
