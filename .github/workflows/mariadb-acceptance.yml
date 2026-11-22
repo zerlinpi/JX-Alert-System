@@ -1,0 +1,34 @@
+name: MariaDB acceptance
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  mariadb-contention:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # Job and service share a private Docker network. No published ports,
+    # environment secrets, production configuration, or live provider clients.
+    container: python:3.12-bookworm
+    services:
+      jx-ci-mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_DATABASE: jx_ci_acceptance
+          MARIADB_USER: jx_ci
+          MARIADB_PASSWORD: ci-test-only
+          MARIADB_ROOT_PASSWORD: ci-root-only
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=3s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: pip install -e ".[dev]"
+      - run: JX_MARIADB_ACCEPTANCE=1 python -m pytest -q tests/integration/test_mariadb_contention.py
