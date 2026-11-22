@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from jx_alert import operations, scheduler
+from jx_alert import hourly_ad_monitor, operations, scheduler
 from jx_alert.storage import db as database
 from jx_alert.storage.db import Base
 from jx_alert.storage.models import SyncJob
@@ -24,11 +24,14 @@ def warehouse(tmp_path, monkeypatch):
     engine.dispose()
 
 
-def test_daily_plan_is_once_per_beijing_day_and_never_collects_in_cron(warehouse, monkeypatch):
+@pytest.mark.parametrize("hourly_mode", [False, True])
+def test_daily_plan_is_once_per_beijing_day_and_never_collects_in_cron(warehouse, monkeypatch, hourly_mode):
+    scheduler.get_settings().hourly_ad_monitor_enabled = hourly_mode
     def forbidden(**kwargs):
         pytest.fail("The cron callback must persist work without running provider requests")
 
     monkeypatch.setattr(operations, "run_collection", forbidden)
+    monkeypatch.setattr(hourly_ad_monitor, "run_hourly_monitor", forbidden)
     first_due = datetime(2026, 11, 13, 10, 30, tzinfo=timezone.utc)
     second_due = first_due + timedelta(days=1)
     scheduler.daily_job(now=first_due)
@@ -46,12 +49,15 @@ def test_daily_plan_is_once_per_beijing_day_and_never_collects_in_cron(warehouse
 
 
 @pytest.mark.parametrize("startup_enqueue_fails", [False, True])
+@pytest.mark.parametrize("hourly_mode", [False, True])
 def test_startup_and_periodic_recovery_restore_missed_collection_once(
-    warehouse, monkeypatch, startup_enqueue_fails,
+    warehouse, monkeypatch, startup_enqueue_fails, hourly_mode,
 ):
     settings = scheduler.get_settings()
     settings.scheduler_enabled = True
     settings.app_timezone = "UTC"
+    settings.hourly_ad_monitor_enabled = hourly_mode
+    settings.hourly_ad_monitor_cron = "0 * * * *"
     settings.feishu_daily_report_cron = "0 8 * * *"
     settings.excel_archive_enabled = True
     settings.excel_daily_snapshot_cron = "30 23 * * *"
@@ -193,12 +199,15 @@ def test_dry_run_and_naive_clock_never_persist_a_daily_plan(warehouse, monkeypat
         assert db.scalar(select(SyncJob)) is None
 
 
-def test_hourly_mode_starts_only_hourly_collection_and_recovery(warehouse, monkeypatch):
+@pytest.mark.parametrize("broad_cron,broad_minute", [(None, 30), ("45 18 * * *", 45)])
+def test_hourly_mode_keeps_independent_broad_hourly_and_delivery_schedules(warehouse, monkeypatch, broad_cron, broad_minute):
     settings = scheduler.get_settings()
     settings.scheduler_enabled = True
     settings.hourly_ad_monitor_enabled = True
     settings.app_timezone = "UTC"
     settings.daily_sync_cron = "0 8 * * *"
+    if broad_cron is not None:
+        settings.hourly_mode_daily_sync_cron = broad_cron
     settings.hourly_ad_monitor_cron = "0 * * * *"
     settings.feishu_daily_report_cron = "0 9 * * *"
     jobs = {}
@@ -213,18 +222,28 @@ def test_hourly_mode_starts_only_hourly_collection_and_recovery(warehouse, monke
         def start(self):
             pass
 
-    def forbidden():
-        pytest.fail("Hourly mode must bypass the legacy daily collector")
-
+    due = datetime(2026, 11, 19, tzinfo=timezone.utc)  # 08:00 Beijing
+    broad_due = due.replace(hour=10, minute=broad_minute)
+    daily_job = scheduler.daily_job
+    clock = due
     monkeypatch.setattr(scheduler, "BlockingScheduler", FakeScheduler)
     monkeypatch.setattr(scheduler, "init_db", lambda: None)
-    monkeypatch.setattr(scheduler, "daily_job", forbidden)
+    monkeypatch.setattr(scheduler, "daily_job", lambda: daily_job(now=clock))
     monkeypatch.setattr(scheduler, "daily_report_job", lambda: None)
     monkeypatch.setattr(scheduler, "daily_excel_snapshot_job", lambda: None)
     scheduler.main()
 
-    assert "daily_pipeline" not in jobs and "daily_pipeline_recovery" not in jobs
-    due = datetime(2026, 11, 19, tzinfo=timezone.utc)  # 08:00 Beijing
+    # Startup at 08:00 is not the broad slot in hourly mode. The independent
+    # 18:xx slot can recover at startup if this process wasn't running at 18:xx.
+    with warehouse() as db:
+        assert db.scalar(select(SyncJob)) is None
+    assert jobs["daily_pipeline"][1].get_next_fire_time(None, due) == broad_due
+    assert jobs["daily_pipeline_recovery"][1].interval == timedelta(minutes=1)
+    clock = broad_due + timedelta(minutes=5)
+    scheduler.main()
+    with warehouse() as db:
+        row = db.scalar(select(SyncJob))
+        assert row.metadata_json["idempotency_key"] == "scheduled-collection:2026-11-19"
     assert jobs["hourly_ad_monitor"][1].get_next_fire_time(None, due) == due
     assert jobs["hourly_ad_monitor_recovery"][1].interval == timedelta(minutes=1)
     for job_id in ("hourly_ad_monitor", "hourly_ad_monitor_recovery", "hourly_ad_monitor_startup"):
@@ -233,22 +252,9 @@ def test_hourly_mode_starts_only_hourly_collection_and_recovery(warehouse, monke
     assert "feishu_daily_report" in jobs and "feishu_outbox" in jobs
 
 
-def test_legacy_hourly_entry_point_does_not_freeze_collector_to_pre_fetch_clock(warehouse, monkeypatch):
-    from jx_alert import hourly_ad_monitor
-
-    settings = scheduler.get_settings()
-    settings.hourly_ad_monitor_enabled = True
-    settings.daily_sync_cron = "0 8 * * *"
-    due = datetime(2026, 11, 19, tzinfo=timezone.utc)
-    observed = []
-
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz):
-            return due.astimezone(tz)
-
-    monkeypatch.setattr(scheduler, "datetime", Clock)
-    monkeypatch.setattr(hourly_ad_monitor, "run_hourly_monitor", lambda *, now: observed.append(now))
-    scheduler.daily_job()
-    scheduler.daily_job(now=due)
-    assert observed == [None, due]
+def test_hourly_entry_point_leaves_source_freshness_to_collector(monkeypatch):
+    calls = []
+    monkeypatch.setattr(hourly_ad_monitor, "run_hourly_monitor",
+                        lambda **kwargs: calls.append(kwargs) or {"status": "ALREADY_COMPLETE"})
+    scheduler.hourly_ad_monitor_job()
+    assert calls == [{}]

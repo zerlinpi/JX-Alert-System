@@ -108,14 +108,27 @@ def test_complete_mature_source_keeps_exact_facts_and_leaves_all_tables_unchange
     assert context == review(warehouse)
 
 
-@pytest.mark.parametrize("failure", ["missing_metric", "missing_current", "failed_partition", "truncated",
+@pytest.mark.parametrize("failure", ["missing_metric", "missing_mature_units", "conflicting_mature_units",
+                                     "missing_current", "failed_partition", "truncated",
                                      "old_observation", "future_capture", "unknown_currency", "mixed_currency", "mixed_source",
-                                     "missing_raw", "old_raw_new_coverage", "revised_raw", "raw_future", "failed_raw"])
+                                     "missing_raw", "old_raw_new_coverage", "revised_raw", "raw_future", "failed_raw",
+                                     "raw_wrong_date", "raw_wrong_store", "raw_unconfirmed_attribution",
+                                     "raw_currency_conflict", "impossible_traffic"])
 def test_incomplete_or_not_reobserved_mature_campaign_never_enters_model_context(warehouse, failure):
     db, _, _ = warehouse
     seed(db)
     if failure == "missing_metric":
         db.delete(fact(db, "orders"))
+    elif failure in {"missing_mature_units", "conflicting_mature_units"}:
+        # Orders and sales are truly zero, but raw units explicitly disagree or
+        # have no normalized match. Neither is verified zero conversion.
+        for metric in ("orders", "sales"):
+            fact(db, metric).value = 0
+            update_raw(db, metric, 0)
+        if failure == "missing_mature_units":
+            db.delete(fact(db, "units"))
+        else:
+            fact(db, "units").value = 0
     elif failure == "missing_current":
         db.delete(fact(db, "clicks", DAY))
     elif failure == "failed_partition":
@@ -144,6 +157,17 @@ def test_incomplete_or_not_reobserved_mature_campaign_never_enters_model_context
     elif failure == "failed_raw":
         record = snapshot(db)
         record.payload = {**record.payload, "status": "FAILED"}
+    elif failure == "raw_wrong_date":
+        update_raw(db, "report_date", DAY.isoformat())
+    elif failure == "raw_wrong_store":
+        update_raw(db, "sid", 5175)
+    elif failure == "raw_unconfirmed_attribution":
+        update_raw(db, "_attribution_unconfirmed", True)
+    elif failure == "raw_currency_conflict":
+        update_raw(db, "confirmed_currency", "CAD")
+    elif failure == "impossible_traffic":
+        fact(db, "clicks", DAY).value = 10001
+        update_raw(db, "clicks", 10001, DAY)
     db.commit()
     context = review(warehouse)
     assert context["campaigns"] == []
@@ -159,6 +183,20 @@ def test_seven_day_baseline_falls_back_only_to_exact_mature_previous_day(warehou
     assert row["baseline"]["basis"] == "PREVIOUS_DAY"
     assert row["baseline"]["dates"] == ["2026-11-08"]
     coverage(db, DAY - timedelta(days=8)).completed_at = datetime(2026, 11, 10)
+    db.commit()
+    assert review(warehouse)["campaigns"] == []
+
+
+def test_equal_partition_counts_do_not_hide_different_campaign_identities(warehouse):
+    db, _, _ = warehouse
+    seed(db)
+    day = DAY - timedelta(days=7)
+    record = snapshot(db, day)
+    raw = record.payload["rows"][0]
+    record.payload = {**record.payload, "rows": [raw, {**raw, "campaign_id": "not-normalized"}]}
+    coverage(db, day).row_count = 2
+    db.add(DailyMetric(store_id="5174", metric_date=day, dimension="campaign_sp",
+        entity_id="not-in-source", metric_name="clicks", value=10, source="lingxing_ads_sp"))
     db.commit()
     assert review(warehouse)["campaigns"] == []
 

@@ -19,6 +19,7 @@ from jx_alert.storage.models import Campaign, Store, SyncJob
 
 
 CLOCK = datetime(2026, 11, 18, 6, tzinfo=timezone.utc)
+real_collect_store = monitor._collect_store
 
 
 @pytest.fixture
@@ -116,6 +117,29 @@ def test_hourly_rechecks_active_campaigns_without_repeating_delivered_alerts(war
         assert db.get(SyncJob, second['job_id']).metadata_json['review_counts']['mature'] == {
             'supported': 1, 'deduplicated': 1, 'submitted': 1, 'confirmed': 1,
         }
+
+
+def test_hourly_rechecks_exact_signal_not_just_evidence_id(warehouse, monkeypatch):
+    original = monitor.build_ad_review_context
+    passes = 0
+
+    def revised_signals(*args, **kwargs):
+        nonlocal passes
+        passes += 1
+        context = original(*args, **kwargs)
+        if passes == 2:
+            # This is the same fact ID and campaign, but the model-selected
+            # signal is no longer supported by the fresh delivery policy.
+            for row in context['campaigns']:
+                row['material_signals'] = ['CPC']
+        return context
+
+    monkeypatch.setattr(monitor, 'build_ad_review_context', revised_signals)
+    result = run(warehouse)
+    assert result['status'] == 'PARTIAL_FAILED'
+    assert not result['outbox_ids'] and result['finding_count'] == 0
+    with warehouse[1]() as db:
+        assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
 
 
 def test_source_failure_waits_before_retry_and_retains_job(warehouse):
@@ -447,7 +471,7 @@ def test_same_campaign_groups_current_budget_risk_before_mature_finding(warehous
         row_id, = hourly_ads.queue_hourly_findings(db, settings, [daily, budget],
             now=CLOCK, slot='paired-risks', send_alerts=True)
         item, = db.get(NotificationOutbox, row_id).payload['hourly_items']
-        assert item['signal'] == hourly_ads.TITLES['intraday_budget']
+        assert item['signal'] == '观测日的花费远超平均日预算'
         assert '比当前日预算多 美元 49.08' in item['numbers']
 
 
@@ -466,8 +490,8 @@ def test_single_day_no_clicks_has_independent_evidence_and_table(warehouse):
         payload = db.get(NotificationOutbox, row_id).payload
         table, = [x for x in payload['card']['body']['elements'] if x['tag'] == 'table']
         row, = table['rows']
-        assert '今天有大量曝光，点击仍为零' in row['c1']
-        assert '今天曝光 10,000' in row['c2'] and '今天点击 0' in row['c2']
+        assert '观测日有大量曝光，点击仍为零' in row['c1']
+        assert '当日曝光 10,000' in row['c2'] and '当日点击 0' in row['c2']
         assert '订单' not in row['c2'] and '参考' not in row['c2']
 
 
@@ -502,6 +526,65 @@ def test_nine_oclock_reuses_only_the_prepared_morning_report(warehouse, monkeypa
     assert len(captured) == 1
 
 
+def test_morning_sales_coverage_is_dated_and_requires_store_and_both_sku_grains(warehouse):
+    from jx_alert.storage.coverage import mark_coverage
+
+    day = CLOCK.date() - timedelta(days=1)
+    with warehouse[1]() as db:
+        mark_coverage(db, store_id='5174', metric_date=day, dimension='campaign_sp', row_count=3)
+        db.flush()
+        assert monitor._morning_sales_status(db, '5174', day)['store_sales'] == 'NOT_COLLECTED'
+        mark_coverage(db, store_id='5174', metric_date=day, dimension='store', row_count=0)
+        db.flush()
+        assert not monitor._morning_sales_status(db, '5174', day)['ready']
+        for dim in ('sku_asin', 'sku_msku'):
+            mark_coverage(db, store_id='5174', metric_date=day, dimension=dim, row_count=0)
+        db.flush()
+        status = monitor._morning_sales_status(db, '5174', day)
+        assert status['ready'] and status['store_sales'] == 'EMPTY'
+        assert not monitor._morning_sales_status(db, '5174', day + timedelta(days=1))['ready']
+
+
+def test_morning_sales_source_failure_does_not_skip_other_date_or_hide_behind_ads(
+        warehouse, monkeypatch):
+    from jx_alert.lingxing import api_business, business_dashboard, campaign_collector, collector
+    from jx_alert.lingxing import intraday_observation, sales_collector
+    from jx_alert.reporting import archive
+    from jx_alert.storage.coverage import mark_coverage
+
+    settings, factory, _, _ = warehouse
+    settings.lingxing_performance_enabled = False
+    day = CLOCK.date() - timedelta(days=2)
+    tried = []
+
+    def get_sales(client, db, dates, **kwargs):
+        from datetime import date
+        actual = date.fromisoformat(dates['5174'])
+        tried.append(actual)
+        if actual == day:
+            raise RuntimeError('upstream failure')
+        for dim in ('store', 'sku_asin', 'sku_msku'):
+            mark_coverage(db, store_id='5174', metric_date=actual, dimension=dim, row_count=0)
+        db.commit()
+
+    monkeypatch.setattr(sales_collector, 'collect_sales_for_day', get_sales)
+    monkeypatch.setattr(api_business, 'collect_api_business_for_day', lambda *a: {'status': 'COMPLETE'})
+    monkeypatch.setattr(business_dashboard, 'collect_business_for_day', lambda *a: {'status': 'COMPLETE'})
+    monkeypatch.setattr(campaign_collector, 'collect_campaigns', lambda *a, **kw: None)
+    monkeypatch.setattr(collector, 'collect_ads_for_day', lambda *a, **kw: {'rows': {'sp': 3}})
+    monkeypatch.setattr(intraday_observation, 'run_observation', lambda *a, **kw: {'status': 'COMPLETE'})
+    monkeypatch.setattr(archive, 'archive_partitions', lambda *a: {})
+    client = type('Client', (), {'seller_ad_accounts': lambda self: {'data': []}})()
+    # Restore the collector overridden by the warehouse fixture.
+    with factory() as db:
+        status = real_collect_store(client, db, settings, Source().get_stores()['data'][0],
+                                    day, morning=True, now=CLOCK)
+    assert tried == [day, day - timedelta(days=1)]
+    assert status['ad_ready'] and status['morning_ready'] and status['status'] == 'PARTIAL'
+    assert status['sales_coverage'][day.isoformat()] == {'ready': False, 'collection': 'FAILED'}
+    assert status['sales_coverage'][(day - timedelta(days=1)).isoformat()]['store_sales'] == 'EMPTY'
+
+
 def test_existing_night_summary_does_not_wait_for_new_ad_analysis_and_survives_retry(warehouse, monkeypatch):
     collect = monitor._collect_store
     evidence = monitor.build_ad_review_context
@@ -532,3 +615,70 @@ def test_existing_night_summary_does_not_wait_for_new_ad_analysis_and_survives_r
         assert job.metadata_json['error_phase'] == 'advertising_evidence'
     recovered = run(warehouse, now=morning + timedelta(minutes=5))
     assert recovered['status'] == 'SUCCEEDED' and recovered['outbox_ids'][0] == 123
+
+
+def test_hourly_failed_sp_attempt_preserves_daily_coverage_without_reporting_success(warehouse, monkeypatch):
+    from jx_alert.lingxing import campaign_collector, intraday_observation
+    from jx_alert.lingxing.collector import collect_ads_for_day
+    from jx_alert.storage.models import DataCoverage
+
+    class API:
+        def seller_ad_accounts(self):
+            return {"data": []}
+
+        def iter_advertising_report(self, kind, payload):
+            return iter([{"campaign_id": "active", "report_date": payload["report_date"],
+                          "cost": 17, "orders": 2, "sales": 50, "units": 2,
+                          "clicks": 12, "impressions": 1200}])
+
+    class FailedAPI(API):
+        def iter_advertising_report(self, kind, payload):
+            raise RuntimeError("Simulated SP provider failure")
+
+    settings, factory, _, _ = warehouse
+    target = (CLOCK - timedelta(days=2)).date()
+    record = Source().get_stores()["data"][0]
+    monkeypatch.setattr(campaign_collector, "collect_campaigns", lambda *a, **kw: None)
+    monkeypatch.setattr(intraday_observation, "run_observation", lambda *a, **kw: {"status": "COMPLETE"})
+    with factory() as db:
+        collect_ads_for_day(API(), db, {"5174": target.isoformat()},
+                            stores_response={"data": [record]}, report_types=("sp",))
+        query = select(DataCoverage).where(DataCoverage.dimension == "campaign_sp",
+                                          DataCoverage.metric_date == target)
+        prior = db.scalar(query)
+        expected = (prior.status, prior.row_count, prior.completed_at)
+
+    with factory() as db:
+        status = real_collect_store(FailedAPI(), db, settings, record, target, now=CLOCK)
+        assert status["status"] == "PARTIAL" and not status["ad_ready"]
+        assert status["reports"][target.isoformat()] == {"status": "FAILED"}
+        coverage = db.scalar(query)
+        assert (coverage.status, coverage.row_count, coverage.completed_at) == expected
+
+
+def test_hourly_card_preserves_activity_date_basis_and_maturity():
+    finding = _finding('5174', '42', day='2026-11-18')
+    finding['evidence'].update(source='lingxing_ads_sp', attribution_days=7)
+    item = hourly_ads.alert_item(finding, include_dates=True)
+    rendered = hourly_ads.advertising_card([item])
+    table, = [e for e in rendered['body']['elements'] if e['tag'] == 'table']
+    row, = table['rows']
+    assert 'SP · 活动 42' in row['c0']
+    assert '转化成熟日 · 店铺当地 2026-11-11 · 7 天归因' in row['c2']
+    assert '来源：领星广告日报' in row['c2']
+    assert '估算' not in row['c2']
+    assert '1 家店铺 · 1 个活动待复核' in json.dumps(rendered, ensure_ascii=False)
+
+
+@pytest.mark.parametrize('minutes,day,budget,valid', [
+    (20, '2026-11-17', 25, True), (76, '2026-11-17', 25, False),
+    (20, '2026-11-16', 25, False), (20, '2026-11-17', 20, False),
+])
+def test_intraday_evidence_window_and_budget_are_rechecked(minutes, day, budget, valid):
+    observed = (CLOCK - timedelta(minutes=minutes)).isoformat()
+    item = {'live_observation': {'day': day, 'captured_at': observed, 'daily_budget': budget}}
+    from types import SimpleNamespace
+
+    store = SimpleNamespace(timezone='America/Los_Angeles')
+    campaign = SimpleNamespace(budget=25)
+    assert hourly_ads._live_observation_current(item, campaign, store, CLOCK) is valid

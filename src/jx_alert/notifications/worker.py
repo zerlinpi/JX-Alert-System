@@ -133,6 +133,29 @@ def _business_card_for_delivery(db, settings, key, payload, created_at, now):
     return select_business_stores(payload['card'], payload['business_sections'], store_ids, allowed)
 
 
+class _LostOutboxClaim(RuntimeError):
+    """The worker no longer owns a send; it must not call Feishu."""
+
+
+def _renew_claim_for_send(row_id, claimed_at, attempts, lease_seconds):
+    # Policy checks, routing and earlier pages in this batch can take long
+    # enough for a different worker to recover the row. The final receipt CAS
+    # alone cannot prevent the stale worker from sending an extra message.
+    fresh = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    with SessionLocal() as db:
+        updated = db.execute(update(NotificationOutbox).where(
+            NotificationOutbox.id == row_id,
+            NotificationOutbox.status == "SENDING",
+            NotificationOutbox.claimed_at == claimed_at,
+            NotificationOutbox.attempts == attempts,
+            NotificationOutbox.claimed_at >= fresh - timedelta(seconds=lease_seconds),
+        ).values(claimed_at=fresh))
+        if updated.rowcount != 1:
+            raise _LostOutboxClaim
+        db.commit()
+    return fresh
+
+
 def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                          outbox_ids: list[int] | None = None) -> dict:
     if outbox_ids is not None and any(type(x) is not int or x <= 0 for x in outbox_ids):
@@ -151,7 +174,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
     # Existing MariaDB DATETIME columns have second precision. Use the same
     # precision for the claim and its CAS predicate; attempts fence same-second claims.
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    claim_time = now.replace(microsecond=0)
+    batch_claim_time = now.replace(microsecond=0)
     # Cover the complete claimed batch, including token acquisition/refresh.
     lease_seconds = max(300, settings.feishu_timeout * 20 * 5 + 60)
     stale_before = now - timedelta(seconds=lease_seconds)
@@ -202,7 +225,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                 NotificationOutbox.id == row.id,
                 NotificationOutbox.status.in_(["PENDING", "RETRY"]),
                 NotificationOutbox.next_attempt_at <= now,
-                ).values(status="SENDING", claimed_at=claim_time,
+                ).values(status="SENDING", claimed_at=batch_claim_time,
                          attempts=attempts))
                 if not claimed.rowcount:
                     continue
@@ -213,6 +236,12 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
     sent = 0
     failed = 0
     for row_id, dedupe_key, payload, attempts, existing_chat_id, created_at in jobs:
+        claim_time = batch_claim_time
+
+        def fence_send():
+            nonlocal claim_time
+            claim_time = _renew_claim_for_send(row_id, claim_time, attempts, lease_seconds)
+
         channel = "feishu_app" if payload.get("transport") == "app" else "feishu_webhook"
         message_id = None
         hourly_delivered_items = None
@@ -248,9 +277,12 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             if skip_reason is None and payload.get("transport") == "app":
                 destination = payload.get("delivery") or {}
                 if destination.get("role") in {"group_question", "private_question"}:
+                    from jx_alert.bot_alert_history import unscoped_frozen_history
                     from jx_alert.bot_service import validate_question_delivery
-                    if not validate_question_delivery(settings, destination):
-                        skip_reason = "原会话权限或通知群已变更，旧回复保留记录"
+                    if unscoped_frozen_history(payload):
+                        skip_reason = "历史回复缺少可核验的原群或店铺范围，旧回复保留记录"
+                    elif not validate_question_delivery(settings, destination):
+                        skip_reason = "原会话、店铺范围或通知群权限已变更，旧回复保留记录"
                 if skip_reason is None and superseded_group_delivery(settings, payload, created_at):
                     skip_reason = "通知群已更换，旧消息保留记录，不迁移或补发"
                 if (skip_reason is None and getattr(settings, 'hourly_ad_monitor_enabled', False)
@@ -284,6 +316,14 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                             payload['card'] = value
                     else:
                         skip_reason = _proactive_delivery_reason(db, settings, dedupe_key, payload, now)
+            if skip_reason is None and payload.get('morning_message_kind') == 'owner_daily':
+                from jx_alert.notifications.owner_daily import owner_daily_delivery_card
+
+                value = owner_daily_delivery_card(settings, dedupe_key, payload)
+                if value is None:
+                    skip_reason = '负责人日报已停用或当前店铺、通知群范围无法核验，旧消息保留记录'
+                else:
+                    payload['card'] = value
             if skip_reason is None and (payload.get('delivery') or {}).get('role') == 'ad_alert_subscriber':
                 from jx_alert.notifications.recipient_policy import subscriber_delivery_blocked
                 if subscriber_delivery_blocked(settings, payload):
@@ -329,9 +369,11 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     reply_args = {"idempotency_key": dedupe_key}
                     if destination["role"] == "private_question":
                         reply_args["reply_in_thread"] = False
+                    fence_send()
                     response = client_cache["app"].reply_card(destination["reply_to_message_id"], card, **reply_args)
                 else:
                     send_message = client_cache["app"].send_card if card is not None else client_cache["app"].send_text
+                    fence_send()
                     response = send_message(
                         card if card is not None else str(payload.get("text") or ""),
                         receive_id=chat_id,
@@ -343,12 +385,16 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             else:
                 # Retain compatibility for persisted webhook notifications.
                 chat_id = _send_webhook(
-                    settings, routing, client_cache, payload, payload_ids, default_ids, chat_id
+                    settings, routing, client_cache, payload, payload_ids, default_ids, chat_id,
+                    before_send=fence_send,
                 )
             status = "DELIVERED"
             error = None
             delivered_at = datetime.now(timezone.utc).replace(tzinfo=None)
             sent += 1
+        except _LostOutboxClaim:
+            logger.info("Feishu send skipped after losing outbox claim id=%s", row_id)
+            continue
         except Exception as exc:
             status = "DEAD" if attempts >= max_attempts else "RETRY"
             # Persist only the type; provider responses may echo credentials or content.
@@ -388,7 +434,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
     return {"sent": sent, "failed": failed, "claimed": len(jobs), "skipped": False}
 
 
-def _send_webhook(settings, routing, client_cache, payload, payload_ids, default_ids, chat_id):
+def _send_webhook(settings, routing, client_cache, payload, payload_ids, default_ids, chat_id,
+                  *, before_send):
     if getattr(settings, "feishu_transport", "webhook") == "app":
         routing = _load_routing(settings.feishu_routing_file)
     if not payload.get("fixed_route"):
@@ -413,6 +460,7 @@ def _send_webhook(settings, routing, client_cache, payload, payload_ids, default
         + _database_entity_open_ids(payload.get("store_id"), payload.get("entity_id"))
         + payload_ids
     ))
+    before_send()
     client_cache[chat_id].send_text(
         str(payload.get("text") or ""), open_ids=open_ids
     )

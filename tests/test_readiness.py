@@ -1,13 +1,14 @@
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from jx_alert.readiness import analysis_plan, configuration_status
 from jx_alert.storage.db import Base
-from jx_alert.storage.models import Store, SyncJob
+from jx_alert.storage.models import DailyMetric, DataCoverage, Store, SyncJob
 
 
 def test_manual_roles_are_reported_without_identifiers_or_secrets(tmp_path):
@@ -64,11 +65,19 @@ def test_collection_status_tracks_the_active_schedule_and_separates_report_cover
             }})
         backfilled = SyncJob(job_type="hourly_ad_monitor", status="SUCCEEDED", started_at=timestamp(4),
                              finished_at=timestamp(4, 6))
-        db.add_all([hourly, daily, failed, backfilled])
+        scheduled = SyncJob(job_type="manual_collection", status="PENDING", started_at=timestamp(10, 30),
+            metadata_json={"idempotency_key": "scheduled-collection:2026-11-19"})
+        user_backfill = SyncJob(job_type="manual_collection", status="SUCCEEDED", started_at=timestamp(11),
+            metadata_json={"idempotency_key": "ordinary-backfill"})
+        db.add_all([hourly, daily, failed, backfilled, scheduled, user_backfill])
         db.flush()
         current = configuration_status(db, settings)
         assert current["collection_mode"] == "hourly_ad_monitor"
         assert current["cron"] == "5 * * * *"
+        assert current["scheduled_collection_cron"] == "30 18 * * *"
+        assert current["scheduled_collection_timezone"] == "Asia/Shanghai"
+        assert current["last_scheduled_collection_attempt"]["job_id"] == scheduled.id
+        assert current["last_scheduled_collection_attempt"]["status"] == "PENDING"
         assert current["last_successful_collection"] == {
             "job_id": hourly.id, "job_type": "hourly_ad_monitor", "status": "SUCCEEDED",
             "started_at_utc": "2026-11-19 06:00:00", "finished_at_utc": "2026-11-19 06:04:00",
@@ -81,6 +90,7 @@ def test_collection_status_tracks_the_active_schedule_and_separates_report_cover
         current = configuration_status(db, settings)
         assert current["collection_mode"] == "daily_collection"
         assert current["cron"] == "0 8 * * *"
+        assert current["scheduled_collection_cron"] == "0 8 * * *"
         assert current["last_successful_collection"]["job_id"] == daily.id
         assert current["last_collection_attempt"]["store_count"] == 3
         assert "sp_report_partition_counts" not in current["last_collection_attempt"]
@@ -111,4 +121,60 @@ def test_unsynced_stores_and_unknown_hourly_timezones_are_not_collection_ready(t
         assert not rows["5175"]["collection_ready"]
         assert rows["5176"]["date_basis"] == "global_complete_unknown_timezone"
         assert not rows["5176"]["collection_ready"]
+    engine.dispose()
+
+
+@pytest.mark.parametrize("attempts,expected", [
+    (("ad_history_only",), "AVAILABLE"),
+    (("sales_succeeded_before_ads_failed",), "AVAILABLE"),
+    (("sales_failed",), "COLLECTION_FAILED"),
+    (("sales_failed", "ad_history_only"), "COLLECTION_FAILED"),
+])
+def test_sales_readiness_resolves_the_exact_sales_attempt(tmp_path, attempts, expected):
+    from jx_alert.mcp_server import _daily_summary
+
+    sid = "101"
+    target = date(2026, 11, 20)
+    scope = tmp_path / "scope.json"
+    scope.write_text(json.dumps({"store_ids": [sid]}))
+    zones = tmp_path / "zones.json"
+    zones.write_text(json.dumps({"stores": {sid: {"timezone": "America/Los_Angeles"}}}))
+    settings = SimpleNamespace(collection_scope_file=str(scope), store_timezones_file=str(zones),
+                               store_controls_file=str(tmp_path / "controls.json"))
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Store(sid=sid, name="Store", status=1, has_ads_setting=1,
+                     timezone="America/Los_Angeles", currency_code="USD"))
+        for on, orders in ((target - timedelta(days=1), 5), (target, 7)):
+            for dimension in ("store", "sku_asin", "sku_msku", "campaign_sp"):
+                db.add(DataCoverage(store_id=sid, metric_date=on, dimension=dimension,
+                                    status="COMPLETE", row_count=1))
+            for metric, value in (("orders", orders), ("units", orders + 1), ("sales", orders * 10)):
+                db.add(DailyMetric(store_id=sid, entity_id=sid, metric_date=on,
+                                   dimension="store", metric_name=metric, value=value, currency="USD"))
+        db.add(DailyMetric(store_id=sid, entity_id="sp1", metric_date=target, dimension="campaign_sp",
+                           metric_name="spend", value=12.5, currency="USD"))
+        for attempt in attempts:
+            report_day = target + timedelta(days=int(attempt == "ad_history_only"))
+            completed = ["store_status"]
+            if attempt != "sales_failed":
+                completed.append("sales")
+            db.add(SyncJob(job_type="daily_collection", status="PARTIAL_FAILED", metadata_json={
+                "report_dates": {sid: report_day.isoformat()},
+                "ad_report_dates": {sid: [target.isoformat(), report_day.isoformat()]},
+                "completed_steps": completed,
+            }))
+        db.commit()
+        now = datetime(2026, 11, 21, 12, tzinfo=timezone.utc)
+        plan = analysis_plan(db, settings, now=now)["stores"][0]
+        actual = _daily_summary(db, sid, target)
+        ready = expected == "AVAILABLE"
+        assert plan["report_date"] == target.isoformat()
+        assert plan["sales_data_status"] == actual["sales_data_status"] == expected
+        assert plan["analysis_ready"] is ready
+        assert actual["sales"]["orders"]["current"] == (7 if ready else None)
+        assert actual["sales"]["orders"]["previous_day"] == 5
+        assert actual["coverage"]["campaign_sp"] is True
+        assert actual["campaign_ads"]["by_type"]["sp"]["totals"]["spend"] == 12.5
     engine.dispose()

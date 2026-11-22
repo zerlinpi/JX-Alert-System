@@ -105,3 +105,16 @@ def test_health_pages_remain_narrow_and_preserve_every_store(warehouse):
     assert [sid for _, ids in pages for sid in ids] == [s.sid for s in stores]
     tables = [element for value, _ in pages for element in value['body']['elements'] if element['tag'] == 'table']
     assert len(tables) == 3 and all(len(table['columns']) == 3 for table in tables)
+
+
+def test_proactive_unknown_source_time_keeps_observation_without_breach_assertion(warehouse):
+    db, settings, store = warehouse
+    db.add(StorePerformance(store_id=store.sid, pull_date=NOW.date(), ahr_score=256,
+        ahr_status='AtRisk', source_updated_at='2026-11-16 16:00:00',
+        captured_at=NOW.replace(tzinfo=None), indicators={'late_shipment': '8'},
+        standards={'lateShipment': '4'}))
+    db.flush()
+    row = morning_health_row(db, settings, store, now=NOW, proactive=True)
+    assert row[1] == '评分 256 · 有风险（观测）'
+    assert '更新时间未核实' in row[2] and '不判定当前异常' in row[2]
+    assert '迟发率' not in row[2] and '标准 4%' not in row[2]

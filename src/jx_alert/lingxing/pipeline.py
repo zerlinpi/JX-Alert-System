@@ -7,7 +7,7 @@ from jx_alert.analysis.evaluator import evaluate_store_status_events
 from jx_alert.lingxing.ad_currency import account_currencies
 from jx_alert.lingxing.campaign_collector import collect_campaigns
 from jx_alert.lingxing.client import LingxingError, LingxingTransientError, LingxingCollectionPaused
-from jx_alert.lingxing.collector import collect_ads_for_day
+from jx_alert.lingxing.collector import SPPartitionBusy, collect_ads_for_day
 from jx_alert.lingxing.product_ads_collector import collect_product_ads_for_day
 from jx_alert.lingxing.performance_openapi import collect_store_performance
 from jx_alert.config import get_settings
@@ -122,15 +122,20 @@ def collect_daily_snapshot(client, db, report_dates: str | dict[str, str], *,
             if not dual:
                 raise
             db.rollback()
-            source_failures.append({"step": name, "error_type": type(exc).__name__})
-            # Keep previously valid records but hide failed exact-date primary
-            # partitions. MCP observations have their own independent coverage.
+            failure = {"step": name, "error_type": type(exc).__name__}
+            if isinstance(exc, SPPartitionBusy):
+                failure.update(store_id=exc.store_id, report_date=exc.metric_date.isoformat())
+            source_failures.append(failure)
+            # The SP collector owns authoritative failure coverage under its
+            # partition lock. Never downgrade it from an outside error handler.
+            # MCP observations have their own independent coverage.
             from jx_alert.storage.coverage import mark_coverage
             last = client.last_request or {}
             sid, day = last.get("store_id"), last.get("report_date")
             allowed = (set(normalize_store_report_dates(dates, sid))
                        if sid and (isinstance(dates, str) or sid in dates) else set())
-            if dimensions and sid in {str(s["sid"]) for s in store_rows} and day in allowed:
+            if (dimensions and dimensions != ("campaign_sp",)
+                    and sid in {str(s["sid"]) for s in store_rows} and day in allowed):
                 exact = dimensions
                 if str(last.get("dataset", "")).startswith("product_ad_"):
                     exact = (last["dataset"],)

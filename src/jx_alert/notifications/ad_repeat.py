@@ -5,12 +5,12 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import math
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 
 from jx_alert.notifications.outbox import NotificationOutbox
-from jx_alert.storage.models import SyncJob
+from jx_alert.storage.models import Campaign, Store, SyncJob
 
 
 INCIDENT = 'hourly_ad_incident'
@@ -77,12 +77,62 @@ def _outbox_reserves(state, payload, item):
         and _stored_identity(row) == _stored_identity(item) for row in sent)
 
 
-def _reserved_incident(status, item, outboxes, today):
+def intraday_observation_is_recent(evidence, now):
+    if not isinstance(evidence, dict):
+        return False
+    try:
+        captured = datetime.fromisoformat(evidence["captured_at"])
+        return captured.tzinfo is not None and timedelta(0) <= now - captured <= timedelta(minutes=75)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def live_observation_current(item, campaign, store, now):
+    """Shared current-day/age/budget policy for held or outgoing observations."""
+    evidence = item.get("live_observation")
+    if evidence is None:
+        return True  # Older drafts have no new observation metadata.
+    if not intraday_observation_is_recent(evidence, now):
+        return False
+    try:
+        report_day = now.astimezone(ZoneInfo(store.timezone)).date().isoformat()
+    except (TypeError, ValueError, ZoneInfoNotFoundError, OverflowError):
+        return False
+    budget = evidence.get("daily_budget")
+    return evidence.get("day") == report_day and (budget is None or budget == campaign.budget)
+
+
+def _held_campaigns(db, candidates, now):
+    ids = {
+        _stored_identity(item)
+        for status, item in candidates
+        if status == "HELD" and isinstance(item, dict)
+        and isinstance(item.get("hourly_item"), dict)
+        and intraday_observation_is_recent(item["hourly_item"].get("live_observation"), now)
+    }
+    return {
+        (campaign.store_id, campaign.campaign_type, campaign.campaign_id): (campaign, store)
+        for campaign, store in db.execute(select(Campaign, Store).join(Store, Store.sid == Campaign.store_id).where(
+            Store.status == 1, Campaign.state == "enabled",
+            tuple_(Campaign.store_id, Campaign.campaign_type, Campaign.campaign_id).in_(ids),
+        ))
+    } if ids else {}
+
+
+def _reserved_incident(status, item, outboxes, today, now, held_campaigns):
     if not isinstance(item, dict) or not item.get('store_id') or not item.get('campaign_id'):
         return False
     if status == 'HELD':
         release = _day(item.get('release_day'))
-        return release is not None and release >= today
+        if release is None or release < today:
+            return False
+        hourly_item = item.get("hourly_item")
+        if isinstance(hourly_item, dict) and hourly_item.get("live_observation") is not None:
+            # Undeliverable intraday holds are not deliveries; letting them
+            # reserve the campaign suppresses the fresh evidence at opening.
+            current = held_campaigns.get(_stored_identity(item))
+            return bool(current and live_observation_current(hourly_item, *current, now))
+        return True
     return any(_outbox_reserves(*outboxes.get(oid, (None, {})), item) for oid in _outbox_ids(item))
 
 
@@ -115,7 +165,9 @@ def incident_already_recorded(db, row, *, now=None):
         SyncJob.metadata_json['incident_key'].as_string() == incident_key(row),
     )).all()
     outboxes = _group_outboxes(db, (item for _, item in candidates))
-    return any(_reserved_incident(status, item, outboxes, today) for status, item in candidates)
+    held = _held_campaigns(db, candidates, clock)
+    return any(_reserved_incident(status, item, outboxes, today, clock, held)
+               for status, item in candidates)
 
 
 def load_incident_history(db, now):
@@ -128,8 +180,9 @@ def load_incident_history(db, now):
     ).order_by(SyncJob.started_at.desc(), SyncJob.id.desc())).all()
     outboxes = _group_outboxes(db, (item for _, _, item in rows))
     history = defaultdict(list)
+    held = _held_campaigns(db, ((status, item) for _, status, item in rows), now)
     for started_at, status, item in rows:
-        if _reserved_incident(status, item, outboxes, today):
+        if _reserved_incident(status, item, outboxes, today, now, held):
             history[_stored_identity(item)].append((started_at.replace(tzinfo=timezone.utc), item))
     return history
 

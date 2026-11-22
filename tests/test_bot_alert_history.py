@@ -12,6 +12,7 @@ from jx_alert.storage.models import Campaign, Store
 NOW = datetime(2026, 11, 19, 6, tzinfo=timezone.utc)
 QUESTION = '最近发过哪些广告告警'
 CAMPAIGN = 'T+人群属性词根打包+br+0.85'
+ROUTE = {'receive_id_type': 'chat_id', 'receive_id': 'oc_reports', 'routing_alias': 'reports'}
 
 
 def _warehouse():
@@ -21,11 +22,11 @@ def _warehouse():
     return engine
 
 
-def _receipt(key, payload, *, status='DELIVERED', kind='chat_id'):
+def _receipt(key, payload, *, status='DELIVERED', kind='chat_id', route=None):
     return NotificationOutbox(idempotency_key=key, status=status,
         created_at=(NOW - timedelta(days=1)).replace(tzinfo=None),
         delivered_at=datetime(2026, 11, 18, 13, 3, 11),
-        payload={**payload, 'hourly_ad_monitor': True, 'delivery': {'receive_id_type': kind}})
+        payload={**payload, 'hourly_ad_monitor': True, 'delivery': {**ROUTE, 'receive_id_type': kind, **(route or {})}})
 
 
 def _item(cid):
@@ -44,7 +45,7 @@ def test_legacy_sent_ad_alert_recovers_the_native_table_from_its_receipt():
         db.add_all([_receipt('legacy', payload),
             _receipt('legacy-outside-scope', {**payload, 'store_id': '9999'})])
         db.commit()
-        result, = recent_alert_cards(db, [store], QUESTION, NOW)
+        result, = recent_alert_cards(db, [store], QUESTION, NOW, report_delivery=ROUTE)
         item, = result['body']['elements']
         row, = item['rows']
         assert item['tag'] == 'table'
@@ -65,7 +66,28 @@ def test_history_uses_the_confirmed_group_rows_when_a_receipt_has_a_manifest():
             _receipt('earlier-batch-format', {'hourly_items': [_item('旧批次已发送')]}),
         ])
         db.commit()
-        output = json.dumps(recent_alert_cards(db, [store], QUESTION, NOW), ensure_ascii=False)
+        output = json.dumps(recent_alert_cards(db, [store], QUESTION, NOW, report_delivery=ROUTE), ensure_ascii=False)
         assert all(value in output for value in ('群内已发送', '旧批次已发送'))
         assert all(value not in output for value in (
             '排队后被移除', '未发送活动', '只发给订阅者', '发送失败', '已过期'))
+
+def test_recorded_alerts_never_replay_across_groups_or_route_generations():
+    store = Store(sid='5174', name='AirBird-主账号-US')
+    current = {**ROUTE, 'routing_changed_at': '2026-11-18T10:00:00+00:00'}
+    with Session(_warehouse()) as db:
+        db.add_all([
+            _receipt('old-group', {'hourly_delivered_items': [_item('原群历史')]},
+                     route={**current, 'receive_id': 'oc_old'}),
+            _receipt('old-generation', {'hourly_delivered_items': [_item('更换前历史')]}),
+            _receipt('other-alias', {'hourly_delivered_items': [_item('其他通知配置')]},
+                     route={**current, 'routing_alias': 'other'}),
+            _receipt('current', {'hourly_delivered_items': [_item('当前群记录')]}, route=current),
+        ])
+        db.commit()
+        output = json.dumps(recent_alert_cards(db, [store], QUESTION, NOW, report_delivery=current),
+                            ensure_ascii=False)
+        assert '当前群记录' in output
+        assert not any(v in output for v in ('原群历史', '更换前历史', '其他通知配置'))
+        unavailable = json.dumps(recent_alert_cards(db, [store], QUESTION, NOW, report_delivery=None),
+                                 ensure_ascii=False)
+        assert '未读取历史告警' in unavailable and '当前群记录' not in unavailable
