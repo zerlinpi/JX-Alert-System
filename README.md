@@ -111,6 +111,8 @@
 docker compose --profile scheduler up -d --build scheduler
 ```
 
+需要直接获取 SparkXAI 原生广告/ASIN 查询结果时，参见 [SparkXAI MCP 隔离试点](docs/SPARKX_DIRECT_MCP.md)。这不替换现有定时任务或飞书报告。
+
 远程 MCP 服务使用独立的可选 profile。先在服务器 `.env` 中生成并设置至少 32 字符的 Bearer Token：
 ```bash
 openssl rand -hex 32

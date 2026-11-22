@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     mcp_bearer_token: str = ""
     mcp_allowed_hosts: str = ""
     mcp_allowed_origins: str = ""
+    # The isolated direct relay has its own inbound credential and no JX data tools.
+    mcp_output_mode: Literal["jx", "sparkx_direct"] = "jx"
+    sparkx_ai_token: SecretStr = SecretStr("")
+    sparkx_profile_ids: str = ""
+    sparkx_relay_bearer_token: SecretStr = SecretStr("")
 
     def mcp_allowed_host_list(self) -> list[str]:
         return [item.strip() for item in self.mcp_allowed_hosts.split(",") if item.strip()]
