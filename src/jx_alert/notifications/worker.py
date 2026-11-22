@@ -13,7 +13,10 @@ from jx_alert.notifications.routing import (
     _load_routing, _routed_open_ids, _route_chat_id, _feishu_group_config,
     _database_entity_open_ids as _routing_database_ids,
 )
-from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.notifications.outbox import (
+    CLAIMABLE, DELIVERY_UNKNOWN, PRE_SEND_RETRY, QUESTION_REPLY_PREFIX, RESERVING, NotificationOutbox,
+)
+from jx_alert.notifications.feishu_app import FeishuTokenRefused
 from jx_alert.notifications.hourly_ads import BEIJING, CLOSES, OPENS, delivery_window, recheck_hourly_delivery
 from jx_alert.notifications.recipient_policy import ROLE, advertising_group_delivery
 from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks, quiet_delivery, original_question_reply
@@ -74,7 +77,7 @@ def _prior_morning_page(db, payload, row_id):
         return False
     return db.scalar(select(NotificationOutbox.id).where(NotificationOutbox.id < row_id,
         NotificationOutbox.idempotency_key.startswith(batch),
-        NotificationOutbox.status.in_(('PENDING', 'RETRY', 'SENDING'))).limit(1)) is not None
+        NotificationOutbox.status.in_(RESERVING)).limit(1)) is not None
 
 
 def _proactive_delivery_reason(db, settings, key, payload, now):
@@ -137,27 +140,72 @@ class _LostOutboxClaim(RuntimeError):
     """The worker no longer owns a send; it must not call Feishu."""
 
 
-def _renew_claim_for_send(row_id, claimed_at, attempts, lease_seconds):
-    # Policy checks, routing and earlier pages in this batch can take long
-    # enough for a different worker to recover the row. The final receipt CAS
-    # alone cannot prevent the stale worker from sending an extra message.
-    fresh = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+class _SparkXScopeChanged(RuntimeError):
+    """The page is no longer permitted; no message POST has been attempted."""
+
+
+class _UnfencedResponse(RuntimeError):
+    """A transport returned without its write-ahead boundary; do not resubmit."""
+
+
+_SPARKX_BLOCK_REASON = "SparkX 页面已过期或投递范围已变更，未发起消息 POST，保留记录不补发"
+_UNKNOWN_REASON = "可能已提交飞书，未确认送达；禁止自动重发，请人工核对原会话"
+_LEGACY_REASON = "旧版尝试没有可核验的提交阶段；禁止自动重发，请人工核对原会话"
+
+
+def _channel(payload):
+    return "feishu_app" if payload.get("transport") == "app" else "feishu_webhook"
+
+
+def _hold_unknown(db, row, reason):
+    changed = db.execute(update(NotificationOutbox).where(
+        NotificationOutbox.id == row.id, NotificationOutbox.status == row.status,
+        NotificationOutbox.attempts == row.attempts, NotificationOutbox.claimed_at == row.claimed_at,
+    ).values(status=DELIVERY_UNKNOWN, claimed_at=None, last_error=reason))
+    if changed.rowcount == 1:
+        db.add(NotificationLog(dedupe_key=row.idempotency_key, channel=_channel(row.payload),
+                               status=DELIVERY_UNKNOWN, error=reason))
+        return 1
+    return 0
+
+
+def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, payload, evidence, sparkx_scope=None):
+    instant = datetime.now(timezone.utc).replace(tzinfo=None)
+    fresh = instant.replace(microsecond=0)
+    # A future adapter must not accidentally persist headers or a secret URL.
+    intent = {key: evidence[key] for key in ("operation", "body_sha256", "provider_uuid", "endpoint_sha256")
+              if key in evidence}
+    intent.update(attempt=attempts, started_at_utc=fresh.isoformat() + "Z", destination=chat_id)
+    route = payload.get("delivery") or {}
+    if route.get("receive_id_type"):
+        intent["destination_type"] = route["receive_id_type"]
+    if route.get("reply_to_message_id"):
+        intent["reply_to_message_id"] = route["reply_to_message_id"]
     with SessionLocal() as db:
-        updated = db.execute(update(NotificationOutbox).where(
+        # Token acquisition / earlier jobs can outlive the initial scope or freshness check.
+        # Resolve the original binding again at the write-ahead boundary, not after POST.
+        if sparkx_scope is not None:
+            from jx_alert.sparkx_feishu import delivery_blocked
+            key, created_at = sparkx_scope
+            if delivery_blocked(db, get_settings(), key, payload, created_at, instant):
+                raise _SparkXScopeChanged
+        changed = db.execute(update(NotificationOutbox).where(
             NotificationOutbox.id == row_id,
-            NotificationOutbox.status == "SENDING",
+            NotificationOutbox.status == "PREPARING",
             NotificationOutbox.claimed_at == claimed_at,
             NotificationOutbox.attempts == attempts,
             NotificationOutbox.claimed_at >= fresh - timedelta(seconds=lease_seconds),
-        ).values(claimed_at=fresh))
-        if updated.rowcount != 1:
+        ).values(status="SUBMITTING", claimed_at=fresh, chat_id=chat_id,
+                 payload={**payload, "delivery_intent": intent}))
+        if changed.rowcount != 1:
             raise _LostOutboxClaim
-        db.commit()
-    return fresh
+        db.commit()  # Absolutely no message POST until this succeeds.
+    return fresh, intent
 
 
 def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
-                         outbox_ids: list[int] | None = None) -> dict:
+                         outbox_ids: list[int] | None = None, *,
+                         question_replies_only: bool = False) -> dict:
     if outbox_ids is not None and any(type(x) is not int or x <= 0 for x in outbox_ids):
         raise ValueError("outbox_ids must contain positive integers")
     settings = get_settings()
@@ -178,31 +226,37 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
     # Cover the complete claimed batch, including token acquisition/refresh.
     lease_seconds = max(300, settings.feishu_timeout * 20 * 5 + 60)
     stale_before = now - timedelta(seconds=lease_seconds)
+    capacity = max(1, min(batch_size, 5))
 
-    # Recover claims left behind by a crashed worker. This is at-least-once delivery:
-    # a crash after Feishu accepts a message but before DB commit can cause a duplicate.
+    # A PREPARING claim has not crossed the write-ahead send fence. Legacy
+    # SENDING or new SUBMITTING might already have reached the remote chat.
+    selection = [NotificationOutbox.id.in_(outbox_ids)] if outbox_ids is not None else []
+    if question_replies_only:
+        selection.append(NotificationOutbox.idempotency_key.startswith(QUESTION_REPLY_PREFIX))
+    stale = or_(NotificationOutbox.claimed_at.is_(None), NotificationOutbox.claimed_at < stale_before)
+    unknown = 0
     with SessionLocal() as db:
-        db.execute(
-            update(NotificationOutbox)
-            .where(
-                NotificationOutbox.status == "SENDING",
-                or_(
-                    NotificationOutbox.claimed_at.is_(None),
-                    NotificationOutbox.claimed_at < stale_before,
-                ),
-            )
-            .values(status="RETRY", claimed_at=None, next_attempt_at=now)
-        )
+        for row in db.scalars(select(NotificationOutbox).where(*selection, stale,
+                NotificationOutbox.status.in_(("SENDING", "SUBMITTING")))
+                .order_by(NotificationOutbox.id).limit(capacity if question_replies_only else 100)
+                .with_for_update(skip_locked=True)):
+            unknown += _hold_unknown(db, row, _LEGACY_REASON if row.status == "SENDING" else _UNKNOWN_REASON)
+        preparing = [*selection, stale, NotificationOutbox.status == "PREPARING"]
+        if question_replies_only:
+            expired_ids = db.scalars(select(NotificationOutbox.id).where(*preparing)
+                .order_by(NotificationOutbox.id).limit(capacity).with_for_update(skip_locked=True)).all()
+            preparing.append(NotificationOutbox.id.in_(expired_ids))
+        db.execute(update(NotificationOutbox).where(*preparing).values(
+            status=PRE_SEND_RETRY, claimed_at=None, next_attempt_at=now))
         db.commit()
 
-        capacity = max(1, min(batch_size, 5))
         jobs = []
         while len(jobs) < capacity:
             rows = db.scalars(
             select(NotificationOutbox)
-            .where(NotificationOutbox.id.in_(outbox_ids) if outbox_ids is not None else True)
+            .where(*selection)
             .where(
-                NotificationOutbox.status.in_(["PENDING", "RETRY"]),
+                NotificationOutbox.status.in_(CLAIMABLE),
                 NotificationOutbox.next_attempt_at <= now,
             )
             .order_by(NotificationOutbox.created_at, NotificationOutbox.id)
@@ -212,6 +266,13 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             if not rows:
                 break
             for row in rows:
+                if row.payload.get("delivery_intent") is not None or (
+                        row.attempts > 0 and row.status != PRE_SEND_RETRY):
+                    # Old RETRY rows did not distinguish a timeout from an
+                    # error before send; even an expired row needs truthful history.
+                    reason = _UNKNOWN_REASON if row.payload.get("delivery_intent") else _LEGACY_REASON
+                    unknown += _hold_unknown(db, row, reason)
+                    continue
                 window, due = _scheduled_window(row.idempotency_key, row.payload, now,
                                                 hourly_mode=hourly_mode, created_at=row.created_at)
                 if window == "EXPIRED":
@@ -222,11 +283,9 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     continue
                 attempts = row.attempts + 1
                 claimed = db.execute(update(NotificationOutbox).where(
-                NotificationOutbox.id == row.id,
-                NotificationOutbox.status.in_(["PENDING", "RETRY"]),
-                NotificationOutbox.next_attempt_at <= now,
-                ).values(status="SENDING", claimed_at=batch_claim_time,
-                         attempts=attempts))
+                    NotificationOutbox.id == row.id, NotificationOutbox.status == row.status,
+                    NotificationOutbox.attempts == row.attempts, NotificationOutbox.next_attempt_at <= now,
+                ).values(status="PREPARING", claimed_at=batch_claim_time, attempts=attempts))
                 if not claimed.rowcount:
                     continue
                 jobs.append((row.id, row.idempotency_key, dict(row.payload), attempts, row.chat_id, row.created_at))
@@ -237,12 +296,26 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
     failed = 0
     for row_id, dedupe_key, payload, attempts, existing_chat_id, created_at in jobs:
         claim_time = batch_claim_time
+        intent = None
 
-        def fence_send():
-            nonlocal claim_time
-            claim_time = _renew_claim_for_send(row_id, claim_time, attempts, lease_seconds)
+        destination = payload.get("delivery")
+        sparkx_page = (dedupe_key.startswith("sparkx-page:") or isinstance(destination, dict)
+                       and destination.get("role") == "sparkx_performance_page")
 
-        channel = "feishu_app" if payload.get("transport") == "app" else "feishu_webhook"
+        def fence_send(evidence):
+            nonlocal claim_time, intent
+            claim_time, intent = _record_submission(row_id, claim_time, attempts, lease_seconds,
+                                                     chat_id, payload, evidence,
+                                                     (dedupe_key, created_at) if sparkx_page else None)
+            if sparkx_page:
+                from jx_alert.sparkx_feishu import page_fresh
+                # Scope reads, a DB lock or the intent COMMIT itself may cross the expiry.
+                # No more policy/database I/O between this check and return to the POST.
+                if not page_fresh(created_at, datetime.now(timezone.utc).replace(tzinfo=None)):
+                    intent = {**intent, "aborted_before_post": True}
+                    raise _SparkXScopeChanged
+
+        channel = _channel(payload)
         message_id = None
         hourly_delivered_items = None
         chat_id = (
@@ -255,9 +328,9 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             with SessionLocal() as db:
                 if _prior_morning_page(db, payload, row_id):
                     db.execute(update(NotificationOutbox).where(
-                        NotificationOutbox.id == row_id, NotificationOutbox.status == "SENDING",
+                        NotificationOutbox.id == row_id, NotificationOutbox.status == "PREPARING",
                         NotificationOutbox.claimed_at == claim_time, NotificationOutbox.attempts == attempts,
-                    ).values(status="RETRY", claimed_at=None, attempts=attempts - 1,
+                    ).values(status=PRE_SEND_RETRY, claimed_at=None, attempts=attempts - 1,
                              next_attempt_at=now + timedelta(seconds=30)))
                     db.commit()
                     continue
@@ -266,6 +339,11 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     and payload.get('morning_message_kind') == 'ad_exception'
                     and not frozen_ad_skills_current(settings, payload.get('ad_skill_checks'))):
                 skip_reason = '广告分析规则已变更或无法核验，日报广告页保留记录'
+            if skip_reason is None and sparkx_page:
+                from jx_alert.sparkx_feishu import delivery_blocked
+                with SessionLocal() as db:
+                    if delivery_blocked(db, settings, dedupe_key, payload, created_at, now):
+                        skip_reason = _SPARKX_BLOCK_REASON
             hourly_batch = isinstance(payload.get('hourly_items'), list)
             business_batch = (dedupe_key.startswith('scheduled-daily:')
                 and payload.get('morning_message_kind') == 'business_daily' and 'business_sections' in payload)
@@ -331,7 +409,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             if skip_reason is not None:
                 with SessionLocal() as db:
                     skipped = db.execute(update(NotificationOutbox).where(
-                        NotificationOutbox.id == row_id, NotificationOutbox.status == "SENDING",
+                        NotificationOutbox.id == row_id, NotificationOutbox.status == "PREPARING",
                         NotificationOutbox.claimed_at == claim_time, NotificationOutbox.attempts == attempts,
                     ).values(status="SKIPPED", claimed_at=None, last_error=skip_reason))
                     if skipped.rowcount == 1:
@@ -343,10 +421,10 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                                             hourly_mode=hourly_mode, created_at=created_at)
             if window != "READY":
                 with SessionLocal() as db:
-                    values = (dict(status="RETRY", next_attempt_at=due, attempts=attempts - 1)
+                    values = (dict(status=PRE_SEND_RETRY, next_attempt_at=due, attempts=attempts - 1)
                               if window == "WAITING" else dict(status="EXPIRED", last_error="已过通知时段"))
                     db.execute(update(NotificationOutbox).where(
-                        NotificationOutbox.id == row_id, NotificationOutbox.status == "SENDING",
+                        NotificationOutbox.id == row_id, NotificationOutbox.status == "PREPARING",
                         NotificationOutbox.claimed_at == claim_time, NotificationOutbox.attempts == attempts,
                     ).values(claimed_at=None, **values))
                     db.commit()
@@ -369,59 +447,70 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     reply_args = {"idempotency_key": dedupe_key}
                     if destination["role"] == "private_question":
                         reply_args["reply_in_thread"] = False
-                    fence_send()
-                    response = client_cache["app"].reply_card(destination["reply_to_message_id"], card, **reply_args)
+                    response = client_cache["app"].reply_card(destination["reply_to_message_id"], card,
+                                                              before_submit=fence_send, **reply_args)
                 else:
                     send_message = client_cache["app"].send_card if card is not None else client_cache["app"].send_text
-                    fence_send()
                     response = send_message(
                         card if card is not None else str(payload.get("text") or ""),
                         receive_id=chat_id,
                         receive_id_type=destination["receive_id_type"],
                         open_ids=destination.get("open_ids", []),
-                        idempotency_key=dedupe_key,
+                        idempotency_key=dedupe_key, before_submit=fence_send,
                     )
                 message_id = response["message_id"]
             else:
                 # Retain compatibility for persisted webhook notifications.
-                chat_id = _send_webhook(
-                    settings, routing, client_cache, payload, payload_ids, default_ids, chat_id,
-                    before_send=fence_send,
-                )
+                chat_id, webhook_client, open_ids = _prepare_webhook(
+                    settings, routing, client_cache, payload, payload_ids, default_ids, chat_id)
+                webhook_client.send_text(str(payload.get("text") or ""), open_ids=open_ids,
+                                         before_submit=fence_send)
+            if intent is None:
+                raise _UnfencedResponse("Feishu transport returned without recording a submission")
             status = "DELIVERED"
             error = None
             delivered_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            sent += 1
+        except _SparkXScopeChanged:
+            status, error, delivered_at = "SKIPPED", _SPARKX_BLOCK_REASON, None
         except _LostOutboxClaim:
             logger.info("Feishu send skipped after losing outbox claim id=%s", row_id)
             continue
         except Exception as exc:
-            status = "DEAD" if attempts >= max_attempts else "RETRY"
+            if isinstance(exc, _UnfencedResponse):
+                status = DELIVERY_UNKNOWN
+            elif intent is not None:
+                status = "REJECTED" if isinstance(exc, FeishuTokenRefused) else DELIVERY_UNKNOWN
+            else:
+                status = "DEAD" if attempts >= max_attempts else PRE_SEND_RETRY
             # Persist only the type; provider responses may echo credentials or content.
             error = f"Feishu delivery failed: {type(exc).__name__}"
             code = re.search(r"\bcode=(-?\d+)\b", str(exc))
             if code:
                 error += f" code={code[1]}"
+            if status == DELIVERY_UNKNOWN:
+                error = f"{_UNKNOWN_REASON} ({error})"
             delivered_at = None
-            failed += 1
-            logger.warning("Feishu delivery failed for outbox id=%s (%s)", row_id, type(exc).__name__)
+            logger.warning("Feishu outbox id=%s status=%s (%s)", row_id, status, type(exc).__name__)
 
         with SessionLocal() as db:
             values = dict(chat_id=chat_id, status=status, last_error=error,
                           claimed_at=None, delivered_at=delivered_at)
+            if status == "SKIPPED" and intent is not None and intent.get("aborted_before_post") is True:
+                values["payload"] = {**payload, "delivery_intent": intent}
             if status == "DELIVERED" and hourly_delivered_items is not None:
-                values["payload"] = {**payload, "hourly_delivered_items": hourly_delivered_items}
-            if status == "RETRY":
+                values["payload"] = {**payload, "delivery_intent": intent, "hourly_delivered_items": hourly_delivered_items}
+            if status == PRE_SEND_RETRY:
                 delay = min(30 * (2 ** max(attempts - 1, 0)), 3600)
                 values["next_attempt_at"] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=delay)
             result = db.execute(update(NotificationOutbox).where(
                 NotificationOutbox.id == row_id,
-                NotificationOutbox.status == "SENDING",
+                NotificationOutbox.status == ("SUBMITTING" if intent is not None else "PREPARING"),
                 NotificationOutbox.claimed_at == claim_time,
                 NotificationOutbox.attempts == attempts,
             ).values(**values))
             # An obsolete attempt must never overwrite a newer worker's result.
-            attempt_status = status if result.rowcount == 1 else f"STALE_{status}"
+            attempt_status = status if result.rowcount == 1 else (
+                "STALE_UNKNOWN" if status == DELIVERY_UNKNOWN else f"STALE_{status}")
             db.add(NotificationLog(
                 dedupe_key=dedupe_key,
                 channel=channel,
@@ -430,12 +519,15 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                 error=error,
             ))
             db.commit()
+            if result.rowcount == 1:
+                sent += int(status == "DELIVERED")
+                unknown += int(status == DELIVERY_UNKNOWN)
+                failed += int(status not in ("DELIVERED", DELIVERY_UNKNOWN, "SKIPPED"))
 
-    return {"sent": sent, "failed": failed, "claimed": len(jobs), "skipped": False}
+    return {"sent": sent, "failed": failed, "unknown": unknown, "claimed": len(jobs), "skipped": False}
 
 
-def _send_webhook(settings, routing, client_cache, payload, payload_ids, default_ids, chat_id,
-                  *, before_send):
+def _prepare_webhook(settings, routing, client_cache, payload, payload_ids, default_ids, chat_id):
     if getattr(settings, "feishu_transport", "webhook") == "app":
         routing = _load_routing(settings.feishu_routing_file)
     if not payload.get("fixed_route"):
@@ -460,8 +552,4 @@ def _send_webhook(settings, routing, client_cache, payload, payload_ids, default
         + _database_entity_open_ids(payload.get("store_id"), payload.get("entity_id"))
         + payload_ids
     ))
-    before_send()
-    client_cache[chat_id].send_text(
-        str(payload.get("text") or ""), open_ids=open_ids
-    )
-    return chat_id
+    return chat_id, client_cache[chat_id], open_ids

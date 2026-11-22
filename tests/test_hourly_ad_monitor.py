@@ -301,7 +301,8 @@ def test_delivered_group_records_only_visible_activities_and_later_rechecks_miss
             return clock.astimezone(tz) if tz else clock.replace(tzinfo=None)
 
     class Feishu:
-        def send_card(self, card, **kwargs):
+        def send_card(self, card, before_submit, **kwargs):
+            before_submit({})
             sends.append(card)
             return {'message_id': 'om_receipt'}
 

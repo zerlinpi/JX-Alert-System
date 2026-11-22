@@ -114,7 +114,8 @@ def pending(sessions, *, role="group_question", with_card=True, original="om_ori
 def test_worker_question_delivery_replies_in_thread_and_records_confirmed_message(warehouse, monkeypatch):
     calls = []
     class Client:
-        def reply_card(self, message_id, value, **kwargs):
+        def reply_card(self, message_id, value, before_submit, **kwargs):
+            before_submit({})
             calls.append((message_id, value, kwargs))
             return {"message_id": "om_confirmed_reply"}
         def send_card(self, *args, **kwargs):
@@ -149,26 +150,144 @@ def test_nonquestion_or_noncard_delivery_cannot_reply(warehouse, monkeypatch, ro
     result = worker.process_outbox_batch(outbox_ids=[row_id])
     assert result["sent"] == 0 and result["failed"] == 1
     with warehouse() as db:
-        assert db.get(NotificationOutbox, row_id).status == "RETRY"
+        assert db.get(NotificationOutbox, row_id).status == "PRE_SEND_RETRY"
         log = db.scalar(select(NotificationLog))
-        assert log.status == "RETRY" and log.message_id is None
+        assert log.status == "PRE_SEND_RETRY" and log.message_id is None
 
 
 def test_retry_retains_original_question_and_key_without_exposing_provider_error(warehouse, monkeypatch):
     calls = []
     class Client:
-        def reply_card(self, message_id, value, **kwargs):
+        def reply_card(self, message_id, value, before_submit, **kwargs):
             calls.append((message_id, kwargs))
             if len(calls) == 1:
-                raise FeishuAppError("private-provider-content")
+                raise FeishuAppError("private-token-service-content")
+            before_submit({})
             return {"message_id": "om_confirmed_reply"}
     monkeypatch.setattr(FeishuAppClient, "from_settings", lambda settings: Client())
     row_id = pending(warehouse)
     assert worker.process_outbox_batch(outbox_ids=[row_id])["failed"] == 1
     with warehouse() as db:
         row = db.get(NotificationOutbox, row_id)
-        assert row.status == "RETRY" and "private-provider-content" not in row.last_error
+        assert row.status == "PRE_SEND_RETRY" and "private-token-service-content" not in row.last_error
         row.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
         db.commit()
     assert worker.process_outbox_batch(outbox_ids=[row_id])["sent"] == 1
     assert calls == [("om_original", {"idempotency_key": "question-answer"})] * 2
+
+
+def test_bot_alone_recovers_stale_replies_in_bounded_batches_without_replaying(warehouse, monkeypatch):
+    from jx_alert import bot_service, config
+    from jx_alert.notifications.outbox import DELIVERY_UNKNOWN
+    from jx_alert.storage import db as storage
+
+    settings = worker.get_settings()
+    now = datetime(2026, 11, 22, 2)
+    elapsed = now - timedelta(hours=2)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.replace(tzinfo=tz)
+
+    monkeypatch.setattr(worker, "datetime", Clock)
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+    monkeypatch.setattr(storage, "SessionLocal", warehouse)
+    monkeypatch.setattr(storage, "engine", warehouse.kw["bind"])
+
+    class TickFinished(Exception):
+        pass
+
+    def tick():
+        def stop(_seconds):
+            raise TickFinished
+        with monkeypatch.context() as mp:
+            mp.setattr(bot_service.time, "sleep", stop)
+            with pytest.raises(TickFinished):
+                bot_service.run_question_worker()
+
+    calls = []
+
+    class Client:
+        def reply_card(self, message_id, value, before_submit, **kwargs):
+            before_submit({"operation": "reply"})
+            calls.append((message_id, value, kwargs))
+            return {"message_id": "om_confirmed_reply"}
+
+    monkeypatch.setattr(FeishuAppClient, "from_settings", lambda settings: Client())
+
+    def add(label, status, claim, *, prefix="group-question:", next_attempt=now):
+        om = "om_" + label
+        key = f"{prefix}{om}:0"
+        payload = {
+            "text": "店铺回复", "transport": "app", "fixed_route": True, "card": answer(),
+            "delivery": {"role": "group_question", "receive_id": "oc_reports", "open_ids": [],
+                         "receive_id_type": "chat_id", "reply_to_message_id": om},
+        }
+        if status == "SUBMITTING":
+            payload["delivery_intent"] = {"operation": "reply", "attempt": 1}
+        record = NotificationOutbox(
+            idempotency_key=key, chat_id="oc_reports", payload=payload, status=status,
+            claimed_at=claim, attempts=int(status != "PENDING"), next_attempt_at=next_attempt, created_at=elapsed,
+        )
+        with warehouse.begin() as db:
+            db.add(record)
+            db.flush()
+            return record.id, key, om
+
+    held = [add("legacy", "SENDING", None),
+            *(add(f"uncertain_{i}", "SUBMITTING", elapsed) for i in range(6))]
+    safe = [add(f"safe_{i}", "PREPARING", elapsed if i else None) for i in range(7)]
+    untouched = [
+        (add("still_preparing", "PREPARING", now), "PREPARING"),
+        (add("still_submitting", "SUBMITTING", now), "SUBMITTING"),
+        (add("future", "PRE_SEND_RETRY", None, next_attempt=now + timedelta(hours=1)), "PRE_SEND_RETRY"),
+        (add("scheduled", "SUBMITTING", elapsed, prefix="scheduled-daily:"), "SUBMITTING"),
+        (add("sparkx", "PREPARING", elapsed, prefix="sparkx-page:"), "PREPARING"),
+        (add("other", "PENDING", None, prefix="group-question-other:"), "PENDING"),
+    ]
+
+    def verify(count):
+        with warehouse() as db:
+            for (row_id, _, _), status in untouched:
+                assert db.get(NotificationOutbox, row_id).status == status
+            for index, (row_id, key, _) in enumerate(held):
+                row = db.get(NotificationOutbox, row_id)
+                if index < count:
+                    assert (row.status, row.attempts, row.claimed_at, row.delivered_at) == (
+                        DELIVERY_UNKNOWN, 1, None, None)
+                    logs = db.execute(select(NotificationLog.status, NotificationLog.message_id)
+                                      .where(NotificationLog.dedupe_key == key)).all()
+                    assert logs == [(DELIVERY_UNKNOWN, None)]
+                else:
+                    assert row.status == "SUBMITTING"
+            for index, (row_id, _, _) in enumerate(safe):
+                row = db.get(NotificationOutbox, row_id)
+                assert row.status == ("DELIVERED" if index < count else "PREPARING")
+                assert row.attempts == (2 if index < count else 1)
+        assert calls == [
+            (om, answer(), {"idempotency_key": key}) for _, key, om in safe[:count]
+        ]
+
+    # No scheduler and no new question is required to discover old leases.
+    tick()
+    verify(5)
+    tick()
+    verify(7)
+    tick()
+    verify(7)
+
+    # A new reply retains fast-path priority without starving discovery of an
+    # old ambiguous lease, and even explicit IDs cannot expand the bot's scope.
+    unknown_id, _, _ = add("old_after_idle", "SUBMITTING", elapsed)
+    new_id, new_key, new_message = add("new", "PENDING", None)
+    other_id = untouched[-1][0][0]
+    monkeypatch.setattr(bot_service, "process_one_question", lambda *_: {"outbox_ids": [new_id, other_id]})
+    tick()
+    assert len(calls) == 8 and calls[-1] == (new_message, answer(), {"idempotency_key": new_key})
+    with warehouse() as db:
+        assert db.get(NotificationOutbox, unknown_id).status == DELIVERY_UNKNOWN
+        assert db.get(NotificationOutbox, new_id).status == "DELIVERED"
+        assert db.get(NotificationOutbox, other_id).status == "PENDING"
+    tick()
+    assert len(calls) == 8

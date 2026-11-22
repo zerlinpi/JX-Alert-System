@@ -294,3 +294,51 @@ def test_sparkx_http_accepts_only_the_distinct_relay_credential(monkeypatch):
         assert accepted.status_code == 200
         assert "JX • SparkXAI direct" in accepted.text
         assert TOKEN not in accepted.text
+
+
+def test_audience_search_and_omitted_metrics_reach_the_provider_without_rewriting():
+    query = _query(factEntity="campaignAudience", search="  家庭 Electronics  ", select=["audienceName", "Spend"])
+    del query["metrics"]
+    validate_performance_query(query, frozenset({PROFILE}))
+    calls = []
+    # This mismatch must be preserved by the raw relay; the separate Feishu card rejects it.
+    raw = {"content": [], "isError": False,
+           "structuredContent": {"data": {"rows": [{"Spend": 0, "Clicks": 4}], "rowCount": 1}}}
+    result = asyncio.run(call_sparkx("get_ads_perf", query, token=TOKEN, transport=_mock_rpc(calls, raw)))
+    request = next(call for call in calls if call["method"] == "tools/call")
+    assert request["params"]["arguments"] == query and "metrics" not in request["params"]["arguments"]
+    assert result.model_dump(mode="json", by_alias=True, exclude_none=True) == raw
+
+
+@pytest.mark.parametrize("search", [None, 1, ["name"], "", " ", "line\nbreak", "x" * 201])
+def test_audience_search_is_a_bounded_literal(search):
+    with pytest.raises(SparkXDirectError, match="search"):
+        validate_performance_query(_query(factEntity="campaignAudience", search=search), frozenset({PROFILE}))
+
+
+def test_audience_exceptions_do_not_relax_other_entities_or_explicit_invalid_metrics():
+    with pytest.raises(SparkXDirectError, match="search"):
+        validate_performance_query(_query(search="name"), frozenset({PROFILE}))
+    query = _query()
+    del query["metrics"]
+    with pytest.raises(SparkXDirectError, match="metric"):
+        validate_performance_query(query, frozenset({PROFILE}))
+    for malformed in (None, [], [""], "Spend"):
+        with pytest.raises(SparkXDirectError, match="metric"):
+            validate_performance_query({**query, "factEntity": "campaignAudience", "metrics": malformed},
+                                       frozenset({PROFILE}))
+
+@pytest.mark.parametrize("key,value", [("groupBy", ["audienceName"]), ("queryType", "keyword"),
+                                       ("groupBy", None), ("queryType", None)])
+def test_audience_rejects_unsupported_grouping_and_query_type(key, value):
+    with pytest.raises(SparkXDirectError, match="Omit groupBy and queryType"):
+        validate_performance_query(_query(factEntity="campaignAudience", **{key: value}), frozenset({PROFILE}))
+
+
+def test_audience_sort_allows_at_most_one_documented_rule():
+    one = {"field": "Spend", "direction": "DESC"}
+    valid = _query(factEntity="campaignAudience", orderBy=[one])
+    validate_performance_query(valid, frozenset({PROFILE}))
+    for bad in ([one, {"field": "Clicks"}], one, None):
+        with pytest.raises(SparkXDirectError, match="orderBy"):
+            validate_performance_query({**valid, "orderBy": bad}, frozenset({PROFILE}))

@@ -101,6 +101,35 @@ def test_custom_question_can_return_a_short_paragraph_without_an_anomaly_templat
     assert DeepSeekClient(KEY).analyze(context, 'CPC是什么意思') == answer
 
 
+@pytest.mark.parametrize("reply_mode", ["answer", "analysis"])
+def test_model_instruction_uses_metric_date_bases_and_not_order_cohorts(monkeypatch, reply_mode):
+    context = {**CONTEXT, "reply_mode": reply_mode, "api_business_observations": {
+        "report_date": "2026-11-12",
+        "product": {"basis": "产品表现", "currency": "USD",
+                    "metrics": {"volume": 2, "returnGoodsCount": 5, "refundCount": 1, "netAmount": 40},
+                    "metric_bases": {"volume": "下单日", "netAmount": "下单日",
+                                     "returnGoodsCount": "退货发生日", "refundCount": "退款发生日"}},
+        "settlement": {"basis": "利润报表，结算日，已发放", "currency": "USD",
+                       "metrics": {"totalSalesRefunds": -7}, "metric_bases": {"totalSalesRefunds": "已发放结算日"}},
+    }}
+
+    def handler(request):
+        prompt, frozen = json.loads(request.content)["messages"]
+        source = json.loads(frozen["content"])["frozen_data"]["api_business_observations"]
+        assert source == context["api_business_observations"]
+        assert "按metric_bases逐项解释日期" in prompt["content"]
+        assert "各按实际事件发生日" in prompt["content"]
+        assert "不得解释为原订单批次的最终退货率" in prompt["content"]
+        assert "不推算未提供的原订单批次退货率" in prompt["content"]
+        assert "不从净销售额再扣结算退款" in prompt["content"]
+        assert "没有逐项依据时不从分组标签猜日期" in prompt["content"]
+        assert "product按下单日" not in prompt["content"]
+        return response()
+
+    mock_http(monkeypatch, handler)
+    assert DeepSeekClient(KEY).analyze(context, "各项退货退款数据是什么日期口径？") == ANALYSIS
+
+
 def test_forecast_uses_compact_frozen_evidence_without_action_tools(monkeypatch):
     context = {**CONTEXT, 'advertising_kpis': {}, 'reply_mode': 'answer',
         'analysis_evidence': {'spend_projection': {'scenario_only': True, 'monthly_total': 3000,

@@ -13,5 +13,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev,bot]"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test tests/ui/*.test.cjs
+      - run: node scripts/verify_skill_library_ui.cjs
       - run: ruff check .
       - run: pytest -q

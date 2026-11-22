@@ -77,7 +77,11 @@ def test_api_facts_remain_separate_repeat_collection_preserves_versions_and_cann
     assert context['product']['metrics']['volume'] == 10
     assert context['settlement']['metrics']['volume'] == 7
     assert context['settlement']['metrics']['grossProfit'] == -20
-    assert '下单日' in context['product']['basis'] and '结算日' in context['settlement']['basis']
+    assert context['product']['basis'] == '产品表现'
+    assert '结算日' in context['settlement']['basis']
+    assert context['product']['metric_bases'] == {
+        'volume': '下单日', 'netAmount': '下单日', 'refundCount': '退款发生日'}
+    assert all(basis == '已发放结算日' for basis in context['settlement']['metric_bases'].values())
 
 
 def test_business_pages_are_archived_one_statement_at_a_time_under_packet_limit(warehouse):
@@ -163,6 +167,7 @@ def test_api_daily_card_labels_bases_and_beijing_report_date_without_changing_fa
     assert rows[0]['c0'] == '销量（下单）' and rows[0]['c1'] == '10'
     assert rows[3]['c1'] == '$-20.00'
     assert rows[5]['c1'] == '20.00%'
+    assert (rows[6]['c0'], rows[6]['c1']) == ('退款率（已发放结算区间）', '10.00%')
     assert '美国统计日：2026-11-16' in elements[-1]['content']
     assert set(db.scalars(select(DailyMetric.metric_date))) == {date(2026, 11, 15), date(2026, 11, 16)}
 
@@ -186,6 +191,8 @@ def test_daily_api_requests_use_fixed_single_store_paths_and_preserve_json_types
     client.profit_report_daily('5174', DAY)
     assert calls[0][0] == '/bd/productPerformance/openApi/asinList'
     assert calls[0][1]['sid'] == '5174' and calls[0][1]['is_recently_enum'] is False
+    assert type(calls[0][1]['purchase_status']) is int and calls[0][1]['purchase_status'] == 0
+    assert calls[0][1]['start_date'] == calls[0][1]['end_date'] == DAY
     assert calls[1][1]['sids'] == [5174] and calls[1][1]['orderStatus'] == 'Disbursed'
 
 
@@ -304,6 +311,7 @@ class ReturnedGoodsClient(PagedProductClient):
         response = super().product_performance_daily(sid, day, offset=offset, length=length)
         row = response["data"]["list"][0]
         row["return_goods_count"] = [0, 2, 5][offset]
+        row["order_items"] = 2
         # The vendor rate is a separate observation and is not additive.
         row["return_goods_rate"] = [0, 0.2, 0.5][offset]
         return response
@@ -323,8 +331,15 @@ def test_physical_return_units_and_signed_settlement_refunds_are_independent(war
     product, settlement = context["product"]["metrics"], context["settlement"]["metrics"]
     assert product["volume"] == 30 and product["returnGoodsCount"] == 7
     assert product["refundCount"] == 3
+    assert product["orders"] == 6 and product["netAmount"] == 300 and product["adSpend"] == 60
+    assert context["product"]["metric_bases"] == {
+        "volume": "下单日", "orders": "下单日", "netAmount": "下单日",
+        "refundCount": "退款发生日", "returnGoodsCount": "退货发生日",
+    }
     assert "returnGoodsRate" not in product and "totalSalesRefunds" not in product
+    assert "returnRate" not in product and "cohortReturnRate" not in product
     assert settlement["totalSalesRefunds"] == -27.50 and "totalFeeRefunds" not in settlement
+    assert context["settlement"]["metric_bases"]["totalSalesRefunds"] == "已发放结算日"
     assert "returnGoodsCount" not in settlement
     prior = api.api_business_context(db, store.sid, "2026-11-15")
     assert prior["settlement"]["metrics"]["totalSalesRefunds"] == 0
@@ -340,8 +355,9 @@ def test_missing_physical_count_in_one_row_is_not_treated_as_zero(warehouse):
 
     db, store, settings = warehouse
     assert collect(db, settings, MissingCount())["status"] == "COMPLETE"
-    metrics = api.api_business_context(db, store.sid, DAY)["product"]["metrics"]
-    assert metrics["volume"] == 30 and "returnGoodsCount" not in metrics
+    product = api.api_business_context(db, store.sid, DAY)["product"]
+    assert product["metrics"]["volume"] == 30 and "returnGoodsCount" not in product["metrics"]
+    assert "returnGoodsCount" not in product["metric_bases"]
 
 
 @pytest.mark.parametrize("invalid", [True, -1, 1.5, "Infinity"])

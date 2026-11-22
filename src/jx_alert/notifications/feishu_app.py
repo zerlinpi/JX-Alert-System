@@ -1,6 +1,6 @@
 """One enterprise app bot for group mentions and individual manager messages.
 
-The durable outbox owns long-term idempotency. Retries also reuse the API uuid.
+The durable outbox holds ambiguous submissions. A UUID is not a durable receipt.
 
 Official contracts:
 https://open.feishu.cn/document/server-docs/authentication-management/access-token/tenant_access_token_internal
@@ -17,9 +17,15 @@ import time
 
 import httpx
 
+from jx_alert.notifications.receipt import strict_response_json
+
 
 class FeishuAppError(RuntimeError):
     """A sanitized failure that can safely be stored in notification logs."""
+
+
+class FeishuTokenRefused(FeishuAppError):
+    """A valid authentication rejection for this POST, not a receipt."""
 
 
 class FeishuAppClient:
@@ -91,7 +97,7 @@ class FeishuAppClient:
                 f"Feishu app HTTP request failed: {type(exc).__name__}"
             ) from None
         try:
-            data = response.json()
+            data = strict_response_json(response)
         except ValueError:
             raise FeishuAppError("Feishu app returned invalid JSON") from None
         if not isinstance(data, dict):
@@ -103,7 +109,7 @@ class FeishuAppClient:
             # An expired token can be reported with a non-2xx HTTP status.
             message_path = path == self._MESSAGE_PATH or re.fullmatch(
                 re.escape(self._MESSAGE_PATH) + r"/om_[A-Za-z0-9_-]+/reply", path)
-            if not (message_path and code == self._EXPIRED_TOKEN_CODE):
+            if not (message_path and response.status_code in (400, 401) and code == self._EXPIRED_TOKEN_CODE):
                 raise FeishuAppError(
                     f"Feishu app HTTP request rejected: HTTP {response.status_code}, code={code}"
                 )
@@ -141,7 +147,7 @@ class FeishuAppClient:
     def send_text(self, text: str, *, receive_id: str,
                   receive_id_type: str = "chat_id",
                   open_ids: list[str] | None = None,
-                  idempotency_key: str) -> dict:
+                  idempotency_key: str, before_submit=None) -> dict:
         """Send text and return ``{"message_id": ...}`` on confirmed success.
 
         The key must identify one delivery to one recipient. Retries must reuse
@@ -177,10 +183,10 @@ class FeishuAppClient:
             "content": json.dumps(content, ensure_ascii=False),
             "uuid": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:40],
         }
-        return self._send_message_payload(payload, receive_id_type)
+        return self._send_message_payload(payload, receive_id_type, before_submit=before_submit)
 
     def send_card(self, card: dict, *, receive_id: str, receive_id_type: str = "chat_id",
-                  open_ids: list[str] | None = None, idempotency_key: str) -> dict:
+                  open_ids: list[str] | None = None, idempotency_key: str, before_submit=None) -> dict:
         """Deliver a native table card with only explicitly mapped mentions."""
         from jx_alert.notifications.cards import with_mentions
         if receive_id_type not in {"chat_id", "open_id"}:
@@ -195,10 +201,10 @@ class FeishuAppClient:
             "content": json.dumps(with_mentions(card, open_ids or []), ensure_ascii=False),
             "uuid": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:40],
         }
-        return self._send_message_payload(payload, receive_id_type)
+        return self._send_message_payload(payload, receive_id_type, before_submit=before_submit)
 
     def reply_card(self, message_id: str, card: dict, *, idempotency_key: str,
-                   reply_in_thread: bool = True) -> dict:
+                   reply_in_thread: bool = True, before_submit=None) -> dict:
         """Reply to the original question, keeping private replies in the main chat."""
         from jx_alert.notifications.cards import with_mentions
         if not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]+", message_id):
@@ -210,18 +216,35 @@ class FeishuAppClient:
         payload = {"msg_type": "interactive", "content": json.dumps(with_mentions(card, []), ensure_ascii=False),
                    "uuid": hashlib.sha256(idempotency_key.encode()).hexdigest()[:40],
                    "reply_in_thread": reply_in_thread}
-        return self._send_message_payload(payload, None, path=f"{self._MESSAGE_PATH}/{message_id}/reply")
+        return self._send_message_payload(payload, None, path=f"{self._MESSAGE_PATH}/{message_id}/reply",
+                                          before_submit=before_submit)
 
-    def _send_message_payload(self, payload, receive_id_type, *, path=None):
+    def _send_message_payload(self, payload, receive_id_type, *, path=None, before_submit=None):
         # Bound operational alerts conservatively, including JSON escaping.
         if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 20 * 1024:
             raise ValueError("Feishu app text message exceeds the 20 KB application limit")
         token = self._get_token()
+        if before_submit is not None:
+            # The exact final content includes rendered mentions, UUID and thread setting.
+            # Never pass the bearer token, headers or app secret to the outbox.
+            before_submit({
+                "operation": "reply" if path else "create",
+                "body_sha256": hashlib.sha256(json.dumps(payload, ensure_ascii=False,
+                    sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                "provider_uuid": payload["uuid"],
+            })
         for attempt in range(2):
             data = self._post_json(
                 path or self._MESSAGE_PATH, payload, token=token,
                 params={"receive_id_type": receive_id_type} if receive_id_type else None,
             )
+            if data["code"] == self._EXPIRED_TOKEN_CODE and before_submit is not None:
+                # One durable intent authorizes one POST. Do not silently issue
+                # another after refreshing credentials outside the outbox fence.
+                with self._token_lock:
+                    if self._token == token:
+                        self._token_expires_at = 0.0
+                raise FeishuTokenRefused(f"Feishu app token rejected: code={data['code']}")
             if data["code"] == self._EXPIRED_TOKEN_CODE and attempt == 0:
                 token = self._get_token(rejected_token=token)
                 continue
@@ -229,7 +252,7 @@ class FeishuAppClient:
                 raise FeishuAppError(f"Feishu app message rejected: code={data['code']}")
             result = data.get("data")
             message_id = result.get("message_id") if isinstance(result, dict) else None
-            if not isinstance(message_id, str) or not message_id.strip():
+            if not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]{1,197}", message_id):
                 raise FeishuAppError("Feishu app success response did not contain a message_id")
             return {"message_id": message_id}
         raise FeishuAppError("Feishu app message could not be sent")

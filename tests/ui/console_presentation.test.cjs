@@ -5,9 +5,17 @@ const { test } = require("node:test");
 const vm = require("node:vm");
 
 class Element {
-  constructor() { this.children = []; this.dataset = {}; this.hidden = false; this.textContent = ""; }
-  addEventListener() {}
-  setAttribute() {}
+  constructor() {
+    this.children = []; this.dataset = {}; this.hidden = false; this.textContent = "";
+    this.attributes = new Map(); this.listeners = new Map();
+  }
+  addEventListener(name, handler) { this.listeners.set(name, handler); }
+  dispatch(name, extra = {}) { return this.listeners.get(name)?.({preventDefault() {}, ...extra}); }
+  setAttribute(name, value) { this.attributes.set(name, value); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  removeAttribute(name) { this.attributes.delete(name); }
+  getClientRects() { return this.hidden ? [] : [{}]; }
+  focus() { this.focused = true; }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
 }
@@ -162,15 +170,38 @@ test("MCP unknown currency does not expose a guessed spend amount", () => {
 test("API business observations show known values with their independent date bases", () => {
   const scope = consoleScope();
   scope.evaluate(`renderSourceObservations({business_daily:{availability:"MISSING"},api_business_observations:{report_date:"2026-11-16",
-    product:{basis:"产品表现，下单日",currency:"USD",metrics:{volume:0,netAmount:100,adSpend:20}},
-    settlement:{basis:"利润报表，结算日，已发放",currency:"USD",metrics:{grossProfit:-20,grossRate:-0.25}}}})`);
+    product:{basis:"产品表现",currency:"USD",metrics:{volume:0,netAmount:100,adSpend:20,returnGoodsCount:5,refundCount:0},
+      metric_bases:{volume:"下单日",netAmount:"下单日",returnGoodsCount:"退货发生日",refundCount:"退款发生日"}},
+    settlement:{basis:"利润报表，结算日，已发放",currency:"USD",metrics:{grossProfit:-20,grossRate:-0.25,refundsRate:0.123},
+      metric_bases:{grossProfit:"已发放结算日",grossRate:"已发放结算日",refundsRate:"已发放结算日"}}}})`);
   const rows = scope.elements.get("source-observation-rows").children[0].children;
-  assert.equal(rows.length, 5);
+  assert.deepEqual(rows.map(row => row.children[0].textContent), ["销量（下单日）", "净销售额（下单日）",
+    "退货量（退货发生日）", "退款量（退款发生日）", "毛利润（已发放结算日）", "毛利率（已发放结算日）",
+    "退款率（已发放结算区间）", "广告费/净销售额（产品表现）"]);
   assert.equal(rows[0].children[1].textContent, "0");
-  assert.equal(rows[3].children[1].textContent, "-25.00%");
-  assert.equal(rows[4].children[1].textContent, "20.00%");
-  assert.ok(scope.elements.get("source-observations-basis").textContent.includes("下单日"));
-  assert.ok(scope.elements.get("source-observations-basis").textContent.includes("结算日"));
+  assert.equal(rows[2].children[1].textContent, "5");
+  assert.equal(rows[3].children[1].textContent, "0");
+  assert.equal(rows[5].children[1].textContent, "-25.00%");
+  assert.equal(rows[6].children[1].textContent, "12.30%");
+  assert.equal(rows[7].children[1].textContent, "20.00%");
+  assert.equal(scope.elements.get("source-observations-basis").textContent, "2026-11-16 · 产品表现 · 利润报表，结算日，已发放");
+});
+
+test("legacy settlement refund rate keeps its source value without implying a denominator", () => {
+  const scope = consoleScope();
+  scope.evaluate(`renderSourceObservations({api_business_observations:{report_date:"2026-11-16",
+    settlement:{basis:"利润报表，结算日，已发放",currency:"USD",metrics:{refundsRate:0}}}})`);
+  const rows = scope.elements.get("source-observation-rows").children[0].children;
+  assert.deepEqual(rows.map(row => row.children.map(cell => cell.textContent)), [["退款率（结算口径）", "0.00%"]]);
+});
+
+test("legacy product response cannot label event counts using its blanket order date", () => {
+  const scope = consoleScope();
+  scope.evaluate(`renderSourceObservations({api_business_observations:{report_date:"2026-11-16",
+    product:{basis:"产品表现，下单日",currency:"USD",metrics:{volume:2,returnGoodsCount:5,refundCount:0}}}})`);
+  const rows = scope.elements.get("source-observation-rows").children[0].children;
+  assert.deepEqual(rows.map(row => row.children[0].textContent), ["销量"]);
+  assert.equal(scope.elements.get("source-observations-basis").textContent, "2026-11-16 · 产品表现");
 });
 
 test("advertising private recipients require an explicit verified choice and can be cleared offline", () => {
@@ -198,4 +229,65 @@ test("private recipient save uses CSRF and sends no report subscription flag", a
   assert.equal(request.headers['X-CSRF-Token'], 'a'.repeat(64));
   assert.deepEqual(JSON.parse(request.body), {open_ids:['ou_first'],revision:'b'.repeat(64)});
   assert.match(scope.elements.get('ad-subscriber-status').textContent, /不会补发旧告警/);
+});
+
+test("compact navigation only exposes links: Escape restores focus, repeated toggles do not reload", () => {
+  const { context, elements } = consoleScope();
+  let requests = 0;
+  context.fetch = () => { requests++; return new Promise(() => {}); };
+  const menu = elements.get("workspace-menu"), panel = elements.get("workspace-navigation");
+  menu.dispatch("click");
+  assert.equal(menu.getAttribute("aria-expanded"), "true");
+  assert.equal(panel.dataset.expanded, "true");
+  menu.dispatch("click");
+  assert.equal(panel.dataset.expanded, "false");
+  menu.dispatch("click");
+  let prevented = false;
+  panel.dispatch("keydown", { key: "Escape", preventDefault: () => { prevented = true; } });
+  assert.ok(prevented && menu.focused);
+  assert.equal(menu.getAttribute("aria-expanded"), "false");
+  assert.equal(requests, 0);
+});
+
+test("each compact navigation choice opens the right view and moves focus to its title", async () => {
+  const { context, elements, evaluate } = consoleScope();
+  const views = ["analysis-settings", "notification-group", "data-sources", "owners", "overview"];
+  const tabs = views.map((view) => Object.assign(new Element(), { dataset: {view} }));
+  context.document.querySelectorAll = (selector) => selector === "[data-view]" ? tabs : [];
+  let requests = 0;
+  context.fetch = () => { requests++; return new Promise(() => {}); };
+  evaluate("state.groups.current={}; state.adSubscribers.data={}; state.sources.data={}; state.deepseek.data={}; state.reviewSkills={}; state.skillLibrary={};");
+  for (const [index, view] of views.entries()) {
+    elements.get("workspace-menu").dispatch("click");
+    await evaluate(`setView(${JSON.stringify(view)})`);
+    assert.equal(elements.get("workspace-navigation").dataset.expanded, "false");
+    assert.equal(elements.get("page-title").focused, true);
+    assert.deepEqual(tabs.map((t) => t.getAttribute("aria-current")), tabs.map((_,i) => i === index ? "page" : null));
+    assert.equal(elements.get("store-board").hidden, !["overview","owners"].includes(view));
+    assert.equal(elements.get("fleet-strip").hidden, elements.get("store-board").hidden);
+    assert.equal(elements.get("ownership").hidden, view !== "owners");
+    for (const page of views.slice(0,3)) assert.equal(elements.get(page+"-panel").hidden, page !== view);
+  }
+  assert.equal(requests, 0);
+});
+
+test("compact store picker preserves search on dismissal and collapses on actual selection", () => {
+  const { context, elements } = consoleScope();
+  const button = elements.get("store-picker-toggle"), panel = elements.get("store-picker-panel");
+  const search = elements.get("store-search");
+  search.value = "北"; elements.get("store-filter").value = "all";
+  const requests = [];
+  context.clearTimeout = () => {};
+  context.fetch = (url, options) => { requests.push({url, options}); return new Promise(() => {}); };
+  button.dispatch("click");
+  panel.dispatch("keydown", {key:"Escape"});
+  assert.equal(panel.dataset.expanded, "false");
+  assert.equal(search.value, "北");
+  assert.equal(button.focused, true);
+  assert.equal(requests.length, 0);
+  button.dispatch("click");
+  elements.get("stores").dispatch("click", { target:{ closest:() => ({dataset:{sid:"123"}}) } });
+  assert.equal(button.getAttribute("aria-expanded"), "false");
+  assert.deepEqual(requests.map((r) => r.url), ["/console/api/stores/123"]);
+  assert.equal(requests[0].options.method, undefined);
 });

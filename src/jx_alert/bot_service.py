@@ -16,7 +16,7 @@ from jx_alert.chat_analysis import _scope
 from jx_alert.lingxing.ad_details import DETAIL_LABELS
 from jx_alert.notifications.cards import card, number
 from jx_alert.notifications.daily_report import build_daily_card
-from jx_alert.notifications.outbox import enqueue_notification
+from jx_alert.notifications.outbox import QUESTION_REPLY_PREFIX, enqueue_notification
 from jx_alert.notifications.routing import _load_routing, _route_entry, report_group_delivery
 from jx_alert.notifications.store_health import card_fits, health_brief_snapshots
 from jx_alert.storage.collection_attempts import collection_issue_for_date as _collection_issue_for_date
@@ -121,7 +121,7 @@ def _reply(db, settings, message_id, chat_id, cards, *, question_meta=None):
         raise QuestionAccessChanged("Original question is outside the current allowed conversation")
     ids = []
     for index, value in enumerate(cards):
-        row = enqueue_notification(db, idempotency_key=f"group-question:{message_id}:{index}",
+        row = enqueue_notification(db, idempotency_key=f"{QUESTION_REPLY_PREFIX}{message_id}:{index}",
             text=value["header"]["title"]["content"], chat_id=chat_id, card=value,
             delivery=delivery, fixed_route=True)
         ids.append(row.id)
@@ -1192,20 +1192,17 @@ def run_question_worker():
     from jx_alert.config import get_settings
     from jx_alert.storage.db import SessionLocal, engine
     from jx_alert.notifications.worker import process_outbox_batch
-    from jx_alert.notifications.outbox import NotificationOutbox
     import logging
     logger = logging.getLogger("jx_alert.bot")
     while True:
         try:
             result = process_one_question(get_settings(), SessionLocal, engine)
-            ids = result.get("outbox_ids", [])
-            with SessionLocal() as db:
-                pending = db.scalars(select(NotificationOutbox.id).where(
-                    NotificationOutbox.idempotency_key.startswith("group-question:"),
-                    NotificationOutbox.status.in_(["PENDING", "RETRY"])).order_by(NotificationOutbox.id).limit(5)).all()
-                ids = list(dict.fromkeys(ids + pending))
+            ids = list(dict.fromkeys(result.get("outbox_ids", [])))
             for offset in range(0, len(ids), 5):
-                process_outbox_batch(batch_size=5, outbox_ids=ids[offset:offset + 5])
+                process_outbox_batch(batch_size=5, outbox_ids=ids[offset:offset + 5], question_replies_only=True)
+            # A standalone bot may be the only reply worker. Also discover
+            # expired leases from before a restart, but never touch other producers' rows.
+            process_outbox_batch(batch_size=5, question_replies_only=True)
         except JobAlreadyRunning:
             pass
         except Exception as exc:

@@ -197,7 +197,7 @@ def api_business_card(db, store, day, *, reporting_day=None, data_warning=None):
         ("settlement", "grossProfit", "毛利润（结算）", "money"),
         ("settlement", "grossRate", "毛利率（结算）", "rate"),
         ("product", "adsNetRatio", "广告费/净销售额", "rate"),
-        ("settlement", "refundsRate", "退款率（结算销量）", "rate"),
+        ("settlement", "refundsRate", "退款率（已发放结算区间）", "rate"),
     ]
     for packet in (current, previous):
         values = packet["product"].get("metrics", {})

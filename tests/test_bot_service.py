@@ -1329,12 +1329,19 @@ def test_worker_skips_unscoped_frozen_history_but_not_other_legacy_replies(wareh
     monkeypatch.setattr(worker, 'get_settings', lambda: settings)
     sent = []
 
-    class Transport:
-        def reply_card(self, _message, value, **_kwargs):
-            sent.append(value['header']['title']['content'])
-            return {'message_id': 'om_mock'}
+    client = feishu_app.FeishuAppClient('fixture', 'fixture')
+    monkeypatch.setattr(feishu_app.FeishuAppClient, 'from_settings', lambda _: client)
+    monkeypatch.setattr(client, '_get_token', lambda: 'mock')
 
-    monkeypatch.setattr(feishu_app.FeishuAppClient, 'from_settings', lambda _: Transport())
+    def post(path, body, **_kwargs):
+        assert path.endswith('/om_legacy1/reply')
+        with sessions() as db:
+            fenced = db.scalars(select(NotificationOutbox).where(NotificationOutbox.status == 'SUBMITTING')).one()
+            assert fenced.payload['delivery_intent']['provider_uuid'] == body['uuid']
+        sent.append(json.loads(body['content'])['header']['title']['content'])
+        return {'code': 0, 'data': {'message_id': 'om_mock'}}
+
+    monkeypatch.setattr(client, '_post_json', post)
     # Base main froze these titles without recording the authorization scope of the read.
     titles = ['最近 7 天已记录的广告异常', '普通回复']
     ids = []

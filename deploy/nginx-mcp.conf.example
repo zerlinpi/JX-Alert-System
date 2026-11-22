@@ -6,6 +6,8 @@ server {
     ssl_certificate /etc/letsencrypt/live/mcp.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/mcp.example.com/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    # If OwnerConsole is enabled, scope its Skill ZIP exception separately:
+    # nginx-owner-skill-library.location.example (not an MCP upstream).
     client_max_body_size 64k;
     # OAuth authorization codes/state occur in URLs. Do not log query strings.
     access_log off;

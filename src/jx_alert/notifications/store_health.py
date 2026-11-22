@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from jx_alert.analysis.store_health import store_health_snapshot
-from jx_alert.notifications.cards import card, number
+from jx_alert.notifications.cards import card, card_fits, number
 from jx_alert.notifications.outbox import NotificationOutbox
 from jx_alert.notifications.routing import _load_routing, report_group_delivery
 from jx_alert.storage.models import Store
@@ -85,26 +85,6 @@ def health_brief_snapshots(db, settings, *, store_id=None, now=None):
     return {"checked_at_utc": clock.isoformat(), "store_count": len(snapshots),
             "status_counts": counts, "observation_only": getattr(settings, "lingxing_performance_observation_only", True),
             "stores": snapshots}
-
-
-def card_fits(value):
-    """Bound both the five-table platform limit and JSON-in-JSON wire size.
-
-    https://open.feishu.cn/document/feishu-cards/feishu-card-cardkit/components/table
-    """
-    pending, tables = [value], 0
-    while pending:
-        item = pending.pop()
-        if isinstance(item, dict):
-            tables += item.get("tag") == "table"
-            if tables > 5:
-                return False
-            pending.extend(item.values())
-        elif isinstance(item, list):
-            pending.extend(item)
-    payload = {"receive_id": "oc_" + "x" * 64, "msg_type": "interactive",
-               "content": json.dumps(value, ensure_ascii=False), "uuid": "x" * 40}
-    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= 20 * 1024
 
 
 def build_health_brief_cards(snapshots, *, report_day):

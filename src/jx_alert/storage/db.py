@@ -1,10 +1,8 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.orm import sessionmaker
+
 from jx_alert.config import get_settings
-
-
-class Base(DeclarativeBase):
-    pass
+from jx_alert.storage.base import Base
 
 
 def make_engine():

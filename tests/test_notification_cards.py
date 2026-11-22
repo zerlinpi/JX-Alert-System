@@ -118,11 +118,13 @@ def test_worker_sends_persisted_card_without_regressing_old_text(monkeypatch, tm
     sent = []
 
     class Client:
-        def send_card(self, value, **kwargs):
+        def send_card(self, value, before_submit, **kwargs):
+            before_submit({})
             sent.append(("card", value))
             return {"message_id": "om_card"}
 
-        def send_text(self, value, **kwargs):
+        def send_text(self, value, before_submit, **kwargs):
+            before_submit({})
             sent.append(("text", value))
             return {"message_id": "om_text"}
 

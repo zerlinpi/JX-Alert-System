@@ -222,8 +222,13 @@ def test_eight_snapshot_is_frozen_until_nine_and_cannot_send_early(warehouse, mo
     monkeypatch.setattr(worker, 'get_settings', lambda: settings)
     monkeypatch.setattr(worker, 'SessionLocal', sessions)
     sent = []
+    def send(value, *, before_submit, **kwargs):
+        before_submit({})
+        sent.append(value)
+        return {'message_id': 'om_daily'}
+
     monkeypatch.setattr('jx_alert.notifications.feishu_app.FeishuAppClient.from_settings',
-        lambda _: SimpleNamespace(send_card=lambda value, **kwargs: sent.append(value) or {'message_id': 'om_daily'}))
+        lambda _: SimpleNamespace(send_card=send))
     assert worker.process_outbox_batch()['sent'] == 0 and sent == []
     instant = NOW
     assert worker.process_outbox_batch()['sent'] == 1 and len(sent) == 1
@@ -266,9 +271,13 @@ def test_morning_ad_delivery_rechecks_frozen_profile(warehouse, monkeypatch, tmp
     monkeypatch.setattr(worker, 'get_settings', lambda: settings)
     monkeypatch.setattr(worker, 'SessionLocal', sessions)
     sent = []
+    def send(value, *, before_submit, **kwargs):
+        before_submit({})
+        sent.append(kwargs['idempotency_key'])
+        return {'message_id': 'om_test'}
+
     monkeypatch.setattr('jx_alert.notifications.feishu_app.FeishuAppClient.from_settings',
-        lambda _: SimpleNamespace(send_card=lambda value, **kwargs:
-            sent.append(kwargs['idempotency_key']) or {'message_id': 'om_test'}))
+        lambda _: SimpleNamespace(send_card=send))
     assert worker.process_outbox_batch()['sent'] == (2 if ad_sent else 1)
     db.expire_all()
     assert health.status == 'DELIVERED'

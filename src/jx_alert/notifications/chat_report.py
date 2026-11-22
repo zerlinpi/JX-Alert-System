@@ -4,7 +4,7 @@ import json
 import re
 from pathlib import Path
 
-from jx_alert.notifications.outbox import enqueue_notification
+from jx_alert.notifications.outbox import IN_FLIGHT, enqueue_notification
 from jx_alert.notifications.quiet_policy import quiet_delivery, quiet_skip
 from jx_alert.notifications.routing import _load_routing, report_group_delivery
 from jx_alert.store_controls import notification_states
@@ -52,7 +52,7 @@ def enqueue_chat_report(db, settings, *, title: str, markdown: str, store_ids: l
                                chat_id=chat_id, card=card, delivery=delivery, fixed_route=True, store_ids=store_ids)
     group = routing["groups"][settings.feishu_daily_report_chat_id]
     return {
-        "status": "QUEUED" if row.status in {"PENDING", "RETRY", "SENDING"} else row.status,
+        "status": "QUEUED" if row.status in IN_FLIGHT else row.status,
         "outbox_id": row.id,
         "group": group.get("display_name") or settings.feishu_daily_report_chat_id,
     }

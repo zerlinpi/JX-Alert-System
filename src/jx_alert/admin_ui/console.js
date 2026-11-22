@@ -21,6 +21,7 @@ const state = {
   sources: { data: null, loading: false, saving: false },
   deepseek: { data: null, loading: false, saving: false },
   reviewSkills: null,
+  skillLibrary: null,
   adSubscribers: { data: null, members: null, selected: new Set(), loading: false, saving: false },
 };
 
@@ -67,10 +68,15 @@ async function api(path, options) {
   });
   if (response.status === 401 || response.redirected) {
     location.assign("/console/login");
-    throw new Error("登录已过期，请重新登录。");
+    throw Object.assign(new Error("登录已过期，请重新登录。"), { status: 401 });
   }
   let json;
-  try { json = await response.json(); } catch { throw new Error("服务暂时不可用，请刷新重试。"); }
+  try { json = await response.json(); } catch {
+    if (path === "skill-library" && options?.method === "POST" && response.status === 413) {
+      throw Object.assign(new Error("代理拒绝了大文件。请核对管理台技能上传路径的大小限制。"), { status: 413 });
+    }
+    throw new Error("服务暂时不可用，请刷新重试。");
+  }
   if (!response.ok) {
     const error = new Error(typeof json.error === "string" ? json.error : "请求失败，请稍后重试。");
     error.status = response.status;
@@ -328,19 +334,25 @@ function renderSourceObservations(data) {
   const rows = [], bases = new Set();
   const api = data.api_business_observations || {};
   if (data.business_daily?.availability !== "AVAILABLE") {
-    for (const [source, key, label, monetary] of [
-      ["product", "volume", "销量（接口下单）", false], ["product", "netAmount", "净销售额（接口下单）", true],
-      ["settlement", "platformIncome", "平台收入（接口结算）", true], ["settlement", "grossProfit", "毛利润（接口结算）", true],
-      ["settlement", "grossRate", "毛利率（接口结算）", false], ["settlement", "refundsRate", "退款率（结算销量）", false],
+    for (const [source, key, label, monetary, needsBasis] of [
+      ["product", "volume", "销量", false], ["product", "netAmount", "净销售额", true],
+      ["product", "returnGoodsCount", "退货量", false, true], ["product", "refundCount", "退款量", false, true],
+      ["settlement", "platformIncome", "平台收入", true], ["settlement", "grossProfit", "毛利润", true],
+      ["settlement", "grossRate", "毛利率", false], ["settlement", "refundsRate", "退款率", false],
     ]) {
       const item = api[source] || {}, value = item.metrics?.[key];
+      const basis = item.metric_bases?.[key];
+      // Older responses did not label the return/refund events per metric.
+      if (needsBasis && !basis) continue;
       if (!Number.isFinite(value) || monetary && !/^[A-Z]{3}$/.test(item.currency || "")) continue;
-      rows.push([label, monetary ? money(value, item.currency) : key.endsWith("Rate") ? `${(value * 100).toFixed(2)}%` : scalar(value)]);
-      if (item.basis) bases.add(item.basis);
+      const labelBasis = key === "refundsRate" ? (basis ? "已发放结算区间" : "结算口径") : basis;
+      rows.push([labelBasis ? `${label}（${labelBasis}）` : label,
+        monetary ? money(value, item.currency) : key.endsWith("Rate") ? `${(value * 100).toFixed(2)}%` : scalar(value)]);
+      if (item.basis) bases.add(source === "product" ? "产品表现" : item.basis);
     }
     const p = api.product || {};
     if (Number.isFinite(p.metrics?.adSpend) && p.metrics?.netAmount > 0) {
-      rows.push(["广告费/净销售额（接口下单）", `${(Math.abs(p.metrics.adSpend) / p.metrics.netAmount * 100).toFixed(2)}%`]);
+      rows.push(["广告费/净销售额（产品表现）", `${(Math.abs(p.metrics.adSpend) / p.metrics.netAmount * 100).toFixed(2)}%`]);
     }
   }
   if (sales && sales.metrics) {
@@ -702,6 +714,7 @@ function renderView() {
   $("notification-group-panel").hidden = !groups;
   $("data-sources-panel").hidden = !sources;
   $("analysis-settings-panel").hidden = !analysisSettings;
+  $("fleet-strip").hidden = groups || sources || analysisSettings;
   $("store-stats").hidden = groups || sources || analysisSettings;
   $("store-board").hidden = groups || sources || analysisSettings;
   $("bulk-sync-panel").hidden = groups || sources || analysisSettings;
@@ -714,15 +727,50 @@ function renderView() {
   $("edit-owners").hidden = owners;
 }
 
+// The same navigation and store list serve both layouts. CSS changes their placement;
+// only disclosure state is UI-local. Opening these must never start a request.
+function bindCompactPanel(triggerId, panelId) {
+  const trigger = $(triggerId), panel = $(panelId);
+  const isOpen = () => trigger.getAttribute("aria-expanded") === "true";
+  function setOpen(open) {
+    trigger.setAttribute("aria-expanded", String(open));
+    panel.dataset.expanded = String(open);
+  }
+  function close(restoreFocus = false) {
+    if (!isOpen()) return false;
+    setOpen(false);
+    const visible = trigger.getClientRects().length > 0;
+    if (restoreFocus && visible) trigger.focus();
+    return visible;
+  }
+  trigger.addEventListener("click", () => setOpen(!isOpen()));
+  const onKey = (event) => {
+    if (event.key === "Escape" && isOpen()) { close(true); event.preventDefault(); }
+  };
+  trigger.addEventListener("keydown", onKey);
+  panel.addEventListener("keydown", onKey);
+  return { close };
+}
+const compactNavigation = bindCompactPanel("workspace-menu", "workspace-navigation");
+const compactStoreList = bindCompactPanel("store-picker-toggle", "store-picker-panel");
+
 async function setView(view) {
+  const fromMenu = compactNavigation.close();
+  const fromStore = document.activeElement === $("edit-owners");
+  compactStoreList.close();
   if (view !== "analysis-settings") $("deepseek-key").value = "";
   state.view = view;
   renderView();
+  if (fromMenu) $("page-title").focus();
+  else if (fromStore && view === "owners") $("owners-title").focus();
   if (view === "owners" && state.data && !state.members) await loadMembers();
   if (view === "notification-group" && !state.groups.current) await loadGroups();
   if (view === "notification-group" && !state.adSubscribers.data) await loadAdSubscribers();
   if (view === "data-sources" && !state.sources.data) await loadSources();
   if (view === "analysis-settings") {
+    if (!state.skillLibrary && window.JxSkillLibrary) {
+      state.skillLibrary = window.JxSkillLibrary.mount($("skill-library-panel"), { api, csrf: () => state.csrf });
+    }
     if (!state.reviewSkills && window.JxReviewSkills) {
       state.reviewSkills = window.JxReviewSkills.mount($("review-skills-panel"), { api, csrf: () => state.csrf });
     }
@@ -1198,7 +1246,10 @@ async function saveOwners() {
 
 $("stores").addEventListener("click", (event) => {
   const btn = event.target.closest("[data-sid]");
-  if (btn) void selectStore(btn.dataset.sid);
+  if (btn) {
+    compactStoreList.close(true);
+    void selectStore(btn.dataset.sid);
+  }
 });
 $("store-search").addEventListener("input", renderStoreList);
 $("reload-sources").addEventListener("click", () => void loadSources());
@@ -1211,6 +1262,7 @@ $("refresh").addEventListener("click", () => {
   if (state.view === "analysis-settings") {
     void loadDeepSeek();
     void state.reviewSkills?.refresh();
+    void state.skillLibrary?.refresh();
   } else if (state.view === "data-sources") void loadSources();
   else if (state.view === "notification-group") void loadGroups();
   else void loadStores();

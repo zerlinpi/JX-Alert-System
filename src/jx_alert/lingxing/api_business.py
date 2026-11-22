@@ -29,6 +29,13 @@ FIELDS = {
               "grossProfit": "grossProfit", "grossRate": "grossRate", "refundsRate": "refundsRate",
               "totalSalesRefunds": "totalSalesRefunds"},
 }
+# The product endpoint's purchase_status=0 only sets the return/refund date
+# basis; ad allocation dates are not established by that switch.
+_PRODUCT_METRIC_BASES = {
+    "volume": "下单日", "orders": "下单日", "netAmount": "下单日",
+    "refundCount": "退款发生日", "returnGoodsCount": "退货发生日",
+}
+_SETTLEMENT_BASIS = "已发放结算日"
 
 
 def _number(value, key):
@@ -157,6 +164,12 @@ def api_business_context(db, sid, on):
             continue
         rows = list(db.scalars(select(DailyMetric).where(DailyMetric.store_id == str(sid),
             DailyMetric.metric_date == day, DailyMetric.dimension == dimension, DailyMetric.source == SOURCE)))
+        # A copied/damaged partition can have the right number of values per field
+        # but from different ASIN sets. Never form same-window rates from such a set.
+        entities = {r.entity_id for r in rows}
+        if (len(entities) > covered.row_count or
+                dimension == FINANCE and (covered.row_count != 1 or entities != {str(sid)})):
+            continue
         codes = {r.currency for r in rows}
         currency = next(iter(codes)) if len(codes) == 1 else None
         if currency is None:
@@ -164,12 +177,18 @@ def api_business_context(db, sid, on):
         values = {}
         for key in FIELDS[dimension]:
             facts = [r for r in rows if r.metric_name == key]
-            if len(facts) == covered.row_count and all(math.isfinite(r.value) for r in facts):
+            if (len(facts) == covered.row_count == len({r.entity_id for r in facts})
+                    and all(math.isfinite(r.value) for r in facts)):
                 if key.endswith("Rate") and len(facts) != 1:
                     continue
-                values[key] = math.fsum(r.value for r in facts)
-        result[name] = {"currency": currency, "metrics": values,
-            "basis": "产品表现，下单日" if dimension == PRODUCT else "利润报表，结算日，已发放"}
+                try:
+                    values[key] = math.fsum(r.value for r in facts)
+                except OverflowError:
+                    continue  # Finite rows can still sum to an unrepresentable value.
+        metric_bases = ({key: _PRODUCT_METRIC_BASES[key] for key in values if key in _PRODUCT_METRIC_BASES}
+                        if dimension == PRODUCT else dict.fromkeys(values, _SETTLEMENT_BASIS))
+        result[name] = {"currency": currency, "metrics": values, "metric_bases": metric_bases,
+            "basis": "产品表现" if dimension == PRODUCT else "利润报表，结算日，已发放"}
         if values:
             result["availability"][name] = "AVAILABLE"
     return result
