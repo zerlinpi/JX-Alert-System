@@ -2,7 +2,7 @@
 from datetime import datetime, time, timedelta, timezone
 import hashlib
 import json
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, tuple_
 
@@ -73,6 +73,9 @@ def _metric(value, code, currency):
 def alert_item(finding, *, include_dates=False):
     """Persist only the identifiers and numeric evidence shown in the alert."""
     row, signals = finding['evidence'], finding['signals']
+    intraday = row.get('intraday') is True
+    source = row.get('source')
+    observed_at = row.get('observation_captured_at')
     currency = row['currency']
     text = []
     if 'intraday_budget' in signals:
@@ -115,21 +118,47 @@ def alert_item(finding, *, include_dates=False):
         if gap:
             text.append(f'按参考点击率估算少约 {gap:.0f} 次点击')
     checks = list(dict.fromkeys(_NEXT_CHECK[code] for code in signals if code in _NEXT_CHECK))
+    headlines = [TITLES[code] for code in signals]
+    basis = []
+    if include_dates and intraday:
+        headlines = [headline.replace('今天', '观测日') for headline in headlines]
+        text = [line.replace('今天', '当日') for line in text]
+        basis.append('日内观测（非最终日报） · 店铺当地 ' + plain(row.get('report_date'), 10))
+        if observed_at:
+            basis.append('采样时间 ' + plain(observed_at, 42))
+    elif include_dates:
+        if TRAFFIC.intersection(signals):
+            basis.append('流量日报 · 店铺当地 ' + plain(row.get('report_date'), 10))
+        if set(signals) - TRAFFIC:
+            window = row.get('attribution_days')
+            suffix = f' · {window} 天归因' if type(window) is int and window > 0 else ''
+            basis.append('转化成熟日 · 店铺当地 ' + plain(row.get('mature_date'), 10) + suffix)
+    if source:
+        basis.append('来源：领星广告日内观测' if intraday else '来源：领星广告日报')
     return {field: row[field] for field in ('store_id', 'ad_type', 'campaign_id')} | {
         'store': plain(row['store_name'], 64), 'campaign': plain(row['campaign_name'], 105),
-        'signal': '；'.join(TITLES[code] for code in signals), 'numbers': '\n'.join(text),
+        'signal': '；'.join(headlines), 'numbers': '\n'.join(text),
+        'basis': '\n'.join(basis),
         'next_check': '；'.join(checks[:2]),
+        **({'live_observation': {'day': row.get('report_date'), 'captured_at': observed_at,
+            'daily_budget': row.get('verified_daily_budget') if 'intraday_budget' in signals else None}}
+           if intraday and source == 'lingxing_sp_intraday_observation' else {}),
     }
 
 
 def _advertising_card_with_items(items, *, title='广告异常', store_mentions=None):
     def render(rows):
-        checks = [(i['store'] + '\n' + i['campaign'],
-            i['signal'] + ('\n先查 ' + i['next_check'] if i.get('next_check') else ''), i['numbers']) for i in rows]
+        has_basis = any('basis' in i for i in rows)
+        checks = [(i['store'] + '\n' + i['campaign']
+                   + (f"\n{i['ad_type'].upper()} · 活动 {i['campaign_id']}" if 'basis' in i else ''),
+            i['signal'] + ('\n先查 ' + i['next_check'] if i.get('next_check') else ''),
+            '\n'.join(part for part in (i.get('basis'), i['numbers']) if part)) for i in rows]
         notes = [f'另有 {len(items) - len(rows)} 项异常已保留记录。'] if len(rows) < len(items) else []
-        value = card(title, subtitle='', sections=[('', ['店铺／活动', '异常', '关键数据'], checks)],
-                     notes=notes, color='orange')
-        value['body']['elements'].pop(0)
+        scope = f"{len({i['store_id'] for i in rows})} 家店铺 · {len(rows)} 个活动待复核"
+        headers = ['店铺／活动', '问题与先查项', '证据／日期'] if has_basis else ['店铺／活动', '异常', '关键数据']
+        value = card(title, subtitle=scope, sections=[('', headers, checks)], notes=notes, color='orange')
+        if not has_basis:
+            value['body']['elements'].pop(0)
         if store_mentions:
             mentions = list(dict.fromkeys(uid for row in rows for uid in store_mentions.get(row['store_id'], ())))
             value = with_mentions(value, mentions)
@@ -187,6 +216,21 @@ def _write_batch(db, bucket, destination, items, day, *, group, routing, overnig
     return row.id
 
 
+def _live_observation_current(item, campaign, store, now):
+    evidence = item.get('live_observation')
+    if evidence is None:
+        return True  # Frozen drafts from earlier versions have no new observation metadata.
+    try:
+        captured = datetime.fromisoformat(evidence['captured_at'])
+        report_day = now.astimezone(ZoneInfo(store.timezone)).date().isoformat()
+    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+        return False
+    if captured.tzinfo is None or not timedelta(0) <= now - captured <= timedelta(minutes=75):
+        return False
+    budget = evidence.get('daily_budget')
+    return evidence.get('day') == report_day and (budget is None or budget == campaign.budget)
+
+
 def eligible_items(db, settings, items, now, *, refreshed_since=None):
     ids = {campaign_identity(i) for i in items}
     if not ids:
@@ -199,13 +243,14 @@ def eligible_items(db, settings, items, now, *, refreshed_since=None):
     if refreshed_since is not None:
         earliest = max(earliest, refreshed_since.astimezone(timezone.utc).replace(tzinfo=None))
     controls = notification_states(settings, {item[0] for item in ids})
-    ready = set()
-    for campaign in db.scalars(select(Campaign).join(Store, Store.sid == Campaign.store_id).where(
+    ready = {}
+    for campaign, store in db.execute(select(Campaign, Store).join(Store, Store.sid == Campaign.store_id).where(
             Store.status == 1, Campaign.state == 'enabled',
             Campaign.updated_at.between(earliest, clock),
             tuple_(Campaign.store_id, Campaign.campaign_type, Campaign.campaign_id).in_(ids))):
-        ready.add((campaign.store_id, campaign.campaign_type, campaign.campaign_id))
+        ready[(campaign.store_id, campaign.campaign_type, campaign.campaign_id)] = (campaign, store)
     return [i for i in items if campaign_identity(i) in ready and controls[i['store_id']][0]
+            and _live_observation_current(i, *ready[campaign_identity(i)], now)
             and i.get('skill_fingerprint') == skill_fingerprint(skills.for_campaign(
                 i['store_id'], i['ad_type'], i['campaign_id']))
             and (controls[i['store_id']][1] is None

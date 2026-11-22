@@ -118,6 +118,29 @@ def test_hourly_rechecks_active_campaigns_without_repeating_delivered_alerts(war
         }
 
 
+def test_hourly_rechecks_exact_signal_not_just_evidence_id(warehouse, monkeypatch):
+    original = monitor.build_ad_review_context
+    passes = 0
+
+    def revised_signals(*args, **kwargs):
+        nonlocal passes
+        passes += 1
+        context = original(*args, **kwargs)
+        if passes == 2:
+            # This is the same fact ID and campaign, but the model-selected
+            # signal is no longer supported by the fresh delivery policy.
+            for row in context['campaigns']:
+                row['material_signals'] = ['CPC']
+        return context
+
+    monkeypatch.setattr(monitor, 'build_ad_review_context', revised_signals)
+    result = run(warehouse)
+    assert result['status'] == 'PARTIAL_FAILED'
+    assert not result['outbox_ids'] and result['finding_count'] == 0
+    with warehouse[1]() as db:
+        assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+
+
 def test_source_failure_waits_before_retry_and_retains_job(warehouse):
     class Failed:
         def get_stores(self):
@@ -447,7 +470,7 @@ def test_same_campaign_groups_current_budget_risk_before_mature_finding(warehous
         row_id, = hourly_ads.queue_hourly_findings(db, settings, [daily, budget],
             now=CLOCK, slot='paired-risks', send_alerts=True)
         item, = db.get(NotificationOutbox, row_id).payload['hourly_items']
-        assert item['signal'] == hourly_ads.TITLES['intraday_budget']
+        assert item['signal'] == '观测日的花费远超平均日预算'
         assert '比当前日预算多 美元 49.08' in item['numbers']
 
 
@@ -466,8 +489,8 @@ def test_single_day_no_clicks_has_independent_evidence_and_table(warehouse):
         payload = db.get(NotificationOutbox, row_id).payload
         table, = [x for x in payload['card']['body']['elements'] if x['tag'] == 'table']
         row, = table['rows']
-        assert '今天有大量曝光，点击仍为零' in row['c1']
-        assert '今天曝光 10,000' in row['c2'] and '今天点击 0' in row['c2']
+        assert '观测日有大量曝光，点击仍为零' in row['c1']
+        assert '当日曝光 10,000' in row['c2'] and '当日点击 0' in row['c2']
         assert '订单' not in row['c2'] and '参考' not in row['c2']
 
 
@@ -532,3 +555,30 @@ def test_existing_night_summary_does_not_wait_for_new_ad_analysis_and_survives_r
         assert job.metadata_json['error_phase'] == 'advertising_evidence'
     recovered = run(warehouse, now=morning + timedelta(minutes=5))
     assert recovered['status'] == 'SUCCEEDED' and recovered['outbox_ids'][0] == 123
+
+def test_hourly_card_preserves_activity_date_basis_and_maturity():
+    finding = _finding('5174', '42', day='2026-11-18')
+    finding['evidence'].update(source='lingxing_ads_sp', attribution_days=7)
+    item = hourly_ads.alert_item(finding, include_dates=True)
+    rendered = hourly_ads.advertising_card([item])
+    table, = [e for e in rendered['body']['elements'] if e['tag'] == 'table']
+    row, = table['rows']
+    assert 'SP · 活动 42' in row['c0']
+    assert '转化成熟日 · 店铺当地 2026-11-11 · 7 天归因' in row['c2']
+    assert '来源：领星广告日报' in row['c2']
+    assert '估算' not in row['c2']
+    assert '1 家店铺 · 1 个活动待复核' in json.dumps(rendered, ensure_ascii=False)
+
+
+@pytest.mark.parametrize('minutes,day,budget,valid', [
+    (20, '2026-11-17', 25, True), (76, '2026-11-17', 25, False),
+    (20, '2026-11-16', 25, False), (20, '2026-11-17', 20, False),
+])
+def test_intraday_evidence_window_and_budget_are_rechecked(minutes, day, budget, valid):
+    observed = (CLOCK - timedelta(minutes=minutes)).isoformat()
+    item = {'live_observation': {'day': day, 'captured_at': observed, 'daily_budget': budget}}
+    from types import SimpleNamespace
+
+    store = SimpleNamespace(timezone='America/Los_Angeles')
+    campaign = SimpleNamespace(budget=25)
+    assert hourly_ads._live_observation_current(item, campaign, store, CLOCK) is valid

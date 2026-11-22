@@ -324,25 +324,41 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     model_usage.append(audit)
             # Models do not grant a delivery right. Recheck fresh active master data.
             phase = 'evidence_recheck'
+            rechecked_at = now or _utcnow()
             refreshed_skills = load_ad_review_skills(settings)
-            refreshed = build_ad_review_context(db, settings, ready, dates, now=now or _utcnow(),
+            refreshed = build_ad_review_context(db, settings, ready, dates, now=rechecked_at,
                 skills=refreshed_skills)
-            valid_ids = {r['evidence_id'] for r in refreshed['campaigns'] if r['current_state'] == '投放中'}
-            refreshed_history = {campaign_identity(r) for r in refreshed['campaigns'] if r['current_state'] == '投放中'}
+            active = [r for r in refreshed['campaigns'] if r['current_state'] == '投放中']
+            refreshed_history = {campaign_identity(r) for r in active}
+            rechecked = [(r, automatic_sp_signals(r)) for r in active]
             for sid, snapshot_id in intraday_snapshots.items():
                 snapshot = db.get(RawSnapshot, snapshot_id)
                 if snapshot:
-                    valid_ids.update(r['evidence_id'] for r in intraday_risk_candidates(
-                        db, db.get(Store, sid), snapshot, now=now or _utcnow(), skills=refreshed_skills)
-                        if automatic_sp_signals(r, has_mature_history=campaign_identity(r) in refreshed_history))
+                    rechecked.extend((r, automatic_sp_signals(
+                        r, has_mature_history=campaign_identity(r) in refreshed_history))
+                        for r in intraday_risk_candidates(
+                            db, db.get(Store, sid), snapshot, now=rechecked_at, skills=refreshed_skills))
+            # IDs bind collected facts, but some automatic eligibility gates
+            # (including a verified mature history for intraday) are external
+            # to the ID. Check exact selected codes against fresh policy too.
+            valid = {}
+            for row, signals in rechecked:
+                key = row['evidence_id']
+                if key in valid:
+                    valid[key] = None
+                else:
+                    valid[key] = (campaign_identity(row), frozenset(signals))
             checked = []
             for finding in findings:
                 r = finding['evidence']
+                supported = valid.get(r['evidence_id'])
+                if (not supported or supported[0] != campaign_identity(r)
+                        or not set(finding['signals']) <= supported[1]):
+                    continue
                 campaign = db.scalar(select(Campaign).where(Campaign.store_id == r['store_id'],
                     Campaign.campaign_type == r['ad_type'], Campaign.campaign_id == r['campaign_id']))
                 store = db.get(Store, r['store_id'])
-                if (store and store.status == 1 and campaign and campaign.state == 'enabled'
-                        and r['evidence_id'] in valid_ids):
+                if store and store.status == 1 and campaign and campaign.state == 'enabled':
                     checked.append(finding)
             phase = 'notification_queue'
             delivery_clock = now or _utcnow()

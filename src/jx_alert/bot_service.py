@@ -941,7 +941,8 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
         meta['ad_review_audit'] = {'eligible_campaigns': len(context['campaigns']), 'candidate_campaigns': 0, 'batches': 0}
         return _complete_question(db, settings, job_id, meta, review_cards([]), 'ad_review_no_findings')
     # A fingerprint includes exact facts, dates and policy, not just shop names.
-    key = review_cache_key(context, question, settings.deepseek_model)
+    from jx_alert.ai.deepseek_config import cache_identity
+    key = review_cache_key(context, question, cache_identity(settings))
     cached = db.scalar(select(SyncJob).where(SyncJob.job_type == 'feishu_question',
         SyncJob.status == 'SUCCEEDED', SyncJob.finished_at >= clock.replace(tzinfo=None) - timedelta(minutes=10),
         SyncJob.metadata_json['chat_id'].as_string() == meta['chat_id'],
@@ -976,7 +977,7 @@ def _review_ad_question(db, settings, job_id, meta, stores, factory):
         # An invalidated snapshot cannot be delivered as a current finding.
         current_stores = list(db.scalars(select(Store).where(Store.sid.in_([s.sid for s in stores]), Store.status == 1)))
         if {s.sid for s in current_stores} != {s.sid for s in stores} or review_cache_key(
-                evidence(), question, settings.deepseek_model) != key:
+                evidence(), question, cache_identity(settings)) != key:
             raise DeepSeekError('广告证据已更新，请重新提问。')
         if not audit.get('model_failures'):
             meta['ad_review_cache_key'] = key
@@ -1030,6 +1031,7 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
     if not settings.feishu_bot_enabled or settings.app_dry_run or not settings.feishu_enabled:
         return {"status": "DISABLED"}
     from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError, analysis_cache_key
+    from jx_alert.ai.deepseek_config import cache_identity
     factory = client_factory or DeepSeekClient.from_settings
     with database_job_lock(warehouse_engine, "feishu_question_worker"):
         with session_factory() as db:
@@ -1120,7 +1122,7 @@ def process_one_question(settings, session_factory, warehouse_engine, *, client_
                 else:
                     meta.update({key: context[key] for key in ("report_date", "requested_report_date", "date_selection")})
                     try:
-                        cache_key = analysis_cache_key(context, meta["question"], settings.deepseek_model)
+                        cache_key = analysis_cache_key(context, meta["question"], cache_identity(settings))
                     except DeepSeekError:
                         # Preserve the ordinary data-card fallback when model
                         # input is too large or rejected; never cache this case.

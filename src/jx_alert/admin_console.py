@@ -23,6 +23,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
 from jx_alert import admin_ad_subscribers, admin_data, admin_groups, admin_mapping, admin_sources, store_controls
+from jx_alert import admin_review_skills
+from jx_alert.ai import deepseek_config
 from jx_alert.lingxing.source_credentials import SourceCredentialsError
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
 from jx_alert.storage.db import SessionLocal
@@ -190,7 +192,8 @@ class OwnerConsole:
 
     async def asset(self, request):
         name = request.path_params["asset"]
-        mime = {"console.css": "text/css", "console.js": "text/javascript"}
+        mime = {"console.css": "text/css", "console.js": "text/javascript",
+                "review-skills.js": "text/javascript"}
         if not self._valid_host(request) or name not in mime:
             return _error("资源不存在。", 404)
         return Response(self._asset(name), media_type=mime[name], headers=_HEADERS)
@@ -451,6 +454,14 @@ class OwnerConsole:
                     if not self._rate_allowed(request, "data-sources-write", per_ip=6, total=12):
                         raise ConsoleError("数据源更新太频繁，请稍后重试。", 429)
                     data = await asyncio.to_thread(admin_sources.save_data_source, self.settings, payload)
+                elif path == "/console/api/deepseek":
+                    if not self._rate_allowed(request, "deepseek-write", per_ip=6, total=12):
+                        raise ConsoleError("DeepSeek 设置更新太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(deepseek_config.save_configuration, self.settings, payload)
+                elif path == "/console/api/review-skills":
+                    if not self._rate_allowed(request, "review-skills-write", per_ip=6, total=12):
+                        raise ConsoleError("分析技能更新太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(admin_review_skills.install_review_skill, self.settings, payload)
                 elif path in {"/console/api/notification-group", "/console/api/notification-group/preview"}:
                     preview = path.endswith("/preview")
                     expected_fields = {"chat_id", "revision"} if preview else {"chat_id", "revision", "confirmed"}
@@ -492,6 +503,10 @@ class OwnerConsole:
                                               include_members=members)
             elif path == "/console/api/data-sources":
                 data = await asyncio.to_thread(admin_sources.get_data_sources, self.settings)
+            elif path == "/console/api/deepseek":
+                data = await asyncio.to_thread(deepseek_config.configuration, self.settings)
+            elif path == "/console/api/review-skills":
+                data = await asyncio.to_thread(admin_review_skills.get_review_skills, self.settings)
             elif path.startswith("/console/api/notification-group"):
                 if path.endswith("/chats"):
                     if not self._rate_allowed(request, "notification-group-list", per_ip=12, total=24):
@@ -515,7 +530,7 @@ class OwnerConsole:
             return JSONResponse(data, headers=_HEADERS)
         except ConsoleError as exc:
             return _error(exc.detail, exc.status)
-        except SourceCredentialsError as exc:
+        except (SourceCredentialsError, deepseek_config.DeepSeekConfigError, admin_review_skills.ReviewSkillError) as exc:
             return _error(exc.detail, exc.status_code)
         except admin_mapping.MappingError as exc:
             return _error(exc.detail, exc.status_code)
@@ -530,6 +545,8 @@ class OwnerConsole:
                 Route("/console/login", self.login, methods=["GET", "POST"]),
                 Route("/console/assets/{asset}", self.asset), Route("/console/api/stores", self.api),
                 Route("/console/api/data-sources", self.api, methods=["GET", "POST"]),
+                Route("/console/api/deepseek", self.api, methods=["GET", "POST"]),
+                Route("/console/api/review-skills", self.api, methods=["GET", "POST"]),
                 Route('/console/api/ad-alert-subscribers', self.api, methods=['GET', 'POST']),
                 Route('/console/api/ad-alert-subscribers/members', self.api),
                 Route("/console/api/notification-group", self.api, methods=["GET", "POST"]),

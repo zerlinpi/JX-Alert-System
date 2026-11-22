@@ -4,6 +4,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
@@ -23,16 +24,27 @@ def _json_file(path):
 
 def group_bot_status(settings):
     """Read activation flags without resetting MCP's cached OAuth configuration."""
+    from jx_alert.ai.deepseek_config import DeepSeekConfigError, configuration
+
     runtime = _json_file(getattr(settings, "runtime_settings_file", ""))
     def value(key, fallback):
         configured = getattr(settings, key, fallback)
         latest = runtime.get(key, configured)
         return latest if type(latest) is type(fallback) else configured
-    key_file = value("deepseek_credentials_file", "/app/data/secrets/deepseek.json")
+    model = value("deepseek_model", "deepseek-flash")
+    try:
+        deepseek = configuration(SimpleNamespace(
+            deepseek_credentials_file=value("deepseek_credentials_file", "/app/data/secrets/deepseek.json"),
+            deepseek_api_key=getattr(settings, "deepseek_api_key", ""),
+            deepseek_model=model,
+            deepseek_request_timeout=getattr(settings, "deepseek_request_timeout", 45.0),
+        ))
+    except DeepSeekConfigError:
+        deepseek = {"configured": False, "model": None}
     return {
         "feishu_bot_enabled": value("feishu_bot_enabled", False),
-        "deepseek_credentials_present": bool(getattr(settings, "deepseek_api_key", "")) or Path(key_file).is_file(),
-        "deepseek_model": value("deepseek_model", "deepseek-flash"),
+        "deepseek_credentials_present": deepseek["configured"],
+        "deepseek_model": deepseek["model"] or model,
         "excel_archive_enabled": value("excel_archive_enabled", False),
         "excel_archive_directory": value("excel_archive_dir", "/app/data/excel"),
         "bot_status_check_scope": "configuration_only",
