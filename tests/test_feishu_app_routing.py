@@ -428,3 +428,254 @@ def test_enabling_fallback_does_not_replay_history_and_explicit_repair_reuses_de
         assert result["status"] == "SUPERSEDED" and result["outbox_ids"] == [group.id]
         assert len(db.scalars(select(NotificationOutbox)).all()) == 2
         assert (group.status, group.attempts) == ("DELIVERED", 1)
+
+
+def _enqueue_sku_card(Session, *, sku="SKU-1", scope="s:sales:sku_msku", metrics=None):
+    with Session.begin() as db:
+        event = AnomalyEvent(
+            store_id="s", entity_id=sku, dedupe_key=f"{scope}:subject", rule="orders_decrease",
+            severity="P1", status="NEW", evaluation_scope=scope, reason="订单下降",
+            metrics={"current": 1, "baseline_7d": 10, **(metrics or {})},
+        )
+        db.add(event)
+        db.flush()
+        for _ in range(2):
+            service.enqueue_anomaly_notifications(db, [event])
+
+
+def _capture_sku_wire(monkeypatch):
+    """Use real message serialization, write-ahead fence and receipt validation, no network."""
+    calls = []
+
+    def post(client, path, payload, **kwargs):
+        if path == client._TOKEN_PATH:
+            return {"code": 0, "tenant_access_token": "synthetic", "expire": 7200}
+        assert path == client._MESSAGE_PATH
+        assert kwargs["params"] == {"receive_id_type": "chat_id"}
+        assert payload["msg_type"] == "interactive"
+        calls.append((payload["receive_id"], json.loads(payload["content"])))
+        return {"code": 0, "data": {"message_id": "om_synthetic"}}
+
+    monkeypatch.setattr(app_module.FeishuAppClient, "_post_json", post)
+    return calls
+
+
+def _wire_mentions(card):
+    return [element["content"] for element in card["body"]["elements"]
+            if element["tag"] == "markdown" and "<at " in element["content"]]
+
+
+@pytest.mark.parametrize("ad", [False, True], ids=["msku-sales", "advertised-msku"])
+def test_exact_sku_card_and_mentions_do_not_expand_to_asin_or_sibling_owners(setup, monkeypatch, ad):
+    Session, settings, config, path = setup
+    config.update(management={"severities": []}, entities={
+        "s:SKU-1": {"chat_id": "operations", "open_ids": ["ou_actual", "ou_configured", "ou_nonmember"]},
+        "s:B0SHARED": ["ou_sibling_asin_owner"],
+        # Store-local ownership wins over this legacy, global SKU mapping.
+        "SKU-1": ["ou_global"], "other:SKU-1": ["ou_other_store"],
+    })
+    config["groups"]["operations"]["verified_member_open_ids"] = [
+        "ou_admin", "ou_operator", "ou_actual", "ou_configured", "ou_sibling_asin_owner",
+        "ou_sibling", "ou_global", "ou_other_store",
+    ]
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with Session.begin() as db:
+        db.add_all([
+            Product(store_id="s", seller_sku="SKU-1", asin="B0SHARED", owner_open_ids=["ou_actual", "ou_admin"]),
+            Product(store_id="s", seller_sku="SIBLING", asin="B0SHARED", owner_open_ids=["ou_sibling"]),
+            Product(store_id="other", seller_sku="SKU-1", asin="B0SHARED", owner_open_ids=["ou_sibling"]),
+            # A refreshed ad link is not evidence that the old incident affected this sibling.
+            AdProduct(store_id="s", campaign_type="sp", campaign_id="campaign", ad_id="ad",
+                      seller_sku="SIBLING", asin="B0SHARED"),
+        ])
+    if ad:
+        _enqueue_sku_card(Session, scope="s:product_ad:sp", metrics={
+            "seller_sku": "SKU-1", "asin": "B0SHARED", "ad_id": "ad", "campaign_id": "campaign"})
+    else:
+        _enqueue_sku_card(Session)
+    calls = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == 1
+    assert worker.process_outbox_batch()["claimed"] == 0
+    [(chat, card)] = calls
+    assert chat == "oc_operations"
+    assert _wire_mentions(card) == [
+        "负责人：<at id=ou_admin></at> <at id=ou_operator></at> <at id=ou_actual></at> <at id=ou_configured></at>"]
+    contents = json.dumps(card, ensure_ascii=False)
+    assert "商品编码 SKU-1" in contents and "B0SHARED" in contents
+    assert "SIBLING" not in contents
+    with Session() as db:
+        [row] = db.scalars(select(NotificationOutbox)).all()
+        assert row.status == "DELIVERED" and row.attempts == 1
+        assert db.scalar(select(NotificationLog)).message_id == "om_synthetic"
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_missing_exact_sku_cannot_borrow_same_named_asin_for_card_or_owner(setup, monkeypatch, fallback):
+    Session, settings, config, path = setup
+    config.update(stores={}, management={"severities": []})
+    settings.feishu_group_fallback_enabled = fallback
+    settings.feishu_daily_report_chat_id = "test"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with Session.begin() as db:
+        db.add(Product(store_id="s", seller_sku="OTHER-SKU", asin="SKU-1", owner_open_ids=["ou_other"]))
+    _enqueue_sku_card(Session)
+    calls = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == int(fallback)
+    if fallback:
+        [(chat, card)] = calls
+        assert chat == "oc_test" and _wire_mentions(card) == []
+        assert "商品编码 SKU-1" in json.dumps(card, ensure_ascii=False)
+    else:
+        assert not calls
+    with Session() as db:
+        [row] = db.scalars(select(NotificationOutbox)).all()
+        assert "OTHER-SKU" not in str(row.payload["card"])
+        assert row.status == ("DELIVERED" if fallback else "ROUTING_FAILED")
+        if not fallback:
+            assert row.last_error == "missing_operations_owner"
+
+
+@pytest.mark.parametrize("member", [True, False])
+def test_global_exact_sku_mapping_used_only_as_configured_and_with_group_roster(setup, monkeypatch, member):
+    Session, settings, config, path = setup
+    settings.feishu_group_fallback_enabled = True
+    settings.feishu_daily_report_chat_id = "test"
+    config.update(stores={}, management={"severities": []}, entities={
+        "SKU-1": {"chat_id": "operations", "open_ids": ["ou_legacy_exact"]}})
+    config["groups"]["operations"]["verified_member_open_ids"] = (
+        ["ou_admin", "ou_legacy_exact"] if member else ["ou_admin"])
+    path.write_text(json.dumps(config), encoding="utf-8")
+    _enqueue_sku_card(Session)
+    calls = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == 1
+    [(chat, card)] = calls
+    assert chat == ("oc_operations" if member else "oc_test")
+    assert _wire_mentions(card) == (
+        ["负责人：<at id=ou_admin></at> <at id=ou_legacy_exact></at>"] if member else [])
+
+
+def test_missing_advertised_sku_does_not_substitute_shared_asin_for_owner(setup, monkeypatch):
+    Session, settings, config, path = setup
+    settings.feishu_group_fallback_enabled = True
+    settings.feishu_daily_report_chat_id = "test"
+    config.update(stores={}, management={"severities": []}, entities={"s:B0SHARED": ["ou_asin_owner"]})
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with Session.begin() as db:
+        db.add(Product(store_id="s", seller_sku="OTHER", asin="B0SHARED", owner_open_ids=["ou_other"]))
+    _enqueue_sku_card(Session, scope="s:product_ad:sd",
+                      metrics={"seller_sku": "SKU-1", "ad_id": "ad", "asin": "B0SHARED"})
+    calls = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == 1
+    [(chat, card)] = calls
+    assert chat == "oc_test" and not _wire_mentions(card)
+    assert "商品编码 SKU-1" in json.dumps(card, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("actual_store,actual_sku", [("s", "sku-1"), ("s", "SKU-1 "), ("S", "SKU-1")])
+def test_exact_product_rejects_sql_collation_near_matches(actual_store, actual_sku):
+    from sqlalchemy import MetaData, String, event
+    from jx_alert.product_identity import exact_store_product
+
+    engine = create_engine("sqlite://")
+
+    @event.listens_for(engine, "connect")
+    def add_collation(conn, _record):
+        def compare(a, b):
+            a, b = a.casefold().rstrip(" "), b.casefold().rstrip(" ")
+            return (a > b) - (a < b)
+
+        conn.create_collation("CASE_AND_PAD_INSENSITIVE", compare)
+
+    # Emulate relevant production collation behavior without depending on a
+    # server or mutating the application's shared model metadata.
+    table = Product.__table__.to_metadata(MetaData())
+    for col in (table.c.store_id, table.c.seller_sku):
+        col.type = String(col.type.length, collation="CASE_AND_PAD_INSENSITIVE")
+    table.create(engine)
+    with sessionmaker(bind=engine).begin() as db:
+        db.add(Product(store_id=actual_store, seller_sku=actual_sku, owner_open_ids=["ou_wrong"]))
+        db.flush()
+        assert db.scalar(select(Product).where(Product.store_id == "s", Product.seller_sku == "SKU-1"))
+        assert exact_store_product(db, "s", "SKU-1") is None
+    engine.dispose()
+
+
+def test_empty_scoped_msku_route_does_not_forward_store_owner_to_global_group(setup, monkeypatch):
+    Session, _, config, path = setup
+    # No verified_member_open_ids on either group: we cannot rely on filtering a
+    # wrongly addressed card. The store's selected group is not the default.
+    config["default_chat_id"] = "test"
+    config["groups"]["test"]["admin_open_ids"] = ["ou_global_admin"]
+    config["stores"]["s"]["chat_id"] = "operations"
+    config.update(management={"severities": []}, entities={
+        "s:SKU-1": {},
+        "SKU-1": {"chat_id": "test", "open_ids": ["ou_global_owner"]},
+    })
+    path.write_text(json.dumps(config), encoding="utf-8")
+    _enqueue_sku_card(Session)
+    calls = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == 1
+    [(chat, card)] = calls
+    assert chat == "oc_operations"
+    assert _wire_mentions(card) == ["负责人：<at id=ou_admin></at> <at id=ou_operator></at>"]
+
+
+def test_unused_global_msku_route_is_not_read_by_scoped_incident_planner(setup):
+    Session, settings, config, path = setup
+    config.update(management={"severities": []}, entities={
+        "s:SKU-1": {"open_ids": ["ou_scoped"]},
+        "SKU-1": {"chat_id": "unknown", "open_ids": ["not-an-id"]},
+    })
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with Session() as db:
+        [destination] = application_deliveries(
+            db, settings, store_id="s", entity_id="SKU-1", metrics={},
+            scope="s:sales:sku_msku", severity="P1", status="NEW",
+        )
+    # The worker still applies its existing full-file safety validation.
+    assert destination["receive_id"] == "oc_operations"
+    assert destination["open_ids"] == ["ou_admin", "ou_operator", "ou_scoped"]
+
+
+@pytest.mark.parametrize("kind", ["scoped_asin", "global_asin", "global_colon"])
+def test_ambiguous_raw_msku_route_cannot_redirect_exact_incident_card(setup, monkeypatch, kind):
+    Session, _, config, path = setup
+    sku = "other:SKU-1" if kind == "global_colon" else "SKU-1"
+    config["groups"]["test"]["admin_open_ids"] = ["ou_unrelated_admin"]
+    config["stores"]["s"]["chat_id"] = "operations"
+    wrong = {"chat_id": "test", "open_ids": ["ou_wrong"]}
+    config.update(management={"severities": []}, entities={sku: wrong})
+    if kind == "scoped_asin":
+        config["entities"][f"s:{sku}"] = wrong
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with Session.begin() as db:
+        db.add(Product(store_id="s", seller_sku=sku, asin="B0ACTUAL", owner_open_ids=["ou_actual"]))
+        if kind != "global_colon":
+            db.add(Product(store_id="s" if kind == "scoped_asin" else "other",
+                           seller_sku="OTHER", asin=sku, owner_open_ids=["ou_wrong"]))
+    _enqueue_sku_card(Session, sku=sku)
+    calls = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == 1
+    [(chat, card)] = calls
+    assert chat == "oc_operations"
+    assert _wire_mentions(card) == ["负责人：<at id=ou_admin></at> <at id=ou_operator></at> <at id=ou_actual></at>"]
+    content = json.dumps(card, ensure_ascii=False)
+    assert f"商品编码 {sku} / 商品编号 B0ACTUAL" in content
+    assert "商品编码 OTHER" not in content
+
+
+def test_exact_ad_card_retains_incident_asin_if_product_has_since_changed(setup, monkeypatch):
+    Session, _, config, path = setup
+    config["management"] = {"severities": []}
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with Session.begin() as db:
+        db.add(Product(store_id="s", seller_sku="SKU-1", asin="B0NEW", owner_open_ids=["ou_actual"]))
+    _enqueue_sku_card(Session, scope="s:product_ad:sp",
+                      metrics={"seller_sku": "SKU-1", "ad_id": "ad", "asin": "B0ORIGINAL"})
+    calls = _capture_sku_wire(monkeypatch)
+    assert worker.process_outbox_batch()["sent"] == 1
+    [(chat, card)] = calls
+    assert chat == "oc_operations"
+    identity = json.dumps(card, ensure_ascii=False)
+    assert "商品编码 SKU-1 / 商品编号 B0ORIGINAL" in identity
+    assert "B0NEW" not in identity

@@ -8,6 +8,9 @@ from pathlib import Path
 
 from sqlalchemy import or_, select
 
+from jx_alert.product_identity import (
+    ambiguous_legacy_product_key, exact_store_product, incident_seller_sku,
+)
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import AdProduct, Product
 
@@ -305,11 +308,28 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
         not isinstance(routing.get(section, {}), dict) for section in ("stores", "entities")
     ):
         raise ApplicationRoutingError("invalid_group_mapping")
-    entity_key = str(metrics.get("seller_sku") or metrics.get("asin") or entity_id)
-    for section, key in (("stores", store_id), ("entities", f"{store_id}:{entity_key}"),
-                         ("entities", entity_key)):
-        _application_route_entry(routing.get(section, {}), key, groups)
-    chat_alias = _route_chat_id(routing, store_id, entity_key)
+    sku = incident_seller_sku(store_id, entity_id, metrics, scope)
+    entity_key = sku or str(metrics.get("seller_sku") or metrics.get("asin") or entity_id)
+    stores, entities = routing.get("stores", {}), routing.get("entities", {})
+    scoped_key = f"{store_id}:{entity_key}"
+    store_route = _application_route_entry(stores, store_id, groups)
+    if sku is not None:
+        # A scoped entry (even empty or ambiguous) shadows the bare key. Raw
+        # routing keys can label either a SKU or an ASIN, so only use an
+        # unambiguous entry for either the destination or product mentions.
+        product_route = {}
+        if scoped_key in entities:
+            if not ambiguous_legacy_product_key(db, store_id, sku, scoped=True):
+                product_route = _application_route_entry(entities, scoped_key, groups)
+        elif (sku in entities and ":" not in sku
+              and not ambiguous_legacy_product_key(db, store_id, sku, scoped=False)):
+            product_route = _application_route_entry(entities, sku, groups)
+        chat_alias = (product_route.get("chat_id") or store_route.get("chat_id")
+                      or routing.get("default_chat_id", "default"))
+    else:
+        _application_route_entry(entities, scoped_key, groups)
+        _application_route_entry(entities, entity_key, groups)
+        chat_alias = _route_chat_id(routing, store_id, entity_key)
     if not isinstance(chat_alias, str):
         raise ApplicationRoutingError("invalid_group_mapping")
     group = groups.get(chat_alias, {})
@@ -323,6 +343,28 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
     except ValueError:
         raise ApplicationRoutingError("invalid_default_mentions") from None
     admin_ids = default_ids + _app_open_ids(group.get("admin_open_ids", []))
+    if sku is not None:
+        # Keep store contacts and the exact SKU mapping, not contacts belonging
+        # to its shared ASIN or to a different product now linked to an old ad.
+        product = exact_store_product(db, store_id, sku)
+        owner_ids = [*store_route.get("open_ids", []), *product_route.get("open_ids", [])]
+        if product is not None:
+            owner_ids.extend(_app_open_ids(product.owner_open_ids or []))
+    else:
+        owner_ids = _other_entity_owners(db, routing, groups, store_id, entity_id, entity_key, metrics, scope)
+    owner_ids = list(dict.fromkeys(owner_ids))
+    admin_ids = group_member_mentions(group, admin_ids)
+    owner_ids = group_member_mentions(group, owner_ids)
+    if not owner_ids:
+        raise ApplicationRoutingError("missing_operations_owner")
+    if not admin_ids:
+        raise ApplicationRoutingError("missing_group_administrator")
+    mentions = list(dict.fromkeys(admin_ids + owner_ids))
+    return bind_group_delivery(routing, chat_alias, {
+        "role": "group", "receive_id": chat_id, "receive_id_type": "chat_id", "open_ids": mentions})
+
+
+def _other_entity_owners(db, routing, groups, store_id, entity_id, entity_key, metrics, scope):
     owner_ids = []
     keys = {str(value) for value in (entity_key, metrics.get("seller_sku"), metrics.get("asin")) if value}
     # Each advertised MSKU resolves independently. A shared ASIN must not pull in
@@ -368,16 +410,7 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
             selected.update((product.id, product) for product in matched)
         for product in selected.values():
             owner_ids.extend(_app_open_ids(product.owner_open_ids or []))
-    owner_ids = list(dict.fromkeys(owner_ids))
-    admin_ids = group_member_mentions(group, admin_ids)
-    owner_ids = group_member_mentions(group, owner_ids)
-    if not owner_ids:
-        raise ApplicationRoutingError("missing_operations_owner")
-    if not admin_ids:
-        raise ApplicationRoutingError("missing_group_administrator")
-    mentions = list(dict.fromkeys(admin_ids + owner_ids))
-    return bind_group_delivery(routing, chat_alias, {
-        "role": "group", "receive_id": chat_id, "receive_id_type": "chat_id", "open_ids": mentions})
+    return owner_ids
 
 
 def _application_management_deliveries(settings, routing, *, store_id, severity, status):

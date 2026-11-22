@@ -286,5 +286,81 @@ def test_cli_does_not_load_ambient_runtime_settings_or_database_url(tmp_path):
     assert help_only.returncode == 0
     run = subprocess.run([sys.executable, str(SCRIPT), "--sqlite-copy", str(path),
                           "--scope-file", str(scope)], cwd=tmp_path, capture_output=True, env=env)
-    assert run.returncode == 2 and json.loads(run.stdout)["status"] == "NO_PREVIEW_VALUES"
+    report = json.loads(run.stdout)
+    assert run.returncode == 2 and report["status"] == "NO_PREVIEW_VALUES"
+    assert report["mode"] == "READ_ONLY_PREVIEW" and "reference_cutoff_at" not in report
     assert not run.stderr
+
+
+@pytest.mark.parametrize("bad", [
+    "2024-06-10", "2024-06-10T01:00:00", "2024-02-30T12:00Z", "2024-06-10T24:00Z",
+    "2024-06-10T01:00+08:60", "2024-06-10T01:00+24:00", "2024-06-10T01:00-00:00",
+    "2024-06-10x01:00Z", "2024-06-10T01:00:00.0000001Z", "0001-01-01T00:00+01:00",
+])
+def test_replay_rejects_ambiguous_or_invalid_cutoff(bad):
+    import argparse
+    with pytest.raises(argparse.ArgumentTypeError):
+        audit_cli._parse_as_of(bad)
+
+
+@pytest.mark.parametrize("value,hint", [
+    ("2024-06-10T01:00", "须为有效日期"), ("9998-01-01T00:00Z", "不能晚于实际执行时刻"),
+])
+def test_cli_rejects_invalid_or_future_cutoff_before_reading_files(tmp_path, value, hint):
+    result = subprocess.run([sys.executable, str(SCRIPT), "--scope-file", "absent.json",
+        "--sqlite-copy", "absent.sqlite", "--as-of", value], cwd=tmp_path, capture_output=True,
+        text=True, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+    assert result.returncode == 2 and result.stdout == ""
+    assert "--as-of" in result.stderr and hint in result.stderr
+    assert not list(tmp_path.iterdir())
+
+
+def test_cli_replays_reference_instant_without_relabelling_late_evidence_or_mutating_copy(tmp_path):
+    cutoff = datetime(2024, 6, 10, 1, 0, 0, 123456, tzinfo=timezone.utc)
+    la_day, tokyo_day = date(2024, 6, 9), date(2024, 6, 10)
+    path, scope = tmp_path / "sealed.sqlite", tmp_path / "scope.json"
+    scope.write_text('{"store_ids":["1","2"]}')
+    engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(path))
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        store(db, "1")
+        store(db, "2", "Asia/Tokyo")
+        partition(db, "1", PRODUCT, day=la_day, at=cutoff-timedelta(minutes=90), facts=FIELDS)
+        partition(db, "1", FINANCE, day=la_day, at=cutoff+timedelta(microseconds=1),
+                  facts={"totalSalesRefunds": -777})
+        partition(db, "2", PRODUCT, day=tokyo_day, at=cutoff-timedelta(minutes=90, microseconds=1),
+                  facts={"netAmount": 888})
+        partition(db, "2", FINANCE, day=tokyo_day, at=cutoff, facts={"totalSalesRefunds": -8})
+        db.commit()
+    engine.dispose()
+    digest = hashlib.sha256(path.read_bytes()).digest()
+    outputs = []
+    for value in ("2024-06-10T01:00:00.123456Z", "2024-06-10T09:00:00.123456+08:00"):
+        before = datetime.now(timezone.utc)
+        result = subprocess.run([sys.executable, str(SCRIPT), "--scope-file", str(scope),
+            "--sqlite-copy", str(path), "--as-of", value], cwd=tmp_path, capture_output=True,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "DATABASE_URL": "unusable"})
+        after = datetime.now(timezone.utc)
+        assert result.returncode == 2 and not result.stderr
+        report = json.loads(result.stdout)
+        assert before <= datetime.fromisoformat(report.pop("generated_at")) <= after
+        outputs.append(report)
+    assert outputs[0] == outputs[1]
+    report = outputs[0]
+    assert report["mode"] == "READ_ONLY_REPLAY" and report["reference_cutoff_at"] == cutoff.isoformat()
+    assert report["status"] == "PARTIAL_PREVIEW" and report["scope_count"] == 2
+    assert report["provider_updated_at"] is None and report["delivery_enabled"] is False
+    la, tokyo = report["groups"]
+    assert (la["report_date"], la["timezone"]) == (la_day.isoformat(), PACIFIC)
+    assert (tokyo["report_date"], tokyo["timezone"]) == (tokyo_day.isoformat(), "Asia/Tokyo")
+    assert la["stores"][0]["metrics"]["ad_spend"] == "PROVISIONAL_VALUE"
+    assert la["stores"][0]["metrics"]["refund_amount"] == "FUTURE"
+    assert tokyo["stores"][0]["metrics"]["sales"] == "STALE_CAPTURE"
+    assert tokyo["stores"][0]["metrics"]["refund_amount"] == "PROVISIONAL_VALUE"
+    assert "USD 777.00" not in text(la["cards"]) and "USD 888.00" not in text(tokyo["cards"])
+    assert "USD 20.00" in text(la["cards"]) and "USD 8.00" in text(tokyo["cards"])
+    for group in (la, tokyo):
+        for card in group["cards"]:
+            assert f"回放参考时刻 {cutoff.isoformat()}" in text(card) and "生成于" not in text(card)
+    assert hashlib.sha256(path.read_bytes()).digest() == digest
+    assert set(tmp_path.iterdir()) == {scope, path}

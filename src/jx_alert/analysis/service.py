@@ -5,6 +5,7 @@ from sqlalchemy import or_, select
 from jx_alert.config import get_settings
 from jx_alert.notifications.outbox import enqueue_notification
 from jx_alert.notifications.quiet_policy import quiet_delivery
+from jx_alert.product_identity import exact_store_product, incident_seller_sku
 from jx_alert.storage.models import AnomalyEvent, Campaign, Product, Store
 
 
@@ -153,6 +154,18 @@ def _notification_labels(db, anomaly: AnomalyEvent) -> tuple[str, str | None, st
             )
         else:
             campaign_label = f"活动编号 {campaign_id}"
+
+    sku = incident_seller_sku(anomaly.store_id, anomaly.entity_id, metrics, anomaly.evaluation_scope)
+    if sku is not None:
+        product = exact_store_product(db, anomaly.store_id, sku)
+        recorded_asin = metrics.get("asin") if ":product_ad:" in anomaly.evaluation_scope else None
+        asin = recorded_asin or (product.asin if product else None)
+        product_label = (
+            f"商品编码 {sku}"
+            + (f" / 商品编号 {asin}" if asin else "")
+            + (f" / 内部编码 {product.local_sku}" if product and product.local_sku else "")
+        )
+        return store_label, campaign_label, product_label
 
     product_label = None
     product_key = (
