@@ -1,0 +1,15 @@
+# Standalone pilot: do not merge with docker-compose.yml or reuse the production project.
+services:
+  sparkx-mcp:
+    build: .
+    command: ["python", "-m", "jx_alert.mcp_server", "--transport", "streamable-http"]
+    env_file:
+      - "${SPARKX_PILOT_ENV_FILE:?Set an absolute path to the private SparkX pilot env file}"
+    environment:
+      MCP_AUTH_MODE: bearer
+      MCP_OUTPUT_MODE: sparkx_direct
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8011"
+      MCP_PATH: /mcp
+    ports:
+      - "127.0.0.1:8011:8011"

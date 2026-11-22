@@ -75,11 +75,11 @@ def validate_performance_query(arguments: dict, allowed_profile_ids: frozenset[i
     if not isinstance(fields, list) or any(not isinstance(field, str) for field in fields):
         raise SparkXDirectError("select must be a list of SparkX field names")
     granularity = arguments.get("timeGranularity", "daily")
-    if not isinstance(granularity, str) or granularity.lower() not in {"daily", "hourly"}:
+    if not isinstance(granularity, str) or granularity.lower() not in {"", "daily", "hourly"}:
         raise SparkXDirectError("timeGranularity must be daily or hourly")
     hourly = granularity.lower() == "hourly"
-    if hourly and (fact != "campaign" or "hour" not in fields):
-        raise SparkXDirectError("Hourly campaign queries must select hour")
+    if hourly and fact != "campaign":
+        raise SparkXDirectError("Hourly granularity is supported only for campaign")
     if fact == "keywordPlacement" and "timeGranularity" in arguments:
         raise SparkXDirectError("Omit timeGranularity for keywordPlacement")
     if (end - start).days not in range(7 if hourly or fact == "keywordPlacement" else 90):

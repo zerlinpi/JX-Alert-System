@@ -39,9 +39,16 @@ def test_configured_profiles_and_daily_boundary():
     assert parse_profile_ids(f"{PROFILE}, {OTHER}") == frozenset({PROFILE, OTHER})
     allowed = frozenset({PROFILE})
     end = date(2026, 11, 20)
-    validate_performance_query(_query(dateStart=(end - timedelta(days=89)).isoformat()), allowed)
-    with pytest.raises(SparkXDirectError):
-        validate_performance_query(_query(dateStart=(end - timedelta(days=90)).isoformat()), allowed)
+    for granularity in ({}, {"timeGranularity": ""}):
+        validate_performance_query(
+            _query(factEntity="asin", dateStart=(end - timedelta(days=89)).isoformat(),
+                   **granularity), allowed
+        )
+        with pytest.raises(SparkXDirectError):
+            validate_performance_query(
+                _query(factEntity="asin", dateStart=(end - timedelta(days=90)).isoformat(),
+                       **granularity), allowed
+            )
 
 
 @pytest.mark.parametrize("value", ["not-a-profile", "0", "-1", "true"])
@@ -63,6 +70,8 @@ def test_profile_configuration_fails_closed(value):
         {"dateStart": "2026-11-31"},
         {"metrics": []},
         {"metrics": ["Spend", None]},
+        {"timeGranularity": None},
+        {"timeGranularity": "weekly"},
         {"userContext": "x" * 101},
     ],
 )
@@ -78,13 +87,12 @@ def test_query_must_specify_the_required_fields():
         validate_performance_query(query, frozenset({PROFILE}))
 
 
-def test_hourly_campaign_scope_and_inclusive_boundary():
+@pytest.mark.parametrize("selection", [{}, {"select": ["date"]}, {"select": ["date", "hour"]}])
+def test_hourly_campaign_scope_and_inclusive_boundary(selection):
     allowed = frozenset({PROFILE})
-    query = _query(timeGranularity="hourly", select=["date", "hour"])
+    query = _query(timeGranularity="hourly", **selection)
     validate_performance_query(query, allowed)
-    for change in (
-        {"select": ["date"]}, {"factEntity": "asin"}, {"dateStart": "2026-11-13"}
-    ):
+    for change in ({"factEntity": "asin"}, {"dateStart": "2026-11-13"}):
         with pytest.raises(SparkXDirectError):
             validate_performance_query({**query, **change}, allowed)
 
@@ -92,7 +100,12 @@ def test_hourly_campaign_scope_and_inclusive_boundary():
 def test_keyword_placement_has_its_own_seven_day_limit():
     allowed = frozenset({PROFILE})
     validate_performance_query(_query(factEntity="keywordPlacement"), allowed)
-    for change in ({"dateStart": "2026-11-13"}, {"timeGranularity": "daily"}):
+    for change in (
+        {"dateStart": "2026-11-13"},
+        {"timeGranularity": "daily"},
+        {"timeGranularity": "hourly"},
+        {"timeGranularity": ""},
+    ):
         with pytest.raises(SparkXDirectError):
             validate_performance_query(_query(factEntity="keywordPlacement", **change), allowed)
 
@@ -132,19 +145,30 @@ def _mock_rpc(calls, result):
     return httpx.MockTransport(handle)
 
 
-def test_sdk_handshake_and_raw_upstream_result_are_preserved():
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"timeGranularity": "hourly"},
+        {"timeGranularity": "Hourly", "select": ["date"]},
+        {"timeGranularity": ""},
+    ],
+)
+def test_sdk_handshake_and_raw_upstream_result_are_preserved(overrides):
     calls = []
     payload = {
         "content": [{"type": "text", "text": "# SparkX 原文\n\n| 花费 |\n| --- |\n| 1.20 |"}],
         "structuredContent": {"data": {"rows": [{"Spend": 1.2, "Conversions": None}]}},
         "isError": False,
     }
+    query = _query(**overrides)
+    validate_performance_query(query, frozenset({PROFILE}))
     result = asyncio.run(call_sparkx(
-        "get_ads_perf", _query(), token=TOKEN, transport=_mock_rpc(calls, payload)
+        "get_ads_perf", query, token=TOKEN, transport=_mock_rpc(calls, payload)
     ))
     assert [r["method"] for r in calls[:2]] == ["initialize", "notifications/initialized"]
     request = next(call for call in calls if call["method"] == "tools/call")
-    assert request["params"] == {"name": "get_ads_perf", "arguments": _query()}
+    assert request["params"] == {"name": "get_ads_perf", "arguments": query}
     assert result.model_dump(mode="json", by_alias=True, exclude_none=True) == payload
 
 

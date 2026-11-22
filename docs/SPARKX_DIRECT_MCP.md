@@ -20,6 +20,19 @@ JX 可以为原生 SparkXAI 广告及支持的 ASIN 经营查询提供一个独�
 4. 仅在隔离试点 MCP 进程设置 `MCP_OUTPUT_MODE=sparkx_direct`。HTTP 入口用 `MCP_AUTH_MODE=bearer`，另设 `SPARKX_RELAY_BEARER_TOKEN`（至少 32 字符，不得与 JX 原入站 Token 或 SparkX 上游 Token 相同），绑定回环或受控私有入口。不要替换现有生产 MCP、日报或 Scheduler。默认 `MCP_OUTPUT_MODE=jx` 保留现有行为。不要在多人共享进程运行 stdio 中转；stdio 的访问边界是启动进程所在的账号。
 5. 用一个批准的测试 profile 比较直接调用 SparkX 和经 JX 中转后的原生 `content` / `structuredContent`，再验证未知 profile、写工具及领星/旧 JX 工具均不可用。不要把其他人、订单或凭据的信息放在 `userContext`。还没验证真实授权与数据覆盖前，不得关闭现有通知。
 
+### Docker：独立试点，不替换原 MCP
+
+使用仓库提供的 `docker-compose.sparkx.yml` **单独**启动试点，不要和主 Compose 文件合并，不要修改生产 `.env`。在仓库之外建立仅部署账户可读的环境文件（权限 0600），填入 `SPARKX_AI_TOKEN`、`SPARKX_RELAY_BEARER_TOKEN` 和 `SPARKX_PROFILE_IDS` 三项，再从试点检出目录运行：
+
+```sh
+export SPARKX_PILOT_ENV_FILE=/absolute/private/path/sparkx-pilot.env
+docker compose -p jx-sparkx-pilot -f docker-compose.sparkx.yml build sparkx-mcp
+docker compose -p jx-sparkx-pilot -f docker-compose.sparkx.yml run --rm sparkx-mcp python -m jx_alert.sparkx_direct
+docker compose -p jx-sparkx-pilot -f docker-compose.sparkx.yml up -d sparkx-mcp
+```
+
+试点仅发布 `http://127.0.0.1:8011/mcp`，不依赖生产数据库、不挂载生产数据或凭据、不会重启旧 MCP。先确认 8011 空闲；不要把试点端口开放到公网。停用用同一文件和项目名执行 `stop sparkx-mcp`，不删除数据或更改原服务。
+
 ## 调用示例
 
 ```json
@@ -39,4 +52,4 @@ JX 可以为原生 SparkXAI 广告及支持的 ASIN 经营查询提供一个独�
 }
 ```
 
-这是指向中转工具 `get_ads_perf` 的 MCP 参数，不是候选 profile 的真实 ID。实际数据日期、归因口径和空记录以供应端为准。传输异常直接报错，不回退领星。若要停用，停止独立中转进程或撤销专用凭据，现有数据卷和 JX 主服务不受影响。
+这是指向中转工具 `get_ads_perf` 的 MCP 参数，不是候选 profile 的真实 ID。按小时查 `campaign` 可以选 `hour` 分组，也可以不选来聚合小时源；按天查普通实体可传空 `timeGranularity`，不由 JX 改写。实际数据日期、归因口径和空记录以供应端为准。传输异常直接报错，不回退领星。若要停用，停止独立中转进程或撤销专用凭据，现有数据卷和 JX 主服务不受影响。
