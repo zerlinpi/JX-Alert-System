@@ -29,6 +29,13 @@ FIELDS = {
               "grossProfit": "grossProfit", "grossRate": "grossRate", "refundsRate": "refundsRate",
               "totalSalesRefunds": "totalSalesRefunds"},
 }
+# The product endpoint's purchase_status=0 only sets the return/refund date
+# basis; ad allocation dates are not established by that switch.
+_PRODUCT_METRIC_BASES = {
+    "volume": "下单日", "orders": "下单日", "netAmount": "下单日",
+    "refundCount": "退款发生日", "returnGoodsCount": "退货发生日",
+}
+_SETTLEMENT_BASIS = "已发放结算日"
 
 
 def _number(value, key):
@@ -178,8 +185,10 @@ def api_business_context(db, sid, on):
                     values[key] = math.fsum(r.value for r in facts)
                 except OverflowError:
                     continue  # Finite rows can still sum to an unrepresentable value.
-        result[name] = {"currency": currency, "metrics": values,
-            "basis": "产品表现，下单日" if dimension == PRODUCT else "利润报表，结算日，已发放"}
+        metric_bases = ({key: _PRODUCT_METRIC_BASES[key] for key in values if key in _PRODUCT_METRIC_BASES}
+                        if dimension == PRODUCT else dict.fromkeys(values, _SETTLEMENT_BASIS))
+        result[name] = {"currency": currency, "metrics": values, "metric_bases": metric_bases,
+            "basis": "产品表现" if dimension == PRODUCT else "利润报表，结算日，已发放"}
         if values:
             result["availability"][name] = "AVAILABLE"
     return result

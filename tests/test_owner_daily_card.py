@@ -51,7 +51,8 @@ def test_summary_is_currency_separated_and_incomplete_ad_never_enters_full_total
     assert advertising[3][1:] == ("币种待确认", "币种待确认")
     assert refunds[1][1:] == ("2 / 8", "25.00%", "待核实")
     assert refunds[2][1:] == ("— / 10", "待核实", "EUR 0.00")
-    assert "已发放结算口径" in json.dumps(summary, ensure_ascii=False)
+    for value in (summary, detail):
+        assert "已发放结算口径，仅含收入退款，不含费用退款，不代表实时退款" in json.dumps(value, ensure_ascii=False)
 
 
 def test_same_window_returns_can_exceed_sales_but_no_division_by_zero():
@@ -59,6 +60,10 @@ def test_same_window_returns_can_exceed_sales_but_no_division_by_zero():
     summary, detail = build_owner_daily_cards(rows, report_date=DAY)
     assert _rows(_tables(summary)[0])[-1] == ("合计件数退货率", "250.00%", "2/2 店")
     assert _rows(_tables(detail)[1])[0][1:3] == ("4 / 0", "待核实")
+    for value in (summary, detail):
+        rendered = json.dumps(value, ensure_ascii=False)
+        assert "期内实际退货件数 ÷ 期内下单销量" in rendered
+        assert "可能包含历史订单的退货，不是原订单批次退货率或退款金额占比" in rendered
     only_summary, _ = build_owner_daily_cards(rows[:1], report_date=DAY)
     assert _rows(_tables(only_summary)[0])[-1] == ("合计件数退货率", "待核实", "1/1 店")
 

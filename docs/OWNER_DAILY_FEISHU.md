@@ -10,7 +10,7 @@ PYTHONPATH=src python scripts/preview_owner_daily.py
 | --- | --- |
 | 广告花费 | 领星[产品表现](https://apidoc.lingxing.com/new/api-docs/Statistics/AsinListNew/)的 `spend`。使用已验证的完整 ASIN 分区，包含源端支持的 SP、SB、SBV、SD 及共享分摊；不再加广告活动报表，避免重复。不是广告账单对账总额。 |
 | 净销售额 | 同日期同店铺产品表现 `net_amount`；明确为净额，非结算收入。 |
-| 件数退货率 | 观察窗口内的 `return_goods_count / volume`。按同一完整覆盖集合汇总分子分母后相除，不平均店铺百分比；非原订单批次最终退货率。零分母不报 0%；跨期退货可超过 100%。 |
+| 件数退货率 | 同一观察窗口内的 `return_goods_count / volume`：分子为实际退货当日的件数（`purchase_status=0`），分母为当日下单销量。按同一完整覆盖集合汇总分子分母后相除，不平均店铺百分比；非原订单批次最终退货率。零分母不报 0%；跨期退货可超过 100%。 |
 | 销售退款额 | 领星[店铺利润报表](https://apidoc.lingxing.com/new/api-docs/Finance/bdSeller/)的 `totalSalesRefunds`，按结算日和已发放状态取扣款绝对值。不是实时退款承诺，不含其他费用退款，不从净额里再扣一次。 |
 
 ## 日期和缺口

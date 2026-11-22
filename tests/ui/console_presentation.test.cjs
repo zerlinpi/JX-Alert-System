@@ -170,15 +170,38 @@ test("MCP unknown currency does not expose a guessed spend amount", () => {
 test("API business observations show known values with their independent date bases", () => {
   const scope = consoleScope();
   scope.evaluate(`renderSourceObservations({business_daily:{availability:"MISSING"},api_business_observations:{report_date:"2026-11-16",
-    product:{basis:"产品表现，下单日",currency:"USD",metrics:{volume:0,netAmount:100,adSpend:20}},
-    settlement:{basis:"利润报表，结算日，已发放",currency:"USD",metrics:{grossProfit:-20,grossRate:-0.25}}}})`);
+    product:{basis:"产品表现",currency:"USD",metrics:{volume:0,netAmount:100,adSpend:20,returnGoodsCount:5,refundCount:0},
+      metric_bases:{volume:"下单日",netAmount:"下单日",returnGoodsCount:"退货发生日",refundCount:"退款发生日"}},
+    settlement:{basis:"利润报表，结算日，已发放",currency:"USD",metrics:{grossProfit:-20,grossRate:-0.25,refundsRate:0.123},
+      metric_bases:{grossProfit:"已发放结算日",grossRate:"已发放结算日",refundsRate:"已发放结算日"}}}})`);
   const rows = scope.elements.get("source-observation-rows").children[0].children;
-  assert.equal(rows.length, 5);
+  assert.deepEqual(rows.map(row => row.children[0].textContent), ["销量（下单日）", "净销售额（下单日）",
+    "退货量（退货发生日）", "退款量（退款发生日）", "毛利润（已发放结算日）", "毛利率（已发放结算日）",
+    "退款率（已发放结算区间）", "广告费/净销售额（产品表现）"]);
   assert.equal(rows[0].children[1].textContent, "0");
-  assert.equal(rows[3].children[1].textContent, "-25.00%");
-  assert.equal(rows[4].children[1].textContent, "20.00%");
-  assert.ok(scope.elements.get("source-observations-basis").textContent.includes("下单日"));
-  assert.ok(scope.elements.get("source-observations-basis").textContent.includes("结算日"));
+  assert.equal(rows[2].children[1].textContent, "5");
+  assert.equal(rows[3].children[1].textContent, "0");
+  assert.equal(rows[5].children[1].textContent, "-25.00%");
+  assert.equal(rows[6].children[1].textContent, "12.30%");
+  assert.equal(rows[7].children[1].textContent, "20.00%");
+  assert.equal(scope.elements.get("source-observations-basis").textContent, "2026-11-16 · 产品表现 · 利润报表，结算日，已发放");
+});
+
+test("legacy settlement refund rate keeps its source value without implying a denominator", () => {
+  const scope = consoleScope();
+  scope.evaluate(`renderSourceObservations({api_business_observations:{report_date:"2026-11-16",
+    settlement:{basis:"利润报表，结算日，已发放",currency:"USD",metrics:{refundsRate:0}}}})`);
+  const rows = scope.elements.get("source-observation-rows").children[0].children;
+  assert.deepEqual(rows.map(row => row.children.map(cell => cell.textContent)), [["退款率（结算口径）", "0.00%"]]);
+});
+
+test("legacy product response cannot label event counts using its blanket order date", () => {
+  const scope = consoleScope();
+  scope.evaluate(`renderSourceObservations({api_business_observations:{report_date:"2026-11-16",
+    product:{basis:"产品表现，下单日",currency:"USD",metrics:{volume:2,returnGoodsCount:5,refundCount:0}}}})`);
+  const rows = scope.elements.get("source-observation-rows").children[0].children;
+  assert.deepEqual(rows.map(row => row.children[0].textContent), ["销量"]);
+  assert.equal(scope.elements.get("source-observations-basis").textContent, "2026-11-16 · 产品表现");
 });
 
 test("advertising private recipients require an explicit verified choice and can be cleared offline", () => {

@@ -334,19 +334,25 @@ function renderSourceObservations(data) {
   const rows = [], bases = new Set();
   const api = data.api_business_observations || {};
   if (data.business_daily?.availability !== "AVAILABLE") {
-    for (const [source, key, label, monetary] of [
-      ["product", "volume", "销量（接口下单）", false], ["product", "netAmount", "净销售额（接口下单）", true],
-      ["settlement", "platformIncome", "平台收入（接口结算）", true], ["settlement", "grossProfit", "毛利润（接口结算）", true],
-      ["settlement", "grossRate", "毛利率（接口结算）", false], ["settlement", "refundsRate", "退款率（结算销量）", false],
+    for (const [source, key, label, monetary, needsBasis] of [
+      ["product", "volume", "销量", false], ["product", "netAmount", "净销售额", true],
+      ["product", "returnGoodsCount", "退货量", false, true], ["product", "refundCount", "退款量", false, true],
+      ["settlement", "platformIncome", "平台收入", true], ["settlement", "grossProfit", "毛利润", true],
+      ["settlement", "grossRate", "毛利率", false], ["settlement", "refundsRate", "退款率", false],
     ]) {
       const item = api[source] || {}, value = item.metrics?.[key];
+      const basis = item.metric_bases?.[key];
+      // Older responses did not label the return/refund events per metric.
+      if (needsBasis && !basis) continue;
       if (!Number.isFinite(value) || monetary && !/^[A-Z]{3}$/.test(item.currency || "")) continue;
-      rows.push([label, monetary ? money(value, item.currency) : key.endsWith("Rate") ? `${(value * 100).toFixed(2)}%` : scalar(value)]);
-      if (item.basis) bases.add(item.basis);
+      const labelBasis = key === "refundsRate" ? (basis ? "已发放结算区间" : "结算口径") : basis;
+      rows.push([labelBasis ? `${label}（${labelBasis}）` : label,
+        monetary ? money(value, item.currency) : key.endsWith("Rate") ? `${(value * 100).toFixed(2)}%` : scalar(value)]);
+      if (item.basis) bases.add(source === "product" ? "产品表现" : item.basis);
     }
     const p = api.product || {};
     if (Number.isFinite(p.metrics?.adSpend) && p.metrics?.netAmount > 0) {
-      rows.push(["广告费/净销售额（接口下单）", `${(Math.abs(p.metrics.adSpend) / p.metrics.netAmount * 100).toFixed(2)}%`]);
+      rows.push(["广告费/净销售额（产品表现）", `${(Math.abs(p.metrics.adSpend) / p.metrics.netAmount * 100).toFixed(2)}%`]);
     }
   }
   if (sales && sales.metrics) {
