@@ -463,7 +463,10 @@ def test_duplicate_privacy_inputs_fail_closed(runtime, tmp_path, file, field):
         assert db.scalar(select(NotificationOutbox.id)) is None
 
 
-@pytest.mark.parametrize("mode", ["stable", "configured_app_rotates", "wrong_cached_adapter", "duplicate_post_config"])
+@pytest.mark.parametrize("mode", [
+    "stable", "configured_app_rotates", "wrong_cached_adapter", "duplicate_post_config",
+    "duplicate_store_pause",
+])
 def test_actual_adapter_and_current_config_must_match_verified_app_at_post(runtime, monkeypatch, mode):
     sessions, settings, routing, _ = runtime
     calls = []
@@ -485,6 +488,14 @@ def test_actual_adapter_and_current_config_must_match_verified_app_at_post(runti
             if mode == "duplicate_post_config":
                 raw = json.dumps(routing).replace('"open_id":', '"open_id":"ou_other","open_id":', 1)
                 Path(settings.feishu_routing_file).write_text(raw, encoding="utf-8")
+            if mode == "duplicate_store_pause":
+                common = {"collection_enabled": True, "updated_at": DUE.isoformat()}
+                paused = json.dumps({**common, "notifications_enabled": False})
+                enabled = json.dumps({**common, "notifications_enabled": True})
+                Path(settings.store_controls_file).write_text(
+                    '{"version":1,"stores":{"1":' + paused + ',"1":' + enabled + '}}',
+                    encoding="utf-8",
+                )
             return httpx.Response(200, json={"code": 0, "tenant_access_token": "synthetic-token", "expire": 7200})
         assert request.url.path == FeishuAppClient._MESSAGE_PATH
         assert request.url.params["receive_id_type"] == "open_id"
