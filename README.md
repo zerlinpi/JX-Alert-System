@@ -4,7 +4,7 @@
 
 > **完整系统逻辑与所有提醒规则：[阅读总文档](docs/SYSTEM_RULES_AND_LOGIC.md)。** 其中区分线上实际开关、代码默认、初筛、最终通知、数据未知和真实送达。 飞书卡片预览、DeepSeek 设置及内置策略见[通知与分析审核](docs/ALERT_REVIEW_CONTROLS.md)。
 >
-> 运营台填写 DeepSeek 密钥/模型、SparkX MCP Token 及连接测试、运营姓名同步见[运营台：DeepSeek、SparkX 与运营姓名](docs/OWNER_CONSOLE_AI_AND_SPARKX.md)；08:30 总负责人公司日报见[公司经营与广告快报](docs/COMPANY_EXECUTIVE_DIGEST.md)。
+> 运营台填写 DeepSeek 密钥/模型、SparkX MCP Token 及连接测试、运营姓名同步见[运营台：DeepSeek、SparkX 与运营姓名](docs/OWNER_CONSOLE_AI_AND_SPARKX.md)；08:30 总负责人公司日报见[公司经营与广告快报](docs/COMPANY_EXECUTIVE_DIGEST.md)；用 SparkX 直出数据的广告日报和“近 7 日对比前 7 日”广告异常见[SparkX 广告日报与广告异常](docs/SPARKX_DAILY_REPORT.md)。
 
 早间08:00按「每天绩效/违规快报，广告只列有意义的SP活动问题」发送；自然提问、数据清单、两项独立开关生效边界及回滚见[早间快报与自然提问](docs/MORNING_BRIEF_AND_QUESTIONS.md)。
 >

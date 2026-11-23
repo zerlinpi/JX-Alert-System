@@ -152,6 +152,30 @@ def company_executive_digest_job(*, now=None):
         logger.error("Company executive digest failed: %s", type(exc).__name__)
 
 
+def sparkx_report_job(*, now=None):
+    """08:30 SparkX daily report and 7-day ad review; the switch is re-read at each run."""
+    from jx_alert.config import load_runtime_settings
+    from jx_alert.sparkx_reports import BEIJING as SPARKX_BEIJING, GENERATE_UNTIL, OPENS, queue_reports
+    from jx_alert.storage.db import SessionLocal, engine
+    from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
+
+    try:
+        clock = now if now is not None else datetime.now(timezone.utc)
+        if not OPENS <= clock.astimezone(SPARKX_BEIJING).time() < GENERATE_UNTIL:
+            return
+        settings = load_runtime_settings()
+        with database_job_lock(engine, "sparkx_report"), SessionLocal() as db:
+            result = queue_reports(db, settings, now=clock)
+            db.commit()
+        if result["status"] not in {"DISABLED", "WAITING", "ALREADY_COMPLETE", "RETRY_LATER", "DELIVERY_DISABLED"}:
+            logger.info("SparkX report status=%s error=%s queued=%s", result["status"], result.get("error"),
+                        len(result.get("outbox_ids") or []))
+    except JobAlreadyRunning:
+        return
+    except Exception as exc:
+        logger.error("SparkX report failed: %s", type(exc).__name__)
+
+
 def main():
     settings = get_settings()
     if not settings.scheduler_enabled:
@@ -165,8 +189,17 @@ def main():
         timezone=settings.app_timezone,
         executors={"default": ThreadPoolExecutor(max_workers=4),
                    "daily_reports": ThreadPoolExecutor(max_workers=1),
-                   "ad_monitor": ThreadPoolExecutor(max_workers=1)},
+                   "ad_monitor": ThreadPoolExecutor(max_workers=1),
+                   "sparkx_reports": ThreadPoolExecutor(max_workers=1)},
     )
+    # SparkX network reads run on their own executor so they never delay other lanes.
+    scheduler.add_job(sparkx_report_job,
+        CronTrigger(hour=COMPANY_OPENS.hour, minute=COMPANY_OPENS.minute, timezone=COMPANY_BEIJING),
+        id="sparkx_report", executor="sparkx_reports", replace_existing=True, max_instances=1,
+        coalesce=True, misfire_grace_time=1800)
+    scheduler.add_job(sparkx_report_job, IntervalTrigger(minutes=5), id="sparkx_report_recovery",
+        executor="sparkx_reports", replace_existing=True, max_instances=1, coalesce=True,
+        misfire_grace_time=120)
     scheduler.add_job(
         daily_report_job,
         CronTrigger.from_crontab(settings.feishu_daily_report_cron, timezone="Asia/Shanghai"),

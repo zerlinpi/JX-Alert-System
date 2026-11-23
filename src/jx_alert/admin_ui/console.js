@@ -21,7 +21,8 @@ const state = {
   sources: { data: null, loading: false, saving: false },
   adSource: { data: null, busy: false },
   deepseek: { data: null, loading: false, saving: false, testing: false },
-  sparkx: { data: null, loading: false, saving: false, testing: false },
+  sparkx: { data: null, loading: false, saving: false, testing: false, authorized: [] },
+  sparkxReport: { data: null, profiles: null, routes: {}, loading: false, saving: false, previewing: false },
   reviewSkills: null,
   skillLibrary: null,
   adSubscribers: { data: null, members: null, selected: new Set(), loading: false, saving: false },
@@ -889,6 +890,7 @@ async function setView(view) {
     }
     if (!state.deepseek.data) await loadDeepSeek();
     if (!state.sparkx.data) await loadSparkX();
+    if (!state.sparkxReport.data) await loadSparkXReport();
   }
 }
 
@@ -1039,6 +1041,8 @@ async function testSparkX() {
     tableRows("sparkx-profile-rows", (result.profiles || []).map((row) => [
       row.profile_id, row.name || "—", row.country || "—", row.allowed ? "是" : "否"]), 4, "该 Token 没有授权任何店铺。");
     $("sparkx-profiles-table").hidden = false;
+    model.authorized = (result.profiles || []).map((row) => row.profile_id);
+    $("sparkx-allow-all").hidden = !model.authorized.length;
   } catch (error) {
     notice("sparkx-status", error.message, "error");
   } finally {
@@ -1388,6 +1392,166 @@ async function saveAdSubscribers() {
   } finally { model.saving = false; updateAdSubscribers(); }
 }
 
+const SPARKX_DESTINATIONS = ["daily_lead", "daily_group", "anomaly_group", "anomaly_lead", "anomaly_operators"];
+const SPARKX_RUN = { SUCCEEDED: "已生成并入队", FAILED: "生成失败，将自动重试", SKIPPED: "未生成（没有可发送对象）" };
+
+function setSparkXReportBusy() {
+  const model = state.sparkxReport;
+  const busy = model.loading || model.saving;
+  $("sparkx-report-fields").disabled = busy || !model.data?.revision || !state.csrf;
+  $("save-sparkx-report").disabled = busy || !model.data?.revision || !state.csrf;
+  $("sparkx-load-profiles").disabled = busy || !state.csrf;
+  $("sparkx-apply-suggestions").disabled = busy || !model.profiles?.some((row) => row.suggested && !model.routes[row.profile_id]);
+  for (const id of ["preview-sparkx-daily", "preview-sparkx-anomaly"]) $(id).disabled = model.previewing || !state.csrf;
+}
+
+function storeOptions(country, selected) {
+  const stores = state.sparkxReport.data?.stores || [];
+  const empty = node("option", "不对应（显示为未映射运营）");
+  empty.value = "";
+  const options = [empty, ...stores.filter((store) => store.country === country || store.sid === selected)
+    .map((store) => { const option = node("option", `${store.name}（${store.sid}）`); option.value = store.sid; return option; })];
+  return options;
+}
+
+function renderSparkXRoutes() {
+  const model = state.sparkxReport;
+  const stores = new Map((model.data?.stores || []).map((store) => [store.sid, store]));
+  const rows = (model.profiles || []).map((profile) => {
+    const select = node("select");
+    select.setAttribute("aria-label", `${profile.name} 对应的 JX 店铺`);
+    select.replaceChildren(...storeOptions(profile.country, model.routes[profile.profile_id]));
+    select.value = model.routes[profile.profile_id] || "";
+    const who = node("span", stores.get(select.value)?.operator || "未映射运营");
+    select.addEventListener("change", () => {
+      if (select.value) model.routes[profile.profile_id] = select.value;
+      else delete model.routes[profile.profile_id];
+      who.textContent = stores.get(select.value)?.operator || "未映射运营";
+      setSparkXReportBusy();
+    });
+    const name = node("span", profile.name);
+    if (!model.routes[profile.profile_id] && profile.suggested) {
+      const hint = stores.get(profile.suggested);
+      name.append(node("small", ` 建议：${hint ? hint.name : profile.suggested}`, "muted"));
+    }
+    if (!profile.allowed) name.append(badge("未允许"));
+    return [name, profile.country, profile.profile_id, select, who];
+  });
+  tableRows("sparkx-route-rows", rows, 5, "该 Token 没有授权店铺。");
+  $("sparkx-routes").hidden = false;
+  setSparkXReportBusy();
+}
+
+function renderSparkXReport() {
+  const data = state.sparkxReport.data;
+  $("sparkx-report-state").replaceChildren(...(data ? [badge(data.enabled ? "已启用" : "未启用")] : []));
+  const meta = $("sparkx-report-meta");
+  meta.replaceChildren();
+  if (data) {
+    metaEntry(meta, "SparkX 连接", data.sparkx_configured ? `已配置 · 允许 ${data.allowed_profile_count} 个店铺` : "未配置 Token");
+    metaEntry(meta, "公司日报总负责人", data.recipients?.daily_lead || "未设置（通知群设置中选择）");
+    metaEntry(meta, "广告总负责人", data.recipients?.anomaly_lead || "未设置（通知群设置中选择）");
+    metaEntry(meta, "已保存店铺对应", `${Object.keys(data.routes || {}).length} 个`);
+    const last = data.last_run;
+    if (last) metaEntry(meta, "最近一次", `${last.day || ""} ${SPARKX_RUN[last.status] || last.status}`
+      + (last.status === "SUCCEEDED" ? ` · ${last.queued} 条消息 · ${last.findings ?? 0} 个异常` : last.error ? ` · ${last.error}` : ""));
+    $("sparkx-report-enabled").checked = Boolean(data.enabled);
+    $("sparkx-daily-source").value = data.daily_source || "lingxing";
+    for (const name of SPARKX_DESTINATIONS) $(`sparkx-dest-${name}`).checked = Boolean(data.destinations?.[name]);
+  }
+  setSparkXReportBusy();
+}
+
+async function loadSparkXReport() {
+  const model = state.sparkxReport;
+  if (model.loading || model.saving) return;
+  model.loading = true;
+  setSparkXReportBusy();
+  try {
+    model.data = await api("sparkx-report");
+    model.routes = { ...(model.data.routes || {}) };
+    notice("sparkx-report-status");
+    if (model.profiles) renderSparkXRoutes();
+  } catch (error) {
+    model.data = null;
+    notice("sparkx-report-status", error.message, "error");
+  } finally {
+    model.loading = false;
+    renderSparkXReport();
+  }
+}
+
+async function loadSparkXProfiles() {
+  const model = state.sparkxReport;
+  if (model.loading || !state.csrf) return;
+  model.loading = true;
+  setSparkXReportBusy();
+  notice("sparkx-report-status", "正在读取 SparkX 授权店铺…");
+  try {
+    const result = await api("sparkx-report/profiles", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: "{}" });
+    model.profiles = result.profiles || [];
+    const suggested = model.profiles.filter((row) => row.suggested && !model.routes[row.profile_id]).length;
+    notice("sparkx-report-status", `已读取 ${model.profiles.length} 个授权店铺，其中 ${suggested} 个有对应建议待确认。`, "success");
+    renderSparkXRoutes();
+  } catch (error) {
+    notice("sparkx-report-status", error.message, "error");
+  } finally {
+    model.loading = false;
+    setSparkXReportBusy();
+  }
+}
+
+function applySparkXSuggestions() {
+  const model = state.sparkxReport;
+  for (const row of model.profiles || []) if (row.suggested && !model.routes[row.profile_id]) model.routes[row.profile_id] = row.suggested;
+  renderSparkXRoutes();
+  notice("sparkx-report-status", "已填入建议，请核对后点击“保存设置”。");
+}
+
+async function saveSparkXReport() {
+  const model = state.sparkxReport;
+  if (model.loading || model.saving || !model.data?.revision || !state.csrf) return;
+  model.saving = true;
+  setSparkXReportBusy();
+  try {
+    const destinations = Object.fromEntries(SPARKX_DESTINATIONS.map((name) => [name, $(`sparkx-dest-${name}`).checked]));
+    model.data = await api("sparkx-report", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf,
+    }, body: JSON.stringify({ revision: model.data.revision, enabled: $("sparkx-report-enabled").checked,
+      daily_source: $("sparkx-daily-source").value, destinations, routes: model.routes }) });
+    model.routes = { ...(model.data.routes || {}) };
+    notice("sparkx-report-status", model.data.enabled ? "已保存。从下一个北京时间 08:30 起发送，不补发今天已过的时段。" : "已保存（未启用）。", "success");
+    if (model.profiles) renderSparkXRoutes();
+  } catch (error) {
+    if (error.status === 409) model.data = null;
+    notice("sparkx-report-status", error.message, "error");
+  } finally {
+    model.saving = false;
+    renderSparkXReport();
+  }
+}
+
+async function previewSparkXReport(kind) {
+  const model = state.sparkxReport;
+  if (model.previewing || !state.csrf) return;
+  model.previewing = true;
+  setSparkXReportBusy();
+  notice("sparkx-report-status", "正在从 SparkX 读取数据生成预览（只读，不发送），约需 30–90 秒…");
+  try {
+    const result = await api("sparkx-report/preview", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: JSON.stringify({ kind }) });
+    renderCardPreview($("sparkx-report-preview"), result.card);
+    notice("sparkx-report-status", `预览已生成（统计日 ${result.report_date}，${result.profiles} 个店铺），未发送。`, "success");
+  } catch (error) {
+    $("sparkx-report-preview").hidden = true;
+    notice("sparkx-report-status", error.message, "error");
+  } finally {
+    model.previewing = false;
+    setSparkXReportBusy();
+  }
+}
+
 function updateCompanyDigest() {
   const model = state.companyDigest;
   const recipient = model.data?.recipient;
@@ -1702,6 +1866,7 @@ $("refresh").addEventListener("click", () => {
   if (state.view === "analysis-settings") {
     void loadDeepSeek();
     void loadSparkX();
+    void loadSparkXReport();
     void state.reviewSkills?.refresh();
     void state.skillLibrary?.refresh();
   } else if (state.view === "data-sources") void loadSources();
@@ -1727,6 +1892,15 @@ $("preview-company-digest").addEventListener("click", () => void previewCompanyD
 $("test-deepseek").addEventListener("click", () => void testDeepSeek());
 $("sparkx-form").addEventListener("submit", (event) => { event.preventDefault(); void saveSparkX(); });
 $("test-sparkx").addEventListener("click", () => void testSparkX());
+$("sparkx-allow-all").addEventListener("click", () => {
+  $("sparkx-profiles").value = state.sparkx.authorized.join(",");
+  notice("sparkx-status", "已填入全部授权店铺，请点击“保存 SparkX 设置”。");
+});
+$("sparkx-load-profiles").addEventListener("click", () => void loadSparkXProfiles());
+$("sparkx-apply-suggestions").addEventListener("click", applySparkXSuggestions);
+$("save-sparkx-report").addEventListener("click", () => void saveSparkXReport());
+$("preview-sparkx-daily").addEventListener("click", () => void previewSparkXReport("daily"));
+$("preview-sparkx-anomaly").addEventListener("click", () => void previewSparkXReport("anomaly"));
 $("sync-owner-names").addEventListener("click", () => void syncOwnerNames());
 for (const button of document.querySelectorAll("[data-view]")) {
   button.addEventListener("click", () => setView(button.dataset.view));

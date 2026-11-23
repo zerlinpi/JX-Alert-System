@@ -24,7 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
 from jx_alert import ad_source_controls, admin_ad_subscribers, admin_data, admin_executive, admin_groups
-from jx_alert import admin_mapping, admin_sources, sparkx_config, store_controls
+from jx_alert import admin_mapping, admin_sources, sparkx_config, sparkx_reports, store_controls
 from jx_alert import admin_review_skills, admin_skill_library
 from jx_alert.agent_skill_package import MAX_REQUEST as SKILL_UPLOAD_LIMIT
 from jx_alert.ai import deepseek_config
@@ -513,6 +513,73 @@ class OwnerConsole:
             self.settings, store, payload, binding, proof, authorize=authorize)
         return self._ad_source_view(store, value)
 
+    _SPARKX_REPORT_ERRORS = {
+        "SPARKX_NOT_CONFIGURED": "尚未配置 SparkX MCP Token，请先在上方「SparkX MCP 连接」保存并测试。",
+        "SPARKX_NO_PROFILES": "尚未填写允许使用的 Profile ID，请在上方「SparkX MCP 连接」保存。",
+        "SPARKX_AUTH_REJECTED": "SparkX 拒绝了该 Token（401）：Token 无效、过期或缺少只读权限。",
+        "SPARKX_TOKEN_INVALID": "SparkX 拒绝了该 Token（401）。",
+        "SPARKX_FORBIDDEN": "SparkX 拒绝访问（403），请核对 Token 的授权范围。",
+        "SPARKX_PERMISSION_DENIED": "Token 缺少所需权限（广告效果或广告配置只读）。",
+        "SPARKX_SCOPE_MISSING": "Token 缺少所需权限（广告效果或广告配置只读）。",
+        "SPARKX_RATE_LIMITED": "SparkX 限流，请稍后重试。",
+        "SPARKX_TIMEOUT": "SparkX 查询超时，请稍后重试。",
+        "SPARKX_UNREACHABLE": "服务器无法连接 mcp.sparkx.cn。",
+        "SPARKX_PROVIDER_ERROR": "SparkX 服务暂时异常，请稍后重试。",
+    }
+
+    def _sparkx_report_error(self, exc):
+        detail = self._SPARKX_REPORT_ERRORS.get(exc.code, f"SparkX 数据未能核验（{exc.code}），未生成内容。")
+        return ConsoleError(detail, 409 if exc.status_code == 409 else 502)
+
+    def _sparkx_report_view(self):
+        from jx_alert.notifications.recipient_policy import subscriber_entries
+
+        config = sparkx_reports.load_config(self.settings)
+        with self.session_factory() as db:
+            stores, routing = sparkx_reports.jx_stores(db, self.settings)
+            job = db.scalar(select(SyncJob).where(SyncJob.job_type == sparkx_reports.JOB)
+                            .order_by(SyncJob.id.desc()).limit(1))
+            last = None
+            if job is not None:
+                meta = job.metadata_json or {}
+                last = {"status": job.status, "day": meta.get("day"), "error": meta.get("error"),
+                        "queued": len(meta.get("outbox_ids") or []), "findings": meta.get("findings"),
+                        "at": job.started_at.isoformat() + "Z" if job.started_at else None}
+        binding = routing.get("company_executive_digest") if isinstance(routing, dict) else None
+        leads = subscriber_entries(routing) if isinstance(routing, dict) else None
+        token, allowed = sparkx_reports._credentials(self.settings)
+        return {"revision": config["revision"], "enabled": config["enabled"], "daily_source": config["daily_source"],
+                "destinations": config["destinations"], "routes": config["routes"], "updated_at": config["updated_at"],
+                "stores": stores, "last_run": last, "sparkx_configured": token is not None,
+                "allowed_profile_count": len(allowed),
+                "recipients": {"daily_lead": (binding or {}).get("name") if isinstance(binding, dict) else None,
+                               "anomaly_lead": leads[0]["name"] if leads and len(leads) == 1 else None}}
+
+    def _sparkx_report_profiles(self):
+        try:
+            profiles, allowed = sparkx_reports.list_profiles(self.settings)
+        except sparkx_reports.SparkXReportError as exc:
+            raise self._sparkx_report_error(exc) from None
+        with self.session_factory() as db:
+            stores, _ = sparkx_reports.jx_stores(db, self.settings)
+        suggested = sparkx_reports.suggest_routes(profiles, stores)
+        rows = [{"profile_id": pid, "name": row["name"], "short_name": sparkx_reports.short_name(row["name"]),
+                 "country": row["country"], "allowed": pid in allowed, "suggested": suggested.get(pid)}
+                for pid, row in profiles.items()]
+        rows.sort(key=lambda row: (row["country"] != "US", row["country"], row["name"]))
+        return {"profiles": rows[:2000]}
+
+    def _sparkx_report_preview(self, kind):
+        try:
+            value, data = sparkx_reports.preview(self.settings, kind, now=datetime.now(timezone.utc))
+        except sparkx_reports.SparkXReportError as exc:
+            raise self._sparkx_report_error(exc) from None
+        if value is None:
+            raise ConsoleError("内容超过飞书卡片上限，请缩小允许的店铺范围。", 409)
+        return {"card": value, "report_date": data["report_date"], "window": data["window"],
+                "previous_window": data["previous_window"], "profiles": len(data["profiles"]),
+                "warnings": sorted(data["errors"])}
+
     def _company_digest_preview(self):
         """The exact card the 08:30 lane would freeze now; read-only, never queued."""
         from jx_alert.notifications import company_executive
@@ -573,10 +640,11 @@ class OwnerConsole:
                 if path == "/console/api/skill-library" and not self._rate_allowed(
                         request, "skill-library-write", per_ip=12, total=20):
                     raise ConsoleError("技能资料库操作太频繁，请稍后重试。", 429)
-                body_limit = {"/console/api/data-sources": 16384, "/console/api/skill-library": SKILL_UPLOAD_LIMIT}
+                body_limit = {"/console/api/data-sources": 16384, "/console/api/skill-library": SKILL_UPLOAD_LIMIT,
+                              "/console/api/sparkx-report": 65536}
                 ad_source_request = path.endswith(("/advertising-source", "/advertising-source/verify"))
                 payload = await _body(request, "application/json", limit=body_limit.get(path, 8192),
-                                      strict_json=ad_source_request)
+                                      strict_json=ad_source_request or path == "/console/api/sparkx-report")
                 if path == '/console/api/ad-alert-subscribers':
                     if set(payload) != {'open_ids', 'revision'}:
                         raise ConsoleError('提交内容无效。', 400)
@@ -613,6 +681,23 @@ class OwnerConsole:
                     if not self._rate_allowed(request, "sparkx-test", per_ip=4, total=8):
                         raise ConsoleError("连接测试太频繁，请稍后重试。", 429)
                     data = await asyncio.to_thread(sparkx_config.check_connection, self.settings)
+                elif path == "/console/api/sparkx-report":
+                    if not self._rate_allowed(request, "sparkx-report-write", per_ip=6, total=12):
+                        raise ConsoleError("SparkX 日报设置更新太频繁，请稍后重试。", 429)
+                    await asyncio.to_thread(sparkx_reports.save_config, self.settings, payload)
+                    data = await asyncio.to_thread(self._sparkx_report_view)
+                elif path == "/console/api/sparkx-report/profiles":
+                    if payload:
+                        raise ConsoleError("读取店铺不接受额外参数。", 400)
+                    if not self._rate_allowed(request, "sparkx-report-profiles", per_ip=4, total=8):
+                        raise ConsoleError("读取 SparkX 店铺太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(self._sparkx_report_profiles)
+                elif path == "/console/api/sparkx-report/preview":
+                    if set(payload) != {"kind"} or payload["kind"] not in {"daily", "anomaly"}:
+                        raise ConsoleError("预览类型无效。", 400)
+                    if not self._rate_allowed(request, "sparkx-report-preview", per_ip=3, total=6):
+                        raise ConsoleError("预览太频繁，请一分钟后重试。", 429)
+                    data = await asyncio.to_thread(self._sparkx_report_preview, payload["kind"])
                 elif path == "/console/api/company-digest":
                     if set(payload) != {"open_ids", "revision"}:
                         raise ConsoleError("提交内容无效。", 400)
@@ -676,6 +761,8 @@ class OwnerConsole:
                 data = await asyncio.to_thread(deepseek_config.configuration, self.settings)
             elif path == "/console/api/sparkx":
                 data = await asyncio.to_thread(sparkx_config.configuration, self.settings)
+            elif path == "/console/api/sparkx-report":
+                data = await asyncio.to_thread(self._sparkx_report_view)
             elif path.startswith("/console/api/company-digest"):
                 if path.endswith("/preview"):
                     if not self._rate_allowed(request, "company-digest-preview", per_ip=6, total=12):
@@ -737,7 +824,8 @@ class OwnerConsole:
         except ConsoleError as exc:
             return _error(exc.detail, exc.status)
         except (SourceCredentialsError, deepseek_config.DeepSeekConfigError, admin_review_skills.ReviewSkillError,
-                admin_skill_library.LibraryError, sparkx_config.SparkXConfigError) as exc:
+                admin_skill_library.LibraryError, sparkx_config.SparkXConfigError,
+                sparkx_reports.SparkXReportConfigError) as exc:
             return _error(exc.detail, exc.status_code)
         except admin_mapping.MappingError as exc:
             return _error(exc.detail, exc.status_code)
@@ -756,6 +844,9 @@ class OwnerConsole:
                 Route("/console/api/deepseek/test", self.api, methods=["POST"]),
                 Route("/console/api/sparkx", self.api, methods=["GET", "POST"]),
                 Route("/console/api/sparkx/test", self.api, methods=["POST"]),
+                Route("/console/api/sparkx-report", self.api, methods=["GET", "POST"]),
+                Route("/console/api/sparkx-report/profiles", self.api, methods=["POST"]),
+                Route("/console/api/sparkx-report/preview", self.api, methods=["POST"]),
                 Route("/console/api/company-digest", self.api, methods=["GET", "POST"]),
                 Route("/console/api/company-digest/members", self.api),
                 Route("/console/api/company-digest/preview", self.api),

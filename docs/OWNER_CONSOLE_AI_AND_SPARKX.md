@@ -13,7 +13,9 @@
 1. 在 SparkX 后台右上角账号菜单 →「MCP & Skills」→「新建 Token」，只勾选需要的店铺和广告效果只读范围（`amazon_sa_performance_data:read`）。Token 关闭弹窗后无法再次查看。
 2. 运营台「SparkX MCP 连接」粘贴 Token，保存。Token 写入服务器私有文件 `data/secrets/sparkx.json`（0600），不会回显到浏览器、日志或 Git；留空保存表示保留现有 Token。运营台保存的值优先于环境变量 `SPARKX_AI_TOKEN`。
 3. 点「测试 SparkX 连接」：调用 `get_user_authorized_context`，列出该 Token 授权的店铺 Profile（ID、名称、站点）。不显示 SparkX 的 userId / tenantId。
-4. 把要用的 Profile ID 填进「允许使用的 Profile ID」并保存。之后在店铺页「商品推广（SP）观测来源」逐店核验并切换，规则见[逐店 SP 观测来源](AD_SOURCE_CONTROLS.md)。
+4. 把要用的 Profile ID 填进「允许使用的 Profile ID」并保存（可点「把以上全部授权店铺填入允许列表」）。之后：
+   - 每天 08:30 的 SparkX 广告日报和广告异常，见[SparkX 广告日报与广告异常](SPARKX_DAILY_REPORT.md)；
+   - 店铺页「商品推广（SP）观测来源」逐店核验并切换小时观测，规则见[逐店 SP 观测来源](AD_SOURCE_CONTROLS.md)。
 
 失败时页面给出分类结论，只依据 HTTP 状态和错误类型，不读取供应端正文：
 

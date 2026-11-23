@@ -336,4 +336,7 @@ tbody tr:last-child > * { border-bottom: 0; }
 .digest-preview .preview-text { margin: 0 var(--pad) 10px; white-space: pre-line; overflow-wrap: anywhere; font-size: 13px; }
 .digest-preview hr { border: 0; border-top: 1px solid var(--edge); margin: 6px var(--pad) 10px; }
 .digest-preview :is(td, th) { white-space: pre-line; vertical-align: top; }
-#sparkx-profiles-table { margin-top: 6px; }
+#sparkx-profiles-table { margin-top: 6px; }.sparkx-report-fields { display: grid; gap: 8px; border: 0; padding: 0; margin: 0 0 12px; }
+.sparkx-report-fields .check-row, .check-row { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.sub-heading { margin: 14px 0 4px; font-size: 15px; }
+#sparkx-routes select { max-width: 280px; }

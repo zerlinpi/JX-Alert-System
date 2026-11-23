@@ -33,6 +33,10 @@
 - “店铺”列为“有完整销售依据的店铺 / 该运营负责的统计店铺”。
 - 卡片放不下时，先缩短“未计入”名单，再省略运营表；仍放不下则不发送（`CARD_TOO_LARGE`）。
 
+## 改用 SparkX 直出数据
+
+运营台「分析设置 → SparkX 日报与广告异常」把「08:30 公司日报数据源」设为 SparkX 并启用后，本页的领星版公司日报不再发送（`SUPERSEDED_BY_SPARKX`），同一位总负责人改收 SparkX 广告日报。说明见[SparkX 广告日报与广告异常](SPARKX_DAILY_REPORT.md)。
+
 ## 停用与回滚
 
 - 停止发送：运营台清空接收人，或把 `feishu_company_executive_digest_enabled` 设为 `false`。已排队消息不迁移、不补发。

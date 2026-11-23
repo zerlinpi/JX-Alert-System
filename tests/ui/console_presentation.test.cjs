@@ -256,7 +256,7 @@ test("each compact navigation choice opens the right view and moves focus to its
   context.document.querySelectorAll = (selector) => selector === "[data-view]" ? tabs : [];
   let requests = 0;
   context.fetch = () => { requests++; return new Promise(() => {}); };
-  evaluate("state.groups.current={}; state.adSubscribers.data={}; state.companyDigest.data={}; state.sources.data={}; state.deepseek.data={}; state.sparkx.data={}; state.reviewSkills={}; state.skillLibrary={};");
+  evaluate("state.groups.current={}; state.adSubscribers.data={}; state.companyDigest.data={}; state.sources.data={}; state.deepseek.data={}; state.sparkx.data={}; state.sparkxReport.data={}; state.reviewSkills={}; state.skillLibrary={};");
   for (const [index, view] of views.entries()) {
     elements.get("workspace-menu").dispatch("click");
     await evaluate(`setView(${JSON.stringify(view)})`);

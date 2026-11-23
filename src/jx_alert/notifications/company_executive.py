@@ -288,6 +288,9 @@ def queue_company_digest(db, settings, *, now):
         return "DISABLED"
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Company digest requires a timezone-aware clock")
+    from jx_alert.sparkx_reports import supersedes_company_digest
+    if supersedes_company_digest(settings):
+        return "SUPERSEDED_BY_SPARKX"  # The owner chose the SparkX daily report for 08:30.
     local = now.astimezone(BEIJING)
     if not OPENS <= local.time() < CLOSES:
         return "WAITING"

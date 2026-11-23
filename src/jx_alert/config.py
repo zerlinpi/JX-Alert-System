@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     sparkx_profile_ids: str = ""
     # Owner-console SparkX token/profile IDs (0600); takes precedence over the environment.
     sparkx_credentials_file: str = "/app/data/secrets/sparkx.json"
+    # Owner switches, recipients and profile→store routes for the SparkX daily report (0600).
+    sparkx_report_settings_file: str = "/app/data/sparkx-report.json"
     sparkx_feishu_enabled: bool = False  # server-only, never set by relay input
     sparkx_relay_bearer_token: SecretStr = SecretStr("")
 

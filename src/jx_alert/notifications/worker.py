@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import or_, select, update
 
+from jx_alert import sparkx_reports
 from jx_alert.ad_source_policy import BLOCKED as AD_SOURCE_BLOCKED, legacy_ad_payload, legacy_payload_allowed
 from jx_alert.ai.ad_review_skills import frozen_ad_skills_current
 from jx_alert.config import get_settings, load_runtime_settings
@@ -36,6 +37,8 @@ def _scheduled_window(key, payload, now, *, hourly_mode=False, created_at=None):
     now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
     if company_executive.is_company_digest(key, payload):
         return company_executive.delivery_window(key, payload, now)
+    if sparkx_reports.is_report(key, payload):
+        return sparkx_reports.delivery_window(key, payload, now)
     if original_question_reply(key, payload):
         return "READY", None
     current = now.astimezone(BEIJING)
@@ -424,6 +427,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
 
         guarded_rule = rule_scope.generic_key(dedupe_key) and rule_scope.guarded(payload)
         company_digest = company_executive.is_company_digest(dedupe_key, payload)
+        sparkx_report = sparkx_reports.is_report(dedupe_key, payload)
         hourly_scoped = (dedupe_key.startswith("app:hourly-batch:")
                          and payload.get("hourly_routing_version") == 1
                          and isinstance(payload.get("hourly_items"), list)
@@ -472,6 +476,10 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                                              created_at=created_at)[0] != "READY"):
                     intent = {**intent, "aborted_before_post": True}
                     raise _HourlyScopeChanged
+            if sparkx_report and sparkx_reports.delivery_window(
+                    dedupe_key, payload, datetime.now(timezone.utc))[0] != "READY":
+                intent = {**intent, "aborted_before_post": True}
+                raise _SparkXScopeChanged
             if sparkx_page:
                 from jx_alert.sparkx_feishu import page_fresh
                 # Scope reads, a DB lock or the intent COMMIT itself may cross the expiry.
@@ -510,6 +518,9 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     if not company_executive.delivery_current(
                             db, settings, dedupe_key, payload, created_at, now, existing_chat_id):
                         skip_reason = company_executive.BLOCKED
+            if skip_reason is None and sparkx_report:
+                skip_reason = sparkx_reports.delivery_blocked(settings, dedupe_key, payload, created_at,
+                                                              now.replace(tzinfo=timezone.utc))
             if skip_reason is None and not company_digest and quiet_blocks(settings, dedupe_key, payload):
                 skip_reason = QUIET_REASON
             if (skip_reason is None and dedupe_key.startswith('scheduled-daily:')
@@ -544,7 +555,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     skip_reason = _HOURLY_SCOPE_BLOCK
                 if (skip_reason is None and getattr(settings, 'hourly_ad_monitor_enabled', False)
                         and destination.get('receive_id_type') == 'open_id' and destination.get('role') != ROLE
-                        and not company_digest
+                        and not company_digest and not sparkx_report
                         and not (destination.get('role') == HOURLY_SCOPED_ROLE and hourly_scoped)
                         and not original_question_reply(dedupe_key, payload)):
                     skip_reason = "主动提醒使用通知群，旧私聊保留记录"
@@ -573,7 +584,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                             skip_reason = '店铺未授权、通知已停用或经营日报无法核验，旧消息保留记录'
                         else:
                             payload['card'] = value
-                    else:
+                    elif not sparkx_report:
+                        # SparkX reports are verified by their own lane above, not Lingxing campaign state.
                         skip_reason = _proactive_delivery_reason(db, settings, dedupe_key, payload, now)
             if skip_reason is None and payload.get('morning_message_kind') == 'owner_daily':
                 from jx_alert.notifications.owner_daily import owner_daily_delivery_card

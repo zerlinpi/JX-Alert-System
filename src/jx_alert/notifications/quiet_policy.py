@@ -21,9 +21,14 @@ def original_question_reply(key, payload):
             and key.startswith(f'group-question:{reply_to}:'))
 
 
+def sparkx_report(key, payload):
+    """Owner-enabled SparkX daily/anomaly report, produced only by the server-side lane."""
+    return key.startswith("sparkx-report:") and payload.get("sparkx_report") in {"daily", "anomaly"}
+
+
 def unsolicited_quality_message(key, payload):
     """Never broadcast repair/status pages; authorized questions can ask for them."""
-    if original_question_reply(key, payload):
+    if original_question_reply(key, payload) or sparkx_report(key, payload):
         return False
     if payload.get('morning_message_kind') == 'data_quality':
         return True
@@ -67,7 +72,7 @@ def quiet_blocks(settings, key, payload):
             return not (title.startswith("店铺绩效与违规快报 · ")
                         or title == "商品推广活动待复核")
         return False
-    if original_question_reply(key, payload):
+    if original_question_reply(key, payload) or sparkx_report(key, payload):
         return False
     # The outbox marker is set by the validated server-side producers, not Chat
     # or Feishu inputs. Older generic rows lack sufficient provenance for this policy.

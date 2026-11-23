@@ -220,6 +220,48 @@ def test_sparkx_transport_failure_is_classified_without_provider_text(response, 
     assert "invalid_token" not in str(caught.value) and TOKEN not in str(caught.value)
 
 
+def test_sparkx_report_console_settings_mapping_and_preview(owner, tmp_path, monkeypatch):
+    from jx_alert import sparkx_reports
+
+    client, _, settings = owner
+    settings.sparkx_report_settings_file = str(tmp_path / "sparkx-report.json")
+    settings.sparkx_credentials_file = str(tmp_path / "sparkx.json")
+    stores = [{"sid": "5174", "name": "川页-US", "country": "US", "operator": "皮泽霖"},
+              {"sid": "5175", "name": "汤宝-US", "country": "US", "operator": "未映射运营"}]
+    monkeypatch.setattr(sparkx_reports, "jx_stores", lambda db, s: (stores, {}))
+    assert client.get("/console/api/sparkx-report").status_code == 401
+    headers = _headers(client)
+    view = client.get("/console/api/sparkx-report").json()
+    assert view["enabled"] is False and view["sparkx_configured"] is False and view["stores"] == stores
+    missing = client.post("/console/api/sparkx-report/profiles", json={}, headers=headers)
+    assert missing.status_code == 409 and "尚未配置 SparkX MCP Token" in missing.json()["error"]
+    monkeypatch.setattr(sparkx_reports, "list_profiles", lambda s: (
+        {"101": {"name": "香港川页", "country": "US", "store_type": None},
+         "102": {"name": "OCTORA-主账号", "country": "US", "store_type": None}}, ["101"]))
+    profiles = client.post("/console/api/sparkx-report/profiles", json={}, headers=headers).json()["profiles"]
+    assert {row["profile_id"]: row["suggested"] for row in profiles} == {"101": "5174", "102": None}
+    assert {row["profile_id"]: row["allowed"] for row in profiles} == {"101": True, "102": False}
+    body = {"revision": view["revision"], "enabled": True, "daily_source": "sparkx",
+            "destinations": sparkx_reports.DESTINATIONS, "routes": {"101": "5174", "102": ""}}
+    assert client.post("/console/api/sparkx-report", json=body, headers={"Origin": ORIGIN}).status_code == 403
+    saved = client.post("/console/api/sparkx-report", json=body, headers=headers)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["routes"] == {"101": "5174"} and saved.json()["enabled"] is True
+    assert client.post("/console/api/sparkx-report", json=body, headers=headers).status_code == 409
+    duplicated = ('{"revision":"' + saved.json()["revision"] + '","enabled":true,"enabled":false,'
+                  '"daily_source":"sparkx","destinations":{},"routes":{}}')
+    assert client.post("/console/api/sparkx-report", content=duplicated,
+                       headers={**headers, "Content-Type": "application/json"}).status_code == 400
+    card = {"schema": "2.0", "header": {"title": {"content": "SparkX 广告日报"}}, "body": {"elements": []}}
+    monkeypatch.setattr(sparkx_reports, "preview", lambda s, kind, now: (card, {
+        "report_date": "2026-11-22", "window": ["2026-11-16", "2026-11-22"],
+        "previous_window": ["2026-11-09", "2026-11-15"], "profiles": {"101": {}}, "errors": {}}))
+    result = client.post("/console/api/sparkx-report/preview", json={"kind": "daily"}, headers=headers)
+    assert result.status_code == 200 and result.json()["card"] == card and result.json()["profiles"] == 1
+    assert client.post("/console/api/sparkx-report/preview", json={"kind": "weekly"},
+                       headers=headers).status_code == 400
+
+
 def test_backend_error_code_survives_base_class_initialisation():
     from jx_alert.sparkx_backend import SparkXBackendError
 

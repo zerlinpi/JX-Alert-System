@@ -159,6 +159,31 @@
           <div class="control-actions"><button id="test-sparkx" class="button secondary" type="button">测试 SparkX 连接</button><span class="muted">调用只读 get_user_authorized_context，列出该 Token 已授权的店铺。</span></div>
           <div id="sparkx-status" class="notice" role="status" hidden></div>
           <div id="sparkx-profiles-table" class="table-scroll" hidden><table><thead><tr><th scope="col">Profile ID</th><th scope="col">店铺名称</th><th scope="col">站点</th><th scope="col">已允许</th></tr></thead><tbody id="sparkx-profile-rows"></tbody></table></div>
+          <div class="control-actions"><button id="sparkx-allow-all" class="link-button" type="button" hidden>把以上全部授权店铺填入允许列表</button></div>
+        </section>
+        <section class="panel source-card" aria-labelledby="sparkx-report-title" id="sparkx-report-panel">
+          <div class="section-heading"><div><h2 id="sparkx-report-title">SparkX 日报与广告异常</h2><p class="muted">每天北京时间 08:30 用 SparkX 直出数据生成「广告日报」（站点汇总 + 店铺明细）和「近 7 日对比前 7 日」的 campaign 异常，按店铺对应的运营发送。只读，不修改任何广告。</p></div><span id="sparkx-report-state"></span></div>
+          <dl id="sparkx-report-meta" class="source-meta"></dl>
+          <fieldset id="sparkx-report-fields" class="sparkx-report-fields" disabled>
+            <legend class="sr-only">SparkX 日报设置</legend>
+            <label class="check-row"><input id="sparkx-report-enabled" type="checkbox"> 启用每日 SparkX 日报与广告异常</label>
+            <label for="sparkx-daily-source">08:30 公司日报数据源</label>
+            <select id="sparkx-daily-source"><option value="sparkx">SparkX 直出（替代领星版公司日报）</option><option value="lingxing">领星（保留原公司日报）</option></select>
+            <span class="muted">广告日报发给</span>
+            <label class="check-row"><input id="sparkx-dest-daily_lead" type="checkbox"> 公司日报总负责人（私聊）</label>
+            <label class="check-row"><input id="sparkx-dest-daily_group" type="checkbox"> 当前通知群</label>
+            <span class="muted">广告异常发给</span>
+            <label class="check-row"><input id="sparkx-dest-anomaly_group" type="checkbox"> 当前通知群，并 @ 涉及店铺的运营</label>
+            <label class="check-row"><input id="sparkx-dest-anomaly_lead" type="checkbox"> 广告总负责人（私聊，全部店铺）</label>
+            <label class="check-row"><input id="sparkx-dest-anomaly_operators" type="checkbox"> 各运营（私聊，只含自己负责的店铺）</label>
+          </fieldset>
+          <h3 class="sub-heading">SparkX 店铺对应 JX 店铺（决定通知到哪位运营）</h3>
+          <p class="muted">运营来自「负责人映射」。系统按名称给出建议，确认无误后点“采用全部建议”并保存；未保存的建议不会用于通知。</p>
+          <div class="control-actions"><button id="sparkx-load-profiles" class="button secondary" type="button">读取 SparkX 店铺并生成建议</button><button id="sparkx-apply-suggestions" class="link-button" type="button" disabled>采用全部建议</button></div>
+          <div id="sparkx-routes" class="table-scroll" hidden><table><thead><tr><th scope="col">SparkX 店铺</th><th scope="col">站点</th><th scope="col">Profile ID</th><th scope="col">对应 JX 店铺</th><th scope="col">运营</th></tr></thead><tbody id="sparkx-route-rows"></tbody></table></div>
+          <div class="control-actions"><button id="save-sparkx-report" class="button primary" type="button" disabled>保存设置</button><button id="preview-sparkx-daily" class="button secondary" type="button">预览广告日报</button><button id="preview-sparkx-anomaly" class="button secondary" type="button">预览广告异常</button></div>
+          <div id="sparkx-report-status" class="notice" role="status" hidden></div>
+          <div id="sparkx-report-preview" class="digest-preview" hidden></div>
         </section>
         <section id="review-skills-panel" class="panel skill-card" aria-labelledby="review-skills-title"></section>
         <section id="skill-library-panel" class="panel skill-card" aria-labelledby="skill-library-title"></section>
