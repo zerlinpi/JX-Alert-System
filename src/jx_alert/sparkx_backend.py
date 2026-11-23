@@ -151,7 +151,9 @@ def _envelope(raw, tool):
     return views[0]
 
 
-async def _call(tool, query, token):
+async def _call(tool, query, token, *, authorize=None):
+    if authorize is not None:
+        authorize()  # Recheck the live binding before each vendor request, not just at slot start.
     try:
         return _envelope(await call_sparkx(tool, query, token=token, timeout_seconds=12), tool)
     except SparkXBackendError:
@@ -160,8 +162,8 @@ async def _call(tool, query, token):
         raise SparkXBackendError("SPARKX_PROVIDER_UNAVAILABLE") from None
 
 
-async def _authorized(scope, token):
-    envelope = await _call("get_user_authorized_context", {}, token)
+async def _authorized(scope, token, *, authorize=None):
+    envelope = await _call("get_user_authorized_context", {}, token, authorize=authorize)
     profiles = envelope.get("profiles")
     if not isinstance(profiles, list):
         raise SparkXBackendError("SPARKX_PROFILE_NOT_PROVEN")
@@ -263,7 +265,7 @@ def _hint_is_warning(hint):
     return bool(value.strip(" .;"))
 
 
-async def _observed(scope, token, store_type, on, granularity, now):
+async def _observed(scope, token, store_type, on, granularity, now, *, authorize=None):
     clock = now.astimezone(ZoneInfo(scope["timezone"]))
     if (granularity not in SOURCES or type(on) is not date or on > clock.date()
             or granularity == "daily" and on == clock.date()):
@@ -274,6 +276,8 @@ async def _observed(scope, token, store_type, on, granularity, now):
         fields.append("hour")
         order.append("hour")
     seen, accumulated, total_hint, provider_warning = set(), [], None, False
+    ordered = {"numeric", "text"}
+    previous_key = None
     for page in range(1, _MAX_PAGES + 1):
         query = {"profileIds": [scope["profile_id"]], "factEntity": "campaign",
                  "dateStart": on.isoformat(), "dateEnd": on.isoformat(), "select": fields,
@@ -283,7 +287,7 @@ async def _observed(scope, token, store_type, on, granularity, now):
                  "timeGranularity": granularity, "userContext": "JX read-only store campaign observation",
                  "language": "en", "page": page, "pageSize": _PAGE_SIZE}
         validate_performance_query(query, frozenset({scope["profile_id"]}))
-        result = await _call("get_ads_perf", query, token)
+        result = await _call("get_ads_perf", query, token, authorize=authorize)
         data, meta = result.get("data"), result.get("meta")
         if (result.keys() - {"isError", "toolName", "data", "meta", "requestId"} or not isinstance(data, dict)
                 or set(data) != {"rows", "rowCount"} or not isinstance(data["rows"], list)
@@ -315,6 +319,17 @@ async def _observed(scope, token, store_type, on, granularity, now):
             if key in seen:
                 raise SparkXBackendError("SPARKX_DUPLICATE_CAMPAIGN_GRAIN")
             seen.add(key)
+            # Campaign IDs can be returned as strings or numbers. Either
+            # ascending ordering is valid, but one ordering must remain
+            # consistent across pages. A disjoint overlap/reorder is not
+            # made safe merely because it has no duplicate campaign keys.
+            cid, hour = row["campaign_id"], row["hour"]
+            sort_key = {"numeric": (int(cid), hour), "text": (cid, hour)}
+            if previous_key is not None:
+                ordered = {style for style in ordered if previous_key[style] < sort_key[style]}
+                if not ordered:
+                    raise SparkXBackendError("SPARKX_UNSTABLE_PAGE_ORDER")
+            previous_key = sort_key
             accumulated.append(row)
         if not more:
             return {"schema": SCHEMA, "provider": "sparkx", "granularity": granularity,
@@ -343,7 +358,7 @@ async def verify_sparkx_binding(settings, store, binding, *, query=None, now=Non
             "provider_warning": sample["provider_warning"], "coverage": sample["coverage"]}
 
 
-async def read_sparkx_observations(settings, store, binding, *, now=None):
+async def read_sparkx_observations(settings, store, binding, *, now=None, authorize=None):
     """Return separate partitions and safe failure codes; never present an empty partition as zero."""
     ts = _clock(now)
     scope, token = _scope(settings, store, binding)
@@ -351,11 +366,13 @@ async def read_sparkx_observations(settings, store, binding, *, now=None):
     seen, failures = {}, {}
     try:
         with anyio.fail_after(35):
-            kind = await _authorized(scope, token)
+            kind = await _authorized(scope, token, authorize=authorize)
             for gran, day in (("daily", local - timedelta(days=1)), ("hourly", local)):
                 try:
-                    seen[gran] = await _observed(scope, token, kind, day, gran, ts)
+                    seen[gran] = await _observed(scope, token, kind, day, gran, ts, authorize=authorize)
                 except SparkXBackendError as exc:
+                    if exc.code == "SCOPE_CHANGED":
+                        raise
                     failures[gran] = exc.code
     except TimeoutError:
         failures.update({gran: "SPARKX_PROVIDER_TIMEOUT" for gran in SOURCES if gran not in seen})
@@ -378,7 +395,9 @@ def persist_sparkx_observation(db, store, selection, value, *, observed_at, slot
     existing = db.scalar(select(RawSnapshot).where(
         RawSnapshot.source == SOURCES[gran], RawSnapshot.store_id == str(store.sid),
         RawSnapshot.payload["selection_id"].as_string() == marker,
-        RawSnapshot.payload["monitor_slot"].as_string() == slot).order_by(RawSnapshot.id.desc()).limit(1))
+        RawSnapshot.payload["monitor_slot"].as_string() == slot,
+        RawSnapshot.payload["report_date"].as_string() == value["report_date"],
+    ).order_by(RawSnapshot.id.desc()).limit(1))
     if existing:
         return {"snapshot_id": existing.id, "row_count": existing.payload["row_count"],
                 "report_date": existing.payload["report_date"], "state": "OBSERVED"}
@@ -395,10 +414,13 @@ def list_sparkx_snapshots(db, store, selection, *, limit=2):
     """Small owner/status surface, returning no credentials, response bodies or campaign rows."""
     if selection.get("source") != "sparkx" or not selection.get("verification"):
         return []
-    rows = db.scalars(select(RawSnapshot).where(
-        RawSnapshot.source.in_(tuple(SOURCES.values())), RawSnapshot.store_id == str(store.sid),
-        RawSnapshot.payload["selection_id"].as_string() == _observation_scope_id(store, selection),
-    ).order_by(RawSnapshot.captured_at.desc(), RawSnapshot.id.desc()).limit(min(max(1, limit), 20)))
+    marker = _observation_scope_id(store, selection)
+    rows = [row for source in SOURCES.values() if (row := db.scalar(select(RawSnapshot).where(
+        RawSnapshot.source == source, RawSnapshot.store_id == str(store.sid),
+        RawSnapshot.payload["selection_id"].as_string() == marker,
+    ).order_by(RawSnapshot.captured_at.desc(), RawSnapshot.id.desc()).limit(1))) is not None]
+    rows.sort(key=lambda row: (row.captured_at, row.id), reverse=True)
+    rows = rows[:min(max(1, limit), len(SOURCES))]
     return [{"period": row.payload["granularity"], "report_date": row.payload["report_date"],
              "row_count": row.payload["row_count"], "captured_at": row.captured_at.isoformat() + "Z",
              "state": "OBSERVED", "coverage": "observed_not_certified",

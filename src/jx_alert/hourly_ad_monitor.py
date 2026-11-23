@@ -256,8 +256,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                 db.commit()
 
         def collect_sparkx():
-            observations = sparkx_hourly_pass(db, settings, slot=slot, now=now,
-                                              previous=meta.get('sparkx_observations'))
+            observations = sparkx_hourly_pass(db, settings, slot=slot, now=now)
             if observations or 'sparkx_observations' in meta:
                 meta['sparkx_observations'] = observations
                 job = db.get(SyncJob, job_id)
@@ -456,7 +455,8 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                 raw_archive=archive_raw_snapshots(db, settings.raw_dir, after_id=meta['raw_start']))
             partial = (bool(model_failures) or 'overnight_digest_error' in meta or len(checked) != len(findings)
                        or any(r.get('status') == 'PARTIAL' for r in meta['stores'].values())
-                       or any(r.get('status') == 'PARTIAL' for r in meta.get('sparkx_observations', {}).values()))
+                       or any(r.get('status') in {'PARTIAL', 'BLOCKED'}
+                              for r in meta.get('sparkx_observations', {}).values()))
             job = db.get(SyncJob, job_id)
             job.status = 'PARTIAL_FAILED' if partial else 'SUCCEEDED'
             finished_at = now or _utcnow()

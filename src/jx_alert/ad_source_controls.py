@@ -1,5 +1,6 @@
 """Owner-selected SP observation source; do not rewrite warehouse or delivery facts."""
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -192,14 +193,26 @@ def _verified(settings, store, current):
             and hmac.compare_digest(basis, proof["token_fingerprint"]))
 
 
-def observation_source(settings, store):
+@contextmanager
+def source_commit_fence(settings):
+    """Serialize a source-dependent durable commit with operating-console switches."""
+    try:
+        with _lock(_path(settings)):
+            yield
+    except StoreControlError as exc:
+        raise _conflict() from exc
+    except OSError:
+        raise _unavailable() from None
+
+
+def observation_source(settings, store, *, selection=None):
     """Return effective choice or None if its proof/configuration is unavailable.
 
     A selected but blocked SparkX source must not silently fall back to Lingxing.
     The caller still applies its existing store/collection eligibility checks.
     """
     try:
-        current = source_snapshot(settings, store.sid)
+        current = source_snapshot(settings, store.sid) if selection is None else selection
         return current["source"] if current["source"] == "lingxing" or _verified(settings, store, current) else None
     except (AdSourceError, AttributeError, ValueError, TypeError, RecursionError):
         return None
@@ -275,9 +288,10 @@ def _write(settings, store, revision, update, *, authorize):
                 stream.flush()
                 os.fsync(stream.fileno())
             marker = _initialized_marker(path)
-            if not marker.exists():
-                # Create before publishing the first choice so an interruption
-                # can only leave the source disabled instead of rearming alerts.
+            if row["selected_at"] is not None and not marker.exists():
+                # A binding check does not switch the source. Create this only
+                # before publishing an actual choice, and keep it after rollback.
+                # A failed first verification then cannot stop existing alerts.
                 marker_fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY
                                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
                 try:

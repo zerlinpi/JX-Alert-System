@@ -1,5 +1,5 @@
 """Selected-store routing is independent across vendors and source changes."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -71,7 +71,7 @@ def test_manual_switch_discards_inflight_and_does_not_fall_back(world, monkeypat
     settings, engine = world
     seen = []
 
-    async def provider(_settings, store, binding, *, now):
+    async def provider(_settings, store, binding, *, now, authorize):
         seen.append((store.sid, binding["profile_id"]))
         _save_selection(settings, _choice(enabled=False))
         return _reply(), {}
@@ -97,7 +97,8 @@ def test_unverified_selection_and_collection_pause_never_call_vendor(world, monk
         _save_selection(settings, _choice())
         Path(settings.store_controls_file).write_text(json.dumps({"version": 1, "stores": {"5174": {
             "collection_enabled": False, "notifications_enabled": True, "updated_at": STAMP}}}))
-        assert lane.sparkx_hourly_pass(db, settings, slot="second", now=CLOCK) == {}
+        paused = lane.sparkx_hourly_pass(db, settings, slot="second", now=CLOCK)
+        assert paused["5174"]["status"] == "PAUSED"
         assert db.scalar(select(func.count()).select_from(RawSnapshot)) == 0
 
 
@@ -105,7 +106,7 @@ def test_scheduler_collects_selected_sparkx_while_lingxing_inventory_is_unavaila
     settings, engine = world
     calls = []
 
-    async def provider(_settings, store, binding, *, now):
+    async def provider(_settings, store, binding, *, now, authorize):
         calls.append(store.sid)
         return _reply(), {}
 
@@ -138,3 +139,127 @@ def test_selected_or_unverified_store_does_not_enter_lingxing_ad_collection(worl
             {"sid": "5174", "has_ads_setting": 1}, CLOCK.date(), now=CLOCK)
         assert not result["ad_ready"] and not result["intraday_ready"]
         assert result["ads"] == "NON_LINGXING_SELECTION"
+
+
+def test_replaced_sparkx_generation_before_dispatch_is_never_read(world, monkeypatch):
+    settings, engine = world
+
+    class DelayedWorker:
+        def __init__(self, **_options):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def map(self, call, work):
+            # A different revision still points to SparkX. A source-name-only
+            # recheck would call the old verified binding anyway.
+            second = "2024-01-01T00:00:01+00:00"
+            _save_selection(settings, {**_choice(), "selected_at": second, "updated_at": second})
+            return map(call, work)
+
+    monkeypatch.setattr(lane, "ThreadPoolExecutor", DelayedWorker)
+    monkeypatch.setattr(lane, "read_sparkx_observations", lambda *_a, **_kw: pytest.fail("unapproved read"))
+    with Session(engine) as db:
+        result = lane.sparkx_hourly_pass(db, settings, slot="first", now=CLOCK)
+        assert result["5174"]["reason"] == "SCOPE_CHANGED"
+        assert db.scalar(select(func.count()).select_from(RawSnapshot)) == 0
+
+
+def test_console_switch_serializes_against_scope_checked_snapshot_commit(world, monkeypatch):
+    from jx_alert import ad_source_controls as controls
+
+    settings, engine = world
+    persist = lane.persist_sparkx_observation
+    rejected = []
+
+    async def provider(_settings, store, binding, *, now, authorize):
+        authorize()
+        return _reply(), {}
+
+    def competing_switch(db, store, selection, observation, **kwargs):
+        with pytest.raises(controls.AdSourceError) as error:
+            controls.save_selection(settings, store, {"revision": selection["revision"], "source": "lingxing"},
+                                    authorize=lambda: None)
+        rejected.append(error.value.status_code)
+        return persist(db, store, selection, observation, **kwargs)
+
+    monkeypatch.setattr(lane, "read_sparkx_observations", provider)
+    monkeypatch.setattr(lane, "persist_sparkx_observation", competing_switch)
+    with Session(engine) as db:
+        observed = lane.sparkx_hourly_pass(db, settings, slot="first", now=CLOCK)
+        assert rejected == [409, 409] and observed["5174"]["status"] == "OBSERVED"
+        assert db.scalar(select(func.count()).select_from(RawSnapshot)) == 2
+        assert lane.selected_ad_provider(settings, "5174") == "sparkx"
+
+        monkeypatch.setattr(lane, "read_sparkx_observations", lambda *_a, **_kw: pytest.fail("repeat read"))
+        replay = lane.sparkx_hourly_pass(db, settings, slot="first", now=CLOCK)
+        assert replay == observed
+        assert db.scalar(select(func.count()).select_from(RawSnapshot)) == 2
+
+        current = controls.source_snapshot(settings, "5174")
+        switched = controls.save_selection(settings, db.get(Store, "5174"),
+            {"revision": current["revision"], "source": "lingxing"}, authorize=lambda: None)
+        assert switched["source"] == "lingxing"
+        assert lane.sparkx_hourly_pass(db, settings, slot="first", now=CLOCK) == {}
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_hybrid_hourly_job_distinguishes_incomplete_sparkx_from_intentional_pause(world, monkeypatch, paused):
+    settings, engine = world
+    _save_selection(settings, _choice(valid=False))
+    if paused:
+        Path(settings.store_controls_file).write_text(json.dumps({"version": 1, "stores": {"5174": {
+            "collection_enabled": False, "notifications_enabled": True, "updated_at": STAMP}}}))
+    inspected, analysed = [], []
+
+    class Lingxing:
+        def get_stores(self):
+            return {"data": [{"sid": sid, "name": "Fixture Shop " + sid, "status": 1, "country": "US",
+                              "marketplace_id": BINDING["marketplace"], "has_ads_setting": 1}
+                             for sid in ("5174", "5175")]}
+
+    def collect(client, db, config, record, target, *, lingxing_ads=True, **_kwargs):
+        inspected.append((record["sid"], lingxing_ads))
+        assert (record["sid"] == "5175") == lingxing_ads
+        return {"status": "COMPLETE", "ad_ready": lingxing_ads}
+
+    def review(db, config, stores, dates, **_kwargs):
+        analysed.append({store.sid for store in stores})
+        return {"campaigns": []}
+
+    monkeypatch.setattr(monitor, "_collect_store", collect)
+    monkeypatch.setattr(monitor, "build_ad_review_context", review)
+    monkeypatch.setattr(lane, "read_sparkx_observations", lambda *_a, **_kw: pytest.fail("unapproved read"))
+
+    def run(at):
+        return monitor.run_hourly_monitor(now=at, settings=settings, warehouse_engine=engine,
+            session_factory=sessionmaker(engine), client_factory=Lingxing, send_alerts=False)
+
+    first = run(CLOCK)
+    assert first["status"] == ("SUCCEEDED" if paused else "PARTIAL_FAILED")
+    assert analysed and all(result == {"5175"} for result in analysed)
+    assert set(inspected) == ({("5175", True)} if paused else {("5174", False), ("5175", True)})
+    assert run(CLOCK + timedelta(minutes=1))["status"] == ("ALREADY_COMPLETE" if paused else "WAITING")
+    if not paused:
+        assert run(CLOCK + timedelta(minutes=5))["status"] == "PARTIAL_FAILED"
+        assert run(CLOCK + timedelta(minutes=10))["status"] == "PARTIAL_FAILED"
+        assert run(CLOCK + timedelta(minutes=15))["status"] == "RETRY_LIMIT"
+    with Session(engine) as db:
+        job = db.get(SyncJob, first["job_id"])
+        assert job.metadata_json["sparkx_observations"]["5174"]["status"] == ("PAUSED" if paused else "BLOCKED")
+        assert job.metadata_json["attempts"] == (1 if paused else 3)
+        assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+
+
+def test_selected_source_without_explicit_scope_is_blocked_not_omitted(world, monkeypatch):
+    settings, engine = world
+    Path(settings.collection_scope_file).unlink()
+    monkeypatch.setattr(lane, "read_sparkx_observations", lambda *_a, **_kw: pytest.fail("unapproved read"))
+    with Session(engine) as db:
+        outcome = lane.sparkx_hourly_pass(db, settings, slot="first", now=CLOCK)
+        assert outcome["5174"]["status"] == "BLOCKED"
+        assert outcome["5174"]["reason"] == "EXPLICIT_COLLECTION_SCOPE_REQUIRED"

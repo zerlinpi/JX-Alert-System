@@ -351,3 +351,18 @@ test("late source response from a previous store cannot populate the selected st
   assert.equal(scope.evaluate('state.adSource.data'), null);
   assert.match(scope.elements.get("ad-source-current").textContent, /尚未读取本店/);
 });
+
+test("source status distinguishes a paused or failed attempt from historical successful observations", () => {
+  const scope = consoleScope();
+  scope.evaluate(`state.csrf="a".repeat(64); state.sid="10"; state.data={};
+    state.adSource.data={source:"sparkx", observation_source:"sparkx", revision:"b".repeat(64),
+      observation_status:"COLLECTION_PAUSED", latest_observations:[{period:"daily",report_date:"2026-11-22",
+        row_count:4,captured_at:"2026-11-23T00:16:00Z"}]}; renderAdSource(true);`);
+  const label = scope.elements.get("ad-source-latest");
+  assert.match(label.textContent, /本店采集已暂停/);
+  assert.match(label.textContent, /历史成功记录（不代表当前连接正常）.*2026-11-22/);
+  assert.doesNotMatch(label.textContent, /等待后续小时任务/);
+  scope.evaluate('state.adSource.data.observation_status="ATTEMPT_INCOMPLETE"; renderAdSource()');
+  assert.match(label.textContent, /最近一次已记录的 SparkX 采集未完整成功/);
+  assert.match(label.textContent, /历史成功记录（不代表当前连接正常）.*2026-11-22/);
+});

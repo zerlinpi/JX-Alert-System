@@ -21,7 +21,8 @@ other stores, edit advertising accounts, or change existing credentials.
    separately; legacy automatic advertising alerts are held and **automatic
    SparkX Feishu advertising alerts are not enabled**. Refresh the same store
    page to see metadata for the latest observations of this selection, when
-   available. Historical observations do not prove the latest provider call was successful.
+   available. The same panel distinguishes a paused store or an incomplete
+   latest recorded attempt from historical successful observations.
    A saved setting is not proof that any observation has completed.
 5. To roll back, select **领星** and save, even after a SparkX token revocation.
    No network probe or credentials change is needed for rollback. New eligible
@@ -33,8 +34,9 @@ The dedicated state file defaults to
 same-origin requests and compare-and-swap revision protection. The file is
 atomically replaced under a lock with private permissions. Keep the data
 mount persistent and back up this file with its neighboring `.initialized`
-marker. Once initialized, the missing state file blocks the lane and does not
-implicitly restore Lingxing. Restore the correct saved state if the file is
+marker. The marker is created when a source is actually changed, not when
+only testing a binding. After a source change, a missing state file blocks
+the lane and does not implicitly restore Lingxing. Restore the correct saved state if the file is
 lost; do not delete the marker to reset the selection. The state file contains a
 local token fingerprint, not a reusable token; neither fingerprint nor token
 is returned to the browser. Credential/profile revocation or a scope or

@@ -495,15 +495,23 @@ function renderAdSource(reset = false) {
           : "已选择 SparkX，但校验已失效。观测暂停，不会自动改回领星；可重新核验或手动切回。";
   const latest = ready && data.observation_source === "sparkx";
   $("ad-source-latest").hidden = !latest;
-  $("ad-source-latest").textContent = !latest ? "" : data.observation_status === "OBSERVED"
-      ? "历史成功记录（不代表当前连接正常）：" + (data.latest_observations || []).map((row) => {
-        const sampled = sourceTime(row.captured_at);
-        return `最近${row.period === "hourly" ? "小时" : "日级"}观测：${row.report_date} · ${row.row_count} 条`
-          + (sampled ? ` · 采集于 ${sampled}（美西）` : "");
-      }).join("；")
-      : data.observation_status === "HOURLY_DISABLED" ? "小时采集尚未启用，当前仅保存了来源选择。"
-      : data.observation_status === "WAITING" ? "尚无本次切换后的 SparkX 观测，等待后续小时任务。"
-      : "暂时无法核实 SparkX 观测记录，可刷新重试。";
+  const messages = {
+    COLLECTION_PAUSED: "本店采集已暂停，不会启动新的 SparkX 观测。",
+    HOURLY_DISABLED: "小时采集尚未启用，当前仅保存了来源选择。",
+    WAITING: "尚无本次切换后的 SparkX 观测，等待后续小时任务。",
+    ATTEMPT_INCOMPLETE: "最近一次已记录的 SparkX 采集未完整成功。",
+    ATTEMPT_BLOCKED: "最近一次已记录的 SparkX 采集未能执行。",
+    OBSERVED: "",
+  };
+  const history = !latest ? [] : (data.latest_observations || []).map((row) => {
+    const sampled = sourceTime(row.captured_at);
+    return `${row.period === "hourly" ? "小时" : "日级"}观测：${row.report_date} · ${row.row_count} 条`
+      + (sampled ? ` · 采集于 ${sampled}（美西）` : "");
+  });
+  $("ad-source-latest").textContent = !latest ? "" : [
+    messages[data.observation_status] ?? "暂时无法核实 SparkX 观测状态，可刷新重试。",
+    history.length ? "历史成功记录（不代表当前连接正常）：" + history.join("；") : "",
+  ].filter(Boolean).join(" ");
 }
 
 async function adSourceAction(action) {
@@ -531,8 +539,8 @@ async function adSourceAction(action) {
     snapshot.data = value;
     renderAdSource(true);
     notice("ad-source-status", isRead ? "" : isVerify ? "只读范围核验通过，未自动切换来源。"
-      : value.source === "lingxing" ? "已切回领星，新任务使用领星；不会补发旧告警。"
-        : "已选择 SparkX。后续小时任务使用 SparkX 观测本店 SP；不会通过 SparkX 发送飞书告警。", "success");
+      : value.source === "lingxing" ? "已切回领星；不会补发旧告警。"
+        : "已选择 SparkX，仅用于符合采集条件的 SP 观测；不会通过 SparkX 发送飞书告警。", "success");
   } catch (error) {
     if (!current()) return;
     if (error.status === 409 || isRead) snapshot.data = null;
@@ -665,6 +673,7 @@ async function reloadControls({ conflict = false } = {}) {
     state.data.controls = response.controls;
     acceptControls(sid, response.controls);
     renderControls();
+    refreshAdSourceAfterControls();
     notice("controls-status", conflict ? "开关已被其他页面更新，已载入最新设置。请重新选择后保存。" : "已载入最新开关状态。", conflict ? "error" : "success");
   } catch (error) {
     if (seq === state.controlsSeq && state.data === details) {
@@ -698,6 +707,7 @@ async function saveControls() {
     if (state.data === details) {
       state.data.controls = controls;
       renderControls();
+      refreshAdSourceAfterControls();
       notice("controls-status", "店铺开关已保存。", "success");
     } else notice("global-status", `店铺 ${sid} 的开关已保存。`, "success");
   } catch (error) {
@@ -707,6 +717,11 @@ async function saveControls() {
     state.controlsSaving = false;
     updateControls();
   }
+}
+
+function refreshAdSourceAfterControls() {
+  if ($("ad-source-panel").open && validAdSource(state.adSource.data)) void adSourceAction("read");
+  else if (!state.adSource.busy) state.adSource.data = null;
 }
 
 function chartElement(tag, attrs = {}, label) {

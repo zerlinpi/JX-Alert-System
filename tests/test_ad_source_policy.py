@@ -48,7 +48,8 @@ def test_only_legacy_proactive_advertising_is_fenced(payload):
     assert policy.legacy_ad_payload(payload)
 
 
-def test_switch_during_feishu_token_step_stops_old_ad_payload(request, monkeypatch):
+@pytest.mark.parametrize("switch_at", ["token", "commit"])
+def test_switch_before_feishu_post_stops_old_ad_payload(request, monkeypatch, switch_at):
     from sqlalchemy import select
 
     from jx_alert.notifications import hourly_ads, worker
@@ -67,7 +68,8 @@ def test_switch_during_feishu_token_step_stops_old_ad_payload(request, monkeypat
 
     class Feishu:
         def send_card(self, card, *, before_submit, **kwargs):
-            selection.update(source="sparkx", selected_at=CLOCK.isoformat())
+            if switch_at == "token":
+                selection.update(source="sparkx", selected_at=CLOCK.isoformat())
             before_submit({})
             posted.append(card)
             return {"message_id": "om_should_never_post"}
@@ -78,6 +80,15 @@ def test_switch_during_feishu_token_step_stops_old_ad_payload(request, monkeypat
     monkeypatch.setattr(worker, "load_runtime_settings", lambda: settings)
     monkeypatch.setattr(worker, "SessionLocal", sessions)
     monkeypatch.setattr(FeishuAppClient, "from_settings", lambda _: Feishu())
+    record = worker._record_submission
+
+    def switch_after_commit(*args):
+        result = record(*args)
+        if switch_at == "commit":
+            selection.update(source="sparkx", selected_at=CLOCK.isoformat())
+        return result
+
+    monkeypatch.setattr(worker, "_record_submission", switch_after_commit)
     with sessions() as db:
         row_id, = hourly_ads.queue_hourly_findings(
             db, settings, [_finding("5174", "active")], now=CLOCK, slot="fixture", send_alerts=True,
@@ -90,4 +101,8 @@ def test_switch_during_feishu_token_step_stops_old_ad_payload(request, monkeypat
     with sessions() as db:
         row = db.scalar(select(NotificationOutbox))
         assert row.status == "SKIPPED" and row.last_error == policy.BLOCKED
-        assert "delivery_intent" not in row.payload
+        if switch_at == "token":
+            assert "delivery_intent" not in row.payload
+        else:
+            assert row.payload["delivery_intent"]["aborted_before_post"] is True
+    assert worker.process_outbox_batch(outbox_ids=[row_id])["claimed"] == 0

@@ -20,6 +20,7 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
 from jx_alert import ad_source_controls, admin_ad_subscribers, admin_data, admin_groups
@@ -431,6 +432,16 @@ class OwnerConsole:
 
         return list_sparkx_snapshots(db, store, selection, limit=2)
 
+    @staticmethod
+    def _ad_source_last_attempt(db, store, selection):
+        from jx_alert.sparkx_backend import _observation_scope_id
+
+        item = SyncJob.metadata_json["sparkx_observations"][store.sid]
+        return db.scalar(select(item["status"].as_string()).where(
+            SyncJob.job_type == "hourly_ad_monitor",
+            item["selection_id"].as_string() == _observation_scope_id(store, selection),
+        ).order_by(SyncJob.id.desc()).limit(1))
+
     def _ad_source_view(self, store, value=None):
         selection = ad_source_controls.source_snapshot(self.settings, store.sid)
         view = value or ad_source_controls.public_snapshot(self.settings, store, selection)
@@ -439,6 +450,10 @@ class OwnerConsole:
         try:
             with self.session_factory() as db:
                 rows = self._ad_source_observations(db, store, selection)
+                try:
+                    attempt = self._ad_source_last_attempt(db, store, selection)
+                except SQLAlchemyError:
+                    attempt = "STATUS_UNAVAILABLE"  # Keep separately retrieved history.
             keys = {"period", "report_date", "row_count", "captured_at"}
             # Never forward arbitrary history fields/campaign rows as UI metadata.
             latest = []
@@ -452,12 +467,20 @@ class OwnerConsole:
                         or datetime.fromisoformat(captured).utcoffset() != timedelta(0)):
                     continue
                 latest.append({key: row[key] for key in keys})
-        except (OSError, TypeError, ValueError, KeyError, RuntimeError, ImportError):
+        except (OSError, TypeError, ValueError, KeyError, RuntimeError, ImportError, SQLAlchemyError):
             return {**view, "observation_status": "STATUS_UNAVAILABLE", "latest_observations": []}
         active = (getattr(self.settings, "hourly_ad_monitor_enabled", False)
                   and getattr(self.settings, "scheduler_enabled", False) and not self.settings.app_dry_run)
-        return {**view, "observation_status": "OBSERVED" if latest else "WAITING" if active else "HOURLY_DISABLED",
-                "latest_observations": latest}
+        try:
+            collection = store_controls.collection_enabled(self.settings, store.sid)
+        except store_controls.StoreControlError:
+            status = "STATUS_UNAVAILABLE"
+        else:
+            attempt_status = {"PARTIAL": "ATTEMPT_INCOMPLETE", "BLOCKED": "ATTEMPT_BLOCKED",
+                              "STATUS_UNAVAILABLE": "STATUS_UNAVAILABLE"}.get(attempt)
+            status = ("COLLECTION_PAUSED" if not collection else "HOURLY_DISABLED" if not active
+                      else attempt_status or ("OBSERVED" if latest else "WAITING"))
+        return {**view, "observation_status": status, "latest_observations": latest}
 
     def _ad_source(self, sid, operation, token, payload=None):
         store = self._ad_source_store(sid)

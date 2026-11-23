@@ -32,6 +32,7 @@ def runtime(tmp_path, monkeypatch):
                                            for sid in ("10", "11")}}), encoding="utf-8")
     settings = Settings(_env_file=None, collection_scope_file=str(scope), store_timezones_file=str(zones),
         advertising_source_controls_file=str(tmp_path / "ad-selection.json"),
+        store_controls_file=str(tmp_path / "store-controls.json"),
         sparkx_ai_token=SYNTHETIC_TOKEN, sparkx_profile_ids=BINDING["profile_id"] + ",123456")
     engine = create_engine("sqlite:///" + str(tmp_path / "warehouse.sqlite"))
     Base.metadata.create_all(engine)
@@ -191,7 +192,9 @@ def test_no_proof_if_verification_no_longer_authorized_or_is_invalid(runtime, mo
 
 
 def test_owner_observation_status_is_local_scope_and_metadata_only(runtime, monkeypatch):
-    client, server, _, _, calls = runtime
+    client, server, _, settings, calls = runtime
+    settings.app_dry_run = False
+    settings.scheduler_enabled = settings.hourly_ad_monitor_enabled = True
     headers = _sign_in(client)
     observations = []
 
@@ -236,3 +239,107 @@ def test_missing_initialized_selection_does_not_automatically_restore_lingxing(r
         assert controls.observation_source(settings, db.get(Store, "10")) is None
     path.write_bytes(historical)
     assert client.get(API).json()["source"] == "sparkx"
+
+
+def test_interrupted_first_verification_does_not_pause_legacy_sources(runtime, monkeypatch):
+    from jx_alert.ad_source_policy import lingxing_ad_allowed
+
+    client, _, _, settings, calls = runtime
+    headers = _sign_in(client)
+    default = client.get(API).json()
+    path = Path(settings.advertising_source_controls_file)
+    original = controls.os.replace
+
+    def interrupted(src, dst):
+        if Path(dst) == path:
+            raise OSError("synthetic failed first replace")
+        return original(src, dst)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(controls.os, "replace", interrupted)
+        result = client.post(API + "/verify", headers=headers, json=_request(default, binding=BINDING))
+    assert result.status_code == 503
+    assert len(calls) == 1 and not path.exists()
+    assert not controls._initialized_marker(path).exists()
+    assert client.get(API).json()["source"] == "lingxing"
+    assert lingxing_ad_allowed(settings, "10") and lingxing_ad_allowed(settings, "11")
+    retry = client.post(API + "/verify", headers=headers, json=_request(default, binding=BINDING))
+    assert retry.status_code == 200 and retry.json()["source"] == "lingxing"
+
+
+def test_selected_scope_reports_collection_pause_instead_of_waiting(runtime):
+    client, _, _, settings, _ = runtime
+    settings.app_dry_run = False
+    settings.scheduler_enabled = settings.hourly_ad_monitor_enabled = True
+    headers = _sign_in(client)
+    initial = client.get(API).json()
+    verified = client.post(API + "/verify", headers=headers, json=_request(initial, binding=BINDING)).json()
+    selected = client.post(API, headers=headers, json=_request(verified, source="sparkx")).json()
+    assert selected["observation_status"] == "WAITING"
+    Path(settings.store_controls_file).write_text(json.dumps({"version": 1, "stores": {"10": {
+        "collection_enabled": False, "notifications_enabled": True, "updated_at": selected["selected_at"]}}}))
+    paused = client.get(API).json()
+    assert paused["source"] == "sparkx" and paused["observation_status"] == "COLLECTION_PAUSED"
+    assert paused["latest_observations"] == []
+
+
+def test_later_failed_attempt_does_not_hide_history_or_claim_success(runtime):
+    from jx_alert.sparkx_backend import _observation_scope_id, persist_sparkx_observation
+
+    client, _, sessions, settings, calls = runtime
+    settings.app_dry_run = False
+    settings.scheduler_enabled = settings.hourly_ad_monitor_enabled = True
+    headers = _sign_in(client)
+    initial = client.get(API).json()
+    verified = client.post(API + "/verify", headers=headers, json=_request(initial, binding=BINDING)).json()
+    assert client.post(API, headers=headers, json=_request(verified, source="sparkx")).status_code == 200
+    selection = controls.source_snapshot(settings, "10")
+    captured = datetime.fromisoformat(selection["selected_at"])
+    with sessions.begin() as db:
+        store = db.get(Store, "10")
+        marker = _observation_scope_id(store, selection)
+        persist_sparkx_observation(db, store, selection,
+            {"granularity": "daily", "row_count": 3, "report_date": "2026-11-22",
+             "rows": [{"campaign_id": "synthetic-do-not-return"}]},
+            observed_at=captured, slot="prior-success")
+        for state, generation in (("PARTIAL", marker), ("OBSERVED", "different-generation")):
+            db.add(SyncJob(job_type="hourly_ad_monitor", status="PARTIAL_FAILED",
+                started_at=captured.replace(tzinfo=None), metadata_json={"sparkx_observations": {
+                    "10": {"selection_id": generation, "status": state,
+                           "errors": {"provider": "synthetic-do-not-return"}}}}))
+    response = client.get(API)
+    latest = response.json()
+    assert latest["observation_status"] == "ATTEMPT_INCOMPLETE"
+    assert latest["latest_observations"][0]["row_count"] == 3
+    assert "synthetic-do-not-return" not in response.text
+    assert len(calls) == 1
+
+
+def test_interrupted_activation_preserves_prior_verification_and_can_retry(runtime, monkeypatch):
+    from jx_alert.ad_source_policy import lingxing_ad_allowed
+
+    client, _, _, settings, calls = runtime
+    headers = _sign_in(client)
+    initial = client.get(API).json()
+    verified = client.post(API + "/verify", headers=headers, json=_request(initial, binding=BINDING)).json()
+    path = Path(settings.advertising_source_controls_file)
+    marker = controls._initialized_marker(path)
+    assert not marker.exists()
+    backup = path.read_bytes()
+    original = controls.os.replace
+
+    def interrupted(src, dst):
+        if Path(dst) == path:
+            assert marker.is_file()
+            raise OSError("synthetic failed activation replace")
+        return original(src, dst)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(controls.os, "replace", interrupted)
+        failed = client.post(API, headers=headers, json=_request(verified, source="sparkx"))
+    assert failed.status_code == 503 and path.read_bytes() == backup
+    assert marker.is_file() and lingxing_ad_allowed(settings, "10")
+    assert client.get(API).json()["verification_status"] == "VERIFIED"
+    retried = client.post(API, headers=headers, json=_request(verified, source="sparkx"))
+    assert retried.status_code == 200 and retried.json()["source"] == "sparkx"
+    assert len(calls) == 1

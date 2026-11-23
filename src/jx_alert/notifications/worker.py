@@ -147,6 +147,18 @@ class _AdSourceChanged(RuntimeError):
     """A legacy ad alert no longer matches the current manual source."""
 
 
+def _check_ad_source(payload, created_at, shown_items=None):
+    try:
+        # Scope follows the actual rendered card, not dropped rows from an
+        # earlier queue snapshot. Read current selection instead of cached state.
+        frozen = {**payload, "hourly_items": shown_items} if shown_items is not None else payload
+        if legacy_payload_allowed(load_runtime_settings(), frozen, created_at):
+            return
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+        pass
+    raise _AdSourceChanged
+
+
 class _LostOutboxClaim(RuntimeError):
     """The worker no longer owns a send; it must not call Feishu."""
 
@@ -211,14 +223,7 @@ def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, pay
         if submission_scope is not None:
             key, created_at, *shown_items = submission_scope
             if legacy_ad_payload(payload):
-                try:
-                    # Use only the exact rows rendered into the attempted card,
-                    # not an originally queued store that was already filtered out.
-                    frozen = {**payload, "hourly_items": shown_items[0]} if shown_items else payload
-                    if not legacy_payload_allowed(load_runtime_settings(), frozen, created_at):
-                        raise _AdSourceChanged
-                except (OSError, RuntimeError, ValueError, TypeError, KeyError):
-                    raise _AdSourceChanged from None
+                _check_ad_source(payload, created_at, shown_items[0] if shown_items else None)
             if company_executive.is_company_digest(key, payload):
                 row = db.scalar(select(NotificationOutbox).where(
                     NotificationOutbox.id == row_id, NotificationOutbox.status == "PREPARING",
@@ -433,6 +438,14 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                     scope += (hourly_delivered_items,)
             claim_time, intent, material_window = _record_submission(
                 row_id, claim_time, attempts, lease_seconds, chat_id, payload, evidence, scope)
+            if legacy_ad_payload(payload):
+                # Serialization and committing the write-ahead intent can
+                # outlive a manual switch. Recheck while POST is still avoidable.
+                try:
+                    _check_ad_source(payload, created_at, hourly_delivered_items)
+                except _AdSourceChanged:
+                    intent = {**intent, "aborted_before_post": True}
+                    raise
             if company_digest:
                 checked = datetime.now(timezone.utc)
                 if (not timedelta() <= checked.replace(tzinfo=None) - claim_time <= timedelta(seconds=lease_seconds)

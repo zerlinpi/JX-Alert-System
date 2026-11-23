@@ -78,6 +78,8 @@ def source(monkeypatch):
                 for i in ([1, 2] if page == 1 else [3])]
         if failure == "duplicate" and page == 2:
             rows = [{**rows[0], "campaignId": 510, **({"hour": 1} if hour else {})}]
+        if failure == "disjoint_reordered_page" and page == 2:
+            rows[0]["campaignId"] = 509
         if failure == "future_hour" and hour:
             rows[0]["hour"] = 23
         if failure == "wrong_ad_type":
@@ -178,6 +180,7 @@ def test_vendor_json_text_exactly_proves_scope(source):
     ("source_warns_truncated", "SPARKX_SOURCE_PARTIAL_WARNING"),
     ("unproven_partial", "SPARKX_PAGE_NOT_PROVEN"),
     ("duplicate", "SPARKX_DUPLICATE_CAMPAIGN_GRAIN"),
+    ("disjoint_reordered_page", "SPARKX_UNSTABLE_PAGE_ORDER"),
     ("wrong_date", "SPARKX_ROW_SCOPE_MISMATCH"),
     ("wrong_row_profile", "SPARKX_ROW_SCOPE_MISMATCH"),
     ("missing_row_profile", "SPARKX_ROW_FIELDS_NOT_PROVEN"),
@@ -247,3 +250,39 @@ def test_generic_caution_does_not_count_as_partial_and_unknown_warning_is_saniti
     assert errors == {} and all(row["provider_warning"] is True and row["coverage"] == "observed_not_certified"
                                 for row in observed.values())
     assert "Upstream advisory code 113" not in json.dumps(observed)
+
+def test_revocation_after_first_page_aborts_remaining_reads(source):
+    auth_checks = 0
+
+    def authorize():
+        nonlocal auth_checks
+        auth_checks += 1
+        if auth_checks == 3:
+            raise sparkx.SparkXBackendError("SCOPE_CHANGED")
+
+    with pytest.raises(sparkx.SparkXBackendError, match="SCOPE_CHANGED"):
+        anyio.run(lambda: sparkx.read_sparkx_observations(
+            _settings(), _store(), BINDING, now=NOW, authorize=authorize))
+    assert [x[0] for x in source["calls"]] == ["get_user_authorized_context", "get_ads_perf"]
+
+
+def test_latest_summary_keeps_both_grains_and_cannot_reuse_the_wrong_date(source):
+    result, errors = anyio.run(lambda: sparkx.read_sparkx_observations(_settings(), _store(), BINDING, now=NOW))
+    assert not errors
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        store = Store(**vars(_store()), name="Approved Shop")
+        db.add(store)
+        daily, hourly = result["daily"], result["hourly"]
+        sparkx.persist_sparkx_observation(db, store, CHOICE, hourly, observed_at=NOW, slot="old")
+        first = sparkx.persist_sparkx_observation(db, store, CHOICE, daily,
+                                                  observed_at=NOW + timedelta(minutes=1), slot="test")
+        new_daily = {**daily, "report_date": NOW.date().isoformat()}
+        second = sparkx.persist_sparkx_observation(db, store, CHOICE, new_daily,
+                                                   observed_at=NOW + timedelta(days=1), slot="test")
+        db.commit()
+        assert first["snapshot_id"] != second["snapshot_id"]
+        identified = {item["period"]: item for item in sparkx.list_sparkx_snapshots(db, store, CHOICE)}
+        assert set(identified) == {"hourly", "daily"} and identified["daily"]["report_date"] == NOW.date().isoformat()
+    engine.dispose()
