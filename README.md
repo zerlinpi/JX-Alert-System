@@ -1,187 +1,46 @@
 # JX Alert System
 
-领星 ERP（Lingxing OpenAPI）只读数据监控、经营/广告异常分析、飞书自建应用通知与群内/私聊问答、Chat MCP和Excel归档服务。
+亚马逊广告监控：**SparkX MCP** 是唯一数据源（只读），**DeepSeek** 负责撰写说明和回答问题，**飞书自建应用**负责发送，所有者在 **管理台** 配置一切。领星数据源已移除。
 
-> **完整系统逻辑与所有提醒规则：[阅读总文档](docs/SYSTEM_RULES_AND_LOGIC.md)。** 其中区分线上实际开关、代码默认、初筛、最终通知、数据未知和真实送达。 飞书卡片预览、DeepSeek 设置及内置策略见[通知与分析审核](docs/ALERT_REVIEW_CONTROLS.md)。
->
-> 运营台填写 DeepSeek 密钥/模型、SparkX MCP Token 及连接测试、运营姓名同步见[运营台：DeepSeek、SparkX 与运营姓名](docs/OWNER_CONSOLE_AI_AND_SPARKX.md)；08:30 总负责人公司日报见[公司经营与广告快报](docs/COMPANY_EXECUTIVE_DIGEST.md)；用 SparkX 直出数据的广告日报和“近 7 日对比前 7 日”广告异常见[SparkX 广告日报与广告异常](docs/SPARKX_DAILY_REPORT.md)。
+| 通知 | 时间（北京） | 接收人 | 内容 |
+|---|---|---|---|
+| 广告日报 | 每天 08:30 | 总负责人（私聊），可选通知群 | 昨日（美西完整日）全公司店铺总销售额、总订单量、广告花费、广告销售额、ACOS、TACOS、CVR、PPC、ROAS 及环比；站点汇总表；有花费店铺明细（含对应运营）；「须知」 |
+| 广告异常复盘 | 每天 08:30（可选仅周一） | 广告负责人（全部店铺，标注运营）、对应运营（只含其店铺），可选通知群 | 近 7 日对比前 7 日：一、最严重（全店零曝光等）；二、异常店铺总览；三、按类型看 campaign（①高花费零出单 ②ACOS 明显恶化 ③加预算后销售反而下滑 ④异常停摆，附建议 CPC）；四、建议动作 |
+| 实时监控 | 每小时（发送时段内） | 广告负责人、对应运营，可选通知群 | 美西当日截至目前：高花费无转化、高花费低转化、低花费无转化、低花费高转化；同一活动同类提醒每天一次 |
+| 飞书问答 | 随时 | 群内 @机器人 或私聊 | DeepSeek 直接调用 SparkX 只读工具查询并回答 |
 
-早间08:00按「每天绩效/违规快报，广告只列有意义的SP活动问题」发送；自然提问、数据清单、两项独立开关生效边界及回滚见[早间快报与自然提问](docs/MORNING_BRIEF_AND_QUESTIONS.md)。
->
-> 源码默认 `APP_DRY_RUN=true`、`FEISHU_ENABLED=false`、`SCHEDULER_ENABLED=false`；现有服务器通过私有运行配置启用服务。以下新环境安装步骤不用于覆盖现有`.env`、私有配置或重建生产数据库。
+## 数据与安全规则
 
-## 当前架构
+- 只调用 SparkX 只读工具 `get_user_authorized_context`、`get_ads_perf`、`get_entity_metadata`；写工具（`batch_update_ads`、`create_*` 等）在代码中不可达。
+- 表格里的每个数字都由服务端从 SparkX 行计算；缺失显示「—」，从不当作 0。分页不完整、币种不一致、行重复或超出请求范围时整条通知不生成。
+- DeepSeek 只改写服务端计算好的事实；回答中出现事实之外的数字、日期或店铺时会被要求重写一次，仍不符合就改用系统规则文字（问答则直接展示 SparkX 原始结果）。
+- 店铺报表时区按 `America/Los_Angeles`；日报用已结束的完整日，近 7–14 天的销售和订单仍会回补，卡片中注明。
+- 卡片在排队时冻结；发送前重新核对开关、发送时段和接收人。可能已提交飞书但未确认的消息不自动重发。
+- 密钥（SparkX Token、DeepSeek Key、飞书 App Secret）只写不读，保存在 0600 私有文件。
 
-- **领星：** access-token 获取接口已按官方文档配置为 POST `/api/auth-server/oauth/access-token` + `multipart/form-data`（`appId`、`appSecret`）；响应映射为 `data.access_token`、`data.refresh_token`、`data.expires_in`。Refresh-token 续约接口仍待用户提供官方契约，不猜测路径或字段。业务 API 使用 Bearer Token + URL Query 签名。
-- **飞书：** 当前线上使用自建应用，支持群通知、定向@及独立长连接问答，不需要Webhook；旧Webhook仅为兼容通道。配置正常与入队不等于真实送达。
-- **数据库：** MariaDB 11；本地测试支持 SQLite。保留原始快照、日指标、异常事件、通知日志和 outbox。
-- **销售采集：** 已接入领星 ASIN/MSKU 日销量接口，分别采集销售额、销量、订单量，并保存店铺汇总和原始响应。
-- **广告采集：** 已接入 SP/SB/SD 活动日报、活动基础资料、SP/SD 商品广告日报，以及 SP/SD 商品广告基础状态（enabled/paused/archived）。SB 商品级报表接口尚未确认，不猜测接口路径。
-- **数据完整性：** 按店铺、日期、数据维度记录coverage。完整请求仍可能无记录；必须有明确有效事实才显示真实0，缺失字段不补0。
-- **时间：** 保留领星源时间，明确偏移才换算；无偏移不套服务器时区。已核实店铺按本地完整日规划，未知时区可用保守历史模式；调度仍为北京时间。
-- **异常：** 保留15%初筛与SP7日/SB、SD14日归因成熟保护。线上启用实质通知门槛：相对变化、绝对影响、样本和普通两日期确认；正向增长、单纯高花费及小波动不直接通知。线上业务告警采用Chat提交模式，授权/数据质量提醒独立保留。
-- **可靠通知：** 持久 outbox 在消息 POST 前记录投递意图；发送前失败可退避重试，可能已提交却未确认的消息不自动重发、不算送达。见[回执核对与回滚](docs/FEISHU_DELIVERY_RECEIPTS.md)。
-- **Excel：** 单店报表日归档、内容版本及独立SP版本并存，每天北京23:30另存已保存全部业务历史的多维度快照；原JSON私有归档，不把版本相加。
-- **调度/回补：** 每日调度连接采集、分析和Excel，默认回刷22日以覆盖14日归因及七日基准；不足时按指标证据回退精确前日或保持未知，不强凑完整性。提供显式历史回补；源码默认调度关闭，现有线上配置已开启。
-- **MCP：** 提供查询、冻结证据分析、显式采集及受控通知；按read/collect/notify作用域与服务开关分别校验。线上远程HTTPS使用OAuth，保留Bearer兼容模式；没有广告修改工具。
-- **店铺绩效：** 已自动观测归档绩效、详情和业绩通知，保留源标准和源时间；健康业务告警保持仅观测保护，不因接受源时间展示而自动启用。
-- **机器人问答：** 群内真实@或已授权用户直接私聊，按店铺全名、品牌或片段解析，多店歧义先确认站点；服务端生成完整表格，DeepSeek解释冻结证据。普通提问不采集，明确采集需对应负责人/管理员权限，原Chat MCP独立运行。运营台可[替换通知群](docs/FEISHU_GROUP_AND_PRIVATE_CHAT.md)，旧消息不跨群迁移。
+## 目录
 
-## 已核验的领星业务 API
-
-| 功能 | 方法 / 路径 |
-|---|---|
-| 店铺列表 | GET `/erp/sc/data/seller/lists` |
-| MSKU/ASIN 每日销量统计 | POST `/erp/sc/data/sales_report/asinDailyLists` |
-| SP 活动资料 | POST `/pb/openapi/newad/spCampaigns` |
-| SB 活动资料 | POST `/pb/openapi/newad/hsaCampaigns` |
-| SD 活动资料 | POST `/pb/openapi/newad/sdCampaigns` |
-| SP 活动日报 | POST `/pb/openapi/newad/spCampaignReports` |
-| SB 活动日报 | POST `/pb/openapi/newad/hsaCampaignReports` |
-| SD 活动日报 | POST `/pb/openapi/newad/sdCampaignReports` |
-| SP 商品广告资料 | POST `/pb/openapi/newad/spProductAds` |
-| SD 商品广告资料 | POST `/pb/openapi/newad/sdProductAds` |
-| SP 商品广告日报 | POST `/pb/openapi/newad/spProductAdReports` |
-| SD 商品广告日报 | POST `/pb/openapi/newad/sdProductAdReports` |
-
-广告接口使用 `X-API-VERSION: 2`。SP/SD 报表按 `next_token` 游标分页，SB 活动报表按 `offset/length` 分页；分页缺失或不完整时客户端会报错，不把部分结果当成完整日报。领星签名按 ASCII 排序，将业务参数、原始 `access_token`、`app_key`、`timestamp` 拼接后 MD5 大写，再使用 AppID 作为 AES 密钥执行 AES/ECB/PKCS5Padding。Bearer Token 通过 `Authorization` 头发送，但仍须参与签名；POST JSON 中的标量业务字段也须参与签名。仅SP广告/投放小时接口的campaign_ids数组已有端点专用签名规范化，实际请求体保留数组；其他未核实嵌套参数仍拒绝猜测。
-
-官方资料：
-- [领星 OpenAPI 接入指南](https://apidoc.lingxing.com/new/guides/new-instructions/)
-- [领星开放平台](https://apidoc.lingxing.com/new)
-- [店铺列表](https://apidoc.lingxing.com/new/api-docs/BasicData/SellerLists/)
-- [MSKU/ASIN 销量统计](https://apidoc.lingxing.com/new/api-docs/Statistics/AsinDailyLists/)
-- [SP 活动报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/spCampaignReports/)
-- [SB 活动报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/hsaCampaignReports/)
-- [SD 活动报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/sdCampaignReports/)
-- [SP 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/spCampaigns/)
-- [SB 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/hsaCampaigns/)
-- [SD 活动资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/sdCampaigns/)
-- [SP 商品广告资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/spProductAds/)
-- [SD 商品广告资料](https://apidoc.lingxing.com/new/api-docs/newAd/baseData/sdProductAds/)
-- [SP 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/spProductAdReports/)
-- [SD 商品广告报表](https://apidoc.lingxing.com/new/api-docs/newAd/report/sdProductAdReports/)
-
-## 旧Webhook兼容通道（当前线上不需要）
-
-自定义机器人只向创建它的群发送消息。Webhook 地址和签名密钥都属于敏感凭据，必须只保存在 Linux 服务器的 `.env` 中。
-
-- 文本消息支持 `<at user_id="OPEN_ID">姓名</at>` 实现真正 @。
-- 群自定义机器人无法通过手机号/邮箱查询用户 ID；请在路由配置中使用该群成员的真实 Open ID。
-- `FEISHU_KEYWORD` 用于满足机器人安全设置中的自定义关键词校验（若启用）。
-- `FEISHU_SIGN_SECRET` 用于签名校验（若启用）。
-- `config/feishu-routing.example.json` 可复制为服务器本地 `data/feishu-routing.json`，按店铺 ID 和 MSKU/ASIN 配置负责人 Open ID。
-- 一个 Webhook 对应一个群；可在路由配置中为多个群分别设置 Webhook 环境变量、群管理员 Open ID，并按店铺/SKU 指定目标群。
-
-官方文档：[飞书自定义机器人使用指南](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)。
-
-## Linux Docker 部署
-
-1. 在 Linux 服务器安装 Docker Engine 和 Docker Compose Plugin。
-2. 克隆仓库并复制配置模板：
-   ```bash
-   git clone https://github.com/zerlinpi/JX-Alert-System.git
-   cd JX-Alert-System
-   cp .env.example .env
-   ```
-3. 生成独立数据库密码并编辑 `.env`。至少填写 `DB_PASSWORD`、`DB_ROOT_PASSWORD`、领星 AppID/AppSecret。不要把 `.env` 发到聊天或提交到 Git。
-   ```bash
-   openssl rand -hex 32
-   nano .env
-   ```
-4. 创建可由容器非 root 用户写入的数据目录：
-   ```bash
-   mkdir -p data
-   cp config/feishu-routing.example.json data/feishu-routing.json
-   cp config/store-timezones.example.json data/store-timezones.json
-   sudo chown -R 10001:10001 data
-   chmod 700 data
-   chmod 600 data/feishu-routing.json data/store-timezones.json
-   nano data/store-timezones.json
-   ```
-5. 先保持 dry-run，验证 Compose 配置并启动 API 与数据库：
-   ```bash
-   docker compose config
-   docker compose up -d --build
-   docker compose ps
-   curl http://127.0.0.1:8000/health
-   ```
-6. 阅读 [Linux 部署说明](docs/DEPLOY_LINUX.md)、[领星 Token 配置说明](docs/LINGXING_TOKEN_SETUP.md)、[飞书 Webhook 配置说明](docs/FEISHU_WEBHOOK.md) 和 [领星店铺绩效 MCP 接入说明](docs/LINGXING_PERFORMANCE_MCP.md)。
-
-调度器是可选 profile。只有完成 API 契约、历史回补、飞书测试后才配置 `SCHEDULER_ENABLED=true`，再执行：
-```bash
-docker compose --profile scheduler up -d --build scheduler
+```
+src/jx_alert/
+  sparkx/       client（只读 MCP 会话与校验）、collect（三条通知的数据采集）、analysis（确定性计算）、
+                stores（店铺目录：监控开关与对应运营）、credentials（Token）
+  reports/      settings（通知开关/阈值）、recipients（接收人）、cards（飞书卡片）、lanes（排队与发送前核对）
+  ai/           deepseek（Chat Completions 客户端）、deepseek_config、narrative（文字生成与数字核对）
+  notifications/ feishu_app、outbox、worker、routing、cards
+  bot_service.py / bot_agent.py / feishu_bot.py   飞书问答
+  admin_console.py / admin_feishu.py / admin_ui/    管理台
+  scheduler.py / api.py / config.py / storage/
 ```
 
-需要直接获取 SparkXAI 原生广告/ASIN 查询结果时，参见 [SparkXAI MCP 隔离试点](docs/SPARKX_DIRECT_MCP.md)。这不替换现有定时任务或飞书报告。 同页还说明如何预览 SparkX 原文/原始数据表，并在单独确认账户、群和投递策略后手动入队。
+详见：[通知内容与规则](docs/NOTIFICATIONS.md) · [管理台](docs/CONSOLE.md) · [飞书问答](docs/FEISHU_BOT.md) · [部署、迁移与回滚](docs/DEPLOY.md)。
 
-远程 MCP 服务使用独立的可选 profile。先在服务器 `.env` 中生成并设置至少 32 字符的 Bearer Token：
-```bash
-openssl rand -hex 32
-nano .env
-# 设置 MCP_BEARER_TOKEN=上一步生成的随机值
+## 本地测试
+
+```sh
+pip install -e ".[dev,bot]"
+ruff check . && pytest -q
+node --test tests/ui/*.test.cjs
+npm install --no-save jsdom@24 && node tests/ui/console.smoke.cjs
 ```
 
-保持默认 `MCP_BIND_IP=127.0.0.1`，再启动：
-```bash
-docker compose --profile mcp up -d --build mcp
-docker compose logs -f mcp
-```
-
-本机 MCP 地址为 `http://127.0.0.1:8001/mcp`。如果要经公网域名提供给远程 MCP 客户端，先配置 TLS 反向代理，并把域名写入 `MCP_ALLOWED_HOSTS`（例如 `mcp.example.com,mcp.example.com:*`）；浏览器客户端还需配置准确的 `MCP_ALLOWED_ORIGINS`。不要将 MCP 容器端口直接暴露公网。客户端需要使用对应 Bearer Token。不要把 Token 写进仓库、聊天或 URL。
-
-默认 API 仅绑定 `127.0.0.1`，建议通过服务器 Nginx/Caddy 反向代理访问，不要直接暴露到公网。生产环境请另行配置 TLS、访问控制和防火墙。
-
-## 测试
-
-CI 会在 push / pull request 时安装开发依赖并运行 pytest。服务器上可在隔离环境运行：
-```bash
-python3.12 -m venv .venv
-. .venv/bin/activate
-pip install -e ".[dev]"
-pytest -q
-ruff check .
-```
-
-领星连接检查默认只检查本地配置，不获取 Token 或请求店铺数据。确认 Token 接口字段已核验后才加 `--request`：
-
-```bash
-python scripts/test_lingxing_connection.py
-python scripts/test_lingxing_connection.py --request
-```
-
-每日全量采集默认 dry-run。确认 Token 配置和每个 sid 的时区后，显式使用 `--collect`，并将服务器本地 `APP_DRY_RUN=false`：
-```bash
-python scripts/collect_lingxing_daily.py
-python scripts/collect_lingxing_daily.py --collect --date 2026-11-10
-# 每个店铺使用自己的站点日期：
-python scripts/collect_lingxing_daily.py --collect --date-map data/store-report-dates.json
-
-# 历史回补：首次上线至少回补 22 天，覆盖 14 天归因窗口及其前七日基准；最多 30 天
-python scripts/backfill_lingxing.py
-python scripts/backfill_lingxing.py --collect --days 22
-
-# 手动导出已有数据
-python scripts/export_daily_report.py --date 2026-11-10
-```
-
-飞书连通性脚本默认只做本地配置检查，不发送消息。只有明确准备好向真实群发送测试时才加 `--send`：
-```bash
-python scripts/test_feishu_webhook.py
-python scripts/test_feishu_webhook.py --send
-```
-
-## 尚未达到生产完成的部分
-
-- 领星 Token 接口的准确路径、请求字段和响应字段路径尚需按你账号开放平台当前文档填写并验证。
-- 领星绩效三个 OpenAPI 接口已接入自动采集；仍需在服务器确认 update_date / lastUpdateDate 的源时区、配置 LINGXING_PERFORMANCE_SOURCE_TIMEZONE，并用真实脱敏响应核验字段及分页。默认 LINGXING_PERFORMANCE_ENABLED=false，验证后启用。所有新采集的原始响应会同时归档到 RAW_DIR/YYYY/MM/DD/，使用原子写入和仅所有者可读写权限。
-- SB 商品级广告日报的公开 API 契约尚未确认；当前不将 SB 活动数据分摊到商品。
-- 产品表现异步报告（reportType=2）需要嵌套 reportOptions 的签名 canonicalizer；当前客户端对此类嵌套参数 fail closed，未猜测签名格式。
-- 业绩通知数据依赖领星插件同步状态；已加入 lastUpdateDate 新鲜度检查，未配置源时区或数据过期时保持未知/异常状态。
-- 店铺/站点时区、币种、负责人映射需由真实账号数据确认。
-- 数据库已加入兼容旧表的幂等增量升级；尚未迁移到完整 Alembic 版本化迁移框架。
-- 已在用户 Linux/MariaDB 上验证只读采集、历史回补、版本去重、容器重启持久化和测试群投递；当前实际店铺范围为5174。公网 ChatGPT OAuth 连接及人员映射后的正式通知仍须验收，不能以本地测试替代。
-
-运行、回滚和后续手填配置见 [OPERATIONS_AND_ROLLBACK](docs/OPERATIONS_AND_ROLLBACK.md)、[手工映射清单](docs/MANUAL_MAPPING.md) 和 [ChatGPT MCP 接入](docs/CHATGPT_MCP.md)。飞书应用机器人使用原生表格卡片展示关键数据，旧文本队列保持兼容；缺数据不补零。健康源时区未知时可以保存观测，但不会新增或恢复健康风险业务告警。
-
-第一阶段只读领星，不提供修改广告预算、竞价、关键词或活动状态的功能。
+测试全部使用合成数据和模拟的 SparkX / DeepSeek / 飞书，不访问真实服务。

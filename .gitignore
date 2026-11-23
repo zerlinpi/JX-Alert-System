@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -7,6 +8,7 @@ __pycache__/
 .env
 data/
 logs/
+node_modules/
 *.xlsx
 *.sqlite3
 .DS_Store

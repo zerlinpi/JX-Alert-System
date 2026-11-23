@@ -225,7 +225,7 @@ def _load_sdk():
 
 
 def run_bot(settings):
-    """Run in its own process; neither MCP routes nor MCP OAuth state are changed."""
+    """Run in its own process: WebSocket intake plus a separate answering worker thread."""
     if not getattr(settings, "feishu_bot_enabled", False):
         logger.info("Feishu group question service is disabled")
         return

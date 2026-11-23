@@ -1,300 +1,69 @@
-from copy import deepcopy
+"""DeepSeek Chat Completions client: tool calls, JSON output and sanitized failures."""
 import json
-from types import SimpleNamespace
 
 import httpx
-from pydantic import SecretStr
 import pytest
 
-from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError, ENDPOINT, MAX_CONTEXT_BYTES
+from jx_alert.ai.deepseek import ENDPOINT, DeepSeekClient, DeepSeekError
+from jx_alert.ai import deepseek_config
+
+KEY = "sk-synthetic-deepseek-key"
 
 
-KEY = "test-only-deepseek-key"
-CONTEXT = {"store_id": "5174", "report_date": "2026-11-12", "currency": "USD",
-           "kpis": {"CPC": {"current": 1.5, "status": "NON_ADVERSE"},
-                    "CDR": {"current": None, "status": "INSUFFICIENT_DATA"}}}
-ANALYSIS = "点击花费未见恶化；转化数据不足，待确认。"
+def client(handler):
+    return DeepSeekClient(KEY, model="deepseek-flash", timeout=5, transport=httpx.MockTransport(handler))
 
 
-@pytest.mark.parametrize("prefix", ["样本仅覆盖", "活动样本仅覆盖", "广告活动样本仅覆盖"])
-def test_materiality_output_removes_watch_and_sample_caveats_but_keeps_real_gaps(prefix):
-    from jx_alert.ai.deepseek import _actionable_text
-    context = {"notification_policy": {"version": 1}, "advertising_kpis": {"CTR": {"status": "WATCH"}}}
-    text = "- CTR较前日下降25%，观察，未达通知门槛。\n- " + prefix + "3个活动，不代表全量。\n- 店铺源时区待确认。"
-    assert _actionable_text(text, context, "店铺异常情况") == "- 店铺源时区待确认。"
-    assert "样本仅覆盖" in _actionable_text(text, context, "覆盖所有活动吗")
+def completion(message, finish="stop"):
+    return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", **message}, "finish_reason": finish}],
+                                     "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})
 
 
-def test_materiality_output_never_discards_supported_adverse_kpis_or_missing_metrics():
-    from jx_alert.ai.deepseek import _actionable_text
-    context = {"notification_policy": {"version": 1}, "advertising_kpis": {
-        "CPC": {"status": "ADVERSE"}, "CDR": {"status": "NO_BASELINE"}}}
-    text = "- CPC上升80%，请复核。\n- CDR缺少基线，待确认。"
-    assert _actionable_text(text, context, "异常情况") == text
-
-
-def test_empty_filtered_output_does_not_claim_missing_evidence_is_normal():
-    from jx_alert.ai.deepseek import _actionable_text
-    context = {"notification_policy": {"version": 1}, "advertising_kpis": {
-        "CTR": {"status": "WATCH"}, "CDR": {"status": "INSUFFICIENT_DATA"}}}
-    result = _actionable_text("- CTR下降25%，观察。", context, "异常情况")
-    assert "CDR" in result and "待确认" in result and "未发现" not in result
-
-
-def test_model_no_anomaly_claim_cannot_hide_material_evidence_or_mislabel_roas_as_money():
-    from jx_alert.ai.deepseek import _actionable_text
-    context = {"notification_policy": {"version": 1}, "screening_candidates": [{
-        "name": "活动甲", "title": "广告投入产出下降", "metric": "ROAS", "current": 1.,
-        "baseline": 3., "currency": "USD", "current_date": "2026-11-01"}]}
-    result = _actionable_text("本次未发现异常。", context, "异常情况")
-    assert "1.00倍" in result and "3.00倍" in result and "美元" not in result
-
-
-def response(text=ANALYSIS, finish="stop", **message):
-    return httpx.Response(200, json={"choices": [{"finish_reason": finish,
-        "message": {"role": "assistant", "content": text, **message}}]})
-
-
-def mock_http(monkeypatch, handler):
-    original = httpx.Client
-    monkeypatch.setattr(httpx, "Client", lambda **kwargs:
-        original(transport=httpx.MockTransport(handler), **kwargs))
-    monkeypatch.setattr("jx_alert.ai.deepseek.time.sleep", lambda value: None)
-
-
-def test_fixed_official_request_freezes_data_and_never_exposes_tools_or_key_in_body(monkeypatch):
-    calls = []
+def test_tool_calls_are_parsed_and_the_request_disables_thinking():
+    seen = {}
 
     def handler(request):
-        assert request.method == "POST" and str(request.url) == ENDPOINT
-        assert request.headers["Authorization"] == "Bearer " + KEY
-        body = json.loads(request.content)
-        calls.append(body)
-        assert KEY not in request.content.decode()
-        assert body["model"] == "deepseek-flash"
-        assert body["tool_choice"] == "none" and "tools" not in body
-        assert body["stream"] is False and body["thinking"] == {"type": "disabled"}
-        assert len(body["messages"]) == 2
-        frozen = json.loads(body["messages"][1]["content"])
-        assert frozen["frozen_data"] == CONTEXT
-        assert frozen["question"] == "查看店铺5174"
-        assert "分母为零" in body["messages"][0]["content"]
-        assert "TCOAS" in body["messages"][0]["content"]
-        return response(reasoning_content="unpublished private reasoning")
+        seen["url"], seen["auth"] = str(request.url), request.headers["authorization"]
+        seen["body"] = json.loads(request.content)
+        return completion({"content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {
+            "name": "list_stores", "arguments": "{}"}}]}, finish="tool_calls")
 
-    mock_http(monkeypatch, handler)
-    before = deepcopy(CONTEXT)
-    settings = SimpleNamespace(deepseek_api_key=SecretStr(KEY))
-    assert DeepSeekClient.from_settings(settings).analyze(CONTEXT, "查看店铺5174") == ANALYSIS
-    assert CONTEXT == before and len(calls) == 1
+    result = client(handler).chat([{"role": "user", "content": "hi"}], tools=[{"type": "function", "function": {
+        "name": "list_stores", "parameters": {"type": "object", "properties": {}}}}])
+    assert seen["url"] == ENDPOINT and seen["auth"] == "Bearer " + KEY
+    assert seen["body"]["thinking"] == {"type": "disabled"} and seen["body"]["tool_choice"] == "auto"
+    assert result["tool_calls"] == [{"id": "call_1", "name": "list_stores", "arguments": {}}]
+    assert result["message"]["tool_calls"][0]["function"]["name"] == "list_stores"
 
 
-def test_custom_question_can_return_a_short_paragraph_without_an_anomaly_template(monkeypatch):
-    answer = 'CPC是广告花费除以点击次数。当前问题没有指定店铺，不能据此判断某家店是否异常。'
-    def handler(request):
-        body = json.loads(request.content)
-        assert '不套用固定异常报告' in body['messages'][0]['content']
-        assert body['tool_choice'] == 'none' and 'tools' not in body
-        return response(text=answer)
-    mock_http(monkeypatch, handler)
-    context = {**CONTEXT, 'reply_mode': 'answer', 'notification_policy': {'version': 1}}
-    assert DeepSeekClient(KEY).analyze(context, 'CPC是什么意思') == answer
-
-
-@pytest.mark.parametrize("reply_mode", ["answer", "analysis"])
-def test_model_instruction_uses_metric_date_bases_and_not_order_cohorts(monkeypatch, reply_mode):
-    context = {**CONTEXT, "reply_mode": reply_mode, "api_business_observations": {
-        "report_date": "2026-11-12",
-        "product": {"basis": "产品表现", "currency": "USD",
-                    "metrics": {"volume": 2, "returnGoodsCount": 5, "refundCount": 1, "netAmount": 40},
-                    "metric_bases": {"volume": "下单日", "netAmount": "下单日",
-                                     "returnGoodsCount": "退货发生日", "refundCount": "退款发生日"}},
-        "settlement": {"basis": "利润报表，结算日，已发放", "currency": "USD",
-                       "metrics": {"totalSalesRefunds": -7}, "metric_bases": {"totalSalesRefunds": "已发放结算日"}},
-    }}
-
-    def handler(request):
-        prompt, frozen = json.loads(request.content)["messages"]
-        source = json.loads(frozen["content"])["frozen_data"]["api_business_observations"]
-        assert source == context["api_business_observations"]
-        assert "按metric_bases逐项解释日期" in prompt["content"]
-        assert "各按实际事件发生日" in prompt["content"]
-        assert "不得解释为原订单批次的最终退货率" in prompt["content"]
-        assert "不推算未提供的原订单批次退货率" in prompt["content"]
-        assert "不从净销售额再扣结算退款" in prompt["content"]
-        assert "没有逐项依据时不从分组标签猜日期" in prompt["content"]
-        assert "product按下单日" not in prompt["content"]
-        return response()
-
-    mock_http(monkeypatch, handler)
-    assert DeepSeekClient(KEY).analyze(context, "各项退货退款数据是什么日期口径？") == ANALYSIS
-
-
-def test_forecast_uses_compact_frozen_evidence_without_action_tools(monkeypatch):
-    context = {**CONTEXT, 'advertising_kpis': {}, 'reply_mode': 'answer',
-        'analysis_evidence': {'spend_projection': {'scenario_only': True, 'monthly_total': 3000,
-            'currency': 'USD', 'basis_start': '2026-11-10', 'basis_end': '2026-11-16'}},
-        'business_daily': {'net_sales': 4089.75, 'currency': 'USD'}}
-    answer = '在日均花费不变的假设下，11月底花费情景估算为美元3,000；未提供预算上限，无法判断超支。'
-    def handler(request):
-        body = json.loads(request.content)
-        prompt = body['messages'][0]['content']
-        packet = json.loads(body['messages'][1]['content'])['frozen_data']
-        assert packet['analysis_evidence'] == context['analysis_evidence']
-        assert packet['business_daily'] == context['business_daily']
-        assert '不是概率或置信区间' in prompt and '没有预算上限不能断言超预算' in prompt
-        assert body['tool_choice'] == 'none' and 'tools' not in body
-        return response(answer)
-    mock_http(monkeypatch, handler)
-    assert DeepSeekClient(KEY).analyze(context, '预测月底广告花费') == answer
-
-
-def test_findings_only_answer_drops_normal_items_under_an_abnormal_heading():
-    from jx_alert.ai.deepseek import _actionable_text
-    text = '## 店铺绩效\n**待确认**\n- 源时区未确认，当前健康待确认。\n**异常**\n- 无已确认异常；订单缺陷率均未见超标。\n**复核建议**：补齐资料。'
-    result = _actionable_text(text, {'reply_mode': 'answer'}, '只回答异常或待确认项')
-    assert result == '- 源时区未确认，当前健康待确认。'
-
-
-def test_findings_filter_preserves_a_risk_that_cannot_be_ruled_out_and_unknown_evidence():
-    from jx_alert.ai.deepseek import _actionable_text
-    text = '- 源时区未知，不能确认当前无违规。\n- 投放花费高且没有订单，成熟数据待复核。'
-    assert _actionable_text(text, {'reply_mode': 'answer'}, '仅列风险和待确认') == text
-
-
-def test_loads_private_credentials_file_and_explicit_model(tmp_path, monkeypatch):
-    path = tmp_path / "private.json"
-    path.write_text(json.dumps({"api_key": KEY}))
-    settings = SimpleNamespace(deepseek_credentials_file=str(path), deepseek_api_key=SecretStr(""),
-        deepseek_model="deepseek-v4-pro", deepseek_request_timeout=30)
-    seen = []
-
-    def handler(request):
-        seen.append(json.loads(request.content)["model"])
-        return response()
-
-    mock_http(monkeypatch, handler)
-    assert DeepSeekClient.from_settings(settings).analyze(CONTEXT, "分析店铺") == ANALYSIS
-    assert seen == ["deepseek-v4-pro"]
-
-
-@pytest.mark.parametrize("value", ["not JSON " + KEY, json.dumps([KEY]), "{\"api_key\": null}"])
-def test_bad_credentials_never_echo_file_contents(tmp_path, value):
-    path = tmp_path / "private.json"
-    path.write_text(value)
-    with pytest.raises(DeepSeekError) as caught:
-        DeepSeekClient.from_settings(SimpleNamespace(deepseek_credentials_file=str(path)))
-    assert KEY not in str(caught.value)
-    assert str(path) not in str(caught.value)
-
-
-@pytest.mark.parametrize("key", ["", None, "\r\n" + KEY, KEY + " \ninside", "中文密钥", 1])
-def test_missing_or_malformed_key_cannot_form_an_authorization_header(key):
+def test_json_mode_and_invalid_json():
+    ok = client(lambda request: completion({"content": '{"notes": []}'})).complete_json("写 json", "{}")
+    assert ok == {"notes": []}
     with pytest.raises(DeepSeekError):
-        DeepSeekClient(key)
+        client(lambda request: completion({"content": "not json"})).complete_json("写 json", "{}")
 
 
-@pytest.mark.parametrize("model", ["deepseek-chat", "https://example.invalid/steal", None, []])
-def test_only_current_documented_models_are_accepted(model):
-    with pytest.raises(DeepSeekError):
-        DeepSeekClient(KEY, model=model)
-
-
-@pytest.mark.parametrize("timeout", [0, -1, 121, True, "45", float("nan"), float("inf")])
-def test_timeout_is_finite_and_bounded(timeout):
-    with pytest.raises(DeepSeekError):
-        DeepSeekClient(KEY, timeout=timeout)
-
-
-@pytest.mark.parametrize("status", [429, 500, 503, 599])
-def test_transient_http_failure_retries_once_only(monkeypatch, status):
-    seen = []
-
+@pytest.mark.parametrize("status,message", [(401, "凭据无效"), (402, "余额不足"), (500, "暂时不可用")])
+def test_http_failures_are_sanitized(status, message):
     def handler(request):
-        seen.append(request)
-        return httpx.Response(status, json={"error": KEY}) if len(seen) == 1 else response()
-
-    mock_http(monkeypatch, handler)
-    assert DeepSeekClient(KEY).analyze(CONTEXT, "分析店铺") == ANALYSIS
-    assert len(seen) == 2 and seen[0].content == seen[1].content
+        return httpx.Response(status, json={"error": {"message": "secret provider detail " + KEY}})
+    with pytest.raises(DeepSeekError) as exc:
+        client(handler).chat([{"role": "user", "content": "hi"}])
+    assert message in str(exc.value) and KEY not in str(exc.value) and "secret" not in str(exc.value)
 
 
-@pytest.mark.parametrize("status,attempts", [(400, 1), (401, 1), (402, 1), (403, 1),
-    (302, 1), (429, 2), (500, 2)])
-def test_http_errors_do_not_echo_provider_error_or_follow_redirect(monkeypatch, status, attempts):
-    seen = []
-
-    def handler(request):
-        seen.append(request)
-        return httpx.Response(status, text="provider echoed " + KEY,
-                              headers={"Location": "https://example.invalid/"})
-
-    mock_http(monkeypatch, handler)
-    with pytest.raises(DeepSeekError) as caught:
-        DeepSeekClient(KEY).analyze(CONTEXT, "分析店铺")
-    assert len(seen) == attempts
-    assert KEY not in str(caught.value) and "provider echoed" not in str(caught.value)
-    assert caught.value.__cause__ is None
+def test_unrequested_tool_calls_truncation_and_key_echo_are_rejected():
+    call = {"content": None, "tool_calls": [{"id": "c", "type": "function", "function": {"name": "x", "arguments": "{}"}}]}
+    for response in (completion(call, finish="tool_calls"), completion({"content": "部分"}, finish="length"),
+                     completion({"content": "密钥是 " + KEY})):
+        with pytest.raises(DeepSeekError):
+            client(lambda request, response=response: response).chat([{"role": "user", "content": "hi"}])
 
 
-@pytest.mark.parametrize("kind", [httpx.ReadTimeout, httpx.ConnectError])
-def test_network_errors_have_no_secret_request_or_provider_exception(monkeypatch, kind):
-    seen = []
-
-    def handler(request):
-        seen.append(request)
-        raise kind("provider secret " + KEY, request=request)
-
-    mock_http(monkeypatch, handler)
-    with pytest.raises(DeepSeekError) as caught:
-        DeepSeekClient(KEY).analyze(CONTEXT, "分析店铺")
-    assert KEY not in str(caught.value) and caught.value.__cause__ is None
-    assert len(seen) == 1  # Do not repeat possibly billed requests after a timeout.
-
-
-@pytest.mark.parametrize("result", [
-    lambda: httpx.Response(200, text="bad JSON " + KEY),
-    lambda: httpx.Response(200, json={"error": KEY}),
-    lambda: httpx.Response(200, json=[KEY]),
-    lambda: response(""), lambda: response(" "), lambda: response(finish="length"),
-    lambda: response(finish="tool_calls", tool_calls=[{"name": "mutate"}]),
-    lambda: response("中文" + KEY), lambda: response("English only"),
-    lambda: response("分析：\n```bash\ncurl example.invalid\n```"),
-    lambda: response("分析：\nsudo docker restart app"),
-    lambda: response("中" * 6001),
-    lambda: httpx.Response(200, text="中" * (128 * 1024)),
-])
-def test_incomplete_invalid_oversized_or_executable_output_is_not_published(monkeypatch, result):
-    mock_http(monkeypatch, lambda request: result())
-    with pytest.raises(DeepSeekError) as caught:
-        DeepSeekClient(KEY).analyze(CONTEXT, "分析店铺")
-    assert KEY not in str(caught.value)
-
-
-@pytest.mark.parametrize("context", [None, [], {}, {"value": float("nan")}, {"value": object()},
-    {"rows": "中" * MAX_CONTEXT_BYTES}, {"extra": {"app_secret": KEY}},
-    {"rows": [{"access_token": KEY}]}])
-def test_untrusted_or_excessive_context_is_rejected_before_network(monkeypatch, context):
-    def forbidden(request):
-        pytest.fail("Invalid context must never be sent")
-
-    mock_http(monkeypatch, forbidden)
-    with pytest.raises(DeepSeekError) as caught:
-        DeepSeekClient(KEY).analyze(context, "分析店铺")
-    assert KEY not in str(caught.value)
-
-
-@pytest.mark.parametrize("question", [None, "", " ", "中" * 1201])
-def test_question_is_required_and_bounded(question):
-    with pytest.raises(DeepSeekError):
-        DeepSeekClient(KEY).analyze(CONTEXT, question)
-
-
-def test_internal_statuses_are_localized_without_changing_kpis_or_values(monkeypatch):
-    text = "待确认：CTR=0.35%，status=LOW_SAMPLE；freshness=NOT_CONFIGURED。CPC=1.47 USD，NON_ADVERSE。状态LOW_SAMPLE待确认。"
-    mock_http(monkeypatch, lambda request: response(text))
-    result = DeepSeekClient(KEY).analyze(CONTEXT, "分析店铺")
-    assert "LOW_SAMPLE" not in result and "NON_ADVERSE" not in result and "NOT_CONFIGURED" not in result
-    assert "样本不足" in result and "源时区待确认" in result
-    assert "CTR=0.35%" in result and "CPC=1.47 USD" in result
-    assert "状态样本不足待确认" in result
+def test_console_configuration_is_write_only(settings):
+    view = deepseek_config.configuration(settings)
+    assert view["configured"] is False
+    saved = deepseek_config.save_configuration(settings, {"revision": view["revision"], "api_key": KEY,
+                                                         "model": "deepseek-flash", "timeout": 30})
+    assert saved["configured"] and saved["key_source"] == "console" and KEY not in json.dumps(saved)
+    assert deepseek_config.client_settings(settings) == (KEY, "deepseek-flash", 30)

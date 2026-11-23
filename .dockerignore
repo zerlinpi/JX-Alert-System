@@ -7,4 +7,6 @@ __pycache__
 .env
 data
 backups
+node_modules
 *.py[cod]
+*.egg-info

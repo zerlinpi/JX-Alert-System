@@ -1,4 +1,4 @@
-# Source updates reuse the existing image and persistent data/database volumes.
+# Source updates reuse the existing images and persistent data/database volumes.
 # The base compose file retains its env_file, health checks, and port bindings.
 services:
   app:
@@ -13,7 +13,7 @@ services:
       - ./src:/app/src:ro
     environment:
       PYTHONPATH: /app/src
-  mcp:
+  console:
     image: jx-alert-app
     volumes:
       - ./src:/app/src:ro

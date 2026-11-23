@@ -17,6 +17,6 @@ jobs:
         with:
           node-version: "22"
       - run: node --test tests/ui/*.test.cjs
-      - run: node scripts/verify_skill_library_ui.cjs
+      - run: npm install --no-save jsdom@24 && node tests/ui/console.smoke.cjs
       - run: ruff check .
       - run: pytest -q

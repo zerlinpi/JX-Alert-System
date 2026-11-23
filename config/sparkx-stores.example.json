@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "revision": "0000000000000000000000000000000000000000000000000000000000000001",
+  "updated_at": "2026-11-24T00:00:00+00:00",
+  "profiles": {
+    "1234567890123456": {
+      "monitored": true,
+      "operators": [{"open_id": "ou_REPLACE_WITH_OPERATOR", "name": "运营姓名"}],
+      "updated_at": "2026-11-24T00:00:00+00:00"
+    }
+  }
+}
