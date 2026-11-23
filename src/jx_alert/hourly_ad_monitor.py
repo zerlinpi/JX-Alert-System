@@ -72,12 +72,13 @@ def _morning_sales_status(db, sid, day):
             and all(state == "COMPLETE" for state in partition_status.values())}
 
 
-def _collect_store(client, db, settings, record, target, *, morning=False, now=None):
+def _collect_store(client, db, settings, record, target, *, morning=False, now=None, lingxing_ads=True):
     from jx_alert.lingxing.campaign_collector import collect_campaigns
     from jx_alert.lingxing.collector import SPPartitionBusy, collect_ads_for_day
     from jx_alert.lingxing.ad_currency import account_currencies
     from jx_alert.lingxing.intraday_observation import run_observation
     from jx_alert.reporting.archive import archive_partitions
+    from jx_alert.sparkx_hourly_lane import selected_ad_provider
 
     sid, errors = str(record['sid']), []
     one = {'data': [record]}
@@ -125,6 +126,13 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
                 db.rollback()
                 errors.append({'step': name, 'error_type': type(exc).__name__})
     sales_detail = {'sales_coverage': sales_coverage} if morning else {}
+    def non_lingxing():
+        return {'status': 'PARTIAL' if errors else 'COMPLETE', 'errors': errors,
+                'ads': 'NON_LINGXING_SELECTION', 'ad_ready': False, 'intraday_ready': False,
+                'morning_ready': morning_ready, **sales_detail}
+
+    if not lingxing_ads or selected_ad_provider(settings, sid) != 'lingxing':
+        return non_lingxing()
     if int(record.get('has_ads_setting') or 0) != 1:
         return {'status': 'PARTIAL' if errors else 'COMPLETE', 'errors': errors,
                 'ads': 'UNAVAILABLE', 'ad_ready': False, 'intraday_ready': False,
@@ -135,6 +143,8 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
         db.rollback()
         return {'status': 'PARTIAL', 'morning_ready': morning_ready, **sales_detail,
                 'errors': [*errors, {'step': 'campaigns', 'error_type': type(exc).__name__}]}
+    if selected_ad_provider(settings, sid) != 'lingxing':
+        return non_lingxing()
     try:
         currencies = account_currencies(client.seller_ad_accounts())
     except Exception as exc:
@@ -152,6 +162,8 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
         try:
             if not collection_states(settings, [sid]).get(sid):
                 return {'status': 'DISABLED', 'errors': errors}
+            if selected_ad_provider(settings, sid) != 'lingxing':
+                return non_lingxing()
             response = collect_ads_for_day(client, db, {sid: on.isoformat()}, stores_response=one,
                 ad_currencies=currencies, report_types=('sp',))
             count = response['rows']['sp']
@@ -162,6 +174,8 @@ def _collect_store(client, db, settings, record, target, *, morning=False, now=N
                 primary_ready = False
             errors.append({'step': 'sp_report', 'date': on.isoformat(), 'error_type': type(exc).__name__})
             reports[on.isoformat()] = {'status': 'BUSY' if isinstance(exc, SPPartitionBusy) else 'FAILED'}
+    if selected_ad_provider(settings, sid) != 'lingxing':
+        return non_lingxing()
     try:
         clock = now or _utcnow()
         day = clock.astimezone(ZoneInfo(store.timezone)).date().isoformat()
@@ -187,6 +201,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
     from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError
     from jx_alert.operations import scoped_stores, sync_scoped_store_inventory, store_report_plan
     from jx_alert.storage.raw_archive import archive_raw_snapshots
+    from jx_alert.sparkx_hourly_lane import selected_ad_provider, sparkx_hourly_pass
 
     settings = settings or get_settings()
     if not settings.hourly_ad_monitor_enabled or not settings.scheduler_enabled or settings.app_dry_run:
@@ -240,6 +255,14 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                 job.metadata_json = deepcopy(meta)
                 db.commit()
 
+        def collect_sparkx():
+            observations = sparkx_hourly_pass(db, settings, slot=slot, now=now)
+            if observations or 'sparkx_observations' in meta:
+                meta['sparkx_observations'] = observations
+                job = db.get(SyncJob, job_id)
+                job.metadata_json = deepcopy(meta)
+                db.commit()
+
         phase = 'raw_archive_checkpoint'
         try:
             if 'raw_start' not in meta:
@@ -252,9 +275,21 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                 if client_factory is None and 'fallback' not in meta:
                     from jx_alert.hourly_source_fallback import collect_fallback_observations
                     db.rollback()
-                    meta['fallback'] = collect_fallback_observations(db, settings, now=clock, morning=morning)
-                    morning_dates.update(meta['fallback'].get('morning_dates', {}))
-                    freeze_morning()
+                    try:
+                        meta['fallback'] = collect_fallback_observations(db, settings, now=clock, morning=morning)
+                        morning_dates.update(meta['fallback'].get('morning_dates', {}))
+                        freeze_morning()
+                    except Exception as exc:
+                        db.rollback()
+                        meta['fallback'] = {'status': 'PARTIAL_FAILED', 'error_type': type(exc).__name__}
+                db.rollback()
+                try:
+                    collect_sparkx()
+                    if meta.get('sparkx_observations'):
+                        meta['raw_archive'] = archive_raw_snapshots(db, settings.raw_dir, after_id=meta['raw_start'])
+                except Exception as exc:
+                    db.rollback()
+                    meta['sparkx_lane_error'] = type(exc).__name__
                 raise
             selected = scoped_stores(inventory, settings.collection_scope_file, allow_missing=True)
             sync_scoped_store_inventory(db, settings, selected)
@@ -269,23 +304,28 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     continue
                 target = date.fromisoformat(plan[sid]['report_date'])
                 previous = meta['stores'].get(sid, {})
-                if previous.get('status') == 'COMPLETE':
+                source = selected_ad_provider(settings, sid)
+                if previous.get('status') == 'COMPLETE' and previous.get('ad_source', 'lingxing') == source:
                     result = previous
                 else:
                     try:
-                        result = _collect_store(cached, db, settings, record, target, morning=morning, now=now)
+                        options = {'lingxing_ads': False} if source != 'lingxing' else {}
+                        result = _collect_store(cached, db, settings, record, target, morning=morning, now=now, **options)
                     except Exception as exc:
                         db.rollback()
                         result = {'status': 'PARTIAL', 'error_type': type(exc).__name__}
+                    if source != 'lingxing':
+                        result = {**result, 'ad_source': source or 'BLOCKED'}
                     meta['stores'][sid] = result
                     job = db.get(SyncJob, job_id)
                     job.metadata_json = deepcopy(meta)
                     db.commit()
-                if result.get('ad_ready'):
-                    ready.append(db.get(Store, sid))
-                    dates[sid] = target
-                if result.get('intraday_ready'):
-                    intraday_snapshots[sid] = result['observation']['snapshot_id']
+                if source == 'lingxing' and selected_ad_provider(settings, sid) == 'lingxing':
+                    if result.get('ad_ready'):
+                        ready.append(db.get(Store, sid))
+                        dates[sid] = target
+                    if result.get('intraday_ready'):
+                        intraday_snapshots[sid] = result['observation']['snapshot_id']
                 if result.get('morning_ready'):
                     morning_dates[sid] = target.isoformat()
             # Night findings have already passed analysis. Release them after
@@ -303,6 +343,9 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             phase = 'morning_report'
             freeze_morning()
             phase = 'advertising_evidence'
+            ready = [store for store in ready if selected_ad_provider(settings, str(store.sid)) == 'lingxing']
+            intraday_snapshots = {sid: snapshot for sid, snapshot in intraday_snapshots.items()
+                                  if selected_ad_provider(settings, sid) == 'lingxing'}
             from jx_alert.ai.intraday_risk_evidence import intraday_risk_candidates
             from jx_alert.analysis.hourly_ad_patterns import OPPORTUNITY
             reviewed_at = now or _utcnow()
@@ -387,7 +430,8 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             for finding in findings:
                 r = finding['evidence']
                 supported = valid.get(r['evidence_id'])
-                if (not supported or supported[0] != campaign_identity(r)
+                if (selected_ad_provider(settings, r['store_id']) != 'lingxing'
+                        or not supported or supported[0] != campaign_identity(r)
                         or not set(finding['signals']) <= supported[1]):
                     continue
                 campaign = db.scalar(select(Campaign).where(Campaign.store_id == r['store_id'],
@@ -401,13 +445,18 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             meta['outbox_ids'] = list(dict.fromkeys([*meta.get('outbox_ids', []), *ids]))
             for field in ('error_type', 'error_phase', 'database_error_code'):
                 meta.pop(field, None)
+            phase = 'sparkx_provider'
+            collect_sparkx()
+            meta.pop('sparkx_lane_error', None)
             phase = 'raw_archive'
             opportunity_count = sum(finding['signals'] == [OPPORTUNITY] for finding in checked)
             meta.update(finding_count=len(checked), opportunity_count=opportunity_count,
                 risk_count=len(checked) - opportunity_count, model_usage=model_usage, model_failures=model_failures,
                 raw_archive=archive_raw_snapshots(db, settings.raw_dir, after_id=meta['raw_start']))
             partial = (bool(model_failures) or 'overnight_digest_error' in meta or len(checked) != len(findings)
-                       or any(r.get('status') == 'PARTIAL' for r in meta['stores'].values()))
+                       or any(r.get('status') == 'PARTIAL' for r in meta['stores'].values())
+                       or any(r.get('status') in {'PARTIAL', 'BLOCKED'}
+                              for r in meta.get('sparkx_observations', {}).values()))
             job = db.get(SyncJob, job_id)
             job.status = 'PARTIAL_FAILED' if partial else 'SUCCEEDED'
             finished_at = now or _utcnow()

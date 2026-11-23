@@ -7,6 +7,7 @@ import re
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from jx_alert.ad_source_policy import lingxing_ad_allowed
 from jx_alert.ai.ad_review_evidence import automatic_sp_signals, build_ad_review_context
 from jx_alert.ai.ad_review_skills import load_ad_review_skills, skill_fingerprint
 from jx_alert.analysis.ad_kpis import compare_kpis
@@ -37,6 +38,8 @@ def _config(settings):
 
 def sp_campaign_exceptions(db, settings, store, target):
     """Read every SP activity; keep dates/maturity and actual materiality gates."""
+    if not lingxing_ad_allowed(settings, store.sid):
+        return [], None  # SparkX observation is separate; do not reuse Lingxing advertising evidence.
     target = _date(target)
     problem = collection_issue_for_date(db, store.sid, target)
     coverage = db.scalar(select(DataCoverage).where(DataCoverage.store_id == store.sid,

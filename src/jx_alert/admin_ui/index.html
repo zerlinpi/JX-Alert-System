@@ -176,6 +176,29 @@
               </details>
             </header>
             <div id="overview" class="detail-content">
+              <section class="panel" aria-labelledby="ad-source-title">
+                <details id="ad-source-panel" class="tool-disclosure">
+                  <summary><span id="ad-source-title">商品推广（SP）观测来源</span></summary>
+                  <div class="source-form">
+                    <p id="ad-source-current" class="muted">展开后读取配置。</p>
+                    <p class="muted">选择 SparkX 后，本店后续小时任务改用 SparkX 采集 SP 广告观测，暂停旧领星自动广告告警；SparkX 自动飞书告警尚未启用。经营日报、销量、店铺绩效和其他店铺不随此设置切换。</p>
+                    <p id="ad-source-latest" class="muted" role="status" hidden></p>
+                    <fieldset id="ad-source-fields" disabled>
+                      <legend class="sr-only">本店商品推广观测来源</legend>
+                      <label for="ad-source-choice">后续 SP 观测来源</label>
+                      <select id="ad-source-choice"><option value="lingxing">领星</option><option value="sparkx">SparkX（仅观测）</option></select>
+                      <label for="ad-source-profile">SparkX Profile ID</label><input id="ad-source-profile" type="text" inputmode="numeric" maxlength="19" autocomplete="off" spellcheck="false">
+                      <label for="ad-source-marketplace">Amazon Marketplace ID</label><input id="ad-source-marketplace" type="text" readonly>
+                      <label for="ad-source-currency">币种</label><input id="ad-source-currency" type="text" readonly>
+                      <label for="ad-source-timezone">报表时区</label><input id="ad-source-timezone" type="text" readonly>
+                      <button class="button secondary" id="verify-ad-source" type="button" disabled>核验 SparkX 只读范围</button>
+                      <button class="button primary" id="save-ad-source" type="button" disabled>保存观测来源</button>
+                    </fieldset>
+                    <p id="ad-source-status" class="notice" role="status" hidden></p>
+                    <button class="link-button" id="reload-ad-source" type="button">刷新本店来源</button>
+                  </div>
+                </details>
+              </section>
               <section class="panel report" aria-labelledby="report-title">
                 <div class="section-heading">
                   <div><h3 id="report-title">店铺日报</h3><p id="report-note" class="muted"></p></div>

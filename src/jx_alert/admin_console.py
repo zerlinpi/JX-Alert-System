@@ -1,7 +1,7 @@
 """A separate single-owner browser session for store data and Feishu routing."""
 import asyncio
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime, timedelta
 import hashlib
 import hmac
 import html
@@ -20,14 +20,17 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
-from jx_alert import admin_ad_subscribers, admin_data, admin_groups, admin_mapping, admin_sources, store_controls
+from jx_alert import ad_source_controls, admin_ad_subscribers, admin_data, admin_groups
+from jx_alert import admin_mapping, admin_sources, store_controls
 from jx_alert import admin_review_skills, admin_skill_library
 from jx_alert.agent_skill_package import MAX_REQUEST as SKILL_UPLOAD_LIMIT
 from jx_alert.ai import deepseek_config
 from jx_alert.lingxing.source_credentials import SourceCredentialsError
 from jx_alert.mcp_oauth import SqliteOAuthProvider, _private_file
+from jx_alert.notifications.receipt import unique_json_fields
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import Store, SyncJob
 
@@ -68,7 +71,7 @@ class ConsoleError(Exception):
         self.detail, self.status = detail, status
 
 
-async def _body(request, media, limit=8192):
+async def _body(request, media, limit=8192, *, strict_json=False):
     if request.headers.get("content-type", "").split(";", 1)[0].lower() != media:
         raise ConsoleError("请求格式无效。", 415)
     body = bytearray()
@@ -78,7 +81,7 @@ async def _body(request, media, limit=8192):
         body.extend(chunk)
     try:
         if media == "application/json":
-            result = json.loads(body)
+            result = json.loads(body, object_pairs_hook=unique_json_fields if strict_json else None)
             if not isinstance(result, dict):
                 raise ValueError
             return result
@@ -409,6 +412,107 @@ class OwnerConsole:
                 raise ConsoleError("该店铺尚未完成同步。", 404)
         return store_controls.save_store_controls(self.settings, sid, **payload)
 
+    def _ad_source_store(self, sid):
+        self._selected(sid)
+        with self.session_factory() as db:
+            store = db.get(Store, sid)
+            if store is None:
+                raise ConsoleError("该店铺尚未完成同步。", 404)
+            return store
+
+    @staticmethod
+    def _verify_sparkx_scope(settings, store, binding):
+        from anyio import run
+        from jx_alert.sparkx_backend import verify_sparkx_binding
+
+        return run(verify_sparkx_binding, settings, store, binding)
+
+    def _ad_source_observations(self, db, store, selection):
+        from jx_alert.sparkx_backend import list_sparkx_snapshots
+
+        return list_sparkx_snapshots(db, store, selection, limit=2)
+
+    @staticmethod
+    def _ad_source_last_attempt(db, store, selection):
+        from jx_alert.sparkx_backend import _observation_scope_id
+
+        item = SyncJob.metadata_json["sparkx_observations"][store.sid]
+        return db.scalar(select(item["status"].as_string()).where(
+            SyncJob.job_type == "hourly_ad_monitor",
+            item["selection_id"].as_string() == _observation_scope_id(store, selection),
+        ).order_by(SyncJob.id.desc()).limit(1))
+
+    def _ad_source_view(self, store, value=None):
+        selection = ad_source_controls.source_snapshot(self.settings, store.sid)
+        view = value or ad_source_controls.public_snapshot(self.settings, store, selection)
+        if view["revision"] != selection["revision"] or view["observation_source"] != "sparkx":
+            return view
+        try:
+            with self.session_factory() as db:
+                rows = self._ad_source_observations(db, store, selection)
+                try:
+                    attempt = self._ad_source_last_attempt(db, store, selection)
+                except SQLAlchemyError:
+                    attempt = "STATUS_UNAVAILABLE"  # Keep separately retrieved history.
+            keys = {"period", "report_date", "row_count", "captured_at"}
+            # Never forward arbitrary history fields/campaign rows as UI metadata.
+            latest = []
+            for row in rows[:2]:
+                if (not isinstance(row, dict) or row.get("period") not in {"daily", "hourly"}
+                        or type(row.get("row_count")) is not int or not 0 < row["row_count"] <= 1_000_000):
+                    continue
+                date_value, captured = row.get("report_date"), row.get("captured_at")
+                if (not isinstance(date_value, str) or date.fromisoformat(date_value).isoformat() != date_value
+                        or not isinstance(captured, str) or len(captured) > 40
+                        or datetime.fromisoformat(captured).utcoffset() != timedelta(0)):
+                    continue
+                latest.append({key: row[key] for key in keys})
+        except (OSError, TypeError, ValueError, KeyError, RuntimeError, ImportError, SQLAlchemyError):
+            return {**view, "observation_status": "STATUS_UNAVAILABLE", "latest_observations": []}
+        active = (getattr(self.settings, "hourly_ad_monitor_enabled", False)
+                  and getattr(self.settings, "scheduler_enabled", False) and not self.settings.app_dry_run)
+        try:
+            collection = store_controls.collection_enabled(self.settings, store.sid)
+        except store_controls.StoreControlError:
+            status = "STATUS_UNAVAILABLE"
+        else:
+            attempt_status = {"PARTIAL": "ATTEMPT_INCOMPLETE", "BLOCKED": "ATTEMPT_BLOCKED",
+                              "STATUS_UNAVAILABLE": "STATUS_UNAVAILABLE"}.get(attempt)
+            status = ("COLLECTION_PAUSED" if not collection else "HOURLY_DISABLED" if not active
+                      else attempt_status or ("OBSERVED" if latest else "WAITING"))
+        return {**view, "observation_status": status, "latest_observations": latest}
+
+    def _ad_source(self, sid, operation, token, payload=None):
+        store = self._ad_source_store(sid)
+        if operation == "read":
+            return self._ad_source_view(store)
+
+        def authorize():
+            if not self._session(token):
+                raise ConsoleError("登录已过期，请重新登录。", 401)
+            current = self._ad_source_store(sid)
+            if any(getattr(current, name) != getattr(store, name)
+                   for name in ("status", "marketplace_id", "currency_code", "timezone")):
+                raise ConsoleError("店铺授权或报表范围已变化，请刷新后重试。", 409)
+
+        authorize()
+        if operation == "save":
+            value = ad_source_controls.save_selection(self.settings, store, payload, authorize=authorize)
+            return self._ad_source_view(store, value)
+        binding, proof = ad_source_controls.prepare_verification(self.settings, store, payload)
+        try:
+            result = self._verify_sparkx_scope(self.settings, store, binding)
+        except Exception:
+            # Vendor responses and exception text must not reach browser or logs.
+            raise ConsoleError("SparkX 未能核验该店铺的只读广告范围。请检查服务端授权及档案绑定后重试。", 502) from None
+        if (not isinstance(result, dict) or result.get("status") != "VERIFIED"
+                or any(result.get(key) != value for key, value in binding.items())
+                or type(result.get("row_count")) is not int or result["row_count"] <= 0):
+            raise ConsoleError("SparkX 未提供与此店铺匹配的完整只读样本。", 502)
+        value = ad_source_controls.save_verification(
+            self.settings, store, payload, binding, proof, authorize=authorize)
+        return self._ad_source_view(store, value)
+
     def _mapping(self, sid, operation, payload=None):
         self._selected(sid)
         with self.session_factory() as db:
@@ -457,13 +561,21 @@ class OwnerConsole:
                         request, "skill-library-write", per_ip=12, total=20):
                     raise ConsoleError("技能资料库操作太频繁，请稍后重试。", 429)
                 body_limit = {"/console/api/data-sources": 16384, "/console/api/skill-library": SKILL_UPLOAD_LIMIT}
-                payload = await _body(request, "application/json", limit=body_limit.get(path, 8192))
+                ad_source_request = path.endswith(("/advertising-source", "/advertising-source/verify"))
+                payload = await _body(request, "application/json", limit=body_limit.get(path, 8192),
+                                      strict_json=ad_source_request)
                 if path == '/console/api/ad-alert-subscribers':
                     if set(payload) != {'open_ids', 'revision'}:
                         raise ConsoleError('提交内容无效。', 400)
                     if not self._rate_allowed(request, 'ad-alert-subscribers-write', per_ip=8, total=16):
                         raise ConsoleError('私聊接收人设置过于频繁，请稍后重试。', 429)
                     data = await asyncio.to_thread(admin_ad_subscribers.save_ad_subscribers, self.settings, **payload)
+                elif ad_source_request:
+                    verify = path.endswith("/verify")
+                    if not self._rate_allowed(request, "ad-source-verify" if verify else "ad-source-write",
+                                              per_ip=3 if verify else 12, total=6 if verify else 24):
+                        raise ConsoleError("广告来源操作太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(self._ad_source, sid, "verify" if verify else "save", token, payload)
                 elif path == "/console/api/data-sources":
                     if not self._rate_allowed(request, "data-sources-write", per_ip=6, total=12):
                         raise ConsoleError("数据源更新太频繁，请稍后重试。", 429)
@@ -551,6 +663,8 @@ class OwnerConsole:
                     data = await asyncio.to_thread(admin_groups.current_notification_group, self.settings)
             elif path == '/console/api/collection/all':
                 data = await asyncio.to_thread(self._bulk_collection)
+            elif path.endswith('/advertising-source'):
+                data = await asyncio.to_thread(self._ad_source, sid, "read", token)
             elif path.endswith('/collection'):
                 data = await asyncio.to_thread(self._collection, sid)
             elif path.endswith("/members"):
@@ -573,7 +687,7 @@ class OwnerConsole:
             return _error(exc.detail, exc.status_code)
         except admin_mapping.MappingError as exc:
             return _error(exc.detail, exc.status_code)
-        except store_controls.StoreControlError as exc:
+        except (store_controls.StoreControlError, ad_source_controls.AdSourceError) as exc:
             return _error(exc.detail, exc.status_code)
         except Exception as exc:
             _LOG.warning("Console request failed (%s)", type(exc).__name__)
@@ -597,6 +711,8 @@ class OwnerConsole:
                 Route("/console/api/stores/{sid}", self.api), Route("/console/api/stores/{sid}/members", self.api),
                 Route("/console/api/stores/{sid}/owners", self.api, methods=["POST"]),
                 Route("/console/api/stores/{sid}/controls", self.api, methods=["POST"]),
+                Route("/console/api/stores/{sid}/advertising-source", self.api, methods=["GET", "POST"]),
+                Route("/console/api/stores/{sid}/advertising-source/verify", self.api, methods=["POST"]),
                 Route("/console/api/stores/{sid}/collection", self.api, methods=["GET", "POST"]),
                 Route("/console/api/collection/all", self.api, methods=["GET", "POST"]),
                 Route("/console/logout", self.api, methods=["POST"])]

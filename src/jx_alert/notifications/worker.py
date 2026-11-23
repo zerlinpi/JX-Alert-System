@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import or_, select, update
 
+from jx_alert.ad_source_policy import BLOCKED as AD_SOURCE_BLOCKED, legacy_ad_payload, legacy_payload_allowed
 from jx_alert.ai.ad_review_skills import frozen_ad_skills_current
 from jx_alert.config import get_settings, load_runtime_settings
 from jx_alert.notifications import company_executive, rule_scope
@@ -142,6 +143,22 @@ def _business_card_for_delivery(db, settings, key, payload, created_at, now):
     return select_business_stores(payload['card'], payload['business_sections'], store_ids, allowed)
 
 
+class _AdSourceChanged(RuntimeError):
+    """A legacy ad alert no longer matches the current manual source."""
+
+
+def _check_ad_source(payload, created_at, shown_items=None):
+    try:
+        # Scope follows the actual rendered card, not dropped rows from an
+        # earlier queue snapshot. Read current selection instead of cached state.
+        frozen = {**payload, "hourly_items": shown_items} if shown_items is not None else payload
+        if legacy_payload_allowed(load_runtime_settings(), frozen, created_at):
+            return
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+        pass
+    raise _AdSourceChanged
+
+
 class _LostOutboxClaim(RuntimeError):
     """The worker no longer owns a send; it must not call Feishu."""
 
@@ -204,7 +221,9 @@ def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, pay
         # Token acquisition / earlier jobs can outlive the initial scope or freshness check.
         # Resolve the original binding again at the write-ahead boundary, not after POST.
         if submission_scope is not None:
-            key, created_at = submission_scope
+            key, created_at, *shown_items = submission_scope
+            if legacy_ad_payload(payload):
+                _check_ad_source(payload, created_at, shown_items[0] if shown_items else None)
             if company_executive.is_company_digest(key, payload):
                 row = db.scalar(select(NotificationOutbox).where(
                     NotificationOutbox.id == row_id, NotificationOutbox.status == "PREPARING",
@@ -280,7 +299,7 @@ def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, pay
                     eligible = False
                 if not eligible:
                     raise _HourlyScopeChanged
-            else:
+            elif key.startswith("sparkx-page:") or route.get("role") == "sparkx_performance_page":
                 from jx_alert.sparkx_feishu import delivery_blocked
                 if delivery_blocked(db, get_settings(), key, payload, created_at, instant):
                     raise _SparkXScopeChanged
@@ -412,10 +431,21 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
 
         def fence_send(evidence):
             nonlocal claim_time, intent
-            claim_time, intent, material_window = _record_submission(row_id, claim_time, attempts, lease_seconds,
-                                                     chat_id, payload, evidence,
-                                                     (dedupe_key, created_at)
-                                                     if sparkx_page or guarded_rule or company_digest or hourly_scoped else None)
+            scope = None
+            if sparkx_page or guarded_rule or company_digest or hourly_scoped or legacy_ad_payload(payload):
+                scope = (dedupe_key, created_at)
+                if hourly_delivered_items is not None:
+                    scope += (hourly_delivered_items,)
+            claim_time, intent, material_window = _record_submission(
+                row_id, claim_time, attempts, lease_seconds, chat_id, payload, evidence, scope)
+            if legacy_ad_payload(payload):
+                # Serialization and committing the write-ahead intent can
+                # outlive a manual switch. Recheck while POST is still avoidable.
+                try:
+                    _check_ad_source(payload, created_at, hourly_delivered_items)
+                except _AdSourceChanged:
+                    intent = {**intent, "aborted_before_post": True}
+                    raise
             if company_digest:
                 checked = datetime.now(timezone.utc)
                 if (not timedelta() <= checked.replace(tzinfo=None) - claim_time <= timedelta(seconds=lease_seconds)
@@ -472,6 +502,9 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             skip_reason = rule_scope.BLOCKED if (
                 guarded_rule and not rule_scope.valid_shape(payload)
                 or "rule_scope" in payload and not rule_scope.generic_key(dedupe_key)) else None
+            if (skip_reason is None and legacy_ad_payload(payload) and "hourly_items" not in payload
+                    and not legacy_payload_allowed(settings, payload, created_at)):
+                skip_reason = AD_SOURCE_BLOCKED
             if skip_reason is None and company_digest:
                 with SessionLocal() as db:
                     if not company_executive.delivery_current(
@@ -618,6 +651,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             status = "DELIVERED"
             error = None
             delivered_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        except _AdSourceChanged:
+            status, error, delivered_at = "SKIPPED", AD_SOURCE_BLOCKED, None
         except _RuleScopeChanged:
             status, error, delivered_at = "SKIPPED", rule_scope.BLOCKED, None
         except _CompanyScopeChanged:
@@ -649,7 +684,8 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
         with SessionLocal() as db:
             values = dict(chat_id=chat_id, status=status, last_error=error,
                           claimed_at=None, delivered_at=delivered_at)
-            if status == "SKIPPED" and (guarded_rule or company_digest or hourly_scoped):
+            if status == "SKIPPED" and (guarded_rule or company_digest or hourly_scoped
+                                         or error == AD_SOURCE_BLOCKED):
                 values.pop("chat_id")  # Retain the original destination even for a malformed row.
             if status == "SKIPPED" and intent is not None and intent.get("aborted_before_post") is True:
                 values["payload"] = {**payload, "delivery_intent": intent}

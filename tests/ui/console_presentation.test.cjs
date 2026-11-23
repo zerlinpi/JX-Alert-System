@@ -291,3 +291,78 @@ test("compact store picker preserves search on dismissal and collapses on actual
   assert.deepEqual(requests.map((r) => r.url), ["/console/api/stores/123"]);
   assert.equal(requests[0].options.method, undefined);
 });
+
+test("per-store SparkX test is explicit, preserves the exact large profile and does not select it", async () => {
+  const scope = consoleScope();
+  const profile = "9007199254740999";
+  const basis = {marketplace: "ATVPDKIKX0DER", currency: "USD", timezone: "America/Los_Angeles"};
+  const before = {source:"lingxing", revision:"b".repeat(64), binding:null, verification_status:"UNVERIFIED",
+    store_basis:basis, sparkx_ready:true, observation_source:"lingxing"};
+  const after = {...before, revision:"c".repeat(64), binding:{profile_id:profile, ...basis}, verification_status:"VERIFIED"};
+  const activated = {...after, source:"sparkx", observation_source:"sparkx", observation_status:"WAITING"};
+  const requests = [];
+  scope.context.fetch = async (url, options) => {
+    requests.push({url, ...options});
+    return {status:200, ok:true, redirected:false, json:async () => [before, after, activated][requests.length - 1]};
+  };
+  scope.evaluate(`state.csrf="a".repeat(64); state.sid="10"; state.data={};`);
+  await scope.evaluate('adSourceAction("read")');
+  assert.deepEqual(requests.map((request) => request.method || "GET"), ["GET"]);
+  const profileInput = scope.elements.get("ad-source-profile");
+  const sourceInput = scope.elements.get("ad-source-choice");
+  profileInput.value = profile;
+  sourceInput.value = "sparkx";
+  scope.evaluate("renderAdSource()");
+  assert.equal(scope.elements.get("save-ad-source").disabled, true);
+  assert.equal(scope.elements.get("verify-ad-source").disabled, false);
+  await scope.evaluate('adSourceAction("verify")');
+  assert.equal(requests[1].url, "/console/api/stores/10/advertising-source/verify");
+  assert.equal(requests[1].headers["X-CSRF-Token"], "a".repeat(64));
+  assert.deepEqual(JSON.parse(requests[1].body), {revision: before.revision, binding:{profile_id:profile, ...basis}});
+  assert.equal(sourceInput.value, "lingxing");
+  assert.match(scope.elements.get("ad-source-status").textContent, /未自动切换/);
+
+  sourceInput.value = "sparkx";
+  scope.evaluate("renderAdSource()");
+  assert.equal(scope.elements.get("save-ad-source").disabled, false);
+  await scope.evaluate('adSourceAction("save")');
+  assert.deepEqual(JSON.parse(requests[2].body), {revision:after.revision, source:"sparkx"});
+  assert.equal(scope.elements.get("ad-source-profile").readOnly, true);
+  assert.match(scope.elements.get("ad-source-latest").textContent, /等待后续小时任务/);
+  assert.match(scope.elements.get("ad-source-status").textContent, /不会通过 SparkX 发送飞书告警/);
+
+  scope.evaluate('state.adSource.data.sparkx_ready=false; state.adSource.data.observation_source=null; renderAdSource(true)');
+  sourceInput.value = "lingxing";
+  scope.evaluate("renderAdSource()");
+  assert.equal(scope.elements.get("verify-ad-source").disabled, true);
+  assert.equal(scope.elements.get("save-ad-source").disabled, false);
+  assert.match(scope.elements.get("ad-source-current").textContent, /观测暂停/);
+});
+
+test("late source response from a previous store cannot populate the selected store", async () => {
+  const scope = consoleScope();
+  let resolve;
+  scope.context.fetch = () => new Promise((result) => { resolve = result; });
+  scope.evaluate('state.csrf="a".repeat(64); state.sid="10"; state.data={};');
+  const call = scope.evaluate('adSourceAction("read")');
+  scope.evaluate('state.sid="11"; state.adSource={data:null,busy:false}; renderAdSource(true);');
+  resolve({status:200, ok:true, redirected:false, json:async () => ({source:"sparkx", revision:"b".repeat(64)})});
+  await call;
+  assert.equal(scope.evaluate('state.adSource.data'), null);
+  assert.match(scope.elements.get("ad-source-current").textContent, /尚未读取本店/);
+});
+
+test("source status distinguishes a paused or failed attempt from historical successful observations", () => {
+  const scope = consoleScope();
+  scope.evaluate(`state.csrf="a".repeat(64); state.sid="10"; state.data={};
+    state.adSource.data={source:"sparkx", observation_source:"sparkx", revision:"b".repeat(64),
+      observation_status:"COLLECTION_PAUSED", latest_observations:[{period:"daily",report_date:"2026-11-22",
+        row_count:4,captured_at:"2026-11-23T00:16:00Z"}]}; renderAdSource(true);`);
+  const label = scope.elements.get("ad-source-latest");
+  assert.match(label.textContent, /本店采集已暂停/);
+  assert.match(label.textContent, /历史成功记录（不代表当前连接正常）.*2026-11-22/);
+  assert.doesNotMatch(label.textContent, /等待后续小时任务/);
+  scope.evaluate('state.adSource.data.observation_status="ATTEMPT_INCOMPLETE"; renderAdSource()');
+  assert.match(label.textContent, /最近一次已记录的 SparkX 采集未完整成功/);
+  assert.match(label.textContent, /历史成功记录（不代表当前连接正常）.*2026-11-22/);
+});

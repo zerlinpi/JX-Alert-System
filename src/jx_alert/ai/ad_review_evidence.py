@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
+from jx_alert.ad_source_policy import lingxing_ad_allowed
 from jx_alert.ai.ad_review_skills import DEFAULT_SKILL, load_ad_review_skills
 from jx_alert.ai.intraday_risk_evidence import MIN_NO_CLICK_IMPRESSIONS
 from jx_alert.analysis.ad_kpis import compare_kpis
@@ -349,6 +350,8 @@ def build_ad_review_context(db, settings, stores, report_dates, *, ad_types=("sp
     skills = skills or load_ad_review_skills(settings)
     campaigns = []
     for store in stores:
+        if not lingxing_ad_allowed(settings, store.sid):
+            continue
         raw = report_dates.get(str(store.sid))
         if raw is None:
             continue

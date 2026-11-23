@@ -14,6 +14,7 @@ from jx_alert.lingxing.source_gateway import CollectionSources
 from jx_alert.notifications.business_daily import DIMENSION
 from jx_alert.operations import _checked_scope, store_report_plan
 from jx_alert.reporting.archive import archive_partitions
+from jx_alert.sparkx_hourly_lane import selected_ad_provider
 from jx_alert.storage.models import DataCoverage, RawSnapshot
 from jx_alert.storage.raw_archive import archive_raw_snapshots
 from jx_alert.store_controls import collection_states
@@ -101,7 +102,8 @@ def collect_fallback_observations(db, settings, *, now, morning=False):
     for row in rows:
         sid = str(row["sid"])
         item = plan[sid]
-        if not item["intraday_enabled"] or int(row.get("has_ads_setting") or 0) != 1:
+        if (selected_ad_provider(settings, sid) != "lingxing"
+                or not item["intraday_enabled"] or int(row.get("has_ads_setting") or 0) != 1):
             continue
         try:
             captured = _utcnow()

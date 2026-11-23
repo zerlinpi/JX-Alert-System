@@ -82,6 +82,19 @@ test("Owner console renders and uploads a disabled Skill in Chromium", { timeout
         await page.getByRole("heading", { name: "离线示例店铺" }).waitFor();
         await layout("overview");
 
+        // Actual HTTPS owner route, with no fixture vendor credentials and no external I/O.
+        await page.locator("#ad-source-panel summary").click();
+        await page.getByText(/当前：领星/).waitFor();
+        const sourceChoice = page.locator("#ad-source-choice");
+        const saveSource = page.getByRole("button", { name: "保存观测来源" });
+        assert.equal(await sourceChoice.inputValue(), "lingxing");
+        await sourceChoice.selectOption("sparkx");
+        assert.equal(await saveSource.isDisabled(), true);
+        assert.equal(await page.getByRole("button", { name: "核验 SparkX 只读范围" }).isDisabled(), true);
+        assert.match(await page.locator("#ad-source-panel").textContent(), /SparkX 自动飞书告警尚未启用/);
+        await layout("unverified SparkX selection");
+        await page.locator("#ad-source-panel summary").click();
+
         const menu = page.getByRole("button", { name: "切换工作区" });
         const nav = page.locator("#workspace-navigation");
         const settings = page.getByRole("navigation", { name: "工作区" })

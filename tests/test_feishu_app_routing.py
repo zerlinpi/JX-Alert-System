@@ -976,13 +976,14 @@ def test_slow_intent_commit_cannot_outlive_material_proof_or_applicable_window(s
     clock = [datetime(2026, 11, 23, 9, 59, 59, tzinfo=timezone.utc)]  # 17:59:59 Beijing
     stamp = clock[0].replace(tzinfo=None)
     config["management"] = {"severities": []}
+    config["stores"]["5174"] = config["stores"].pop("s")
     path.write_text(json.dumps(config))
     with Session.begin() as db:
-        db.add(Store(sid="s", name="fixture", has_ads_setting=1, status=1))
+        db.add(Store(sid="5174", name="fixture", has_ads_setting=1, status=1))
         observed = stamp - timedelta(minutes=90) + timedelta(seconds=1) if crossing == "campaign_freshness" else stamp
-        db.add(Campaign(store_id="s", campaign_type="sp", campaign_id="actual", state="enabled", updated_at=observed))
+        db.add(Campaign(store_id="5174", campaign_type="sp", campaign_id="actual", state="enabled", updated_at=observed))
         result = enqueue_application_deliveries(db, settings, text="fixture", event_key="material-scope",
-            context=dict(store_id="s", entity_id="actual", scope="s:campaign:sp",
+            context=dict(store_id="5174", entity_id="actual", scope="5174:campaign:sp",
                          metrics={}, severity="P1", status="NEW"), material_ad_alert=True)
         row = db.get(NotificationOutbox, result["outbox_ids"][0])
         row.next_attempt_at = row.created_at = stamp
