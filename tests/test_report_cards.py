@@ -1,8 +1,10 @@
 """Feishu card layout of the daily report, the 7-day review and the hourly monitor."""
+import copy
+
 from jx_alert.notifications.cards import card_fits, plain_text
 from jx_alert.reports import cards
 from jx_alert.sparkx import analysis
-from test_sparkx_analysis import DAILY, HOURLY, PEOPLE, REVIEW
+from test_sparkx_analysis import DAILY, HOURLY, PEOPLE, REVIEW, m
 
 
 def tables(value):
@@ -53,6 +55,20 @@ def test_review_card_follows_the_four_part_structure():
     assert "Campx | 高爽 | CTH-ASIN定投-TEST | $223 | 95 | 2.35 → 1.64" in text
     assert "香港川页 | 皮泽霖 | S-14MQ-metal bed frame | $126 | 无投放记录" in text
     assert "另有 2 个店铺两周零数据" in text
+
+
+def test_low_spend_high_conversion_campaigns_are_listed_as_opportunities():
+    data = copy.deepcopy(REVIEW)
+    data["campaigns"]["104"]["8"] = {"name": "陈子俊-Exact", "type": "sponsoredProducts", "state": "enabled",
+                                     "w": m(800, 30, 40, 400, 5), "p": m(700, 25, 35, 300, 4)}
+    report = analysis.build_review(data, PEOPLE)
+    assert [item["cid"] for item in report["opportunities"]] == ["8"]
+    assert any(fact["text"] == "低花费高转化 1 个" for fact in report["facts"])
+    value = cards.review_card(report, {"headline": None, "actions": report["actions"]}, "rules")
+    assert card_fits(value) and tables(value) == 5
+    assert "**⑤ 低花费高转化（机会，可加预算或出价放量）**\n- 陈子俊（未映射运营）陈子俊-Exact：近 7 日花费 $40.00、5 单、ACOS 10.0%" \
+        in plain_text(value)
+    assert analysis.review_slice(report, {"102"})["opportunities"] == []
 
 
 def test_operator_review_card_only_holds_their_stores_and_none_when_clean():

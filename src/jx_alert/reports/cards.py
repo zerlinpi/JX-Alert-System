@@ -179,7 +179,7 @@ def _category_rows(code, items, cur):
 _CATEGORY_TABLES = (
     ("zero_orders", "① 高花费零出单（钱花了，一单没有）",
      ["店铺", "运营", "Campaign", "近7日花费", "点击", "建议 CPC"]),
-    ("acos_worse", "② ACOS 明显恶化（效率下降）",
+    ("acos_worse", "② ACOS 明显恶化（高花费低转化）",
      ["店铺", "运营", "Campaign", "ACOS 前7日→近7日", "近7日花费", "近7日销售", "建议 CPC"]),
     ("surge", "③ 加预算后销售反而下滑", ["店铺", "运营", "Campaign", "花费变化", "销售变化", "销售额"]),
     ("stalled", "④ 异常停摆（开启但完全不消耗）", ["店铺", "运营", "Campaign", "前7日花费", "近7日"]),
@@ -235,6 +235,13 @@ def _review_elements(report, text, source, cap, store_cap):
         category += [markdown(f"**{heading}**"), table(headers, _category_rows(code, items[:cap], cur))]
         if len(items) > cap:
             category.append(markdown(f"另有 {len(items) - cap} 个{REVIEW_LABELS[code]}活动未展开。"))
+    chances = report.get("opportunities") or []
+    if chances:
+        lines = [f"- {md_safe(item['store'], 30)}（{md_safe(item['operator'], 20)}）{md_safe(item['campaign'], 60)}："
+                 f"近 7 日花费 {money(item['w'].get('spend'), cur)}、{count(item['w'].get('orders'))} 单、"
+                 f"ACOS {percent(item['acos'])}" for item in chances[:cap // 2 or 1]]
+        more = f"\n另有 {len(chances) - len(lines)} 个未展开。" if len(chances) > len(lines) else ""
+        category.append(markdown("**⑤ 低花费高转化（机会，可加预算或出价放量）**\n" + "\n".join(lines) + more))
     if category:
         sections.append(("按问题类型看具体 campaign", category))
     actions = text.get("actions") or []

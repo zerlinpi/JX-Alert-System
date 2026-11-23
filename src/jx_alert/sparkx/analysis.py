@@ -15,7 +15,8 @@ from jx_alert.sparkx.stores import COUNTRY_LABELS, UNMAPPED, display_names
 REVIEW_THRESHOLDS = {"zero_spend": 50.0, "zero_clicks": 10, "acos_spend": 50.0, "acos_ratio": 1.5,
                      "acos_delta": 0.15, "surge_prev_spend": 30.0, "surge_spend": 50.0, "surge_up": 0.30,
                      "surge_sales_down": -0.20, "stall_prev_spend": 50.0, "zero_bid_cut": 0.30,
-                     "min_bid_clicks": 10}
+                     "min_bid_clicks": 10, "opportunity_max_spend": 100.0, "opportunity_min_orders": 3,
+                     "opportunity_max_acos": 0.20}
 HOURLY_DEFAULTS = {"high_spend": 30.0, "low_spend": 10.0, "min_clicks": 15, "acos_high": 60.0,
                    "cvr_low": 5.0, "acos_good": 20.0, "min_orders_good": 2}
 REVIEW_LABELS = {"zero_stores": "全店零曝光", "zero_orders": "高花费零出单", "acos_worse": "ACOS 明显恶化",
@@ -288,6 +289,15 @@ def _classify(item, usd, t):
     return None
 
 
+def _opportunity(item, t):
+    """低花费高转化: little spend, several orders and a low ACOS in the last 7 days."""
+    w = item.get("w") or {}
+    acos = ratio(w.get("spend"), w.get("sales"))
+    return (item.get("state") in (None, "enabled") and w.get("spend") is not None and 0 < w["spend"] < t["opportunity_max_spend"]
+            and (w.get("orders") or 0) >= t["opportunity_min_orders"] and acos is not None
+            and acos <= t["opportunity_max_acos"])
+
+
 def _advice(item, t):
     """A concrete, explainable bid suggestion from the campaign's own numbers."""
     w, p = item["w"] or {}, item["p"] or {}
@@ -312,7 +322,7 @@ def build_review(collected, people, thresholds=None):
     enabled = collected.get("enabled_campaigns")
     currency = collected.get("currency")
     usd = currency == "USD"
-    findings, zero_stores, idle_stores, stores = [], [], [], {}
+    findings, zero_stores, idle_stores, stores, opportunities = [], [], [], {}, []
     sites = defaultdict(lambda: {"store_count": 0, "active": 0, "w": [], "p": []})
     for key, profile in collected["profiles"].items():
         site = sites[profile["country"]]
@@ -343,6 +353,10 @@ def build_review(collected, people, thresholds=None):
                            "w": item["w"], "p": item["p"]}
                 finding["advice"] = _advice(finding, t)
                 findings.append(finding)
+            elif usd and _opportunity(item, t):
+                opportunities.append({"pid": key, "store": names[key], "operator": operator, "cid": cid,
+                                      "campaign": item["name"], "w": item["w"], "p": item["p"],
+                                      "acos": ratio(item["w"]["spend"], item["w"]["sales"])})
     overview = []
     by_store = defaultdict(list)
     for item in findings:
@@ -374,8 +388,10 @@ def build_review(collected, people, thresholds=None):
                           "active": site["active"], "w": w, "p": p,
                           "acos_w": ratio((w or {}).get("spend"), (w or {}).get("sales")),
                           "acos_p": ratio((p or {}).get("spend"), (p or {}).get("sales"))})
+    opportunities.sort(key=lambda item: (item["acos"], -(item["w"].get("orders") or 0)))
     report = {"kind": "review", "window": collected["window"], "previous_window": collected["previous_window"],
               "currency": currency, "usd": usd, "sites": site_rows, "findings": findings, "grouped": grouped,
+              "opportunities": opportunities,
               "overview": overview, "zero_stores": zero_stores, "idle_stores": idle_stores,
               "store_total": len(collected["profiles"]), "active_total": sum(s["active"] for s in site_rows),
               "affected": len(by_store), "metadata_unavailable": enabled is None,
@@ -424,6 +440,13 @@ def review_facts(report):
             if advice.get("target") is not None:
                 text += f"，建议 CPC {advice['cpc']:.2f} → {advice['target']:.2f}（{advice['basis']}）"
             facts.append({"kind": code, "store": item["store"], "text": text})
+    if report["opportunities"]:
+        facts.append({"kind": "count_opportunity", "text": f"低花费高转化 {len(report['opportunities'])} 个"})
+    for item in report["opportunities"][:3]:
+        w = item["w"]
+        facts.append({"kind": "opportunity", "store": item["store"], "text": (
+            f"{item['store']} 的 {_label_campaign(item['campaign'], 60)}：近 7 日花费 {money(w.get('spend'), cur)}、"
+            f"{count(w.get('orders'))} 单，ACOS {percent(item['acos'])}，可适当加预算或出价放量")})
     if report["idle_stores"]:
         facts.append({"kind": "idle", "text": f"另有 {len(report['idle_stores'])} 个店铺两周零数据，暂不计为异常"})
     if not report["usd"] and report["currency"]:
@@ -479,6 +502,7 @@ def review_slice(report, only):
     names = {row["name"] for row in report["overview"] + report["zero_stores"] if row["pid"] in only}
     return {**report, "findings": keep(report["findings"]), "grouped": grouped,
             "overview": keep(report["overview"]), "zero_stores": keep(report["zero_stores"]),
+            "opportunities": keep(report["opportunities"]),
             "idle_stores": [], "affected": len({row["pid"] for row in keep(report["findings"])}),
             "actions": [row for row in report["actions"] if row.get("store") in names], "scoped": True}
 
