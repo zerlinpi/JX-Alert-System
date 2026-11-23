@@ -118,7 +118,9 @@ def _replacement(settings, chat_id, revision):
     if current != revision:
         raise mapping.MappingError(409, "群或人员映射已更新，请刷新后重新选择。")
     chats = _joined_chats(settings, selected=chat_id)
-    roster = mapping._members(settings, chat_id)
+    verified_app = mapping.scoped_app(settings)
+    roster = (mapping._members(settings, chat_id, app_id=verified_app) if verified_app
+              else mapping._members(settings, chat_id))
     admins = list(dict.fromkeys(group.get("admin_open_ids", [])))
     retained = [uid for uid in admins if uid in roster]
     outside = set()
@@ -136,7 +138,7 @@ def _replacement(settings, chat_id, revision):
                "previous_name": mapping._group_label(group, alias),
                "retained_administrators": len(retained), "removed_administrators": len(admins) - len(retained),
                "outside_owner_count": len(outside), "changed": chat_id != group["chat_id"]}
-    return raw, routing, alias, group, retained, roster, preview
+    return raw, routing, alias, group, retained, roster, verified_app, preview
 
 
 def preview_notification_group(settings, chat_id, revision):
@@ -146,10 +148,14 @@ def preview_notification_group(settings, chat_id, revision):
 def save_notification_group(settings, chat_id, revision, confirmed):
     if confirmed is not True:
         raise mapping.MappingError(400, "请先确认通知群替换范围。")
-    raw, routing, alias, group, admins, roster, preview = _replacement(settings, chat_id, revision)
+    raw, routing, alias, group, admins, roster, verified_app, preview = _replacement(settings, chat_id, revision)
     updated = dict(group)
     updated.update(chat_id=chat_id, display_name=preview["name"], admin_open_ids=admins,
                    verified_member_open_ids=sorted(roster))
+    if verified_app:
+        updated["hourly_verified_roster_app_id"] = verified_app
+    else:
+        updated.pop("hourly_verified_roster_app_id", None)
     if preview["changed"]:
         now = datetime.now(timezone.utc).isoformat()
         retired = dict(updated.get("retired_chat_ids", {}))

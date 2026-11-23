@@ -17,6 +17,7 @@ from jx_alert.ai.ad_review_skills import DEFAULT_SKILL, load_ad_review_skills
 from jx_alert.ai.intraday_risk_evidence import MIN_NO_CLICK_IMPRESSIONS
 from jx_alert.analysis.ad_kpis import compare_kpis
 from jx_alert.analysis.materiality import POLICY, material_change
+from jx_alert.analysis.hourly_ad_patterns import classify_hourly_ad_pattern, HIGH_LOW, LOW_ZERO, OPPORTUNITY
 from jx_alert.lingxing.attribution import AD_ATTRIBUTION_DAYS
 from jx_alert.storage.models import Campaign, DailyMetric, DataCoverage, RawSnapshot
 
@@ -88,8 +89,17 @@ def automatic_sp_signals(row, *, has_mature_history=False):
     # Raw spend growth alone can be planned scaling. Report the evidence-backed
     # efficiency or conversion problem that warrants an operator's attention.
     gap = ctr_expected_click_gap(row) if 'CTR' in row['material_signals'] else None
-    return [code for code in row['material_signals'] if code != 'spend'
-            and (code != 'CTR' or gap is not None and gap >= MIN_CTR_EXPECTED_CLICK_GAP)]
+    chosen = [code for code in row['material_signals'] if code != 'spend' and code not in {HIGH_LOW, LOW_ZERO, OPPORTUNITY}
+              and (code != 'CTR' or gap is not None and gap >= MIN_CTR_EXPECTED_CLICK_GAP)]
+    pattern = (row.get('hourly_pattern') or {}).get('code')
+    if pattern in {HIGH_LOW, LOW_ZERO}:
+        # A mature conversion finding replaces correlated CPA/CDR etc., not
+        # valid independent traffic evidence. Per-day and accumulated zero
+        # patterns are mutually exclusive.
+        return [pattern, *(code for code in chosen if code in _TRAFFIC_SIGNALS)]
+    if pattern == OPPORTUNITY and not chosen:
+        return [pattern]
+    return chosen
 
 
 def _utc(value):
@@ -160,7 +170,7 @@ def _store_campaigns(db, settings, store, target, kinds, clock, skills):
         return []
     if store.status != 1 or target >= clock.astimezone(zone).date():
         return []
-    first = target - timedelta(days=max(AD_ATTRIBUTION_DAYS[k] for k in kinds) + 8)
+    first = target - timedelta(days=max(AD_ATTRIBUTION_DAYS[k] for k in kinds) + 10)
     dimensions = ["campaign_" + kind for kind in kinds]
     facts = list(db.scalars(select(DailyMetric).where(DailyMetric.store_id == str(store.sid),
         DailyMetric.dimension.in_(dimensions), DailyMetric.metric_date.between(first, target),
@@ -299,6 +309,7 @@ def _store_campaigns(db, settings, store, target, kinds, clock, skills):
         selected_kpis = {code: {key: item[key] for key in _KPI_FIELDS if key in item}
             for code, item in kpis.items() if item["current"] is not None and item["baseline"] is not None
             and item["status"] not in {"SCOPE_UNSUPPORTED", "CURRENCY_UNCONFIRMED"}}
+        pattern = classify_hourly_ad_pattern(observed, mature_day, baseline_days, skill)
         state_at = _utc(campaign.updated_at)
         state = _STATES.get((campaign.state or "").lower(), "状态未确认") if state_at and state_at <= clock else "状态未确认"
         row = {"store_id": str(store.sid), "store_name": store.name,
@@ -314,7 +325,7 @@ def _store_campaigns(db, settings, store, target, kinds, clock, skills):
                 "dates": [day.isoformat() for day in baseline_days], **baseline},
             "ad_skill": skill, "mature_comparison": mature_comparison,
             "kpis": selected_kpis, "material_signals": signals,
-            "evidence_dates": capture}
+            "evidence_dates": capture, "hourly_pattern": pattern}
         row["evidence_id"] = hashlib.sha256(json.dumps({"row": row, "facts": proof},
             sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
         result.append(row)

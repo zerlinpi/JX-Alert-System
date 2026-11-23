@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, tuple_
 
+from jx_alert.analysis.hourly_ad_patterns import HIGH_LOW, LOW_ZERO, OPPORTUNITY
 from jx_alert.notifications.outbox import NotificationOutbox, RESERVING
 from jx_alert.storage.models import Campaign, Store, SyncJob
 
@@ -24,12 +25,14 @@ _FAMILIES = {
     'orders': 'conversion', 'zero_conversion': 'conversion',
     'intraday_budget': 'budget',
     'intraday_no_clicks': 'intraday_traffic',
+    HIGH_LOW: 'conversion', LOW_ZERO: 'conversion', OPPORTUNITY: 'opportunity',
 }
 # Increase in adverse difference from the comparison, in each metric's units.
 _ADDITIONAL_IMPACT = {
     'CTR': .002, 'CDR': .02,  # 0.2 and 2 percentage points
     'CPC': .25, 'CPA': 5, 'CPS': 5, 'ROAS': .5, 'orders': 3,
     'zero_conversion': 30, 'intraday_budget': 30, 'intraday_no_clicks': 10000,
+    HIGH_LOW: 30, LOW_ZERO: 30, OPPORTUNITY: 1,
 }
 _NEGATIVE_DIRECTION = {'CTR', 'CDR', 'ROAS', 'orders'}
 
@@ -40,7 +43,8 @@ def campaign_identity(row):
 
 def incident_key(row):
     identity = [row['store_id'], row['campaign_id'], row['ad_type'], row['report_date'],
-                'intraday' if row.get('intraday') else 'daily_review']
+                'intraday' if row.get('intraday') else
+                'daily_opportunity' if row.get('category') == 'opportunity' else 'daily_review']
     return 'hourly-ad:' + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
@@ -64,6 +68,11 @@ def _stored_identity(item):
 
 
 def _outbox_reserves(state, payload, item):
+    planned = payload.get('hourly_items')
+    if isinstance(planned, list) and not any(
+            isinstance(row, dict) and _stored_identity(row) == _stored_identity(item)
+            and row.get('category') == item.get('category') for row in planned):
+        return False
     if state in RESERVING:
         return True
     if state != 'DELIVERED':
@@ -73,7 +82,8 @@ def _outbox_reserves(state, payload, item):
         return True
     sent = payload['hourly_delivered_items']
     return isinstance(sent, list) and any(isinstance(row, dict)
-        and _stored_identity(row) == _stored_identity(item) for row in sent)
+        and _stored_identity(row) == _stored_identity(item)
+        and row.get('category') == item.get('category') for row in sent)
 
 
 def intraday_observation_is_recent(evidence, now):
@@ -205,6 +215,12 @@ def _measure(row, code):
     """Compare only comparable, explicitly documented impacts from evidence."""
     mature = row.get('mature') or {}
     baseline = row.get('baseline') or {}
+    if code in {HIGH_LOW, LOW_ZERO}:
+        pattern = row.get('hourly_pattern') or {}
+        amount = pattern.get('estimated_excess_spend' if code == HIGH_LOW else 'spend')
+        if pattern.get('code') == code and _number(amount):
+            return code, _day(row.get('mature_date')), amount, None
+        return None
     if code == 'zero_conversion':
         amount = mature.get('spend')
         orders = mature.get('orders')
@@ -243,6 +259,7 @@ def incident_metadata(row, signals):
         'incident_key': incident_key(row), 'store_id': row['store_id'], 'ad_type': row['ad_type'],
         'campaign_id': row['campaign_id'], 'report_date': row['report_date'], 'currency': row.get('currency'),
         'intraday': row.get('intraday') is True,
+        **({'category': 'opportunity'} if row.get('category') == 'opportunity' else {}),
         'risk_metrics': {code: _measure(row, code) for code in signals},
     }
 
@@ -276,7 +293,9 @@ def _earlier_daily_incident(item, report_day):
 
 def repeat_eligible_signals(row, signals, history, now):
     """Keep ordinary cooldowns and allow one independently verified intraday risk."""
-    previous = history.get(campaign_identity(row), ())
+    opportunity = list(signals) == [OPPORTUNITY]
+    previous = [(stamp, item) for stamp, item in history.get(campaign_identity(row), ())
+                if (item.get('category') == 'opportunity') == opportunity]
     if not previous:
         return list(signals)
     report_day = _day(row.get('report_date'))

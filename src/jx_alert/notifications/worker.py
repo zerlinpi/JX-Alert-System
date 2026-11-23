@@ -7,7 +7,7 @@ from sqlalchemy import or_, select, update
 
 from jx_alert.ai.ad_review_skills import frozen_ad_skills_current
 from jx_alert.config import get_settings, load_runtime_settings
-from jx_alert.notifications import rule_scope
+from jx_alert.notifications import company_executive, rule_scope
 from jx_alert.notifications.business_daily import select_business_stores
 from jx_alert.notifications.feishu import FeishuClient
 from jx_alert.notifications.routing import (
@@ -18,6 +18,7 @@ from jx_alert.notifications.outbox import (
     CLAIMABLE, DELIVERY_UNKNOWN, PRE_SEND_RETRY, QUESTION_REPLY_PREFIX, RESERVING, NotificationOutbox,
 )
 from jx_alert.notifications.feishu_app import FeishuTokenRefused
+from jx_alert.notifications.hourly_ad_routing import ROLE as HOURLY_SCOPED_ROLE, scoped_routing_enabled
 from jx_alert.notifications.hourly_ads import BEIJING, CLOSES, OPENS, delivery_window, recheck_hourly_delivery
 from jx_alert.notifications.recipient_policy import ROLE, advertising_group_delivery
 from jx_alert.notifications.quiet_policy import QUIET_REASON, quiet_blocks, quiet_delivery, original_question_reply
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 def _scheduled_window(key, payload, now, *, hourly_mode=False, created_at=None):
     """Apply Beijing delivery windows to queued proactive notices."""
     now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+    if company_executive.is_company_digest(key, payload):
+        return company_executive.delivery_window(key, payload, now)
     if original_question_reply(key, payload):
         return "READY", None
     current = now.astimezone(BEIJING)
@@ -151,10 +154,19 @@ class _RuleScopeChanged(RuntimeError):
     """The final generic alert route is not proven; the message was not posted."""
 
 
+class _CompanyScopeChanged(RuntimeError):
+    """The original private company digest is no longer permitted."""
+
+
+class _HourlyScopeChanged(RuntimeError):
+    """The frozen hourly recipient or card no longer matches verified scope."""
+
+
 class _UnfencedResponse(RuntimeError):
     """A transport returned without its write-ahead boundary; do not resubmit."""
 
 
+_HOURLY_SCOPE_BLOCK = "店铺、运营映射或告警有效期已变，未发起消息 POST，保留记录不补发"
 _SPARKX_BLOCK_REASON = "SparkX 页面已过期或投递范围已变更，未发起消息 POST，保留记录不补发"
 _UNKNOWN_REASON = "可能已提交飞书，未确认送达；禁止自动重发，请人工核对原会话"
 _LEGACY_REASON = "旧版尝试没有可核验的提交阶段；禁止自动重发，请人工核对原会话"
@@ -193,7 +205,24 @@ def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, pay
         # Resolve the original binding again at the write-ahead boundary, not after POST.
         if submission_scope is not None:
             key, created_at = submission_scope
-            if rule_scope.generic_key(key):
+            if company_executive.is_company_digest(key, payload):
+                row = db.scalar(select(NotificationOutbox).where(
+                    NotificationOutbox.id == row_id, NotificationOutbox.status == "PREPARING",
+                    NotificationOutbox.claimed_at == claimed_at, NotificationOutbox.attempts == attempts,
+                ).with_for_update())
+                if row is None:
+                    raise _LostOutboxClaim
+                try:
+                    settings = load_runtime_settings()
+                    eligible = (row.payload == payload and row.chat_id == chat_id and row.idempotency_key == key
+                        and evidence.get("app_identity_sha256") == route.get("app_identity_sha256")
+                        and company_executive.delivery_current(
+                            db, settings, key, payload, created_at, datetime.now(timezone.utc), chat_id))
+                except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                    eligible = False
+                if not eligible:
+                    raise _CompanyScopeChanged
+            elif rule_scope.generic_key(key):
                 # Fence the actual original row, not a newer attempt or a stale
                 # claim snapshot. Never overwrite a changed payload with intent.
                 row = db.scalar(select(NotificationOutbox).where(
@@ -222,6 +251,35 @@ def _record_submission(row_id, claimed_at, attempts, lease_seconds, chat_id, pay
                     eligible = False  # Unreadable local configuration is not authorization.
                 if not eligible:
                     raise _RuleScopeChanged
+            elif key.startswith("app:hourly-batch:") and payload.get("hourly_routing_version") == 1:
+                row = db.scalar(select(NotificationOutbox).where(
+                    NotificationOutbox.id == row_id, NotificationOutbox.status == "PREPARING",
+                    NotificationOutbox.claimed_at == claimed_at, NotificationOutbox.attempts == attempts,
+                ).with_for_update())
+                if row is None:
+                    raise _LostOutboxClaim
+                if (row.idempotency_key != key or row.chat_id != chat_id
+                        or {**row.payload, "card": payload.get("card")} != payload):
+                    raise _HourlyScopeChanged
+                try:
+                    settings = load_runtime_settings()
+                    clock = datetime.now(timezone.utc)
+                    result = recheck_hourly_delivery(db, settings, row.payload, clock)
+                    bound_app = row.payload.get("hourly_routing_app_identity")
+                    actual_app = evidence.get("app_identity_sha256")
+                    private = route.get("role") == HOURLY_SCOPED_ROLE
+                    same_app = (isinstance(bound_app, str) and bound_app == actual_app) if bound_app else not private
+                    eligible = (same_app and scoped_routing_enabled(settings) and settings.feishu_enabled
+                        and not settings.app_dry_run and settings.feishu_transport == "app"
+                        and result is not None and result[0] == payload.get("card")
+                        and _scheduled_window(key, row.payload, clock, hourly_mode=True,
+                                              created_at=created_at)[0] == "READY")
+                    if not row.payload.get("hourly_overnight"):
+                        eligible = eligible and timedelta() <= clock.replace(tzinfo=None) - created_at <= timedelta(minutes=90)
+                except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                    eligible = False
+                if not eligible:
+                    raise _HourlyScopeChanged
             else:
                 from jx_alert.sparkx_feishu import delivery_blocked
                 if delivery_blocked(db, get_settings(), key, payload, created_at, instant):
@@ -346,12 +404,24 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                        and destination.get("role") == "sparkx_performance_page")
 
         guarded_rule = rule_scope.generic_key(dedupe_key) and rule_scope.guarded(payload)
+        company_digest = company_executive.is_company_digest(dedupe_key, payload)
+        hourly_scoped = (dedupe_key.startswith("app:hourly-batch:")
+                         and payload.get("hourly_routing_version") == 1
+                         and isinstance(payload.get("hourly_items"), list)
+                         and payload.get("transport") == "app")
 
         def fence_send(evidence):
             nonlocal claim_time, intent
             claim_time, intent, material_window = _record_submission(row_id, claim_time, attempts, lease_seconds,
                                                      chat_id, payload, evidence,
-                                                     (dedupe_key, created_at) if sparkx_page or guarded_rule else None)
+                                                     (dedupe_key, created_at)
+                                                     if sparkx_page or guarded_rule or company_digest or hourly_scoped else None)
+            if company_digest:
+                checked = datetime.now(timezone.utc)
+                if (not timedelta() <= checked.replace(tzinfo=None) - claim_time <= timedelta(seconds=lease_seconds)
+                        or company_executive.delivery_window(dedupe_key, payload, checked)[0] != "READY"):
+                    intent = {**intent, "aborted_before_post": True}
+                    raise _CompanyScopeChanged
             if guarded_rule:
                 # The DB commit itself may consume the last seconds of the
                 # applicable delivery window or ad freshness. No I/O after this clock check.
@@ -363,6 +433,15 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                                              created_at=created_at)[0] != "READY"):
                     intent = {**intent, "aborted_before_post": True}
                     raise _RuleScopeChanged
+            if hourly_scoped:
+                checked = datetime.now(timezone.utc)
+                instant = checked.replace(tzinfo=None)
+                if (not timedelta() <= instant - claim_time <= timedelta(seconds=lease_seconds)
+                        or not payload.get("hourly_overnight") and instant - created_at > timedelta(minutes=90)
+                        or _scheduled_window(dedupe_key, payload, checked, hourly_mode=True,
+                                             created_at=created_at)[0] != "READY"):
+                    intent = {**intent, "aborted_before_post": True}
+                    raise _HourlyScopeChanged
             if sparkx_page:
                 from jx_alert.sparkx_feishu import page_fresh
                 # Scope reads, a DB lock or the intent COMMIT itself may cross the expiry.
@@ -393,7 +472,12 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             skip_reason = rule_scope.BLOCKED if (
                 guarded_rule and not rule_scope.valid_shape(payload)
                 or "rule_scope" in payload and not rule_scope.generic_key(dedupe_key)) else None
-            if skip_reason is None and quiet_blocks(settings, dedupe_key, payload):
+            if skip_reason is None and company_digest:
+                with SessionLocal() as db:
+                    if not company_executive.delivery_current(
+                            db, settings, dedupe_key, payload, created_at, now, existing_chat_id):
+                        skip_reason = company_executive.BLOCKED
+            if skip_reason is None and not company_digest and quiet_blocks(settings, dedupe_key, payload):
                 skip_reason = QUIET_REASON
             if (skip_reason is None and dedupe_key.startswith('scheduled-daily:')
                     and payload.get('morning_message_kind') == 'ad_exception'
@@ -423,8 +507,12 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
                         skip_reason = "原会话、店铺范围或通知群权限已变更，旧回复保留记录"
                 if skip_reason is None and superseded_group_delivery(settings, payload, created_at):
                     skip_reason = "通知群已更换，旧消息保留记录，不迁移或补发"
+                if skip_reason is None and destination.get('role') == HOURLY_SCOPED_ROLE and not hourly_scoped:
+                    skip_reason = _HOURLY_SCOPE_BLOCK
                 if (skip_reason is None and getattr(settings, 'hourly_ad_monitor_enabled', False)
                         and destination.get('receive_id_type') == 'open_id' and destination.get('role') != ROLE
+                        and not company_digest
+                        and not (destination.get('role') == HOURLY_SCOPED_ROLE and hourly_scoped)
                         and not original_question_reply(dedupe_key, payload)):
                     skip_reason = "主动提醒使用通知群，旧私聊保留记录"
                 if skip_reason is None and payload.get('ad_group_owners') is True:
@@ -532,6 +620,10 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
             delivered_at = datetime.now(timezone.utc).replace(tzinfo=None)
         except _RuleScopeChanged:
             status, error, delivered_at = "SKIPPED", rule_scope.BLOCKED, None
+        except _CompanyScopeChanged:
+            status, error, delivered_at = "SKIPPED", company_executive.BLOCKED, None
+        except _HourlyScopeChanged:
+            status, error, delivered_at = "SKIPPED", _HOURLY_SCOPE_BLOCK, None
         except _SparkXScopeChanged:
             status, error, delivered_at = "SKIPPED", _SPARKX_BLOCK_REASON, None
         except _LostOutboxClaim:
@@ -557,7 +649,7 @@ def process_outbox_batch(batch_size: int = 20, max_attempts: int = 8,
         with SessionLocal() as db:
             values = dict(chat_id=chat_id, status=status, last_error=error,
                           claimed_at=None, delivered_at=delivered_at)
-            if status == "SKIPPED" and guarded_rule:
+            if status == "SKIPPED" and (guarded_rule or company_digest or hourly_scoped):
                 values.pop("chat_id")  # Retain the original destination even for a malformed row.
             if status == "SKIPPED" and intent is not None and intent.get("aborted_before_post") is True:
                 values["payload"] = {**payload, "delivery_intent": intent}

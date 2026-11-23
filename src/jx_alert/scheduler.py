@@ -8,6 +8,8 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from jx_alert.config import effective_daily_sync_cron, get_settings
+from jx_alert.reporting.company_executive import BEIJING as COMPANY_BEIJING, CLOSES as COMPANY_CLOSES
+from jx_alert.reporting.company_executive import OPENS as COMPANY_OPENS
 from jx_alert.storage.db import init_db
 
 logging.basicConfig(
@@ -127,6 +129,29 @@ def daily_report_job():
         logger.error("Scheduled daily reports failed: %s", type(exc).__name__)
 
 
+def company_executive_digest_job(*, now=None):
+    """Queue only the private digest, with minute recovery inside its own window."""
+    from jx_alert.config import load_runtime_settings
+    from jx_alert.notifications.company_executive import queue_company_digest
+    from jx_alert.storage.db import SessionLocal, engine
+    from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
+
+    try:
+        clock = now if now is not None else datetime.now(timezone.utc)
+        if not COMPANY_OPENS <= clock.astimezone(COMPANY_BEIJING).time() < COMPANY_CLOSES:
+            return
+        settings = load_runtime_settings()
+        with database_job_lock(engine, "company_executive_digest"), SessionLocal() as db:
+            result = queue_company_digest(db, settings, now=clock)
+            db.commit()
+        if result not in {"WAITING", "ALREADY_QUEUED", "DISABLED"}:
+            logger.info("Company executive digest status=%s", result)
+    except JobAlreadyRunning:
+        return
+    except Exception as exc:
+        logger.error("Company executive digest failed: %s", type(exc).__name__)
+
+
 def main():
     settings = get_settings()
     if not settings.scheduler_enabled:
@@ -149,6 +174,14 @@ def main():
         replace_existing=True, max_instances=1, coalesce=True,
         misfire_grace_time=1800,
     )
+    if getattr(settings, "feishu_company_executive_digest_enabled", False):
+        scheduler.add_job(company_executive_digest_job,
+            CronTrigger(hour=COMPANY_OPENS.hour, minute=COMPANY_OPENS.minute, timezone=COMPANY_BEIJING),
+            id="company_executive_digest", replace_existing=True, max_instances=1, coalesce=True,
+            misfire_grace_time=600)
+        scheduler.add_job(company_executive_digest_job, IntervalTrigger(minutes=1),
+            id="company_executive_digest_recovery", replace_existing=True, max_instances=1, coalesce=True,
+            misfire_grace_time=60)
     scheduler.add_job(
         daily_report_job, IntervalTrigger(minutes=1),
         id="feishu_daily_report_recovery", executor="daily_reports",

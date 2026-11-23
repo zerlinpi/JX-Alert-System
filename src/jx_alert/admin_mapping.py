@@ -10,10 +10,13 @@ import re
 import stat
 import tempfile
 import unicodedata
+from uuid import uuid4
 
 import httpx
 
 from jx_alert.notifications.feishu_app import FeishuAppClient, FeishuAppError
+from jx_alert.notifications.hourly_ad_routing import app_fingerprint, scoped_app, scoped_routing_enabled
+from jx_alert.notifications.receipt import unique_json_fields
 from jx_alert.notifications.routing import (
     ApplicationRoutingError, _application_route_entry, _validate_routing_data, report_group_delivery,
 )
@@ -56,7 +59,7 @@ def _routing_snapshot(path: Path):
         if path.is_symlink() or not path.is_file():
             raise OSError
         raw = path.read_bytes()
-        routing = _validate_routing_data(json.loads(raw.decode("utf-8")))
+        routing = _validate_routing_data(json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_fields))
     except (OSError, ValueError, RuntimeError):
         raise MappingError(503, _ROUTING_ERROR) from None
     return raw, routing, hashlib.sha256(raw).hexdigest()
@@ -135,11 +138,13 @@ def store_mapping_summaries(settings, sids):
     return result
 
 
-def _members(settings, chat):
+def _members(settings, chat, *, app_id=None):
     """Feishu group member Open IDs, scoped to the currently routed chat."""
     # https://open.feishu.cn/document/server-docs/group/chat-member/get
     try:
         client = FeishuAppClient.from_settings(settings)
+        if app_id is not None and client.application_identity != app_fingerprint(app_id):
+            raise ValueError("Feishu roster scope changed")
         token = client._get_token()
         params = {"member_id_type": "open_id", "page_size": 100}
         members, seen_tokens = {}, set()
@@ -255,19 +260,34 @@ def save_store_mapping(settings, sid, open_ids, revision):
     route, alias, chat, _, fallback_group = _store_route(settings, routing, sid)
     if not ids and fallback_group is None:
         raise MappingError(400, "清空负责人前需启用并核实日报群兜底。")
-    roster = _members(settings, chat) if ids else {}
+    verified_app = scoped_app(settings)
+    roster = (_members(settings, chat, app_id=verified_app) if verified_app else _members(settings, chat)) if ids else {}
     if any(uid not in roster for uid in ids):
         raise MappingError(400, "有选中的人员已不在此群中，请刷新群成员后再选择。")
     updated = dict(route)
     updated["open_ids"] = ids
     updated["owner_display_names"] = {uid: roster[uid] for uid in ids}
+    scoped = scoped_routing_enabled(settings)
+    if ids and verified_app:
+        updated["hourly_verified_operator_app_id"] = verified_app
+    else:
+        updated.pop("hourly_verified_operator_app_id", None)
+    if (scoped or "hourly_operator_generation" in route) and (ids != route.get("open_ids", [])
+            or updated.get("hourly_verified_operator_app_id") != route.get("hourly_verified_operator_app_id")):
+        updated["hourly_operator_generation"] = uuid4().hex
     if not route.get("chat_id") and alias != routing["default_chat_id"]:
         updated["chat_id"] = alias
     routing.setdefault("stores", {})[sid] = updated
     group_changed = False
-    if "verified_member_open_ids" in routing["groups"][alias] and ids:
-        group_changed = routing["groups"][alias]["verified_member_open_ids"] != sorted(roster)
-        routing["groups"][alias]["verified_member_open_ids"] = sorted(roster)
+    if ids and (scoped or "verified_member_open_ids" in routing["groups"][alias]):
+        group = routing["groups"][alias]
+        group_changed = (group.get("verified_member_open_ids") != sorted(roster)
+                         or group.get("hourly_verified_roster_app_id") != verified_app)
+        group["verified_member_open_ids"] = sorted(roster)
+        if verified_app:
+            group["hourly_verified_roster_app_id"] = verified_app
+        else:
+            group.pop("hourly_verified_roster_app_id", None)
     payload = (json.dumps(routing, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     try:
         with _mapping_lock(path):
