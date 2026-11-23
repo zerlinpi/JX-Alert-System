@@ -81,6 +81,8 @@ class Settings(BaseSettings):
     mcp_output_mode: Literal["jx", "sparkx_direct"] = "jx"
     sparkx_ai_token: SecretStr = SecretStr("")
     sparkx_profile_ids: str = ""
+    # Owner-console SparkX token/profile IDs (0600); takes precedence over the environment.
+    sparkx_credentials_file: str = "/app/data/secrets/sparkx.json"
     sparkx_feishu_enabled: bool = False  # server-only, never set by relay input
     sparkx_relay_bearer_token: SecretStr = SecretStr("")
 

@@ -143,6 +143,9 @@ def source_snapshot(settings, sid):
 
 
 def _token_basis(settings, profile):
+    from jx_alert.sparkx_config import with_console_credentials
+
+    settings = with_console_credentials(settings)
     try:
         token = settings.sparkx_ai_token.get_secret_value()
         validate_token(token)
@@ -154,6 +157,9 @@ def _token_basis(settings, profile):
 
 
 def _available_token(settings):
+    from jx_alert.sparkx_config import with_console_credentials
+
+    settings = with_console_credentials(settings)
     try:
         validate_token(settings.sparkx_ai_token.get_secret_value())
         return bool(parse_profile_ids(settings.sparkx_profile_ids))

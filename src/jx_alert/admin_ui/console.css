@@ -329,3 +329,11 @@ tbody tr:last-child > * { border-bottom: 0; }
 #skill-library-panel li { padding-block: 6px; }
 #skill-library-panel section > :is(button,select), #skill-library-panel li > button { margin: 5px 6px 4px 0; }
 #skill-library-panel .skill-library-digest, #skill-library-panel li > p { color: var(--muted); font-size: 13px; }
+
+/* Read-only company digest preview: the exact Feishu card rendered as plain text and tables. */
+.digest-preview { margin: 4px 0 12px; border: 1px solid var(--edge); border-radius: 6px; padding: 12px 0 4px; background: #fff; }
+.digest-preview h3 { margin: 0 var(--pad) 8px; }
+.digest-preview .preview-text { margin: 0 var(--pad) 10px; white-space: pre-line; overflow-wrap: anywhere; font-size: 13px; }
+.digest-preview hr { border: 0; border-top: 1px solid var(--edge); margin: 6px var(--pad) 10px; }
+.digest-preview :is(td, th) { white-space: pre-line; vertical-align: top; }
+#sparkx-profiles-table { margin-top: 6px; }

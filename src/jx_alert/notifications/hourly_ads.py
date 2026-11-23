@@ -19,6 +19,7 @@ from jx_alert.notifications.ad_repeat import (
     live_observation_current as _live_observation_current,
 )
 from jx_alert.notifications.cards import card, number, plain, with_mentions
+from jx_alert.notifications.operators import UNMAPPED_OPERATOR, store_operator_labels
 from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
 from jx_alert.notifications.recipient_policy import ROLE, advertising_subscriber_deliveries
 from jx_alert.notifications.routing import (
@@ -245,6 +246,18 @@ def _key(bucket, destination):
     return 'app:hourly-batch:' + hashlib.sha256(raw.encode()).hexdigest()
 
 
+def row_operator_labels(settings, routing, store_ids, app_id=None):
+    """Display-only person per store for group and lead cards; never a recipient or mention."""
+    sids = sorted({str(sid) for sid in store_ids})
+    labels = store_operator_labels(routing, sids, unmapped=UNMAPPED_OPERATOR)
+    if scoped_routing_enabled(settings):
+        for sid in sids:
+            proof = assignment(routing, sid, app_id)
+            if proof:
+                labels[sid] = proof['operator_name']
+    return labels
+
+
 def _group_mentions(settings, routing, delivery, items, app_id):
     sids = {i['store_id'] for i in items}
     if not scoped_routing_enabled(settings):
@@ -330,8 +343,9 @@ def _write_routes(db, settings, bucket, items, day, *, overnight=False):
     items = _group_eligible(settings, routing, items, app_id)
     if not group or not items:
         return []
+    people = row_operator_labels(settings, routing, {item['store_id'] for item in items}, app_id)
     primary = _write_batch(db, settings, bucket, group, items, day, group=group, routing=routing,
-                           overnight=overnight, app_id=app_id)
+                           overnight=overnight, app_id=app_id, operator_labels=people)
     if primary is None:
         # Keep late findings eligible for the next cycle rather than sending a
         # second group message or a private-only batch in this cycle.
@@ -371,7 +385,9 @@ def _write_routes(db, settings, bucket, items, day, *, overnight=False):
     private_items = [i for i in items if i.get('incident_key') not in reserved]
     if not private_items:
         return [primary]
-    copy = _write_batch(db, settings, bucket, lead[0], private_items, day, group=group, routing=routing, overnight=overnight)
+    # The 总负责人 sees every store, so each row names the store's mapped operator.
+    copy = _write_batch(db, settings, bucket, lead[0], private_items, day, group=group, routing=routing,
+                        overnight=overnight, operator_labels=people)
     return [primary, copy] if copy is not None else [primary]
 
 
@@ -500,6 +516,9 @@ def recheck_hourly_delivery(db, settings, payload, now):
         rows = _group_eligible(settings, routing, rows, app_id)
     if not rows:
         return None
+    if labels is None:
+        # Group and 总负责人 cards name each store's current operator (display only).
+        labels = row_operator_labels(settings, routing, {item['store_id'] for item in rows}, app_id)
     mentions = _group_mentions(settings, routing, current, rows, app_id) if destination == current else None
     return _advertising_card_with_items(rows,
         title='夜间广告异常汇总' if payload['hourly_overnight'] else '广告异常',

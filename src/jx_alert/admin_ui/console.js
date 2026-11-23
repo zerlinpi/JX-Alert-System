@@ -20,10 +20,13 @@ const state = {
   groups: { current: null, chats: [], preview: null, saving: false, loading: false, seq: 0 },
   sources: { data: null, loading: false, saving: false },
   adSource: { data: null, busy: false },
-  deepseek: { data: null, loading: false, saving: false },
+  deepseek: { data: null, loading: false, saving: false, testing: false },
+  sparkx: { data: null, loading: false, saving: false, testing: false },
   reviewSkills: null,
   skillLibrary: null,
   adSubscribers: { data: null, members: null, selected: new Set(), loading: false, saving: false },
+  companyDigest: { data: null, members: null, selected: new Set(), loading: false, saving: false, previewing: false },
+  ownerNames: { busy: false },
 };
 
 function node(tag, text, name) {
@@ -819,7 +822,7 @@ function renderView() {
   const sources = state.view === "data-sources";
   const analysisSettings = state.view === "analysis-settings";
   $("page-title").textContent = analysisSettings ? "分析设置" : sources ? "领星数据源" : groups ? "通知群设置" : owners ? "负责人映射" : "经营概览";
-  $("page-description").textContent = analysisSettings ? "管理 DeepSeek 模型与广告分析技能。" : sources ? "管理接口与 MCP 凭据、更换日期及操作记录。" : groups ? "管理接收日报和默认提醒的飞书群聊。" : owners ? "按店铺管理接收异常提醒的飞书负责人。" : "查看各店铺的销售、广告与账户绩效。";
+  $("page-description").textContent = analysisSettings ? "管理 DeepSeek 模型、SparkX MCP 连接与广告分析技能。" : sources ? "管理接口与 MCP 凭据、更换日期及操作记录。" : groups ? "管理接收日报和默认提醒的飞书群聊，以及总负责人私聊。" : owners ? "按店铺管理接收异常提醒的飞书负责人（运营）。" : "查看各店铺的销售、广告与账户绩效。";
   $("notification-group-panel").hidden = !groups;
   $("data-sources-panel").hidden = !sources;
   $("analysis-settings-panel").hidden = !analysisSettings;
@@ -875,6 +878,7 @@ async function setView(view) {
   if (view === "owners" && state.data && !state.members) await loadMembers();
   if (view === "notification-group" && !state.groups.current) await loadGroups();
   if (view === "notification-group" && !state.adSubscribers.data) await loadAdSubscribers();
+  if (view === "notification-group" && !state.companyDigest.data) await loadCompanyDigest();
   if (view === "data-sources" && !state.sources.data) await loadSources();
   if (view === "analysis-settings") {
     if (!state.skillLibrary && window.JxSkillLibrary) {
@@ -884,12 +888,163 @@ async function setView(view) {
       state.reviewSkills = window.JxReviewSkills.mount($("review-skills-panel"), { api, csrf: () => state.csrf });
     }
     if (!state.deepseek.data) await loadDeepSeek();
+    if (!state.sparkx.data) await loadSparkX();
   }
 }
 
 function setDeepSeekBusy() {
   const settings = state.deepseek;
   $("deepseek-fields").disabled = settings.loading || settings.saving || !settings.data?.revision || !state.csrf;
+  $("test-deepseek").disabled = settings.loading || settings.saving || settings.testing || !state.csrf;
+}
+
+const CREDENTIAL_SOURCES = { console: "运营台保存", environment: "服务器环境变量", private_file: "服务器私有文件" };
+
+function metaEntry(meta, label, value) {
+  const entry = node("div");
+  entry.append(node("dt", label), node("dd", value));
+  meta.append(entry);
+}
+
+const DEEPSEEK_TEST = {
+  OK: ["连接正常：密钥有效，所选模型可用。", "success"],
+  INVALID_KEY: ["DeepSeek 拒绝了该密钥（401），请更换后保存。", "error"],
+  INSUFFICIENT_BALANCE: ["DeepSeek 账户余额不足，分析请求会失败。", "error"],
+  MODEL_UNAVAILABLE: ["密钥有效，但账户可用模型中没有所选模型，请改选模型。", "error"],
+  FORBIDDEN: ["DeepSeek 拒绝访问（403）。", "error"],
+  RATE_LIMITED: ["DeepSeek 繁忙（429），请稍后重试。", "error"],
+  TIMEOUT: ["连接 DeepSeek 超时，请检查服务器网络。", "error"],
+  UNREACHABLE: ["服务器无法连接 DeepSeek，请检查网络或代理。", "error"],
+  SERVICE_UNAVAILABLE: ["DeepSeek 服务暂时不可用。", "error"],
+  RESPONSE_INVALID: ["DeepSeek 返回格式无法核对。", "error"],
+  NOT_CONFIGURED: ["尚未配置 DeepSeek 密钥。", "error"],
+  INVALID_CONFIGURATION: ["DeepSeek 密钥格式无效。", "error"],
+  CONFIGURATION_UNAVAILABLE: ["DeepSeek 私有配置无法读取。", "error"],
+};
+
+async function testDeepSeek() {
+  const settings = state.deepseek;
+  if (settings.testing || !state.csrf) return;
+  settings.testing = true;
+  setDeepSeekBusy();
+  notice("deepseek-status", "正在测试 DeepSeek 连接…");
+  try {
+    const result = await api("deepseek/test", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: "{}" });
+    const [text, tone] = DEEPSEEK_TEST[result.status] || ["连接测试结果待核实。", "error"];
+    const extra = result.balance_available === null && result.status === "OK" ? "（余额状态未返回）" : "";
+    notice("deepseek-status", text + extra, tone);
+  } catch (error) {
+    notice("deepseek-status", error.message, "error");
+  } finally {
+    settings.testing = false;
+    setDeepSeekBusy();
+  }
+}
+
+function setSparkXBusy() {
+  const model = state.sparkx;
+  $("sparkx-fields").disabled = model.loading || model.saving || !model.data?.revision || !state.csrf;
+  $("test-sparkx").disabled = model.loading || model.saving || model.testing || !state.csrf;
+}
+
+function renderSparkX() {
+  const data = state.sparkx.data;
+  $("sparkx-state").replaceChildren(...(data ? [badge(data.configured ? "已配置 Token" : "未配置 Token")] : []));
+  const meta = $("sparkx-meta");
+  meta.replaceChildren();
+  if (data) {
+    metaEntry(meta, "Token 来源", CREDENTIAL_SOURCES[data.token_source] || "未配置");
+    metaEntry(meta, "允许的 Profile", data.profile_count ? `${data.profile_count} 个` : "未填写");
+    if (data.updated_at) {
+      const when = new Date(data.updated_at);
+      if (Number.isFinite(when.getTime())) metaEntry(meta, "最后更新", when.toLocaleString("zh-CN"));
+    }
+    $("sparkx-profiles").value = data.profile_ids || "";
+  }
+  setSparkXBusy();
+}
+
+async function loadSparkX() {
+  const model = state.sparkx;
+  if (model.loading || model.saving) return;
+  model.loading = true;
+  $("sparkx-token").value = "";
+  setSparkXBusy();
+  try {
+    model.data = await api("sparkx");
+    notice("sparkx-status");
+  } catch (error) {
+    model.data = null;
+    notice("sparkx-status", error.message, "error");
+  } finally {
+    model.loading = false;
+    renderSparkX();
+  }
+}
+
+async function saveSparkX() {
+  const model = state.sparkx;
+  if (model.loading || model.saving || !model.data?.revision || !state.csrf) return;
+  model.saving = true;
+  setSparkXBusy();
+  try {
+    model.data = await api("sparkx", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf,
+    }, body: JSON.stringify({ revision: model.data.revision, token: $("sparkx-token").value,
+      profile_ids: $("sparkx-profiles").value }) });
+    notice("sparkx-status", "SparkX 设置已保存。可点击“测试 SparkX 连接”核对授权。", "success");
+  } catch (error) {
+    if (error.status === 409) model.data = null;
+    notice("sparkx-status", error.message, "error");
+  } finally {
+    $("sparkx-token").value = "";
+    model.saving = false;
+    renderSparkX();
+  }
+}
+
+const SPARKX_TEST = {
+  AUTH_REJECTED: "SparkX 拒绝了该 Token（401）：Token 无效、过期、被禁用，或缺少广告效果只读权限。",
+  FORBIDDEN: "SparkX 拒绝访问（403），请核对 Token 的授权范围。",
+  RATE_LIMITED: "SparkX 限流（429），请稍后重试。",
+  PROVIDER_ERROR: "SparkX 服务暂时异常（5xx），请稍后重试。",
+  HTTP_ERROR: "SparkX 返回了无法识别的 HTTP 状态。",
+  TIMEOUT: "连接 SparkX 超时，请检查服务器网络。",
+  UNREACHABLE: "服务器无法连接 mcp.sparkx.cn，请检查网络、DNS 或防火墙。",
+  REQUEST_FAILED: "SparkX MCP 请求失败。",
+  NOT_CONFIGURED: "尚未配置 SparkX MCP Token。",
+  INVALID_TOKEN_FORMAT: "SparkX MCP Token 格式无效。",
+  RESULT_UNREADABLE: "SparkX 返回的授权店铺无法核对。",
+};
+
+async function testSparkX() {
+  const model = state.sparkx;
+  if (model.testing || !state.csrf) return;
+  model.testing = true;
+  setSparkXBusy();
+  $("sparkx-profiles-table").hidden = true;
+  notice("sparkx-status", "正在连接 SparkX MCP…");
+  try {
+    const result = await api("sparkx/test", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: "{}" });
+    if (result.status !== "OK") {
+      notice("sparkx-status", SPARKX_TEST[result.status] || "SparkX 连接测试结果待核实。", "error");
+      return;
+    }
+    const missing = (result.allowed_not_authorized || []).length;
+    notice("sparkx-status", `连接正常：该 Token 已授权 ${result.profile_count} 个店铺 Profile。`
+      + (missing ? ` 另有 ${missing} 个已填写的 Profile ID 不在授权范围内，请删除或重新授权。` : ""),
+      missing ? "error" : "success");
+    tableRows("sparkx-profile-rows", (result.profiles || []).map((row) => [
+      row.profile_id, row.name || "—", row.country || "—", row.allowed ? "是" : "否"]), 4, "该 Token 没有授权任何店铺。");
+    $("sparkx-profiles-table").hidden = false;
+  } catch (error) {
+    notice("sparkx-status", error.message, "error");
+  } finally {
+    model.testing = false;
+    setSparkXBusy();
+  }
 }
 
 function renderDeepSeek() {
@@ -898,13 +1053,13 @@ function renderDeepSeek() {
   $("deepseek-state").replaceChildren(...(label ? [badge(label)] : []));
   const meta = $("deepseek-meta");
   meta.replaceChildren();
+  if (data) {
+    metaEntry(meta, "密钥来源", CREDENTIAL_SOURCES[data.key_source] || "未配置");
+    metaEntry(meta, "模型来源", data.model_source === "console" ? "运营台保存" : "服务器默认 / 环境变量");
+  }
   if (data?.updated_at) {
     const when = new Date(data.updated_at);
-    if (Number.isFinite(when.getTime())) {
-      const entry = node("div");
-      entry.append(node("dt", "最后更新"), node("dd", when.toLocaleString("zh-CN")));
-      meta.append(entry);
-    }
+    if (Number.isFinite(when.getTime())) metaEntry(meta, "最后更新", when.toLocaleString("zh-CN"));
   }
   $("deepseek-model").replaceChildren(...(data?.models || []).map((model) => {
     const option = node("option", model);
@@ -1144,6 +1299,7 @@ async function saveNotificationGroup() {
     notice("group-settings-status", `通知群已保存为「${result.name}」，后续通知使用新配置。`, "success");
     await loadStores();
     await loadAdSubscribers();
+    await loadCompanyDigest();
   } catch (error) {
     clearGroupPreview();
     notice("group-settings-status", error.message || "通知群保存失败。", "error");
@@ -1224,11 +1380,186 @@ async function saveAdSubscribers() {
     model.data = result;
     model.selected = new Set((result.recipients || []).map((row) => row.id));
     if (state.groups.current) state.groups.current.revision = result.revision;
+    if (state.companyDigest.data) state.companyDigest.data.revision = result.revision;
     clearGroupPreview();
     notice("ad-subscriber-status", "广告总负责人已保存，不会补发旧告警。", "success");
   } catch (error) {
     notice("ad-subscriber-status", error.message || "保存失败，请刷新配置后重试。", "error");
   } finally { model.saving = false; updateAdSubscribers(); }
+}
+
+function updateCompanyDigest() {
+  const model = state.companyDigest;
+  const recipient = model.data?.recipient;
+  const status = model.data?.status;
+  const selected = [...model.selected];
+  const changed = (recipient ? [recipient.id] : []).join() !== selected.join();
+  const busy = model.loading || model.saving;
+  $("current-company-digest").replaceChildren(recipient
+    ? node("li", recipient.name || recipient.id)
+    : node("li", "未设置公司日报总负责人", "muted"));
+  let summary = "正在读取…";
+  if (status) {
+    summary = (status.enabled ? `已启用 · ${status.schedule || "每天北京时间 08:30"}` : "08:30 公司日报尚未在服务器启用")
+      + (status.start_date ? ` · 首发日 ${status.start_date}` : "")
+      + (Number.isInteger(status.store_count) ? ` · 统计店铺 ${status.store_count} 家` : "")
+      + (status.excluded_store_count ? `（另有 ${status.excluded_store_count} 家已关闭采集或通知，不计入）` : "");
+  } else if (!model.loading) summary = "暂时无法读取公司日报设置。";
+  $("company-digest-state").textContent = summary;
+  const verified = new Set((model.members || []).map((row) => row.id));
+  const unverified = selected.some((uid) => !verified.has(uid));
+  $("reload-company-digest").disabled = busy;
+  $("preview-company-digest").disabled = model.previewing;
+  $("clear-company-digest").disabled = busy || !model.data || !selected.length;
+  $("save-company-digest").disabled = busy || !state.csrf || !model.data || !changed || selected.length > 1
+    || (selected.length > 0 && unverified);
+  $("company-digest-field").disabled = busy;
+  $("company-digest-note").textContent = busy ? "正在处理…" : selected.length
+    ? "保存后从下一次 08:30 起私聊发送，不补发旧日报。" : "未设置时不发送公司日报。";
+}
+
+function renderCompanyDigestMembers() {
+  const model = state.companyDigest;
+  const query = String($("company-digest-search").value || "").trim().toLowerCase();
+  const known = new Set((model.members || []).map((row) => row.id));
+  const current = model.data?.recipient;
+  const missing = current && !known.has(current.id) ? [{ ...current, unavailable: true }] : [];
+  $("company-digest-members").replaceChildren(...[...missing, ...(model.members || [])]
+    .filter((row) => (row.name || row.id).toLowerCase().includes(query)).map((member) => {
+      const label = node("label", undefined, "member");
+      const check = node("input"); check.type = "radio"; check.name = "company-digest-recipient";
+      check.checked = model.selected.has(member.id);
+      check.disabled = Boolean(member.unavailable);
+      check.addEventListener("change", () => {
+        if (check.checked) model.selected = new Set([member.id]);
+        updateCompanyDigest();
+      });
+      label.append(check, node("span", member.name || member.id));
+      if (member.unavailable) label.append(badge("成员待核实"));
+      return label;
+    }));
+  updateCompanyDigest();
+}
+
+async function loadCompanyDigest(includeMembers = false) {
+  const model = state.companyDigest;
+  if (model.loading || model.saving) return;
+  model.loading = true;
+  updateCompanyDigest();
+  notice("company-digest-status", includeMembers ? "正在读取通知群成员…" : "");
+  try {
+    const value = await api(`company-digest${includeMembers ? "/members" : ""}`);
+    if (!value || !/^[0-9a-f]{64}$/.test(value.revision || "")) throw new Error("公司日报配置无法核对，请刷新。");
+    model.data = value;
+    model.selected = new Set(value.recipient ? [value.recipient.id] : []);
+    model.members = includeMembers ? value.members || [] : null;
+    $("company-digest-search").hidden = !includeMembers;
+    $("company-digest-field").hidden = !includeMembers;
+    if (includeMembers) renderCompanyDigestMembers();
+    notice("company-digest-status");
+  } catch (error) {
+    notice("company-digest-status", error.message || "无法读取公司日报设置。", "error");
+  } finally { model.loading = false; updateCompanyDigest(); }
+}
+
+async function saveCompanyDigest() {
+  const model = state.companyDigest;
+  if (model.loading || model.saving || $("save-company-digest").disabled) return;
+  model.saving = true; updateCompanyDigest();
+  try {
+    const result = await api("company-digest", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf },
+      body: JSON.stringify({ open_ids: [...model.selected], revision: model.data.revision }),
+    });
+    model.data = { ...result, members: model.data?.members };
+    model.selected = new Set(result.recipient ? [result.recipient.id] : []);
+    if (state.groups.current) state.groups.current.revision = result.revision;
+    if (state.adSubscribers.data) state.adSubscribers.data.revision = result.revision;
+    clearGroupPreview();
+    notice("company-digest-status", result.recipient ? "公司日报总负责人已保存。" : "已清空，之后不再发送公司日报。", "success");
+  } catch (error) {
+    notice("company-digest-status", error.message || "保存失败，请刷新配置后重试。", "error");
+  } finally { model.saving = false; updateCompanyDigest(); }
+}
+
+function cardText(value) {
+  return String(value ?? "").replace(/\*\*/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+// Render the exact Feishu card JSON as text-only DOM; no HTML is interpreted.
+function renderCardPreview(container, card) {
+  const parts = [];
+  const title = card?.header?.title?.content;
+  if (title) parts.push(node("h3", title));
+  for (const element of card?.body?.elements || []) {
+    if (element.tag === "markdown") parts.push(node("p", cardText(element.content), "preview-text"));
+    else if (element.tag === "hr") parts.push(node("hr"));
+    else if (element.tag === "table") {
+      const columns = element.columns || [];
+      const wrap = node("div", undefined, "table-scroll");
+      const table = node("table");
+      const head = node("thead");
+      const header = node("tr");
+      for (const column of columns) {
+        const th = node("th", column.display_name);
+        th.scope = "col";
+        header.append(th);
+      }
+      head.append(header);
+      const body = node("tbody");
+      for (const row of element.rows || []) {
+        const tr = node("tr");
+        columns.forEach((column, index) => {
+          const cell = node(index === 0 ? "th" : "td", row[column.name] ?? "");
+          if (index === 0) cell.scope = "row";
+          tr.append(cell);
+        });
+        body.append(tr);
+      }
+      table.append(head, body);
+      wrap.append(table);
+      parts.push(wrap);
+    }
+  }
+  container.replaceChildren(...parts);
+  container.hidden = false;
+}
+
+async function previewCompanyDigest() {
+  const model = state.companyDigest;
+  if (model.previewing) return;
+  model.previewing = true; updateCompanyDigest();
+  notice("company-digest-status", "正在生成预览（只读，不发送）…");
+  try {
+    const result = await api("company-digest/preview");
+    renderCardPreview($("company-digest-preview"), result.card);
+    notice("company-digest-status", `以下为按当前数据生成的日报预览（经营日 ${result.date}，成熟归因日 ${result.mature_date}），未发送。`, "success");
+  } catch (error) {
+    $("company-digest-preview").hidden = true;
+    notice("company-digest-status", error.message || "无法生成预览。", "error");
+  } finally { model.previewing = false; updateCompanyDigest(); }
+}
+
+async function syncOwnerNames() {
+  const model = state.ownerNames;
+  if (model.busy || !state.csrf) return;
+  model.busy = true;
+  $("sync-owner-names").disabled = true;
+  notice("owner-names-status", "正在从飞书群成员同步运营姓名…");
+  try {
+    const result = await api("owners/sync-names", { method: "POST", headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: "{}" });
+    const unresolved = result.unresolved_owner_count
+      ? `；${result.unresolved_owner_count} 位已映射人员不在对应群内，姓名未更新` : "";
+    notice("owner-names-status", `已更新 ${result.updated_store_count} 家店铺的运营姓名${unresolved}。告警和日报将显示这些姓名。`, "success");
+    if (state.data?.routing && result.revision) state.data.routing.revision = result.revision;
+    if (state.view === "owners" && state.data) await loadMembers();
+  } catch (error) {
+    notice("owner-names-status", error.message || "同步失败，请稍后重试。", "error");
+  } finally {
+    model.busy = false;
+    $("sync-owner-names").disabled = false;
+  }
 }
 
 function ownerIDs() {
@@ -1370,11 +1701,14 @@ $("store-filter").addEventListener("change", renderStoreList);
 $("refresh").addEventListener("click", () => {
   if (state.view === "analysis-settings") {
     void loadDeepSeek();
+    void loadSparkX();
     void state.reviewSkills?.refresh();
     void state.skillLibrary?.refresh();
   } else if (state.view === "data-sources") void loadSources();
-  else if (state.view === "notification-group") void loadGroups();
-  else void loadStores();
+  else if (state.view === "notification-group") {
+    void loadGroups();
+    void loadCompanyDigest();
+  } else void loadStores();
 });
 $("reload-groups").addEventListener("click", loadGroups);
 $("notification-group-select").addEventListener("change", () => { clearGroupPreview(); notice("group-settings-status"); });
@@ -1385,6 +1719,15 @@ $("reload-ad-subscribers").addEventListener("click", () => loadAdSubscribers(tru
 $("ad-subscriber-search").addEventListener("input", renderAdSubscriberMembers);
 $("save-ad-subscribers").addEventListener("click", saveAdSubscribers);
 $("clear-ad-subscribers").addEventListener("click", () => { state.adSubscribers.selected.clear(); renderAdSubscriberMembers(); });
+$("reload-company-digest").addEventListener("click", () => loadCompanyDigest(true));
+$("company-digest-search").addEventListener("input", renderCompanyDigestMembers);
+$("save-company-digest").addEventListener("click", saveCompanyDigest);
+$("clear-company-digest").addEventListener("click", () => { state.companyDigest.selected.clear(); renderCompanyDigestMembers(); });
+$("preview-company-digest").addEventListener("click", () => void previewCompanyDigest());
+$("test-deepseek").addEventListener("click", () => void testDeepSeek());
+$("sparkx-form").addEventListener("submit", (event) => { event.preventDefault(); void saveSparkX(); });
+$("test-sparkx").addEventListener("click", () => void testSparkX());
+$("sync-owner-names").addEventListener("click", () => void syncOwnerNames());
 for (const button of document.querySelectorAll("[data-view]")) {
   button.addEventListener("click", () => setView(button.dataset.view));
 }

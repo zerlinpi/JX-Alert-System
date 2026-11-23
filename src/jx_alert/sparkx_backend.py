@@ -14,6 +14,7 @@ import anyio
 from sqlalchemy import select
 
 from jx_alert.notifications.receipt import unique_json_fields
+from jx_alert.sparkx_config import with_console_credentials
 from jx_alert.sparkx_direct import (
     SparkXDirectError, call_sparkx, parse_profile_ids, validate_performance_query, validate_token,
 )
@@ -86,6 +87,7 @@ def _clock(value):
 
 
 def _scope(settings, store, binding):
+    settings = with_console_credentials(settings)
     if (store is None or getattr(store, "status", None) != 1 or not isinstance(binding, dict)
             or not re.fullmatch(r"[1-9][0-9]{0,29}", str(getattr(store, "sid", "")))):
         raise SparkXBackendError("STORE_NOT_AUTHORIZED")

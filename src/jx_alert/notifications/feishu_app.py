@@ -66,6 +66,11 @@ class FeishuAppClient:
         return cls._from_configured_credentials(settings).application_identity
 
     @classmethod
+    def configured_app_id(cls, settings):
+        """The configured public App ID (``cli_…``, not a secret), without requesting a token."""
+        return cls._from_configured_credentials(settings)._app_id
+
+    @classmethod
     def from_settings(cls, settings):
         return cls._from_configured_credentials(settings)
 

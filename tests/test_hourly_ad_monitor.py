@@ -287,6 +287,42 @@ def test_daytime_batches_in_one_group_and_refreshes_owner_mentions(warehouse):
             now=CLOCK + timedelta(hours=1), slot='second', send_alerts=True)
 
 
+def test_group_and_lead_cards_name_each_campaign_store_operator(warehouse):
+    settings, session, _, _ = warehouse
+    path = Path(settings.feishu_routing_file)
+    routing = json.loads(path.read_text())
+    routing['stores'] = {'5174': {'chat_id': 'reports', 'open_ids': ['ou_owner'],
+                                  'owner_display_names': {'ou_owner': '运营小王'}}}
+    routing['ad_alert_subscribers'] = {'recipients': [
+        {'open_id': 'ou_lead', 'name': '总负责人', 'generation': 'a' * 32},
+    ]}
+    path.write_text(json.dumps(routing))
+    with session() as db:
+        db.get(Store, '5175').status = 1
+        db.add(Campaign(store_id='5175', campaign_id='b', campaign_type='sp', state='enabled',
+                        updated_at=CLOCK.replace(tzinfo=None)))
+        db.commit()
+        ids = hourly_ads.queue_hourly_findings(db, settings, [_finding('5174', 'active'), _finding('5175', 'b')],
+                                               now=CLOCK, slot='first', send_alerts=True)
+        group, lead = (db.get(NotificationOutbox, oid) for oid in ids)
+        assert (group.chat_id, lead.chat_id) == ('oc_reports', 'ou_lead')
+        for row in (group, lead):
+            frozen = json.dumps(row.payload['card'], ensure_ascii=False)
+            rendered, _ = hourly_ads.recheck_hourly_delivery(db, settings, row.payload, CLOCK)
+            for text in (frozen, json.dumps(rendered, ensure_ascii=False)):
+                # Every campaign row carries the person responsible for its store.
+                assert '店铺5174\\nactive\\nSP · 活动 active\\n对应运营：运营小王' in text
+                assert '店铺5175\\nb\\nSP · 活动 b\\n对应运营：未映射运营' in text
+        # The labels are display text only: the lead's private card mentions nobody.
+        lead_card, _ = hourly_ads.recheck_hourly_delivery(db, settings, lead.payload, CLOCK)
+        assert '<at id' not in json.dumps(lead_card)
+        # Renaming the operator in the console mapping is reflected at send time.
+        routing['stores']['5174']['owner_display_names']['ou_owner'] = '运营小李'
+        path.write_text(json.dumps(routing))
+        refreshed, _ = hourly_ads.recheck_hourly_delivery(db, settings, lead.payload, CLOCK)
+        assert '对应运营：运营小李' in json.dumps(refreshed, ensure_ascii=False)
+
+
 def test_delivered_group_records_only_visible_activities_and_later_rechecks_missing_one(warehouse, monkeypatch):
     from jx_alert.notifications import worker
     from jx_alert.notifications.feishu_app import FeishuAppClient

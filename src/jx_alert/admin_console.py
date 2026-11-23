@@ -1,7 +1,7 @@
 """A separate single-owner browser session for store data and Feishu routing."""
 import asyncio
 from contextlib import closing
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
 import html
@@ -23,8 +23,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
-from jx_alert import ad_source_controls, admin_ad_subscribers, admin_data, admin_groups
-from jx_alert import admin_mapping, admin_sources, store_controls
+from jx_alert import ad_source_controls, admin_ad_subscribers, admin_data, admin_executive, admin_groups
+from jx_alert import admin_mapping, admin_sources, sparkx_config, store_controls
 from jx_alert import admin_review_skills, admin_skill_library
 from jx_alert.agent_skill_package import MAX_REQUEST as SKILL_UPLOAD_LIMIT
 from jx_alert.ai import deepseek_config
@@ -513,6 +513,19 @@ class OwnerConsole:
             self.settings, store, payload, binding, proof, authorize=authorize)
         return self._ad_source_view(store, value)
 
+    def _company_digest_preview(self):
+        """The exact card the 08:30 lane would freeze now; read-only, never queued."""
+        from jx_alert.notifications import company_executive
+
+        with self.session_factory() as db:
+            try:
+                snapshot, value = company_executive.preview_company_digest(
+                    db, self.settings, now=datetime.now(timezone.utc))
+            except (OSError, ValueError, RuntimeError, TypeError):
+                raise ConsoleError("公司日报的店铺范围或时区配置待核实，暂不能预览。", 409) from None
+        return {"card": value, "date": snapshot["date"], "mature_date": snapshot["mature_date"],
+                "store_count": snapshot["store_count"]}
+
     def _mapping(self, sid, operation, payload=None):
         self._selected(sid)
         with self.session_factory() as db:
@@ -584,6 +597,34 @@ class OwnerConsole:
                     if not self._rate_allowed(request, "deepseek-write", per_ip=6, total=12):
                         raise ConsoleError("DeepSeek 设置更新太频繁，请稍后重试。", 429)
                     data = await asyncio.to_thread(deepseek_config.save_configuration, self.settings, payload)
+                elif path == "/console/api/deepseek/test":
+                    if payload:
+                        raise ConsoleError("连接测试不接受额外参数。", 400)
+                    if not self._rate_allowed(request, "deepseek-test", per_ip=4, total=8):
+                        raise ConsoleError("连接测试太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(deepseek_config.check_connection, self.settings)
+                elif path == "/console/api/sparkx":
+                    if not self._rate_allowed(request, "sparkx-write", per_ip=6, total=12):
+                        raise ConsoleError("SparkX 设置更新太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(sparkx_config.save_configuration, self.settings, payload)
+                elif path == "/console/api/sparkx/test":
+                    if payload:
+                        raise ConsoleError("连接测试不接受额外参数。", 400)
+                    if not self._rate_allowed(request, "sparkx-test", per_ip=4, total=8):
+                        raise ConsoleError("连接测试太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(sparkx_config.check_connection, self.settings)
+                elif path == "/console/api/company-digest":
+                    if set(payload) != {"open_ids", "revision"}:
+                        raise ConsoleError("提交内容无效。", 400)
+                    if not self._rate_allowed(request, "company-digest-write", per_ip=8, total=16):
+                        raise ConsoleError("公司日报接收人设置过于频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(admin_executive.save_executive, self.settings, **payload)
+                elif path == "/console/api/owners/sync-names":
+                    if payload:
+                        raise ConsoleError("同步姓名不接受额外参数。", 400)
+                    if not self._rate_allowed(request, "owner-names", per_ip=3, total=6):
+                        raise ConsoleError("同步姓名太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(admin_mapping.sync_owner_names, self.settings)
                 elif path == "/console/api/skill-library":
                     data = await asyncio.to_thread(self._write_skill_library, token, payload)
                 elif path == "/console/api/review-skills":
@@ -633,6 +674,19 @@ class OwnerConsole:
                 data = await asyncio.to_thread(admin_sources.get_data_sources, self.settings)
             elif path == "/console/api/deepseek":
                 data = await asyncio.to_thread(deepseek_config.configuration, self.settings)
+            elif path == "/console/api/sparkx":
+                data = await asyncio.to_thread(sparkx_config.configuration, self.settings)
+            elif path.startswith("/console/api/company-digest"):
+                if path.endswith("/preview"):
+                    if not self._rate_allowed(request, "company-digest-preview", per_ip=6, total=12):
+                        raise ConsoleError("预览太频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(self._company_digest_preview)
+                else:
+                    members = path.endswith("/members")
+                    if members and not self._rate_allowed(request, "company-digest-members", per_ip=12, total=24):
+                        raise ConsoleError("成员列表读取过于频繁，请稍后重试。", 429)
+                    data = await asyncio.to_thread(admin_executive.get_executive, self.settings,
+                                                  include_members=members)
             elif path == "/console/api/review-skills":
                 data = await asyncio.to_thread(admin_review_skills.get_review_skills, self.settings)
             elif path == "/console/api/skill-library":
@@ -683,7 +737,7 @@ class OwnerConsole:
         except ConsoleError as exc:
             return _error(exc.detail, exc.status)
         except (SourceCredentialsError, deepseek_config.DeepSeekConfigError, admin_review_skills.ReviewSkillError,
-                admin_skill_library.LibraryError) as exc:
+                admin_skill_library.LibraryError, sparkx_config.SparkXConfigError) as exc:
             return _error(exc.detail, exc.status_code)
         except admin_mapping.MappingError as exc:
             return _error(exc.detail, exc.status_code)
@@ -699,6 +753,13 @@ class OwnerConsole:
                 Route("/console/assets/{asset}", self.asset), Route("/console/api/stores", self.api),
                 Route("/console/api/data-sources", self.api, methods=["GET", "POST"]),
                 Route("/console/api/deepseek", self.api, methods=["GET", "POST"]),
+                Route("/console/api/deepseek/test", self.api, methods=["POST"]),
+                Route("/console/api/sparkx", self.api, methods=["GET", "POST"]),
+                Route("/console/api/sparkx/test", self.api, methods=["POST"]),
+                Route("/console/api/company-digest", self.api, methods=["GET", "POST"]),
+                Route("/console/api/company-digest/members", self.api),
+                Route("/console/api/company-digest/preview", self.api),
+                Route("/console/api/owners/sync-names", self.api, methods=["POST"]),
                 Route("/console/api/review-skills", self.api, methods=["GET", "POST"]),
                 Route("/console/api/skill-library", self.api, methods=["GET", "POST"]),
                 Route("/console/api/skill-library/{name}", self.api),

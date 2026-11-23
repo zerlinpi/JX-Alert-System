@@ -1,4 +1,8 @@
-"""Read-only company snapshot from exact, completed Lingxing daily partitions."""
+"""Read-only company snapshot from exact, completed Lingxing daily partitions.
+
+Totals only contain stores whose partitions prove the metric. Stores without
+that evidence are listed with a reason and are never counted as zero.
+"""
 
 from collections import defaultdict
 from datetime import datetime, time, timedelta, timezone
@@ -8,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
+from jx_alert.notifications.operators import UNMAPPED_OPERATOR, UNNAMED_OPERATOR
 from jx_alert.storage.models import DailyMetric, DataCoverage, Store
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -20,6 +25,8 @@ MATURE_REPORT_LAG_DAYS = MATURE_DAYS + 1  # Allow the ordinary prior 18:30 refre
 REPORTING_DELAY = timedelta(hours=12)  # Amazon Ads: conversions may take 12 hours to appear.
 METRICS = ("sales", "orders", "spend", "acos", "tacos", "cvr", "ppc")
 LATEST = ("sales", "orders", "spend", "tacos", "ppc")
+_AD_LABELS = {"campaign_sp": "SP", "campaign_sb": "SB", "campaign_sd": "SD"}
+_STATUS_ISSUES = {0: "领星停止同步", 2: "领星授权异常", 3: "领星欠费停服"}
 
 
 def _utc(value):
@@ -143,40 +150,65 @@ def _ad_totals(verified, dimensions, fields, currency):
     return values
 
 
-def _complete(rows, family, *fields):
-    return len([row for row in rows if all(row[family].get(field) is not None for field in fields)])
+def _metric_sum(rows, family, field):
+    values = [row[family][field] for row in rows if row[family].get(field) is not None]
+    return (_sum(values) if values else None), len(values)
+
+
+def _pair_ratio(rows, numerator, denominator):
+    """Weight a ratio over stores proving both sides; never mix partial sides."""
+    (top_family, top), (bottom_family, bottom) = numerator, denominator
+    pairs = [(row[top_family][top], row[bottom_family][bottom]) for row in rows
+             if row[top_family].get(top) is not None and row[bottom_family].get(bottom) is not None]
+    if not pairs:
+        return None, 0
+    return _ratio(_sum([a for a, _ in pairs]), _sum([b for _, b in pairs])), len(pairs)
 
 
 def _aggregate(rows):
-    sums = {family: {metric: _sum([row[family].get(metric) for row in rows]) for metric in fields}
-            for family, fields in {
-                "business": ("sales", "orders"), "ads": ("spend", "clicks"),
-                "mature": ("spend", "sales"), "mature_sp": ("orders", "clicks"),
-            }.items()}
-    sales, orders, spend = sums["business"]["sales"], sums["business"]["orders"], sums["ads"]["spend"]
-    mature = sums["mature"]
+    sales, sales_n = _metric_sum(rows, "business", "sales")
+    orders, orders_n = _metric_sum(rows, "business", "orders")
+    spend, spend_n = _metric_sum(rows, "ads", "spend")
+    tacos, tacos_n = _pair_ratio(rows, ("ads", "spend"), ("business", "sales"))
+    ppc, ppc_n = _pair_ratio(rows, ("ads", "spend"), ("ads", "clicks"))
+    acos, acos_n = _pair_ratio(rows, ("mature", "spend"), ("mature", "sales"))
+    # Standard SB/SD purchases can include views under vCPM. Only SP
+    # click-attributed orders can prove a click conversion rate here.
+    cvr, cvr_n = _pair_ratio(rows, ("mature_sp", "orders"), ("mature_sp", "clicks"))
     return {
         "values": dict(sales=sales, orders=int(orders) if orders is not None else None, spend=spend,
-                       tacos=_ratio(spend, sales), ppc=_ratio(spend, sums["ads"]["clicks"]),
-                       acos=_ratio(mature["spend"], mature["sales"]),
-                       cvr=_ratio(sums["mature_sp"]["orders"], sums["mature_sp"]["clicks"])),
-        "covered": dict(sales=_complete(rows, "business", "sales"), orders=_complete(rows, "business", "orders"),
-                        spend=_complete(rows, "ads", "spend"),
-                        tacos=sum(row["ads"].get("spend") is not None
-                                  and row["business"].get("sales") is not None for row in rows),
-                        ppc=_complete(rows, "ads", "spend", "clicks"),
-                        acos=_complete(rows, "mature", "spend", "sales"),
-                        cvr=_complete(rows, "mature_sp", "orders", "clicks")),
+                       tacos=tacos, ppc=ppc, acos=acos, cvr=cvr),
+        "covered": dict(sales=sales_n, orders=orders_n, spend=spend_n, tacos=tacos_n, ppc=ppc_n,
+                        acos=acos_n, cvr=cvr_n),
         "store_count": len(rows),
     }
 
 
-def company_snapshot(db, scope, confirmed_zones, *, now):
-    """Produce no partial total. Currency cohorts are exhaustive or suppressed."""
+def _gaps(row, latest_ads, mature_ads):
+    gaps = []
+    business = row["business"]
+    if business.get("sales") is None or business.get("orders") is None:
+        gaps.append("销售/订单日报不完整")
+    missing = [_AD_LABELS[d] for d in AD_DIMENSIONS if d not in latest_ads]
+    if missing:
+        gaps.append("缺少当日 " + "/".join(missing) + " 广告日报")
+    elif row["ads"].get("spend") is None:
+        gaps.append("当日广告日报无可用记录")
+    missing = [_AD_LABELS[d] for d in AD_DIMENSIONS if d not in mature_ads]
+    if missing:
+        gaps.append("成熟归因日 " + "/".join(missing) + " 未达成熟或缺失")
+    elif row["mature"].get("spend") is None or row["mature"].get("sales") is None:
+        gaps.append("成熟归因日广告无可用记录")
+    return gaps
+
+
+def company_snapshot(db, scope, confirmed_zones, *, now, operators=None, excluded_store_count=0):
+    """Totals cover only proven stores; every omitted store is listed, never zeroed."""
     latest, mature = report_dates(now)
     if not scope:
         raise ValueError("Company digest requires an explicit nonempty store scope")
-    scope = sorted(set(scope))
+    scope = sorted(set(scope), key=lambda sid: (len(sid), sid))
+    operators = operators or {}
     stores = {store.sid: store for store in db.scalars(select(Store).where(Store.sid.in_(scope)))}
     # A single bounded date/dimension predicate per table; no provider or collection side effects.
     def predicates(model):
@@ -189,34 +221,62 @@ def company_snapshot(db, scope, confirmed_zones, *, now):
     for row in db.scalars(select(DailyMetric).where(*predicates(DailyMetric))):
         facts[(row.store_id, row.metric_date, row.dimension)].append(row)
 
-    stores_missing_currency = 0
-    cohorts, rows = defaultdict(list), []
+    rows, issues, gaps = [], [], []
     for sid in scope:
         store = stores.get(sid)
-        row = dict(business={}, ads={}, mature={}, mature_sp={})
+        name = (store.name if store is not None and isinstance(store.name, str) and store.name.strip()
+                else sid)
+        row = dict(sid=sid, name=name, operator=operators.get(sid) or UNMAPPED_OPERATOR, currency=None,
+                   business={}, ads={}, mature={}, mature_sp={})
         rows.append(row)
-        if (store is None or store.status != 1
-                or store.timezone != MARKETPLACE.key or confirmed_zones.get(sid) != MARKETPLACE.key):
-            stores_missing_currency += 1
-            continue
-        row["business"], currency = _store_totals(sid, latest, coverage, facts, now)
-        ads = _ad_facts(sid, latest, coverage, facts, now)
-        attributed = _ad_facts(sid, mature, coverage, facts, now, mature=True)
-        row["ads"] = _ad_totals(ads, AD_DIMENSIONS, ("spend", "clicks"), currency)
-        row["mature"] = _ad_totals(attributed, AD_DIMENSIONS, ("spend", "sales"), currency)
-        # Standard SB/SD purchases can include views under vCPM. Only SP
-        # click-attributed orders can prove a click conversion rate here.
-        row["mature_sp"] = _ad_totals(attributed, ("campaign_sp",), ("orders", "clicks"), None)
-        if currency:
-            cohorts[currency].append(row)
-        else:
-            stores_missing_currency += 1
-    orders = _sum([row["business"].get("orders") for row in rows])
+        issue = None
+        if store is None:
+            issue = "尚未同步店铺资料"
+        elif store.timezone != MARKETPLACE.key or confirmed_zones.get(sid) != MARKETPLACE.key:
+            issue = "报表时区未确认为美西"
+        elif store.status != 1:
+            issue = _STATUS_ISSUES.get(store.status, "领星店铺状态异常")
+        if issue is None:
+            row["business"], currency = _store_totals(sid, latest, coverage, facts, now)
+            if currency is None:
+                issue = "缺少完整销售日报或币种待确认"
+            else:
+                row["currency"] = currency
+                ads = _ad_facts(sid, latest, coverage, facts, now)
+                attributed = _ad_facts(sid, mature, coverage, facts, now, mature=True)
+                row["ads"] = _ad_totals(ads, AD_DIMENSIONS, ("spend", "clicks"), currency)
+                row["mature"] = _ad_totals(attributed, AD_DIMENSIONS, ("spend", "sales"), currency)
+                row["mature_sp"] = _ad_totals(attributed, ("campaign_sp",), ("orders", "clicks"), None)
+                found = _gaps(row, ads, attributed)
+                if found:
+                    gaps.append({"sid": sid, "name": name, "operator": row["operator"], "gaps": found})
+        if issue is not None:
+            issues.append({"sid": sid, "name": name, "operator": row["operator"], "issue": issue})
+
+    cohorts = defaultdict(list)
+    for row in rows:
+        if row["currency"]:
+            cohorts[row["currency"]].append(row)
+    by_operator = defaultdict(list)
+    for row in rows:
+        by_operator[row["operator"]].append(row)
+    operator_rows = []
+    placeholders = {UNNAMED_OPERATOR: 1, UNMAPPED_OPERATOR: 2}
+    for label in sorted(by_operator, key=lambda value: (placeholders.get(value, 0), value)):
+        members = by_operator[label]
+        codes = sorted({row["currency"] for row in members if row["currency"]})
+        for code in codes or [None]:
+            subset = [row for row in members if row["currency"] == code] if code else []
+            operator_rows.append({"operator": label, "currency": code, "store_total": len(members),
+                                  **_aggregate(subset)})
+    orders, orders_n = _metric_sum(rows, "business", "orders")
     return {
         "date": latest.isoformat(), "mature_date": mature.isoformat(),
-        "store_count": len(scope), "unconfirmed_currency_stores": stores_missing_currency,
+        "store_count": len(scope), "excluded_store_count": excluded_store_count,
+        "unconfirmed_currency_stores": len(issues),
         "company_orders": int(orders) if orders is not None else None,
-        "orders_covered": _complete(rows, "business", "orders"),
-        "currencies": ({code: _aggregate(group) for code, group in sorted(cohorts.items())}
-                       if not stores_missing_currency else {}),
+        "orders_covered": orders_n,
+        "currencies": {code: _aggregate(group) for code, group in sorted(cohorts.items())},
+        "operators": operator_rows,
+        "issues": issues, "gaps": gaps,
     }

@@ -256,7 +256,7 @@ test("each compact navigation choice opens the right view and moves focus to its
   context.document.querySelectorAll = (selector) => selector === "[data-view]" ? tabs : [];
   let requests = 0;
   context.fetch = () => { requests++; return new Promise(() => {}); };
-  evaluate("state.groups.current={}; state.adSubscribers.data={}; state.sources.data={}; state.deepseek.data={}; state.reviewSkills={}; state.skillLibrary={};");
+  evaluate("state.groups.current={}; state.adSubscribers.data={}; state.companyDigest.data={}; state.sources.data={}; state.deepseek.data={}; state.sparkx.data={}; state.reviewSkills={}; state.skillLibrary={};");
   for (const [index, view] of views.entries()) {
     elements.get("workspace-menu").dispatch("click");
     await evaluate(`setView(${JSON.stringify(view)})`);
@@ -365,4 +365,42 @@ test("source status distinguishes a paused or failed attempt from historical suc
   scope.evaluate('state.adSource.data.observation_status="ATTEMPT_INCOMPLETE"; renderAdSource()');
   assert.match(label.textContent, /最近一次已记录的 SparkX 采集未完整成功/);
   assert.match(label.textContent, /历史成功记录（不代表当前连接正常）.*2026-11-22/);
+});
+
+test("company digest preview renders the exact Feishu card as text-only tables", () => {
+  const { elements, evaluate } = consoleScope();
+  evaluate(`renderCardPreview($("company-digest-preview"), {header:{title:{content:"公司经营与广告快报"}}, body:{elements:[
+    {tag:"markdown", content:"北京时间 08:30 &lt;at id=ou_x&gt;&lt;/at&gt;"},
+    {tag:"table", columns:[{name:"c0", display_name:"运营"}, {name:"c1", display_name:"销售额"}],
+     rows:[{c0:"运营甲", c1:"1,000.00 USD"}]},
+    {tag:"hr"}]}})`);
+  const preview = elements.get("company-digest-preview");
+  assert.equal(preview.hidden, false);
+  assert.equal(preview.children[0].textContent, "公司经营与广告快报");
+  // Escaped markup stays literal text; nothing is parsed as HTML.
+  assert.equal(preview.children[1].textContent, "北京时间 08:30 <at id=ou_x></at>");
+  const table = preview.children[2].children[0];
+  const [head, body] = table.children;
+  assert.equal(head.children[0].children[1].textContent, "销售额");
+  assert.equal(body.children[0].children[0].textContent, "运营甲");
+  assert.equal(body.children[0].children[1].textContent, "1,000.00 USD");
+});
+
+test("company digest status explains schedule, scope and the missing recipient", () => {
+  const { elements, evaluate } = consoleScope();
+  evaluate(`state.companyDigest.data = {revision: "a".repeat(64), recipient: null, status: {enabled: true,
+    schedule: "每天北京时间 08:30（10 分钟内送达窗口）", start_date: "2026-11-24", store_count: 24,
+    excluded_store_count: 40}}; updateCompanyDigest();`);
+  assert.match(elements.get("company-digest-state").textContent, /已启用.*首发日 2026-11-24.*统计店铺 24 家.*40 家/);
+  assert.equal(elements.get("current-company-digest").children[0].textContent, "未设置公司日报总负责人");
+  assert.equal(elements.get("save-company-digest").disabled, true);
+});
+
+test("DeepSeek settings show where the key and model come from", () => {
+  const { elements, evaluate } = consoleScope();
+  evaluate(`state.deepseek.data = {revision: "b".repeat(64), status: "CONFIGURED", configured: true,
+    model: "deepseek-flash", timeout: 45, models: ["deepseek-flash", "deepseek-v4-pro"],
+    key_source: "private_file", model_source: "environment", updated_at: null}; renderDeepSeek();`);
+  const rows = elements.get("deepseek-meta").children.map((entry) => entry.children.map((cell) => cell.textContent));
+  assert.deepEqual(rows, [["密钥来源", "服务器私有文件"], ["模型来源", "服务器默认 / 环境变量"]]);
 });

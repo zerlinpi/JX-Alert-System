@@ -20,9 +20,11 @@ CONTENT_CONTRACT = "scoped-structured-page-v1"
 
 def _route(db, settings, profile):
     from jx_alert.notifications.routing import _load_routing, report_group_delivery
+    from jx_alert.sparkx_config import with_console_credentials
     from jx_alert.storage.models import Store
     from jx_alert.store_controls import notifications_enabled
 
+    settings = with_console_credentials(settings)
     if (not settings.sparkx_feishu_enabled or settings.app_dry_run or not settings.feishu_enabled
             or settings.feishu_transport != "app" or settings.feishu_quiet_delivery_enabled
             or profile not in parse_profile_ids(settings.sparkx_profile_ids)):
@@ -82,6 +84,8 @@ async def prepare(settings, query, *, enqueue=False, inspect=False, fresh_after=
         raise SparkXDirectError("仅 --enqueue 可用 --fresh-after 有效编号；确认送达仅用于显式新导出")
     if not isinstance(query, dict):
         raise SparkXDirectError("需要单个 SparkX 查询对象")
+    from jx_alert.sparkx_config import with_console_credentials
+    settings = with_console_credentials(settings)
     allowed = parse_profile_ids(settings.sparkx_profile_ids)
     validate_performance_query(query, allowed)
     profile, = query["profileIds"]

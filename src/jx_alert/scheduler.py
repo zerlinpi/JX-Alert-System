@@ -174,14 +174,15 @@ def main():
         replace_existing=True, max_instances=1, coalesce=True,
         misfire_grace_time=1800,
     )
-    if getattr(settings, "feishu_company_executive_digest_enabled", False):
-        scheduler.add_job(company_executive_digest_job,
-            CronTrigger(hour=COMPANY_OPENS.hour, minute=COMPANY_OPENS.minute, timezone=COMPANY_BEIJING),
-            id="company_executive_digest", replace_existing=True, max_instances=1, coalesce=True,
-            misfire_grace_time=600)
-        scheduler.add_job(company_executive_digest_job, IntervalTrigger(minutes=1),
-            id="company_executive_digest_recovery", replace_existing=True, max_instances=1, coalesce=True,
-            misfire_grace_time=60)
+    # Always registered: the job re-reads runtime settings, so enabling the lane
+    # or choosing its recipient in the console needs no scheduler restart.
+    scheduler.add_job(company_executive_digest_job,
+        CronTrigger(hour=COMPANY_OPENS.hour, minute=COMPANY_OPENS.minute, timezone=COMPANY_BEIJING),
+        id="company_executive_digest", replace_existing=True, max_instances=1, coalesce=True,
+        misfire_grace_time=600)
+    scheduler.add_job(company_executive_digest_job, IntervalTrigger(minutes=1),
+        id="company_executive_digest_recovery", replace_existing=True, max_instances=1, coalesce=True,
+        misfire_grace_time=60)
     scheduler.add_job(
         daily_report_job, IntervalTrigger(minutes=1),
         id="feishu_daily_report_recovery", executor="daily_reports",

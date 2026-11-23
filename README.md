@@ -3,6 +3,8 @@
 领星 ERP（Lingxing OpenAPI）只读数据监控、经营/广告异常分析、飞书自建应用通知与群内/私聊问答、Chat MCP和Excel归档服务。
 
 > **完整系统逻辑与所有提醒规则：[阅读总文档](docs/SYSTEM_RULES_AND_LOGIC.md)。** 其中区分线上实际开关、代码默认、初筛、最终通知、数据未知和真实送达。 飞书卡片预览、DeepSeek 设置及内置策略见[通知与分析审核](docs/ALERT_REVIEW_CONTROLS.md)。
+>
+> 运营台填写 DeepSeek 密钥/模型、SparkX MCP Token 及连接测试、运营姓名同步见[运营台：DeepSeek、SparkX 与运营姓名](docs/OWNER_CONSOLE_AI_AND_SPARKX.md)；08:30 总负责人公司日报见[公司经营与广告快报](docs/COMPANY_EXECUTIVE_DIGEST.md)。
 
 早间08:00按「每天绩效/违规快报，广告只列有意义的SP活动问题」发送；自然提问、数据清单、两项独立开关生效边界及回滚见[早间快报与自然提问](docs/MORNING_BRIEF_AND_QUESTIONS.md)。
 >

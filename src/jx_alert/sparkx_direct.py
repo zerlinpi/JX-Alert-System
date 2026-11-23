@@ -23,6 +23,45 @@ _QUERY_KEYS = frozenset({
 
 class SparkXDirectError(ValueError):
     """Safe to show to a caller; must not contain remote bodies or credentials."""
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        if code is not None or not hasattr(self, "code"):
+            self.code = code  # Subclasses may already have set their own code.
+
+
+_FAILURES = {
+    "AUTH_REJECTED": "SparkX rejected the token (HTTP 401): it is invalid, expired, disabled "
+                     "or lacks amazon_sa_performance_data:read",
+    "FORBIDDEN": "SparkX refused this token or profile scope (HTTP 403)",
+    "RATE_LIMITED": "SparkX rate limit reached (HTTP 429); retry later",
+    "PROVIDER_ERROR": "SparkX service error (HTTP 5xx); retry later",
+    "HTTP_ERROR": "SparkX MCP returned an unexpected HTTP status",
+    "TIMEOUT": "SparkX MCP request timed out",
+    "UNREACHABLE": "SparkX MCP endpoint is unreachable from this server",
+    "REQUEST_FAILED": "SparkX MCP request failed; check authorization, connectivity and timeout",
+}
+
+
+def failure_code(error) -> str:
+    """Classify a transport failure by type and HTTP status only, never by provider text."""
+    pending, seen = [error], set()
+    while pending:
+        item = pending.pop()
+        if item is None or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, httpx.HTTPStatusError):
+            status = item.response.status_code
+            return ({401: "AUTH_REJECTED", 403: "FORBIDDEN", 429: "RATE_LIMITED"}.get(status)
+                    or ("PROVIDER_ERROR" if status >= 500 else "HTTP_ERROR"))
+        if isinstance(item, (httpx.TimeoutException, TimeoutError)):
+            return "TIMEOUT"
+        if isinstance(item, httpx.TransportError):
+            return "UNREACHABLE"
+        if isinstance(item, BaseExceptionGroup):
+            pending.extend(item.exceptions)
+        pending.extend((item.__cause__, item.__context__))
+    return "REQUEST_FAILED"
 
 
 def parse_profile_ids(raw: str) -> frozenset[int]:
@@ -135,12 +174,11 @@ async def call_sparkx(tool_name: str, arguments: dict, *, token: str,
                     ) as session:
                         await session.initialize()
                         return await session.call_tool(tool_name, arguments)
-    except Exception:
+    except Exception as exc:
         # Streamable HTTP wraps failures in task-group exception chains; never expose
         # the upstream response body, headers, token or raw exception to a caller.
-        raise SparkXDirectError(
-            "SparkX MCP request failed; check authorization, connectivity and timeout"
-        ) from None
+        code = failure_code(exc)
+        raise SparkXDirectError(_FAILURES[code], code) from None
 
 
 def check_authorized_profiles(result: CallToolResult, profile_ids: frozenset[int]) -> None:
@@ -192,8 +230,9 @@ def check_authorized_profiles(result: CallToolResult, profile_ids: frozenset[int
 
 async def _check() -> None:
     from jx_alert.config import get_settings
+    from jx_alert.sparkx_config import with_console_credentials
 
-    settings = get_settings()
+    settings = with_console_credentials(get_settings())
     profiles = parse_profile_ids(settings.sparkx_profile_ids)
     token = settings.sparkx_ai_token.get_secret_value()
     result = await call_sparkx("get_user_authorized_context", {}, token=token)

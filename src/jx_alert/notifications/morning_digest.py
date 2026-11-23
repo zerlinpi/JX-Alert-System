@@ -280,6 +280,19 @@ def _business_chunks(db, settings, stores, dates, warnings, target_dates, report
     return chunks
 
 
+def _operator_labels(settings, store_ids):
+    """Display-only operator per store from the owner-console mapping."""
+    if not store_ids:
+        return {}
+    from jx_alert.notifications.operators import UNMAPPED_OPERATOR, store_operator_labels
+    from jx_alert.notifications.routing import _load_routing
+    try:
+        routing = _load_routing(settings.feishu_routing_file)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return {}
+    return store_operator_labels(routing, store_ids, unmapped=UNMAPPED_OPERATOR)
+
+
 def _proactive_ad_chunks(db, settings, stores, dates, warnings, target_dates, now, incident_pages):
     targets = target_dates or dates
     eligible = [s for s in stores if not (warnings or {}).get(s.sid)
@@ -303,9 +316,10 @@ def _proactive_ad_chunks(db, settings, stores, dates, warnings, target_dates, no
             check = (*identity, skill_fingerprint(evidence.get('ad_skill') or skills.for_campaign(*identity)))
             items.append((item, (incident, check)))
     chunks = []
+    people = _operator_labels(settings, {item['store_id'] for item, _ in items})
     for offset in range(0, len(items), 10):
         batch, incidents = zip(*items[offset:offset + 10])
-        value = advertising_card(batch, title='商品推广活动待复核')
+        value = advertising_card(batch, title='商品推广活动待复核', operator_labels=people)
         chunks.append((value, list(dict.fromkeys(row['store_id'] for row in batch))))
         if incident_pages is not None:
             incident_pages.append(incidents)

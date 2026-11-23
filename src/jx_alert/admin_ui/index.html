@@ -81,6 +81,18 @@
           <div id="ad-subscriber-status" class="notice" role="status" hidden></div>
           <div class="save-bar"><span id="ad-subscriber-note" class="muted">未设置时不额外私聊。</span><div class="control-actions"><button id="clear-ad-subscribers" class="link-button" type="button" disabled>清空选择</button><button id="save-ad-subscribers" class="button primary" type="button" disabled>保存总负责人</button></div></div>
         </div></section>
+        <section class="panel" aria-labelledby="company-digest-title">
+          <div class="section-heading"><div><h2 id="company-digest-title">公司日报总负责人（08:30）</h2><p class="muted">每天北京时间 08:30 私聊发送全公司销售额、订单量、广告花费、ACOS、TACOS、CVR、PPC，并按运营分列。</p></div><div class="control-actions"><button id="preview-company-digest" class="button secondary" type="button">预览日报内容</button><button id="reload-company-digest" class="button secondary" type="button">选择总负责人</button></div></div>
+          <div class="group-settings-body">
+            <p id="company-digest-state" class="muted">正在读取…</p>
+            <ul id="current-company-digest" class="owner-chips" aria-label="当前公司日报总负责人"></ul>
+            <label class="sr-only" for="company-digest-search">搜索公司日报总负责人</label><input id="company-digest-search" type="search" placeholder="搜索当前通知群成员" autocomplete="off" hidden>
+            <fieldset id="company-digest-field" disabled hidden><legend class="sr-only">选择一位公司日报总负责人</legend><div id="company-digest-members" class="members"></div></fieldset>
+            <div id="company-digest-status" class="notice" role="status" hidden></div>
+            <div id="company-digest-preview" class="digest-preview" hidden></div>
+            <div class="save-bar"><span id="company-digest-note" class="muted">未设置时不发送公司日报。</span><div class="control-actions"><button id="clear-company-digest" class="link-button" type="button" disabled>清空选择</button><button id="save-company-digest" class="button primary" type="button" disabled>保存总负责人</button></div></div>
+          </div>
+        </section>
       </section>
       <section id="data-sources-panel" class="data-sources" aria-labelledby="sources-title" hidden>
         <div class="sources-intro"><div><h2 id="sources-title">数据源配置</h2><p class="muted">添加或更换凭据后，后续采集自动读取新配置。超过所填日期将停止使用该凭据，并尝试其他可用数据源。</p></div><button id="reload-sources" class="button secondary" type="button">刷新配置记录</button></div>
@@ -129,7 +141,24 @@
               <button class="button primary" type="submit">保存 DeepSeek 设置</button>
             </fieldset>
           </form>
+          <div class="control-actions"><button id="test-deepseek" class="button secondary" type="button">测试 DeepSeek 连接</button><span class="muted">只查询模型列表和余额，不发送分析请求、不消耗 Token。</span></div>
           <div id="deepseek-status" class="notice" role="status" hidden></div>
+        </section>
+        <section class="panel source-card" aria-labelledby="sparkx-title">
+          <div class="section-heading"><div><h2 id="sparkx-title">SparkX MCP 连接</h2><p class="muted">只读广告数据源 https://mcp.sparkx.cn/mcp。Token 只保存在服务器私有文件，不会回显；JX 不调用任何 SparkX 写工具。</p></div><span id="sparkx-state"></span></div>
+          <dl id="sparkx-meta" class="source-meta"></dl>
+          <form id="sparkx-form" class="source-form" autocomplete="off">
+            <fieldset id="sparkx-fields" disabled>
+              <label for="sparkx-token">MCP Token</label>
+              <input id="sparkx-token" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false" placeholder="在 SparkX 后台「MCP &amp; Skills」新建只读 Token；留空保留现有 Token">
+              <label for="sparkx-profiles">允许使用的 Profile ID（逗号分隔）</label>
+              <input id="sparkx-profiles" type="text" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="测试连接后可参照下方已授权店铺填写">
+              <button class="button primary" type="submit">保存 SparkX 设置</button>
+            </fieldset>
+          </form>
+          <div class="control-actions"><button id="test-sparkx" class="button secondary" type="button">测试 SparkX 连接</button><span class="muted">调用只读 get_user_authorized_context，列出该 Token 已授权的店铺。</span></div>
+          <div id="sparkx-status" class="notice" role="status" hidden></div>
+          <div id="sparkx-profiles-table" class="table-scroll" hidden><table><thead><tr><th scope="col">Profile ID</th><th scope="col">店铺名称</th><th scope="col">站点</th><th scope="col">已允许</th></tr></thead><tbody id="sparkx-profile-rows"></tbody></table></div>
         </section>
         <section id="review-skills-panel" class="panel skill-card" aria-labelledby="review-skills-title"></section>
         <section id="skill-library-panel" class="panel skill-card" aria-labelledby="skill-library-title"></section>
@@ -240,7 +269,8 @@
               </div>
             </div>
             <section class="panel ownership" aria-labelledby="owners-title" id="ownership" hidden>
-              <div class="section-heading"><div><h3 id="owners-title" tabindex="-1">飞书负责人</h3><p class="muted" id="group-label"></p></div></div>
+              <div class="section-heading"><div><h3 id="owners-title" tabindex="-1">飞书负责人</h3><p class="muted" id="group-label"></p></div><button type="button" id="sync-owner-names" class="button secondary">同步全部运营姓名</button></div>
+              <div id="owner-names-status" class="notice" role="status" hidden></div>
               <div class="owner-body">
                 <p class="eyebrow">当前负责人</p><ul id="current-owners" class="owner-chips" aria-label="当前负责人"></ul>
                 <div id="mapping-status" class="notice" role="status" hidden></div>

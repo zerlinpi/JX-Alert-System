@@ -110,6 +110,20 @@ def cache_identity(settings):
     return model if revision == _EMPTY_REVISION else f"{model}:{revision}"
 
 
+def _sources(settings, saved):
+    """Where the effective key and model come from; never the values themselves."""
+    console = saved.get("version") == 1
+    if console and saved.get("api_key"):
+        key = "console"
+    elif _env_key(settings):
+        key = "environment"
+    elif saved.get("api_key"):
+        key = "private_file"
+    else:
+        key = None
+    return key, "console" if console else "environment"
+
+
 def _projection(settings, saved, revision):
     from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError
 
@@ -122,6 +136,7 @@ def _projection(settings, saved, revision):
             status = "INVALID_CONFIGURATION"
         else:
             status = "CONFIGURED"
+    key_source, model_source = _sources(settings, saved)
     return {
         "revision": revision,
         "status": status,
@@ -130,7 +145,67 @@ def _projection(settings, saved, revision):
         "timeout": timeout if _valid_timeout(timeout) else None,
         "models": list(MODELS),
         "updated_at": saved.get("updated_at") if saved.get("version") == 1 else None,
+        "key_source": key_source if key else None,
+        "model_source": model_source,
     }
+
+
+_API = "https://api.deepseek.com"
+_TEST_ERRORS = {401: "INVALID_KEY", 402: "INSUFFICIENT_BALANCE", 403: "FORBIDDEN", 429: "RATE_LIMITED"}
+
+
+def check_connection(settings, *, transport=None):
+    """No-cost check of the effective settings: List Models and Get Balance only.
+
+    https://api-docs.deepseek.com/api/list-models
+    https://api-docs.deepseek.com/api/get-user-balance
+    No chat completion is sent, so no tokens are billed. Provider text is never returned.
+    """
+    import httpx
+
+    from jx_alert.ai.deepseek import DeepSeekError, _validated_key
+
+    checked = datetime.now(timezone.utc).isoformat()
+    try:
+        key, model, timeout = client_settings(settings)
+    except DeepSeekConfigError:
+        return {"status": "CONFIGURATION_UNAVAILABLE", "checked_at": checked}
+    if not key:
+        return {"status": "NOT_CONFIGURED", "checked_at": checked}
+    try:
+        key = _validated_key(key)
+    except DeepSeekError:
+        return {"status": "INVALID_CONFIGURATION", "checked_at": checked}
+    headers = {"Authorization": "Bearer " + key, "Accept": "application/json"}
+    try:
+        with httpx.Client(timeout=min(float(timeout), 15.0), follow_redirects=False, trust_env=False,
+                          transport=transport) as client:
+            listed = client.get(_API + "/models", headers=headers)
+            if listed.status_code != 200:
+                status = _TEST_ERRORS.get(listed.status_code, "SERVICE_UNAVAILABLE")
+                return {"status": status, "checked_at": checked, "model": model}
+            if len(listed.content) > 256 * 1024:
+                raise ValueError
+            data = listed.json().get("data")
+            if not isinstance(data, list):
+                raise ValueError
+            ids = sorted({row["id"] for row in data if isinstance(row, dict) and isinstance(row.get("id"), str)})
+            balance = None
+            response = client.get(_API + "/user/balance", headers=headers)
+            if response.status_code == 200 and len(response.content) <= 64 * 1024:
+                value = response.json().get("is_available")
+                balance = value if type(value) is bool else None
+    except httpx.TimeoutException:
+        return {"status": "TIMEOUT", "checked_at": checked, "model": model}
+    except httpx.HTTPError:
+        return {"status": "UNREACHABLE", "checked_at": checked, "model": model}
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return {"status": "RESPONSE_INVALID", "checked_at": checked, "model": model}
+    available = model in ids
+    status = ("MODEL_UNAVAILABLE" if not available else
+              "INSUFFICIENT_BALANCE" if balance is False else "OK")
+    return {"status": status, "checked_at": checked, "model": model, "model_available": available,
+            "balance_available": balance, "listed_models": [name for name in ids if name in MODELS]}
 
 
 def configuration(settings):

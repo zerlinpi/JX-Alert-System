@@ -244,6 +244,58 @@ def _replace_mapping(path, expected, payload, sid, stamp):
             temporary.unlink(missing_ok=True)
 
 
+def sync_owner_names(settings):
+    """Fill display names of already-mapped owners from each store group's roster.
+
+    Only ``owner_display_names`` changes. Recipients, groups and verification
+    fields are untouched, so no one gains or loses a notification.
+    """
+    if getattr(settings, "feishu_transport", "webhook") != "app":
+        raise MappingError(503, "同步姓名需要配置飞书自建应用。")
+    path = Path(settings.feishu_routing_file)
+    raw, routing, _ = _routing_snapshot(path)
+    groups, stores = routing.get("groups", {}), routing.get("stores", {})
+    rosters, updated, unresolved = {}, 0, 0
+    for sid, entry in stores.items():
+        if not isinstance(entry, dict) or not entry.get("open_ids"):
+            continue
+        group = groups.get(entry.get("chat_id") or routing["default_chat_id"], {})
+        chat = group.get("chat_id")
+        if not _valid_chat(chat):
+            unresolved += len(entry["open_ids"])
+            continue
+        if chat not in rosters:
+            rosters[chat] = _members(settings, chat)
+        roster = rosters[chat]
+        previous = entry.get("owner_display_names")
+        previous = previous if isinstance(previous, dict) else {}
+        names = {}
+        for uid in dict.fromkeys(entry["open_ids"]):
+            if uid in roster:
+                names[uid] = _label(roster[uid], uid)
+            else:
+                unresolved += 1
+                if isinstance(previous.get(uid), str):
+                    names[uid] = previous[uid]
+        if names != previous:
+            entry["owner_display_names"] = names
+            updated += 1
+    result = {"updated_store_count": updated, "unresolved_owner_count": unresolved}
+    if not updated:
+        return {**result, "revision": hashlib.sha256(raw).hexdigest()}
+    payload = (json.dumps(routing, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    try:
+        with _mapping_lock(path):
+            if path.is_symlink() or path.read_bytes() != raw:
+                raise MappingError(409, _CONFLICT)
+            now = datetime.now(timezone.utc)
+            _replace_mapping(path, raw, payload, "owner-names", now.strftime("%Y%m%dT%H%M%SZ"))
+    except OSError:
+        raise MappingError(503, "保存飞书映射失败，请核对运行目录权限。") from None
+    _LOG.info("Owner display names synchronized stores=%s at=%s", updated, now.isoformat())
+    return {**result, "revision": hashlib.sha256(payload).hexdigest()}
+
+
 def save_store_mapping(settings, sid, open_ids, revision):
     """Verify the requested members before changing the selected store entry."""
     sid = _store_key(sid)

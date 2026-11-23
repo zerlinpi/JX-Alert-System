@@ -1,97 +1,40 @@
-# Private 08:30 Beijing company digest
+# 08:30 公司经营与广告快报（总负责人私聊）
 
-The executive digest is off by default. It uses the existing warehouse only;
-it never triggers Lingxing reads, backfills, historical replays, or budget
-changes. It does not replace or change the separately configured daily report
-(e.g. the existing 09:00 notification group) or hourly advertising alerts.
+每天北京时间 08:30，向一位总负责人私聊发送全公司的销售额、订单量、广告花费、TACOS、PPC，以及成熟归因日的 ACOS、CVR，并按运营分列。它只读取已入库数据，不触发领星采集、回补或任何广告修改，也不替代 09:00 群日报和每小时广告巡检。
 
-## Scope and first delivery
+## 怎么开启
 
-An owner must first approve **both** the full intended list of company stores
-and the single recipient for this aggregate. Do not reuse a daily report group,
-Feishu administrator, ad subscriber, or a list of currently visible/ready shops
-as a substitute. Verify the recipient's Open ID using the **same Feishu app**
-that will deliver their private message, and confirm they are authorized to
-receive this company scope. No routing fallback or mentions are added.
+1. 运营台 →「通知群设置」→「公司日报总负责人（08:30）」→「选择总负责人」，从当前日报群成员中选一人，保存。系统用当前飞书自建应用的 App ID 绑定这位接收人（生成新的绑定版本和核验时间），不写入任何密钥。清空选择即停止发送。
+2. 私有运行配置 `runtime-settings.json` 中设置 `feishu_company_executive_digest_enabled=true`，并把 `feishu_company_executive_digest_start_date` 设为首发的北京日期（`YYYY-MM-DD`）。调度器每次运行都重新读取这两项，**不需要重启调度器**。
+3. 同一页的「预览日报内容」按当前数据生成一张与实际发送完全相同的卡片，只在浏览器显示，不入队、不发送。
 
-Add this dedicated section to the existing server-side `FEISHU_ROUTING_FILE`
-after approval, keeping real values out of source control:
+发送还需要调度开启、非演练模式、飞书启用且使用自建应用。北京时间 08:30 生成并冻结卡片，08:40 前为送达窗口；错过窗口不补发，同一北京日期只有一条（持久幂等键）。回执不明的消息保留人工核对，不自动重发。
 
-```json
-{
-  "company_executive_digest": {
-    "open_id": "ou_REPLACE_WITH_VERIFIED_ID",
-    "app_id": "cli_REPLACE_WITH_VERIFIED_APPLICATION_ID",
-    "generation": "0123456789abcdef0123456789abcdef",
-    "verified_at": "2026-01-01T00:00:00+00:00",
-    "store_ids": ["101", "102"]
-  }
-}
-```
+## 统计哪些店铺
 
-Use a fresh random 32-character lowercase hexadecimal generation at every
-authorization or recipient change, with the actual verification time. The
-explicit approved store set must match `COLLECTION_SCOPE_FILE` exactly; adding
-or omitting even one store blocks the private lane. Every store must currently
-be authorized and configured for `America/Los_Angeles` in both the warehouse and
-store-timezone configuration. Pausing any included store's notification stops
-the combined message rather than sending a partial report. Authorization and
-its generation are checked again immediately before the message POST.
-The verified application ID must also match both current effective Feishu
-credentials and the actual adapter which acquired the token. Secrets do not
-enter the binding, frozen card, or send receipt. Duplicate JSON keys in route,
-scope, timezone or credentials files fail closed rather than selecting a winner.
+- 统计范围：采集范围文件中的店铺里，**数据采集和飞书通知都开启**的店铺。在运营台关闭任一开关的店铺不计入，卡片标题写明“另有 N 家未纳入统计”。
+- 绑定中如果手工写了 `store_ids`，它只能进一步缩小范围。
+- 冻结后到发送前，如果某个已计入的店铺被关闭通知，或店铺离开采集范围，整条消息跳过；接收人、绑定版本或飞书应用变化同样跳过。
 
-Set `FEISHU_COMPANY_EXECUTIVE_DIGEST_START_DATE` to the first approved
-Beijing delivery date, `YYYY-MM-DD`, and only then set
-`FEISHU_COMPANY_EXECUTIVE_DIGEST_ENABLED=true`. The scheduler also requires its
-usual application transport, Feishu enablement and dry-run-off gates. Restart
-the scheduler when enabling so it registers the new tasks. The first attempt is
-scheduled at **08:30 Beijing time**; minute recovery and outbox retry are
-bounded by **08:40 exclusive**. Recovery is for a missed enqueue tick or an
-unavailable route, not for replacing a frozen card when more data arrives.
-Missing the window means no catch-up. One
-persistent outbox key per Beijing date prevents duplicates after restart or a
-route change. Ambiguous delivery is retained for manual verification, not
-retried automatically. To stop the lane, disable it or remove its private
-binding; pending messages are not migrated or replayed. No schema or data
-migration is required.
+## 数字怎么算（不补零、不凑数）
 
-## What the digest means
+- 最近已完结经营日：发送时刻对应的洛杉矶完整日期（通常是北京发送日的前两天）。成熟归因日：再往前 15 天，覆盖 SB/SD 14 天归因加 12 小时上报延迟，且要求成熟后重新采集过的报表。
+- 销售额、订单量来自领星店铺与 ASIN 日报，两者必须一致；广告花费、点击来自 SP/SB/SD 活动日报，三类都完整才计入该店广告数字。
+- **合计只含具备完整依据的店铺**，每项指标都显示覆盖店数（如 `18/20 店`）。没有依据的店铺列在卡片底部“未计入”或“部分指标未计入”，写明原因（领星授权异常、缺少当日 SB 日报、成熟归因日未达成熟等），**不按 0 计**。
+- 比率先汇总再相除，并且只用分子和分母都有依据的店铺：TACOS=广告花费÷销售额；PPC=广告花费÷点击（CPC 口径，可能含按展示付费）；ACOS=成熟日 SP/SB/SD 花费÷归因销售额；CVR=成熟日 SP 点击归因订单÷SP 点击。分母为 0 显示“—”，不显示 0%。
+- 订单量是按 ASIN 汇总的订单数，不是去重后的客户订单。不同币种分别列出，不换算、不相加。
+- 最近经营日的 ACOS、CVR 不显示，因为归因还没成熟。
 
-- The latest cohort is the most recent **completed** Los Angeles report day
-  at 08:30 Beijing, normally two calendar dates before the Beijing send date.
-  It shows sales, order volume, SP/SB/SD spend, TACOS (same-date ad spend /
-  total sales), and PPC as effective CPC (same-date mixed SP/SB/SD spend /
-  clicks, which may include impression charges; not the per-click bill rate).
-- Order volume is the normalized ASIN-grain order sum, not distinct customer
-  orders. No cross-currency money total or FX conversion is shown. The
-  all-store order count is displayed only when all configured stores have
-  complete order evidence.
-- ACOS (mature SP/SB/SD spend / their attributed sales) and CVR (mature SP
-  click-attributed ad orders / SP clicks) appear only under their separately
-  dated mature cohort, exactly 15 marketplace dates before the latest closed
-  date. The extra date allows a routine prior 18:30 Beijing collection to clear
-  the 14-day attribution and 12-hour reporting cushion when it captured all
-  needed partitions. The latest closed day's ACOS/CVR are deliberately absent.
-  [Amazon Ads attribution](https://advertising.amazon.com/help/GX7KDKHMWQYMJ385)
-  distinguishes click-only SP from standard SB/SD conversions that may also
-  include views. The warehouse does not prove a click-only company-wide CVR
-  across all three types. Mature captures require the complete attribution
-  window plus a conservative 12 hours for late reported conversions; stale
-  earlier captures, even if marked complete, cannot establish a mature value.
-- Ratios are weighted by summing matching numerators and denominators first.
-  A currency bucket omits a metric when any of its stores lacks evidence for
-  it. If any store's currency cannot be established from its sales facts, no
-  currency subtotals are shown. Empty/missing data and zero denominators are
-  not interpreted as zero. Explicit reported zeros remain zeros.
-- Scope means exactly the owner-approved configured shops, not every shop
-  listed in an upstream account. Coverage counts are evidence counts rather
-  than a claim about provider freshness. Only an offline/mocked delivery test
-  can be claimed until an explicitly approved private Feishu canary confirms
-  the live route.
+## 按运营分列
 
-For a trusted operator, `preview_company_digest(db, settings, now=aware_clock)`
-in `jx_alert.notifications.company_executive` returns the aggregate and card
-from a read-only session without requiring delivery settings, enqueuing or
-sending. Keep previewed business data private.
+卡片后两张表按运营列出同样的指标。运营来自运营台「负责人映射」里每家店铺的负责人：
+
+- 有姓名的显示姓名；已映射但还没同步姓名的显示“已映射（姓名待同步）”，可在「负责人映射」点「同步全部运营姓名」从飞书群成员补齐；没有映射的店铺归入“未映射运营”。
+- “店铺”列为“有完整销售依据的店铺 / 该运营负责的统计店铺”。
+- 卡片放不下时，先缩短“未计入”名单，再省略运营表；仍放不下则不发送（`CARD_TOO_LARGE`）。
+
+## 停用与回滚
+
+- 停止发送：运营台清空接收人，或把 `feishu_company_executive_digest_enabled` 设为 `false`。已排队消息不迁移、不补发。
+- 代码回滚到上一版本时，旧版本要求绑定含与采集范围完全一致的 `store_ids`；本版运营台保存的绑定不含该字段，旧版会安全地视为未授权而不发送。无需数据库或数据卷变更。
+- 可信操作员也可在服务器只读预览：`preview_company_digest(db, settings, now=...)`（`jx_alert.notifications.company_executive`），不入队、不发送。预览结果属于经营数据，请勿外传。
