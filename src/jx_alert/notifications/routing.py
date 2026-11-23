@@ -8,6 +8,9 @@ from pathlib import Path
 
 from sqlalchemy import or_, select
 
+from jx_alert.product_identity import (
+    ambiguous_legacy_product_key, exact_store_product, incident_seller_sku,
+)
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import AdProduct, Product
 
@@ -305,11 +308,28 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
         not isinstance(routing.get(section, {}), dict) for section in ("stores", "entities")
     ):
         raise ApplicationRoutingError("invalid_group_mapping")
-    entity_key = str(metrics.get("seller_sku") or metrics.get("asin") or entity_id)
-    for section, key in (("stores", store_id), ("entities", f"{store_id}:{entity_key}"),
-                         ("entities", entity_key)):
-        _application_route_entry(routing.get(section, {}), key, groups)
-    chat_alias = _route_chat_id(routing, store_id, entity_key)
+    sku = incident_seller_sku(store_id, entity_id, metrics, scope)
+    entity_key = sku or str(metrics.get("seller_sku") or metrics.get("asin") or entity_id)
+    stores, entities = routing.get("stores", {}), routing.get("entities", {})
+    scoped_key = f"{store_id}:{entity_key}"
+    store_route = _application_route_entry(stores, store_id, groups)
+    if sku is not None:
+        # A scoped entry (even empty or ambiguous) shadows the bare key. Raw
+        # routing keys can label either a SKU or an ASIN, so only use an
+        # unambiguous entry for either the destination or product mentions.
+        product_route = {}
+        if scoped_key in entities:
+            if not ambiguous_legacy_product_key(db, store_id, sku, scoped=True):
+                product_route = _application_route_entry(entities, scoped_key, groups)
+        elif (sku in entities and ":" not in sku
+              and not ambiguous_legacy_product_key(db, store_id, sku, scoped=False)):
+            product_route = _application_route_entry(entities, sku, groups)
+        chat_alias = (product_route.get("chat_id") or store_route.get("chat_id")
+                      or routing.get("default_chat_id", "default"))
+    else:
+        _application_route_entry(entities, scoped_key, groups)
+        _application_route_entry(entities, entity_key, groups)
+        chat_alias = _route_chat_id(routing, store_id, entity_key)
     if not isinstance(chat_alias, str):
         raise ApplicationRoutingError("invalid_group_mapping")
     group = groups.get(chat_alias, {})
@@ -323,6 +343,28 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
     except ValueError:
         raise ApplicationRoutingError("invalid_default_mentions") from None
     admin_ids = default_ids + _app_open_ids(group.get("admin_open_ids", []))
+    if sku is not None:
+        # Keep store contacts and the exact SKU mapping, not contacts belonging
+        # to its shared ASIN or to a different product now linked to an old ad.
+        product = exact_store_product(db, store_id, sku)
+        owner_ids = [*store_route.get("open_ids", []), *product_route.get("open_ids", [])]
+        if product is not None:
+            owner_ids.extend(_app_open_ids(product.owner_open_ids or []))
+    else:
+        owner_ids = _other_entity_owners(db, routing, groups, store_id, entity_id, entity_key, metrics, scope)
+    owner_ids = list(dict.fromkeys(owner_ids))
+    admin_ids = group_member_mentions(group, admin_ids)
+    owner_ids = group_member_mentions(group, owner_ids)
+    if not owner_ids:
+        raise ApplicationRoutingError("missing_operations_owner")
+    if not admin_ids:
+        raise ApplicationRoutingError("missing_group_administrator")
+    mentions = list(dict.fromkeys(admin_ids + owner_ids))
+    return bind_group_delivery(routing, chat_alias, {
+        "role": "group", "receive_id": chat_id, "receive_id_type": "chat_id", "open_ids": mentions})
+
+
+def _other_entity_owners(db, routing, groups, store_id, entity_id, entity_key, metrics, scope):
     owner_ids = []
     keys = {str(value) for value in (entity_key, metrics.get("seller_sku"), metrics.get("asin")) if value}
     # Each advertised MSKU resolves independently. A shared ASIN must not pull in
@@ -368,16 +410,7 @@ def _application_group_delivery(db, settings, routing, *, store_id, entity_id, m
             selected.update((product.id, product) for product in matched)
         for product in selected.values():
             owner_ids.extend(_app_open_ids(product.owner_open_ids or []))
-    owner_ids = list(dict.fromkeys(owner_ids))
-    admin_ids = group_member_mentions(group, admin_ids)
-    owner_ids = group_member_mentions(group, owner_ids)
-    if not owner_ids:
-        raise ApplicationRoutingError("missing_operations_owner")
-    if not admin_ids:
-        raise ApplicationRoutingError("missing_group_administrator")
-    mentions = list(dict.fromkeys(admin_ids + owner_ids))
-    return bind_group_delivery(routing, chat_alias, {
-        "role": "group", "receive_id": chat_id, "receive_id_type": "chat_id", "open_ids": mentions})
+    return owner_ids
 
 
 def _application_management_deliveries(settings, routing, *, store_id, severity, status):
@@ -458,14 +491,22 @@ def application_deliveries(db, settings, *, store_id: str, entity_id: str,
     Malformed configuration stays a failure, and valid manager messages remain
     independent. This planner never rearms persisted notifications.
     """
-    routing_failed = False
+    return _application_plan(db, settings, store_id=store_id, entity_id=entity_id, metrics=metrics,
+                             scope=scope, severity=severity, status=status)[0]
+
+
+def _read_application_routing(settings):
     try:
-        routing = json.loads(Path(settings.feishu_routing_file).read_text(encoding="utf-8"))
-        if not isinstance(routing, dict):
-            routing_failed = True
-            routing = {}
+        return json.loads(Path(settings.feishu_routing_file).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        routing_failed = True
+        return None
+
+
+def _application_plan(db, settings, *, store_id, entity_id, metrics, scope, severity, status, routing=None):
+    if routing is None:
+        routing = _read_application_routing(settings)
+    routing_failed = not isinstance(routing, dict)
+    if routing_failed:
         routing = {}
     try:
         if routing_failed:
@@ -502,17 +543,20 @@ def application_deliveries(db, settings, *, store_id: str, entity_id: str,
                 except ApplicationRoutingError as exc:
                     managers[index] = {"role": "management", "routing_failure": str(exc)}
     deliveries.extend(managers)
-    return _merge_same_destinations(deliveries)
+    # Freeze the operations mode BEFORE merging. Management can independently
+    # fall back to the same physical chat as a normally mapped operations group.
+    mode = "fallback" if group.get("group_fallback") else "mapped"
+    return _merge_same_destinations(deliveries), routing, mode
 
 
 def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
                                    context: dict, roles: set[str] | None = None,
                                    card: dict | None = None, material_ad_alert: bool = False) -> dict:
     """Persist each destination or unresolved role once, in the event transaction."""
-    from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
-    from jx_alert.storage.models import NotificationLog
+    from jx_alert.notifications.outbox import enqueue_notification
+    from jx_alert.notifications.rule_scope import freeze_scope
 
-    planned = application_deliveries(db, settings, **context)
+    planned, routing, operations_mode = _application_plan(db, settings, **context)
     if roles is not None:
         planned = [item for item in planned if roles.intersection(item.get("covered_roles", [item["role"]]))]
     if material_ad_alert and roles is None:
@@ -538,23 +582,16 @@ def enqueue_application_deliveries(db, settings, *, event_key: str, text: str,
             key = "app:" + hashlib.sha256(
                 f"{event_key}:{delivery['receive_id_type']}:{delivery['receive_id']}".encode()
             ).hexdigest()
-        existing = db.scalar(select(NotificationOutbox).where(NotificationOutbox.idempotency_key == key))
         row = enqueue_notification(
             db, idempotency_key=key, text=text,
             store_id=context["store_id"], entity_id=context["entity_id"] or None,
             chat_id=delivery.get("receive_id", f"routing:{delivery['role']}"), delivery=delivery,
             card=card, material_ad_alert=material_ad_alert,
+            rule_scope=None if failure else freeze_scope(
+                db, context, delivery, material_ad_alert, routing, operations_mode),
+            failed_route={"event_key": event_key, "routing_context": context,
+                          "routing_role": delivery["role"]} if failure else None,
         )
-        if failure and existing is None:
-            row.status = "ROUTING_FAILED"
-            row.last_error = failure
-            row.payload = {
-                **row.payload, "event_key": event_key,
-                "routing_context": context, "routing_role": delivery["role"],
-            }
-            db.add(NotificationLog(
-                dedupe_key=key, channel="feishu_app", status="ROUTING_FAILED", error=failure,
-            ))
         outbox_ids.append(row.id)
     db.flush()
     return {"outbox_ids": outbox_ids, "routing_failed": unresolved, "planned": len(planned)}

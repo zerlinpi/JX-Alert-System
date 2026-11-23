@@ -304,6 +304,7 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             freeze_morning()
             phase = 'advertising_evidence'
             from jx_alert.ai.intraday_risk_evidence import intraday_risk_candidates
+            from jx_alert.analysis.hourly_ad_patterns import OPPORTUNITY
             reviewed_at = now or _utcnow()
             skills = load_ad_review_skills(settings)
             meta['ad_review_skills_status'] = skills.status
@@ -332,8 +333,9 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
                     if not signals:
                         continue
                     counts['supported'] += 1
-                    if (not repeat_eligible_signals(row, signals, history, reviewed_at)
-                            or incident_already_recorded(db, row, now=reviewed_at)):
+                    dedup_row = {**row, 'category': 'opportunity'} if signals == [OPPORTUNITY] else row
+                    if (not repeat_eligible_signals(dedup_row, signals, history, reviewed_at)
+                            or incident_already_recorded(db, dedup_row, now=reviewed_at)):
                         # Count notification reservations without withholding
                         # evidence from this hour's independent model review.
                         counts['deduplicated'] += 1
@@ -400,7 +402,9 @@ def run_hourly_monitor(*, now=None, settings=None, session_factory=None, warehou
             for field in ('error_type', 'error_phase', 'database_error_code'):
                 meta.pop(field, None)
             phase = 'raw_archive'
-            meta.update(finding_count=len(checked), model_usage=model_usage, model_failures=model_failures,
+            opportunity_count = sum(finding['signals'] == [OPPORTUNITY] for finding in checked)
+            meta.update(finding_count=len(checked), opportunity_count=opportunity_count,
+                risk_count=len(checked) - opportunity_count, model_usage=model_usage, model_failures=model_failures,
                 raw_archive=archive_raw_snapshots(db, settings.raw_dir, after_id=meta['raw_start']))
             partial = (bool(model_failures) or 'overnight_digest_error' in meta or len(checked) != len(findings)
                        or any(r.get('status') == 'PARTIAL' for r in meta['stores'].values()))

@@ -37,17 +37,20 @@ def _metric_states(raw, sources):
     )}
 
 
-def prepare_owner_today(db, scope_ids, *, now=None):
+def prepare_owner_today(db, scope_ids, *, now=None, as_of=None):
     """Caller supplies a verified scope and one consistent read-only DB snapshot."""
     if (not isinstance(scope_ids, (tuple, list)) or not scope_ids or
             any(type(sid) not in (str, int) or not re.fullmatch(r"[1-9][0-9]{0,99}", str(sid))
                 for sid in scope_ids)):
         raise ValueError("An explicit nonempty store scope is required")
     ids = sorted({str(sid) for sid in scope_ids})
-    clock = now if now is not None else datetime.now(timezone.utc)
-    if clock.tzinfo is None or clock.utcoffset() is None:
+    generated = now if now is not None else datetime.now(timezone.utc)
+    if generated.utcoffset() is None:
         raise ValueError("Same-day preview requires a timezone-aware clock")
-    clock = clock.astimezone(timezone.utc)
+    generated = generated.astimezone(timezone.utc)
+    if as_of is not None and (as_of.utcoffset() is None or as_of > generated):
+        raise ValueError("Replay cutoff must be timezone-aware and not in the future")
+    clock = generated if as_of is None else as_of.astimezone(timezone.utc)
     inventory = {store.sid: store for store in db.scalars(select(Store).where(Store.sid.in_(ids)))}
     grouped, blocked = defaultdict(list), []
     for sid in ids:
@@ -72,12 +75,15 @@ def prepare_owner_today(db, scope_ids, *, now=None):
         observed_count += observed
         groups.append({"report_date": day.isoformat(), "timezone": zone_name, "stores": checks,
             "cards": build_owner_daily_cards(rows, report_date=day, as_of=clock, provisional=True,
-                                            preview_scope=(zone_name, len(ids)))
+                                            preview_scope=(zone_name, len(ids)), replay=as_of is not None)
                      if observed else []})
     return {
-        "mode": "READ_ONLY_PREVIEW", "generated_at": clock.isoformat(), "scope_count": len(ids),
+        "mode": "READ_ONLY_PREVIEW" if as_of is None else "READ_ONLY_REPLAY",
+        "generated_at": generated.isoformat(), "scope_count": len(ids),
+        **({"reference_cutoff_at": clock.isoformat()} if as_of is not None else {}),
         "provider_updated_at": None, "delivery_enabled": False,
-        "note": "店铺当地日尚未结束。完成采集不等于领星已更新至该时刻。只展示已存分区，不补采、不推送。",
+        "note": ("店铺当地日尚未结束。完成采集不等于领星已更新至该时刻。只展示已存分区，不补采、不推送。"
+                 if as_of is None else "按参考时刻核验所给副本；不证明副本在当时已封存或领星已更新至该时刻。不补采、不推送。"),
         "status": ("NO_PREVIEW_VALUES" if not observed_count else
                    "ALL_METRICS_PROVISIONAL" if observed_count == len(ids) * 4 else "PARTIAL_PREVIEW"),
         "blocked_stores": blocked, "groups": groups,

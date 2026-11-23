@@ -683,3 +683,242 @@ def test_intraday_evidence_window_and_budget_are_rechecked(minutes, day, budget,
     store = SimpleNamespace(timezone='America/Los_Angeles')
     campaign = SimpleNamespace(budget=25)
     assert hourly_ads._live_observation_current(item, campaign, store, CLOCK) is valid
+
+
+def _scoped_routing(settings):
+    path = Path(settings.feishu_routing_file)
+    routing = json.loads(path.read_text())
+    app_id = 'cli_testhourly'
+    settings.hourly_ad_store_routing_app_id = settings.feishu_app_id = app_id
+    settings.feishu_app_secret = 'fake-test-secret'
+    routing["groups"]["reports"].update(
+        admin_open_ids=["ou_report_admin"], hourly_verified_roster_app_id=app_id,
+        verified_member_open_ids=["ou_amy", "ou_bo", "ou_manager", "ou_wrong_manager",
+                                  "ou_report_admin", "ou_global_subscriber"],
+    )
+    routing["stores"] = {
+        "5174": {"open_ids": ["ou_amy"], "owner_display_names": {"ou_amy": "运营甲"},
+                 "hourly_verified_operator_app_id": app_id, "manager_open_ids": ["ou_manager"], "hourly_operator_generation": "a" * 32},
+        "5175": {"open_ids": ["ou_bo"], "owner_display_names": {"ou_bo": "运营乙"},
+                 "hourly_verified_operator_app_id": app_id, "manager_open_ids": ["ou_wrong_manager"], "hourly_operator_generation": "b" * 32},
+    }
+    routing["management"] = {"open_ids": ["ou_report_admin"]}
+    routing["ad_alert_subscribers"] = {"recipients": [
+        {"open_id": "ou_global_subscriber", "name": "旧的总订阅人", "generation": "c" * 32}]}
+    settings.hourly_ad_store_routing_enabled = True
+    settings.feishu_manager_open_ids = 'ou_global_subscriber'
+    path.write_text(json.dumps(routing))
+    return path, routing
+
+
+def test_verified_scoped_manager_and_operator_are_exact_store_no_duplicates(warehouse):
+    settings, sessions, _, _ = warehouse
+    path, routing = _scoped_routing(settings)
+    routing['stores']['5174']['manager_open_ids'] += ['ou_manager', 'ou_amy', 'ou_nonmember']
+    path.write_text(json.dumps(routing))
+    with sessions() as db:
+        db.get(Store, '5175').status = 1
+        db.add(Campaign(store_id='5175', campaign_id='active', campaign_type='sp', state='enabled',
+                        updated_at=CLOCK.replace(tzinfo=None)))
+        db.commit()
+        findings = [_finding('5174', 'active'), _finding('5175', 'active')]
+        ids = hourly_ads.queue_hourly_findings(db, settings, [*findings, *findings], now=CLOCK,
+                                             slot='first', send_alerts=True)
+        assert len(ids) == 5 and len(set(ids)) == 5
+        by_dest = {db.get(NotificationOutbox, oid).chat_id: db.get(NotificationOutbox, oid) for oid in ids}
+        assert set(by_dest) == {'oc_reports', 'ou_amy', 'ou_bo', 'ou_manager', 'ou_wrong_manager'}
+        for uid, sid, name in [('ou_manager', '5174', '运营甲'), ('ou_amy', '5174', '运营甲'),
+                               ('ou_wrong_manager', '5175', '运营乙'), ('ou_bo', '5175', '运营乙')]:
+            payload = by_dest[uid].payload
+            assert payload['store_ids'] == [sid]
+            assert set(payload['hourly_private_scopes']) == {sid}
+            card, receipts = hourly_ads.recheck_hourly_delivery(db, settings, payload, CLOCK)
+            assert [i['store_id'] for i in receipts] == [sid]
+            assert '对应运营：' + name in json.dumps(card, ensure_ascii=False)
+        for job in db.scalars(select(SyncJob).where(SyncJob.job_type == hourly_ads.INCIDENT)):
+            sid = job.metadata_json['store_id']
+            assert all(sid in db.get(NotificationOutbox, oid).payload['store_ids']
+                       for oid in job.metadata_json['outbox_ids'])
+        assert not hourly_ads.queue_hourly_findings(db, settings, findings, now=CLOCK, slot='second', send_alerts=True)
+
+
+@pytest.mark.parametrize('change', ['ambiguous_operator', 'missing_name', 'removed_roster', 'bad_manager',
+                                    'removed_scope', 'manager_revoked'])
+def test_unverified_or_revoked_assigned_identifications_do_not_migrate_or_send(warehouse, change):
+    settings, sessions, _, _ = warehouse
+    path, routing = _scoped_routing(settings)
+    with sessions() as db:
+        ids = hourly_ads.queue_hourly_findings(db, settings, [_finding('5174', 'active')],
+                                             now=CLOCK, slot='first', send_alerts=True)
+        rows = {row.chat_id: row.payload for row in (db.get(NotificationOutbox, oid) for oid in ids)}
+        assert 'ou_manager' in rows
+        store = routing['stores']['5174']
+        if change == 'ambiguous_operator':
+            store['open_ids'] += ['ou_bo']
+            store['owner_display_names']['ou_bo'] = '运营乙'
+        elif change == 'missing_name':
+            store['owner_display_names']['ou_amy'] = 'ou_amy'
+        elif change == 'removed_roster':
+            routing['groups']['reports']['verified_member_open_ids'].remove('ou_amy')
+        elif change == 'bad_manager':
+            store['manager_open_ids'] = ['invalid']
+        elif change == 'removed_scope':
+            Path(settings.collection_scope_file).write_text(json.dumps({'store_ids': ['5175']}))
+        else:
+            store['manager_open_ids'] = ['ou_wrong_manager']
+        path.write_text(json.dumps(routing))
+        assert hourly_ads.recheck_hourly_delivery(db, settings, rows['ou_manager'], CLOCK) is None
+
+
+def test_pre_post_fence_rechecks_manager_after_transport_preparation(warehouse, monkeypatch):
+    from jx_alert.notifications import worker
+    from jx_alert.notifications.feishu_app import FeishuAppClient
+
+    settings, sessions, _, _ = warehouse
+    path, routing = _scoped_routing(settings)
+    posted = []
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return CLOCK.astimezone(tz) if tz else CLOCK.replace(tzinfo=None)
+
+    class Transport:
+        def send_card(self, card, *, receive_id, before_submit, **kwargs):
+            if receive_id == 'ou_manager':
+                routing['stores']['5174']['manager_open_ids'] = []
+                path.write_text(json.dumps(routing))
+            from jx_alert.notifications.hourly_ad_routing import app_fingerprint
+            before_submit({"app_identity_sha256": app_fingerprint("cli_testhourly")})
+            posted.append(receive_id)
+            return {'message_id': 'om_test'}
+
+    monkeypatch.setattr(worker, 'datetime', Clock)
+    monkeypatch.setattr(worker, 'get_settings', lambda: settings)
+    monkeypatch.setattr(worker, 'load_runtime_settings', lambda: settings)
+    monkeypatch.setattr(worker, 'SessionLocal', sessions)
+    monkeypatch.setattr(FeishuAppClient, 'from_settings', lambda _: Transport())
+    with sessions() as db:
+        ids = hourly_ads.queue_hourly_findings(db, settings, [_finding('5174', 'active')],
+                                             now=CLOCK, slot='first', send_alerts=True)
+        copies = {row.chat_id: row for row in (db.get(NotificationOutbox, oid) for oid in ids)}
+        for row in copies.values():
+            row.next_attempt_at = row.created_at = CLOCK.replace(tzinfo=None)
+        db.commit()
+        manager, operator = copies['ou_manager'].id, copies['ou_amy'].id
+    assert worker.process_outbox_batch(outbox_ids=[operator, manager])['sent'] == 1
+    assert posted == ['ou_amy']
+    with sessions() as db:
+        assert db.get(NotificationOutbox, operator).status == 'DELIVERED'
+        blocked = db.get(NotificationOutbox, manager)
+        assert blocked.status == 'SKIPPED' and 'delivery_intent' not in blocked.payload
+
+
+def test_held_scoped_notice_will_not_migrate_to_new_private_owner(warehouse):
+    settings, sessions, _, _ = warehouse
+    path, routing = _scoped_routing(settings)
+    night = CLOCK + timedelta(hours=5)
+    opens = CLOCK + timedelta(hours=18)
+    with sessions() as db:
+        activity = db.scalar(select(Campaign).where(Campaign.campaign_id == 'active'))
+        activity.updated_at = night.replace(tzinfo=None)
+        db.commit()
+        assert hourly_ads.queue_hourly_findings(db, settings, [_finding('5174', 'active')],
+                    now=night, slot='night', send_alerts=True) == []
+        routing['stores']['5174'].update(open_ids=['ou_bo'], owner_display_names={'ou_bo': '改派运营'},
+                                         hourly_operator_generation='d' * 32)
+        path.write_text(json.dumps(routing))
+        activity.updated_at = opens.replace(tzinfo=None)
+        db.commit()
+        ids = hourly_ads.queue_overnight_digest(db, settings, opens)
+        assert [db.get(NotificationOutbox, oid).chat_id for oid in ids] == ['oc_reports']
+
+
+@pytest.mark.parametrize('mutation', ['duplicate_route', 'unbound_roster', 'different_roster_app',
+                                      'unbound_operator', 'conflicting_credentials'])
+def test_ambiguous_or_unbound_app_scope_never_queues_a_private_alert(warehouse, mutation):
+    settings, sessions, _, _ = warehouse
+    path, routing = _scoped_routing(settings)
+    if mutation == 'duplicate_route':
+        text = json.dumps(routing).replace(
+            '"open_ids": ["ou_amy"]', '"open_ids": ["ou_bo"], "open_ids": ["ou_amy"]')
+        path.write_text(text)
+    elif mutation == 'conflicting_credentials':
+        settings.feishu_app_id = settings.feishu_app_secret = ''
+        credentials = path.parent / 'app.json'
+        credentials.write_text('{"app_id":"cli_wrong","app_id":"cli_testhourly","app_secret":"fake"}')
+        settings.feishu_app_credentials_file = str(credentials)
+    else:
+        if mutation == 'unbound_roster':
+            routing['groups']['reports'].pop('hourly_verified_roster_app_id')
+        elif mutation == 'different_roster_app':
+            routing['groups']['reports']['hourly_verified_roster_app_id'] = 'cli_wrong'
+        else:
+            routing['stores']['5174'].pop('hourly_verified_operator_app_id')
+        path.write_text(json.dumps(routing))
+    with sessions() as db:
+        ids = hourly_ads.queue_hourly_findings(db, settings, [_finding('5174', 'active')],
+                                             now=CLOCK, slot='app-verification', send_alerts=True)
+        if mutation == 'duplicate_route':
+            assert ids == []  # even the group document cannot authorize an ambiguous destination
+        else:
+            group, = [db.get(NotificationOutbox, oid) for oid in ids]
+            assert group.chat_id == 'oc_reports'
+            assert '<at id=' not in json.dumps(group.payload['card'])
+
+
+@pytest.mark.parametrize('mutation', ['rotate_config_after_token', 'wrong_actual_sender', 'missing_actual_sender',
+                                      'duplicate_route_after_token'])
+def test_private_pre_post_stops_other_app_or_changed_routing(warehouse, monkeypatch, mutation):
+    from jx_alert.notifications import worker
+    from jx_alert.notifications.feishu_app import FeishuAppClient
+    from jx_alert.notifications.hourly_ad_routing import app_fingerprint
+
+    settings, sessions, _, _ = warehouse
+    path, _ = _scoped_routing(settings)
+    settings.feishu_app_id = settings.feishu_app_secret = ''
+    credentials = path.parent / 'app.json'
+    credentials.write_text('{"app_id":"cli_testhourly","app_secret":"fake"}')
+    settings.feishu_app_credentials_file = str(credentials)
+    posted = []
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return CLOCK.astimezone(tz) if tz else CLOCK.replace(tzinfo=None)
+
+    class Transport:
+        def send_card(self, card, *, receive_id, before_submit, **kwargs):
+            sender = app_fingerprint('cli_testhourly')
+            if mutation == 'rotate_config_after_token':
+                credentials.write_text('{"app_id":"cli_rotated","app_secret":"different"}')
+            elif mutation == 'duplicate_route_after_token':
+                path.write_text(path.read_text().replace(
+                    '"open_ids": ["ou_amy"]', '"open_ids": ["ou_bo"], "open_ids": ["ou_amy"]'))
+            elif mutation == 'wrong_actual_sender':
+                sender = app_fingerprint('cli_wrong')
+            else:
+                sender = None
+            before_submit({"app_identity_sha256": sender} if sender else {})
+            posted.append(receive_id)
+            return {'message_id': 'om_wrong'}
+
+    monkeypatch.setattr(worker, 'datetime', Clock)
+    monkeypatch.setattr(worker, 'get_settings', lambda: settings)
+    monkeypatch.setattr(worker, 'load_runtime_settings', lambda: settings)
+    monkeypatch.setattr(worker, 'SessionLocal', sessions)
+    monkeypatch.setattr(FeishuAppClient, 'from_settings', lambda _: Transport())
+    with sessions() as db:
+        ids = hourly_ads.queue_hourly_findings(db, settings, [_finding('5174', 'active')],
+                                             now=CLOCK, slot='app-verification', send_alerts=True)
+        manager, = [db.get(NotificationOutbox, oid) for oid in ids
+                    if db.get(NotificationOutbox, oid).chat_id == 'ou_manager']
+        manager.next_attempt_at = manager.created_at = CLOCK.replace(tzinfo=None)
+        manager_id = manager.id
+        db.commit()
+    assert worker.process_outbox_batch(outbox_ids=[manager_id])['sent'] == 0
+    assert posted == []
+    with sessions() as db:
+        row = db.get(NotificationOutbox, manager_id)
+        assert row.status == 'SKIPPED'
+        assert 'delivery_intent' not in row.payload

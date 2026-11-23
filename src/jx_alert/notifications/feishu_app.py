@@ -17,7 +17,7 @@ import time
 
 import httpx
 
-from jx_alert.notifications.receipt import strict_response_json
+from jx_alert.notifications.receipt import strict_response_json, unique_json_fields
 
 
 class FeishuAppError(RuntimeError):
@@ -55,8 +55,22 @@ class FeishuAppClient:
         self._token_expires_at = 0.0
         self._token_lock = threading.Lock()
 
+    @property
+    def application_identity(self):
+        """Non-secret fingerprint of the app to which this token client is bound."""
+        return hashlib.sha256(self._app_id.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def configured_app_identity(cls, settings):
+        """Fingerprint currently configured credentials, without requesting a token."""
+        return cls._from_configured_credentials(settings).application_identity
+
     @classmethod
     def from_settings(cls, settings):
+        return cls._from_configured_credentials(settings)
+
+    @classmethod
+    def _from_configured_credentials(cls, settings):
         """Use configured credentials or a private, unlogged credential file."""
         app_id = getattr(settings, "feishu_app_id", "")
         secret = getattr(settings, "feishu_app_secret", "")
@@ -65,7 +79,8 @@ class FeishuAppClient:
             path = getattr(settings, "feishu_app_credentials_file", "")
             if path:
                 try:
-                    credentials = json.loads(Path(path).read_text(encoding="utf-8"))
+                    credentials = json.loads(Path(path).read_text(encoding="utf-8"),
+                                             object_pairs_hook=unique_json_fields)
                 except FileNotFoundError:
                     credentials = {}
                 except (OSError, ValueError):
@@ -232,6 +247,7 @@ class FeishuAppClient:
                 "body_sha256": hashlib.sha256(json.dumps(payload, ensure_ascii=False,
                     sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                 "provider_uuid": payload["uuid"],
+                "app_identity_sha256": self.application_identity,
             })
         for attempt in range(2):
             data = self._post_json(

@@ -219,3 +219,41 @@ def test_worker_rechecks_revocation_before_creating_a_feishu_client(registry, mo
         assert db.get(NotificationOutbox, selected).status == 'SKIPPED'
         assert '订阅已变更' in db.get(NotificationOutbox, selected).last_error
     engine.dispose()
+
+
+def test_generic_material_lead_revoked_and_readded_during_token_fetch_never_posts(registry, monkeypatch):
+    from jx_alert.notifications import worker
+    from jx_alert.notifications.feishu_app import FeishuAppClient
+
+    settings, _, _ = registry
+    settings.app_dry_run, settings.feishu_enabled = False, True
+    settings.feishu_app_id, settings.feishu_app_secret = "cli_fixture", "synthetic"
+    save(settings, ["ou_first"])
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(engine)
+    with sessions.begin() as db:
+        db.add(Store(sid="5174", name="test", status=1, has_ads_setting=1))
+        db.add(Campaign(store_id="5174", campaign_id="actual", campaign_type="sp", state="enabled",
+                        updated_at=datetime.now(timezone.utc).replace(tzinfo=None)))
+        enqueue_application_deliveries(db, settings, event_key="rule", text="fixture", material_ad_alert=True,
+            context={"store_id": "5174", "entity_id": "actual", "scope": "5174:campaign:sp",
+                     "metrics": {}, "severity": "P1", "status": "NEW"})
+        [lead] = [r for r in db.scalars(select(NotificationOutbox)) if r.payload["delivery"]["role"] == "ad_alert_subscriber"]
+        oid, frozen = lead.id, lead.payload
+    monkeypatch.setattr(worker, "SessionLocal", sessions)
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    monkeypatch.setattr(worker, "load_runtime_settings", lambda: settings)
+
+    def post(client, url, payload, **kwargs):
+        assert url == client._TOKEN_PATH, "revoked generation must not POST a message"
+        save(settings, [])
+        save(settings, ["ou_first"])
+        return {"code": 0, "tenant_access_token": "fixture", "expire": 7200}
+
+    monkeypatch.setattr(FeishuAppClient, "_post_json", post)
+    assert worker.process_outbox_batch(outbox_ids=[oid])["sent"] == 0
+    with sessions() as db:
+        row = db.get(NotificationOutbox, oid)
+        assert row.status == "SKIPPED" and row.payload == frozen
+    engine.dispose()

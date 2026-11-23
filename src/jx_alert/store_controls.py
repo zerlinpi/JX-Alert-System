@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import tempfile
 
+from jx_alert.notifications.receipt import unique_json_fields
 from jx_alert.storage.job_lock import _try_file_lock, _unlock_file
 
 
@@ -48,7 +49,7 @@ def _snapshot(path):
             if not path.is_file() or path.stat().st_size > 1024 * 1024:
                 raise ValueError
             raw = path.read_bytes()
-            data = json.loads(raw)
+            data = json.loads(raw, object_pairs_hook=unique_json_fields)
         if (not isinstance(data, dict) or set(data) != {"version", "stores"}
                 or type(data["version"]) is not int or data["version"] != 1
                 or not isinstance(data["stores"], dict)):
@@ -64,7 +65,7 @@ def _snapshot(path):
             cutoff = row.get("notification_cutoff_at")
             if cutoff is not None and datetime.fromisoformat(cutoff).tzinfo is None:
                 raise ValueError
-    except (OSError, ValueError, TypeError, StoreControlError):
+    except (OSError, ValueError, TypeError, RecursionError, StoreControlError):
         raise StoreControlError(503, _UNAVAILABLE) from None
     return raw, data, hashlib.sha256(raw).hexdigest()
 

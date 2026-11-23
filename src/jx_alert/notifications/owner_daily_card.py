@@ -183,7 +183,8 @@ def _bounded_pages(rows, maximum, render):
 
 def build_owner_daily_pages(rows, *, report_date: date, as_of: str | datetime | None = None,
                             provisional: bool = False,
-                            preview_scope: tuple[str, int] | None = None) -> list[tuple[dict, list[str]]]:
+                            preview_scope: tuple[str, int] | None = None,
+                            replay: bool = False) -> list[tuple[dict, list[str]]]:
     """Return summary pages with their entire scope, then scoped detail pages.
 
     Caller supplies exactly one row per authorized store for the selected report
@@ -209,13 +210,13 @@ def build_owner_daily_pages(rows, *, report_date: date, as_of: str | datetime | 
     if isinstance(as_of, datetime):
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("Owner report observation timestamp must include a timezone")
-        as_of = as_of.isoformat(timespec="seconds")
+        as_of = as_of.isoformat(timespec="auto" if replay else "seconds")
     if as_of:
         # The observation label is written into a Feishu Markdown subtitle.
         # Only allow the display characters needed by timestamp labels, never markup.
         if not isinstance(as_of, str) or not re.fullmatch(r"[A-Za-z0-9: +.\-\u4e00-\u9fff]{1,70}", as_of):
             raise ValueError("Invalid owner report observation timestamp")
-        subtitle += f"｜生成于 {as_of}"
+        subtitle += f"｜回放参考时刻 {as_of}" if replay else f"｜生成于 {as_of}"
     summary = _bounded_pages(_summary_rows(items), 8,
                              lambda rows, page: _summary_page(subtitle, rows, page))
     details = _bounded_pages(items, 6,
@@ -225,6 +226,8 @@ def build_owner_daily_pages(rows, *, report_date: date, as_of: str | datetime | 
 
 
 def build_owner_daily_cards(rows, *, report_date: date, as_of: str | datetime | None = None,
-                            provisional: bool = False, preview_scope: tuple[str, int] | None = None) -> list[dict]:
+                            provisional: bool = False, preview_scope: tuple[str, int] | None = None,
+                            replay: bool = False) -> list[dict]:
     return [value for value, _ in build_owner_daily_pages(
-        rows, report_date=report_date, as_of=as_of, provisional=provisional, preview_scope=preview_scope)]
+        rows, report_date=report_date, as_of=as_of, provisional=provisional, preview_scope=preview_scope,
+        replay=replay)]

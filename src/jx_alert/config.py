@@ -16,9 +16,14 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = False
     daily_sync_cron: str = "0 8 * * *"
     feishu_daily_report_cron: str = "0 9 * * *"
+    # Separate private lane; defaults to no collection/delivery changes.
+    feishu_company_executive_digest_enabled: bool = False
+    feishu_company_executive_digest_start_date: str = ""
     # In hourly mode, keep the broad collection outside the existing 08:00 sweep.
     hourly_mode_daily_sync_cron: str = "30 18 * * *"
     hourly_ad_monitor_enabled: bool = False
+    hourly_ad_store_routing_enabled: bool = False
+    hourly_ad_store_routing_app_id: str = ""
     hourly_ad_monitor_cron: str = "0 * * * *"
     feishu_daily_report_start_date: str = ""
     feishu_daily_report_group_digest: bool = False
@@ -191,14 +196,30 @@ def effective_daily_sync_cron(settings: Settings) -> str:
 
 @lru_cache
 def get_settings() -> Settings:
+    settings = load_runtime_settings()
+    if not settings.mcp_bearer_token and Path(settings.mcp_auth_file).is_file():
+        auth = json.loads(Path(settings.mcp_auth_file).read_text(encoding="utf-8"))
+        token = auth.get("bearer_token") if isinstance(auth, dict) else None
+        if not isinstance(token, str) or len(token) < 32:
+            raise ValueError("MCP authentication file is invalid")
+        settings = settings.model_copy(update={"mcp_bearer_token": token})
+    return settings
+
+
+def load_runtime_settings() -> Settings:
+    """Read the effective process configuration, including the current runtime JSON."""
     settings = Settings()
     path = Path(settings.runtime_settings_file)
     if path.is_file():
-        runtime = json.loads(path.read_text(encoding="utf-8"))
+        # Runtime selection also contains explicit app and routing authorizations.
+        from jx_alert.notifications.receipt import unique_json_fields
+        runtime = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_json_fields)
         allowed = {
             "app_dry_run", "scheduler_enabled", "daily_sync_cron",
             "hourly_ad_monitor_enabled", "hourly_ad_monitor_cron", "hourly_mode_daily_sync_cron",
+            "hourly_ad_store_routing_enabled", "hourly_ad_store_routing_app_id",
             "feishu_daily_report_cron", "feishu_daily_report_start_date",
+            "feishu_company_executive_digest_enabled", "feishu_company_executive_digest_start_date",
             "feishu_daily_report_group_digest",
             "sb_sd_detail_reports_enabled",
             "business_alert_delivery_mode",
@@ -225,10 +246,4 @@ def get_settings() -> Settings:
         if not isinstance(runtime, dict) or set(runtime) - allowed:
             raise ValueError("Runtime settings contain unsupported fields")
         settings = Settings(_env_file=None, **{**settings.model_dump(), **runtime})
-    if not settings.mcp_bearer_token and Path(settings.mcp_auth_file).is_file():
-        auth = json.loads(Path(settings.mcp_auth_file).read_text(encoding="utf-8"))
-        token = auth.get("bearer_token") if isinstance(auth, dict) else None
-        if not isinstance(token, str) or len(token) < 32:
-            raise ValueError("MCP authentication file is invalid")
-        settings = settings.model_copy(update={"mcp_bearer_token": token})
     return settings
