@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, tuple_
 
+from jx_alert.ad_source_policy import lingxing_ad_allowed
 from jx_alert.ai.ad_review_evidence import ctr_expected_click_gap
 from jx_alert.ai.ad_review_skills import load_ad_review_skills, skill_fingerprint
 from jx_alert.analysis.hourly_ad_patterns import HIGH_LOW, LOW_ZERO, OPPORTUNITY, PATTERN_SIGNALS
@@ -303,6 +304,7 @@ def eligible_items(db, settings, items, now, *, refreshed_since=None):
             tuple_(Campaign.store_id, Campaign.campaign_type, Campaign.campaign_id).in_(ids))):
         ready[(campaign.store_id, campaign.campaign_type, campaign.campaign_id)] = (campaign, store)
     return [i for i in items if campaign_identity(i) in ready and controls[i['store_id']][0]
+            and lingxing_ad_allowed(settings, i['store_id'], evidence_at=i.get('detected_at'))
             and _live_observation_current(i, *ready[campaign_identity(i)], now)
             and i.get('skill_fingerprint') == skill_fingerprint(skills.for_campaign(
                 i['store_id'], i['ad_type'], i['campaign_id']))

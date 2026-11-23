@@ -75,7 +75,7 @@ def main():
         "runtime_settings_file", "mcp_auth_file", "collection_scope_file", "store_timezones_file",
         "store_controls_file", "feishu_routing_file", "lingxing_sources_file",
         "lingxing_business_credentials_file", "deepseek_credentials_file",
-        "ad_review_skills_file", "agent_skill_library_dir",
+        "ad_review_skills_file", "agent_skill_library_dir", "advertising_source_controls_file",
     )}
     settings = config.Settings(_env_file=None, database_url="sqlite://", app_dry_run=True,
                                scheduler_enabled=False, feishu_enabled=False, **paths)

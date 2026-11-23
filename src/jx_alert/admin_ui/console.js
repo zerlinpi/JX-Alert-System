@@ -19,6 +19,7 @@ const state = {
   bulkCollection: null, bulkBusy: false, bulkTimer: null,
   groups: { current: null, chats: [], preview: null, saving: false, loading: false, seq: 0 },
   sources: { data: null, loading: false, saving: false },
+  adSource: { data: null, busy: false },
   deepseek: { data: null, loading: false, saving: false },
   reviewSkills: null,
   skillLibrary: null,
@@ -247,6 +248,10 @@ async function selectStore(sid, date) {
   state.collectionBusy = false;
   state.sid = sid;
   state.data = null;
+  state.adSource = { data: null, busy: false };
+  $("ad-source-panel").open = false;
+  renderAdSource();
+  notice("ad-source-status");
   state.members = null;
   state.revision = null;
   state.selected = new Set();
@@ -449,6 +454,95 @@ function renderDetail() {
   $("detail-placeholder").hidden = true;
   $("detail-content").hidden = false;
   renderView();
+}
+
+function validAdSource(data) {
+  return data && ["lingxing", "sparkx"].includes(data.source) && /^[a-f0-9]{64}$/.test(data.revision || "");
+}
+
+function adSourceDraft() {
+  return Object.fromEntries([["profile_id", "profile"], ["marketplace", "marketplace"],
+    ["currency", "currency"], ["timezone", "timezone"]].map(([key, field]) =>
+    [key, ($("ad-source-" + field).value || "").trim()]));
+}
+
+function renderAdSource(reset = false) {
+  const {data, busy} = state.adSource;
+  const ready = validAdSource(data);
+  const disabled = !ready || busy || !state.csrf;
+  if (reset || !ready) {
+    $("ad-source-choice").value = ready ? data.source : "lingxing";
+    $("ad-source-profile").value = ready ? data.binding?.profile_id || "" : "";
+    for (const key of ["marketplace", "currency", "timezone"]) {
+      $("ad-source-" + key).value = ready ? data.store_basis?.[key] || "" : "";
+    }
+  }
+  const draft = adSourceDraft();
+  const bindingVerified = ready && data.verification_status === "VERIFIED"
+      && Object.keys(draft).every((key) => draft[key] === data.binding?.[key]);
+  const selected = $("ad-source-choice").value;
+  $("ad-source-fields").disabled = disabled;
+  $("ad-source-profile").readOnly = ready && data.source === "sparkx";
+  $("reload-ad-source").disabled = busy || !state.sid;
+  $("verify-ad-source").disabled = disabled || !data.sparkx_ready || !/^[1-9][0-9]{0,18}$/.test(draft.profile_id)
+      || !draft.marketplace || !draft.currency || !draft.timezone;
+  $("save-ad-source").disabled = disabled || selected === data.source || (selected === "sparkx" && !bindingVerified);
+  $("ad-source-current").textContent = !ready ? "尚未读取本店广告来源。"
+      : data.source === "lingxing"
+        ? (data.verification_status === "VERIFIED" ? "当前：领星。SparkX 范围已核验，尚未切换。"
+          : "当前：领星。" + (!data.sparkx_ready ? "SparkX 服务端 Token 或允许的 Profile 尚未配置。" : ""))
+        : data.observation_source === "sparkx" ? "当前：SparkX（仅 SP 观测）。"
+          : "已选择 SparkX，但校验已失效。观测暂停，不会自动改回领星；可重新核验或手动切回。";
+  const latest = ready && data.observation_source === "sparkx";
+  $("ad-source-latest").hidden = !latest;
+  $("ad-source-latest").textContent = !latest ? "" : data.observation_status === "OBSERVED"
+      ? "历史成功记录（不代表当前连接正常）：" + (data.latest_observations || []).map((row) => {
+        const sampled = sourceTime(row.captured_at);
+        return `最近${row.period === "hourly" ? "小时" : "日级"}观测：${row.report_date} · ${row.row_count} 条`
+          + (sampled ? ` · 采集于 ${sampled}（美西）` : "");
+      }).join("；")
+      : data.observation_status === "HOURLY_DISABLED" ? "小时采集尚未启用，当前仅保存了来源选择。"
+      : data.observation_status === "WAITING" ? "尚无本次切换后的 SparkX 观测，等待后续小时任务。"
+      : "暂时无法核实 SparkX 观测记录，可刷新重试。";
+}
+
+async function adSourceAction(action) {
+  const snapshot = state.adSource;
+  const sid = state.sid;
+  if (!sid || !state.data || snapshot.busy || !state.csrf) return;
+  if ((action === "verify" && $("verify-ad-source").disabled) ||
+      (action === "save" && $("save-ad-source").disabled)) return;
+  const current = () => state.sid === sid && state.adSource === snapshot;
+  const isRead = action === "read";
+  const isVerify = action === "verify";
+  const payload = { revision: snapshot.data?.revision };
+  if (isVerify) payload.binding = adSourceDraft();
+  if (action === "save") payload.source = $("ad-source-choice").value;
+  snapshot.busy = true;
+  renderAdSource();
+  notice("ad-source-status", isRead ? "正在读取本店来源…" : isVerify ? "正在进行一次 SparkX 只读核验…" : "正在保存本店来源…");
+  try {
+    const value = await api(`stores/${encodeURIComponent(sid)}/advertising-source${isVerify ? "/verify" : ""}`, isRead ? undefined : {
+      method: "POST", headers: {"Content-Type": "application/json", "X-CSRF-Token": state.csrf},
+      body: JSON.stringify(payload),
+    });
+    if (!current()) return;
+    if (!validAdSource(value)) throw new Error("无法确认本店来源，请刷新。");
+    snapshot.data = value;
+    renderAdSource(true);
+    notice("ad-source-status", isRead ? "" : isVerify ? "只读范围核验通过，未自动切换来源。"
+      : value.source === "lingxing" ? "已切回领星，新任务使用领星；不会补发旧告警。"
+        : "已选择 SparkX。后续小时任务使用 SparkX 观测本店 SP；不会通过 SparkX 发送飞书告警。", "success");
+  } catch (error) {
+    if (!current()) return;
+    if (error.status === 409 || isRead) snapshot.data = null;
+    notice("ad-source-status", error.message || "操作未确认，请刷新本店来源。", "error");
+  } finally {
+    if (current()) {
+      snapshot.busy = false;
+      renderAdSource();
+    }
+  }
 }
 
 function validControls(controls) {
@@ -1293,6 +1387,14 @@ for (const [id, key] of [["control-collection", "collection_enabled"], ["control
 }
 $("save-controls").addEventListener("click", saveControls);
 $("reload-controls").addEventListener("click", () => reloadControls());
+$("ad-source-panel").addEventListener("toggle", () => {
+  if ($("ad-source-panel").open && !state.adSource.data) void adSourceAction("read");
+});
+$("reload-ad-source").addEventListener("click", () => void adSourceAction("read"));
+$("verify-ad-source").addEventListener("click", () => void adSourceAction("verify"));
+$("save-ad-source").addEventListener("click", () => void adSourceAction("save"));
+$("ad-source-profile").addEventListener("input", () => renderAdSource());
+$("ad-source-choice").addEventListener("change", () => renderAdSource());
 $("date-form").addEventListener("submit", (event) => {
   event.preventDefault();
   if (state.sid && $("report-date").value) void selectStore(state.sid, $("report-date").value);
