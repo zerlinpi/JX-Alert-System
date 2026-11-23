@@ -227,8 +227,9 @@ def company_card(snapshot, *, include_operators=True, gap_limit=_NOTE_LIMIT):
     for code, data in snapshot["currencies"].items():
         for metric in METRICS:
             rows = latest if metric in LATEST else settled
+            # Coverage is relative to every store in scope, so gaps are visible at a glance.
             rows.append((code, _LABELS[metric], _metric_text(metric, data["values"][metric], code),
-                         f"{data['covered'][metric]}/{data['store_count']} 店"))
+                         f"{data['covered'][metric]}/{total} 店"))
     sections = [
         (f"全公司 · 最近已完结经营日 {snapshot['date']}（美西）", ["币种", "指标", "数值", "覆盖"], latest),
         (f"全公司 · 成熟归因日 {snapshot['mature_date']}（美西）", ["币种", "指标", "数值", "覆盖"], settled),

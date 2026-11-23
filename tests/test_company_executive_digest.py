@@ -216,6 +216,26 @@ def test_incomplete_evidence_is_listed_and_never_counted_as_zero(runtime, reason
         assert snapshot["currencies"]["EUR"]["values"]["spend"] == 55
 
 
+def test_empty_sales_response_is_named_and_coverage_counts_whole_scope(runtime):
+    sessions, settings, _, _ = runtime
+    with sessions.begin() as db:
+        for row in db.scalars(select(DailyMetric).where(DailyMetric.store_id == "2", DailyMetric.metric_date == LATEST,
+                                                       DailyMetric.dimension.in_(("store", "sku_asin")))):
+            db.delete(row)
+        for row in db.scalars(select(DataCoverage).where(DataCoverage.store_id == "2",
+                DataCoverage.metric_date == LATEST, DataCoverage.dimension.in_(("store", "sku_asin")))):
+            row.row_count = 0
+    with sessions() as db:
+        snapshot, value = notify.preview_company_digest(db, settings, now=DUE)
+    assert snapshot["issues"] == [{"sid": "2", "name": "Synthetic-2", "operator": "运营甲",
+                                   "issue": "当日销量接口无记录（不按 0 计）"}]
+    assert snapshot["company_orders"] == 30 and snapshot["orders_covered"] == 2
+    first = next(e for e in value["body"]["elements"] if e["tag"] == "table")
+    sales = next(row for row in first["rows"] if row["c0"] == "USD" and row["c1"] == "销售额")
+    assert sales["c2"] == "100.00 USD" and sales["c3"] == "1/3 店"
+    assert "全公司订单量¹：30（覆盖 2/3 店）" in json_visible_text(value)
+
+
 def test_confirmed_zero_rows_vs_missing_and_currency_mismatch(runtime):
     sessions, settings, _, _ = runtime
     with sessions.begin() as db:

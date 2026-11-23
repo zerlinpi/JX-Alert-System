@@ -87,35 +87,50 @@ def _by_entity(facts, metric):
     return {fact.entity_id: fact for fact in facts if fact.metric_name == metric}
 
 
+EMPTY_SALES = "当日销量接口无记录（不按 0 计）"
+
+
+def _sales_gap(coverage, sid, day, total, grain):
+    store, asin = coverage.get((sid, day, "store")), coverage.get((sid, day, "sku_asin"))
+    if (not total and not grain and store is not None and asin is not None
+            and store.status == asin.status == "COMPLETE" and store.row_count == asin.row_count == 0):
+        return EMPTY_SALES
+    return "销量日报未完整采集"
+
+
 def _store_totals(sid, day, coverage, rows, now):
+    """Return proven sales/orders, the sales currency, and a reason when unproven."""
     total, grain = rows.get((sid, day, "store"), []), rows.get((sid, day, "sku_asin"), [])
     if not (total and grain
             and _partition(coverage.get((sid, day, "store")), total, day, now)
             and _partition(coverage.get((sid, day, "sku_asin")), grain, day, now)
             and {row.entity_id for row in total} == {sid}
             and all(row.source == "lingxing_sales_report" for row in (*total, *grain))):
-        return {}, None
+        return {}, None, _sales_gap(coverage, sid, day, total, grain)
     entities = {row.entity_id for row in grain}
-    values, currency = {}, None
+    values, currency, reason = {}, None, None
     totals = {item.metric_name: item for item in total}
     for metric in ("orders", "sales"):
         whole, parts = totals.get(metric), _by_entity(grain, metric)
         count = metric == "orders"
         if (whole is None or set(parts) != entities or not _value(whole.value, count=count)
                 or not all(_value(row.value, count=count) for row in parts.values())):
+            reason = reason or "销量日报字段不完整"
             continue
         summed = _sum([row.value for row in parts.values()])
         # MariaDB legacy FLOAT independently rounds the normalized grain and
         # the stored aggregate. Reconcile within Float precision, not cents.
         if summed is None or (whole.value != summed if count else
                               not math.isclose(whole.value, summed, rel_tol=2e-7, abs_tol=1e-8)):
+            reason = reason or "店铺汇总与 ASIN 明细不一致"
             continue
         if metric == "sales":
             if not _currency(whole.currency) or any(row.currency != whole.currency for row in parts.values()):
+                reason = reason or "销售额币种待确认"
                 continue
             currency = whole.currency
         values[metric] = whole.value
-    return values, currency
+    return values, currency, reason
 
 
 def _ad_facts(sid, day, coverage, rows, now, *, mature=False):
@@ -237,9 +252,9 @@ def company_snapshot(db, scope, confirmed_zones, *, now, operators=None, exclude
         elif store.status != 1:
             issue = _STATUS_ISSUES.get(store.status, "领星店铺状态异常")
         if issue is None:
-            row["business"], currency = _store_totals(sid, latest, coverage, facts, now)
+            row["business"], currency, reason = _store_totals(sid, latest, coverage, facts, now)
             if currency is None:
-                issue = "缺少完整销售日报或币种待确认"
+                issue = reason or "销售额币种待确认"
             else:
                 row["currency"] = currency
                 ads = _ad_facts(sid, latest, coverage, facts, now)
