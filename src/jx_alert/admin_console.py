@@ -50,6 +50,13 @@ _HEADERS = {
                                "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 }
 _ASSETS = {"console.css": "text/css", "console.js": "text/javascript"}
+# Paths of the retired JX MCP server. The existing Nginx vhost still proxies them
+# (and "/") to the old MCP port, which now reaches this console.
+RETIRED_PATHS = ("/mcp", "/authorize", "/token", "/register", "/revoke", "/oauth/owner",
+                 "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource",
+                 "/.well-known/oauth-protected-resource/mcp")
+RETIRED_MESSAGE = ("JX MCP 服务已停用。广告数据请在 ChatGPT/Claude 中直接连接 SparkX MCP"
+                   "（https://mcp.sparkx.cn/mcp）；管理台地址为 /console/。")
 _ROLE_LABELS = {"group": "通知群", "lead": "负责人", "operator": "运营", "group_question": "群内问答",
                 "private_question": "私聊问答"}
 _LANE_LABELS = {"daily": "08:30 日报", "review": "异常复盘", "hourly": "实时监控"}
@@ -192,6 +199,14 @@ class OwnerConsole:
         if not self._valid_host(request) or name not in _ASSETS:
             return _error("资源不存在。", 404)
         return Response(self._asset(name), media_type=_ASSETS[name], headers=_HEADERS)
+
+    async def root(self, request):
+        return RedirectResponse("/console/", 302, headers=_HEADERS)
+
+    async def retired(self, request):
+        # Old ChatGPT connectors get a clear, final answer instead of a 502 from Nginx.
+        return JSONResponse({"error": RETIRED_MESSAGE, "sparkx_mcp": "https://mcp.sparkx.cn/mcp"}, 410,
+                            headers=_HEADERS)
 
     # ------------------------------------------------------------ views
 
@@ -501,10 +516,11 @@ class OwnerConsole:
         api_post = ["sparkx", "sparkx/test", "stores/refresh", "stores/save", "stores/suggestions/apply",
                     "recipients/company", "recipients/ad", "groups", "members/refresh", "reports",
                     "reports/preview", "deepseek", "deepseek/test"]
-        routes = [Route("/console", self.home), Route("/console/", self.home),
+        routes = [Route("/", self.root), Route("/console", self.home), Route("/console/", self.home),
                   Route("/console/login", self.login, methods=["GET", "POST"]),
                   Route("/console/assets/{asset}", self.asset),
                   Route("/console/logout", self.api, methods=["POST"])]
+        routes += [Route(path, self.retired, methods=["GET", "POST", "DELETE", "OPTIONS"]) for path in RETIRED_PATHS]
         for name in dict.fromkeys(api_get + api_post):
             methods = (["GET"] if name in api_get else []) + (["POST"] if name in api_post else [])
             routes.append(Route(f"/console/api/{name}", self.api, methods=methods))

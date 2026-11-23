@@ -1,4 +1,4 @@
-# Source updates reuse the existing images and persistent data/database volumes.
+# Server overlay: source updates reuse the existing images and persistent data/database volumes.
 # The base compose file retains its env_file, health checks, and port bindings.
 services:
   app:
@@ -19,3 +19,8 @@ services:
       - ./src:/app/src:ro
     environment:
       PYTHONPATH: /app/src
+    # The existing Nginx vhost still sends "/" and the retired MCP paths to the old
+    # MCP port. Publishing the console there too keeps that vhost working unchanged:
+    # "/" redirects to /console/ and retired MCP/OAuth paths answer 410.
+    ports:
+      - "${MCP_BIND_IP:-127.0.0.1}:${MCP_BIND_PORT:-8001}:8002"

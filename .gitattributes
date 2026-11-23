@@ -1,0 +1,2 @@
+# Shell scripts run on the Linux server: always LF, whatever the workstation's autocrlf.
+*.sh text eol=lf

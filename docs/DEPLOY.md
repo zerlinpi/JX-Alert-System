@@ -7,37 +7,70 @@
 | `db` | MariaDB 11 | 数据卷 `jx-alert_db_data`，不删除 |
 | `app` | `uvicorn jx_alert.api:app` | `/health`：数据库、SparkX/DeepSeek 是否配置、是否发送 |
 | `scheduler` | `python -m jx_alert.scheduler` | 08:30 日报与复盘、每小时监控、10 秒一次的发送队列 |
-| `console` | `python -m jx_alert.admin_console` | 管理台，仅映射 `127.0.0.1:8002`，由 Nginx 反代 `/console` |
+| `console` | `python -m jx_alert.admin_console` | 管理台，监听 `127.0.0.1:8002`；服务器上同时占用原 MCP 端口（默认 8001） |
 | `bot` | `python -m jx_alert.feishu_bot` | 飞书长连接问答 |
 
 原 `mcp` 服务（领星数据的 ChatGPT 连接器）已移除。需要在 ChatGPT/Claude 中查广告数据时，可按 SparkX 官方说明直接连接 SparkX MCP。
 
-## 从领星版本升级
+## 服务器不需要改的配置
 
-1. 备份：`mysqldump` 全库、`data/` 目录（含 `secrets/`、`feishu-routing.json`、`runtime-settings.json`）。
-2. 拉取已测试的版本，`docker-compose.runtime.yml` 中 `scheduler`、`console` 挂载 `./src`，更新代码后重启即可：
+- **Nginx 不用改。** 现有站点把 `/console`、`/oauth/owner` 转到 8002，其余路径转到原 MCP 端口。新版本的 `docker-compose.runtime.yml` 让管理台同时监听这个端口：`/` 跳转到 `/console/`，`/mcp`、`/authorize`、`/token`、`/.well-known/oauth-*` 等旧路径返回 410 和停用说明，不再出现 502。想精简时可换成 `deploy/jxmcp.pacefitday.com.conf`（只转发 `/console`），属于可选项。
+- **`.env` 不用改。** `MCP_PUBLIC_URL`、`MCP_OWNER_CREDENTIALS_FILE`、`MCP_FORWARDED_ALLOW_IPS` 继续作为管理台设置使用，`MCP_BIND_IP`/`MCP_BIND_PORT` 决定兼容端口。
+- **`runtime-settings.json` 不用改。** 领星、MCP、Excel 等旧字段被忽略，文件不会被改写。
+- **不需要重新构建镜像。** `app`、`scheduler`、`console` 用现有 `jx-alert-app` 镜像挂载 `./src`，`bot` 用现有 `jx-alert-bot` 镜像。
+- 原所有者口令 `data/secrets/mcp-owner.json`、管理台会话文件、`feishu-routing.json`（通知群、总负责人、广告负责人）原样沿用。
+- 数据库只新增、不删除：领星时期的表原样保留、不再写入；`notification_outbox`、`notification_logs`、`sync_jobs` 继续使用。发送队列里领星时期的待发消息不会发送，标记为「已跳过」。
 
-```sh
-cd /opt/jx-alert-system
-sudo docker compose -p jx-alert -f docker-compose.yml -f docker-compose.runtime.yml \
-  --profile scheduler --profile console --profile bot up -d --no-build app scheduler console bot
-sudo docker stop jx-alert-mcp-1   # 新 Compose 文件已无 mcp 服务；停用旧容器，不删除其数据
+## 升级（`deploy/upgrade.sh`）
+
+脚本依次执行：只读检查 → 备份数据库与 `data/*.json` → 停止 scheduler、bot 和旧 mcp 容器（容器保留，不删除）→ 切换到指定提交并核对 tree → 启动 app、console → 检查 `/health`、8002 与兼容端口上的登录页、旧 `/mcp` 返回 410 → 启动 scheduler、bot → 核对消息与任务表行数没有减少。任何一步失败都会停下并打印回滚命令。
+
+以下检查会让脚本拒绝执行（`--force` 可跳过后两项）：
+
+- 目标提交不在服务器仓库，或其 tree 与测试通过的 tree 不一致。
+- `jx-alert-app` 或 `jx-alert-bot` 镜像不存在、目标 Compose 文件校验失败、数据库容器未运行。
+- 仓库里有被修改的受跟踪文件。
+- 旧版本仍有 6 小时内开始、状态为 RUNNING 的任务（例如 18:30 的采集）。
+
+### 1. 把提交带到服务器
+
+代码在 GitHub 上时，在服务器执行 `git fetch origin`。仅在本地的提交用 git bundle 传送（服务器已有 `29055f7`，bundle 只含之后的提交）：
+
+```powershell
+# 工作站（PowerShell）
+git bundle create $env:TEMP\jx-sparkx.bundle 29055f7..local/sparkx-only
+git rev-parse local/sparkx-only; git rev-parse "local/sparkx-only^{tree}"   # 记下提交与 tree
+scp $env:TEMP\jx-sparkx.bundle ubuntu@43.153.88.94:/tmp/
 ```
 
-3. Nginx：按 `deploy/jxmcp.pacefitday.com.conf` 只保留 `/console` 反代到 8002，`nginx -t` 通过后重新加载。
-4. 管理台按 [首次配置顺序](CONSOLE.md#首次配置顺序) 配置并预览，确认后再开启通知。
+```sh
+# 服务器
+cd /opt/jx-alert-system
+sudo git -c safe.directory=$PWD bundle verify /tmp/jx-sparkx.bundle
+sudo git -c safe.directory=$PWD fetch /tmp/jx-sparkx.bundle local/sparkx-only:refs/jx/sparkx-only
+```
 
-兼容性：
+### 2. 预检，再执行
 
-- 现有 `runtime-settings.json` 中领星、MCP、Excel 等旧字段会被忽略（不改写文件）；`mcp_public_url`、`mcp_owner_credentials_file`、`mcp_forwarded_allow_ips` 自动作为管理台设置使用。环境变量 `MCP_PUBLIC_URL` 等同 `CONSOLE_PUBLIC_URL`。
-- 原所有者口令文件 `data/secrets/mcp-owner.json` 继续用于管理台登录。
-- 数据库只新增、不删除：领星时期的表（`stores`、`daily_metrics`、`campaigns` 等）原样保留，不再写入；`notification_outbox`、`notification_logs`、`sync_jobs` 继续使用。
-- 发送队列里领星时期的待发消息不会发送，标记为「已跳过」保留。
-- `feishu-routing.json` 的群、总负责人、广告负责人原样沿用；旧的按领星店铺 ID 的负责人映射保留，只用于「采用全部建议运营」。
+```sh
+SHA=<提交>; TREE=<tree>
+sudo git -c safe.directory=/opt/jx-alert-system -C /opt/jx-alert-system show $SHA:deploy/upgrade.sh | sudo tee /tmp/jx-upgrade.sh >/dev/null
+sudo bash /tmp/jx-upgrade.sh --dry-run $SHA $TREE      # 只读：检查并打印计划
+sudo nohup bash /tmp/jx-upgrade.sh $SHA $TREE > /tmp/jx-upgrade.log 2>&1 < /dev/null &
+tail -f /tmp/jx-upgrade.log                            # SSH 断开不影响脚本
+```
 
-## 回滚
+### 3. 升级后
 
-1. `git checkout` 回到升级前的版本（代码回滚不删除新文件和新记录）。
-2. `sudo docker compose -p jx-alert ... up -d mcp scheduler console bot` 恢复旧服务；恢复旧 Nginx 配置后 `nginx -t` 并重新加载。
-3. 新增的 `data/sparkx-stores.json`、`data/jx-notifications.json` 与 `sync_jobs` 中的新记录保留，不影响旧版本。
-4. 从不删除 Docker 数据卷。
+所有通知默认关闭，升级本身不会发送任何消息。按 [管理台首次配置顺序](CONSOLE.md#首次配置顺序) 保存 SparkX Token、指定店铺运营、预览，再开启通知。问答机器人在 SparkX Token 保存前会回复「尚未配置 SparkX MCP Token」。
+
+## 回滚（`deploy/rollback.sh`）
+
+```sh
+sudo cp /opt/jx-alert-system/deploy/rollback.sh /tmp/jx-rollback.sh
+sudo bash /tmp/jx-rollback.sh <升级前的提交>   # 升级日志和 backups/pre-sparkx-*/previous-commit 中都有
+```
+
+脚本先停止新的 scheduler、bot、console（释放兼容端口），切回旧提交，用现有镜像启动 app、mcp、console（旧版 console 用 `jx-alert-console:latest`），健康后再启动 scheduler、bot。数据库、数据卷、`data/` 以及新版本建立的 `data/sparkx-stores.json`、`data/jx-notifications.json` 都保留，不影响旧版本。如果 Nginx 曾换成精简配置，恢复修改前的配置并 `nginx -t` 后重新加载。
+
+需要恢复数据库时使用升级前的备份 `backups/pre-sparkx-<时间>/jxalert.sql.gz`；回滚代码本身不需要恢复数据库。

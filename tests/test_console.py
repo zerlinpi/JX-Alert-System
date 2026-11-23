@@ -101,6 +101,15 @@ def test_store_directory_lists_the_roster_and_saves_verified_operators(console, 
     assert stale.status_code == 409
 
 
+def test_existing_vhost_routes_reach_a_clear_answer(console):
+    root = console.get("/", follow_redirects=False)
+    assert root.status_code == 302 and root.headers["location"] == "/console/"
+    for path in ("/mcp", "/authorize", "/oauth/owner", "/.well-known/oauth-protected-resource/mcp"):
+        response = console.post(path) if path == "/mcp" else console.get(path)
+        assert response.status_code == 410 and "SparkX MCP" in response.json()["error"]
+    assert console.get("/anything-else").status_code == 404
+
+
 def test_live_preview_is_read_only(console, session_factory):
     headers = login(console)
     preview = console.post("/console/api/reports/preview", json={"lane": "daily"}, headers=headers)
