@@ -284,7 +284,8 @@ def company_snapshot(db, scope, confirmed_zones, *, now, operators=None, exclude
             subset = [row for row in members if row["currency"] == code] if code else []
             operator_rows.append({"operator": label, "currency": code, "store_total": len(members),
                                   **_aggregate(subset)})
-    orders, orders_n = _metric_sum(rows, "business", "orders")
+    # A store listed as excluded contributes nothing anywhere, including the count total.
+    orders, orders_n = _metric_sum([row for row in rows if row["currency"]], "business", "orders")
     return {
         "date": latest.isoformat(), "mature_date": mature.isoformat(),
         "store_count": len(scope), "excluded_store_count": excluded_store_count,

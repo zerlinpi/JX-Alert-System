@@ -2,6 +2,7 @@ from datetime import datetime, time, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -189,14 +190,14 @@ def test_incomplete_evidence_is_listed_and_never_counted_as_zero(runtime, reason
         assert usd["store_count"] == 1
         assert usd["values"] == pytest.approx(dict(sales=100, orders=10, spend=20, tacos=20 / 100,
                                                    ppc=20 / 10, acos=30 / 100, cvr=2 / 10))
-        # Orders are a count: a store with proven orders but no sales currency still counts.
-        assert snapshot["company_orders"] == (30 if reason == "invalid_scope_zone" else 120)
-        assert "未计入：Synthetic-2（" in plain
+        # An excluded store contributes nothing, not even its separately proven order count.
+        assert snapshot["company_orders"] == 30 and snapshot["orders_covered"] == 2
+        assert re.search(r"未计入：[^；\n]+（1 家）：Synthetic-2", plain)
     else:
         assert snapshot["company_orders"] == 120 and snapshot["issues"] == []
         expected_gaps = [] if reason == "zero_denominator" else ["2"]
         assert [row["sid"] for row in snapshot["gaps"]] == expected_gaps
-        assert ("部分指标未计入：Synthetic-2（" in plain) is bool(expected_gaps)
+        assert bool(re.search(r"部分指标未计入：[^；\n]+（1 家）：Synthetic-2", plain)) is bool(expected_gaps)
         if reason in {"pre_maturity", "zero_denominator"}:
             assert usd["values"]["spend"] == 60
             if reason == "pre_maturity":
@@ -322,7 +323,7 @@ def test_scope_follows_active_company_stores_and_lists_exclusions(runtime, chang
     if change in {"paused_store", "collection_paused", "approved_subset"}:
         assert "另有 1 家未纳入统计" in plain
     if change == "scope_expanded":
-        assert "未计入：4（尚未同步店铺资料）" in plain
+        assert "未计入：尚未同步店铺资料（1 家）：4" in plain
 
 
 def test_scheduler_registered_for_exact_0830_and_09_lane_preserved(runtime, monkeypatch):

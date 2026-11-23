@@ -29,7 +29,6 @@ _OPTIONAL = {"name", "store_ids", "updated_at"}
 _LABELS = {"sales": "销售额", "orders": "订单量¹", "spend": "广告花费（SP/SB/SD）",
            "acos": "ACOS", "tacos": "TACOS", "cvr": "CVR（仅 SP 点击转化率）",
            "ppc": "PPC（CPC，单次点击花费）"}
-_NOTE_LIMIT = 900
 
 
 def is_company_digest(key, payload):
@@ -200,18 +199,21 @@ def _metric_text(name, value, code):
     return f"{value:,.2f} {code}" if code else f"{value:,.2f}"
 
 
-def _join_limited(parts, limit=_NOTE_LIMIT):
-    shown, size = [], 0
-    for part in parts:
-        if size + len(part) > limit and shown:
-            break
-        shown.append(part)
-        size += len(part) + 1
-    text = "；".join(shown)
-    return text + (f"；等共 {len(parts)} 家" if len(shown) < len(parts) else "")
+def _reason_lines(rows, field, names_limit):
+    """Group stores by reason: '领星授权异常（4 家）：A、B、C、D'."""
+    grouped = {}
+    for row in rows:
+        reasons = row[field] if isinstance(row[field], list) else [row[field]]
+        for reason in reasons:
+            grouped.setdefault(reason, []).append(row["name"])
+    lines = []
+    for reason, names in grouped.items():
+        shown = "、".join(names[:names_limit]) + (" 等" if len(names) > names_limit else "")
+        lines.append(f"{reason}（{len(names)} 家）：{shown}")
+    return "；".join(lines)
 
 
-def company_card(snapshot, *, include_operators=True, gap_limit=_NOTE_LIMIT):
+def company_card(snapshot, *, include_operators=True, names_limit=12):
     order_label = "订单量¹"
     across = snapshot["company_orders"]
     total = snapshot["store_count"]
@@ -255,11 +257,9 @@ def company_card(snapshot, *, include_operators=True, gap_limit=_NOTE_LIMIT):
                          ["运营", "ACOS", "CVR", "覆盖店数"], mature))
     notes = []
     if snapshot.get("issues"):
-        notes.append("未计入：" + _join_limited(
-            [f"{row['name']}（{row['issue']}）" for row in snapshot["issues"]], gap_limit))
+        notes.append("未计入：" + _reason_lines(snapshot["issues"], "issue", names_limit))
     if snapshot.get("gaps"):
-        notes.append("部分指标未计入：" + _join_limited(
-            [f"{row['name']}（{'、'.join(row['gaps'])}）" for row in snapshot["gaps"]], gap_limit))
+        notes.append("部分指标未计入：" + _reason_lines(snapshot["gaps"], "gaps", names_limit))
     notes += [
         "合计和比率只含具备完整依据的店铺；未覆盖店铺不按 0 计，— 表示没有可用依据或分母为零。",
         "¹ 订单量为按 ASIN 商品汇总，非唯一订单去重；不同币种不换算、不合计。",
@@ -275,7 +275,7 @@ def company_card(snapshot, *, include_operators=True, gap_limit=_NOTE_LIMIT):
 
 def fitted_company_card(snapshot):
     """Prefer the full card; shorten store lists, then drop the operator tables to fit."""
-    for options in ({}, {"gap_limit": 300}, {"include_operators": False, "gap_limit": 300}):
+    for options in ({}, {"names_limit": 4}, {"include_operators": False, "names_limit": 4}):
         value = company_card(snapshot, **options)
         if card_fits(value):
             return value
