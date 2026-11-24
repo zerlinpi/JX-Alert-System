@@ -52,6 +52,8 @@ main() {
   else
     compose "${profiles[@]}" -- up -d --no-build app console
   fi
+  # app kept running through the checkout and mounts ./src: restart it on the previous code.
+  compose "${profiles[@]}" -- restart app
   wait_for 90 "app /health" healthy || fail "app did not become healthy at $previous"
   compose "${profiles[@]}" -- up -d --no-build scheduler bot
   sleep 10

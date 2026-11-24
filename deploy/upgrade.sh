@@ -142,6 +142,9 @@ main() {
   [[ "$(repo_git rev-parse 'HEAD^{tree}')" == "$tree" ]] || fail "checked-out tree differs from $tree"
   say "ok: code at $target"
   compose up -d --no-build app console
+  # app and console mount ./src; an unchanged running container is left alone by "up -d",
+  # so restart them to load the code just checked out.
+  compose restart app console
   local rollback="sudo cp $REPO/deploy/rollback.sh /tmp/jx-rollback.sh && sudo bash /tmp/jx-rollback.sh $previous"
   wait_for 90 "app /health reports data_source=sparkx" health_is_sparkx || fail "app is not healthy; rollback: $rollback"
   local host

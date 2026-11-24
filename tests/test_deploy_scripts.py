@@ -38,6 +38,14 @@ def test_upgrade_requires_the_tested_tree_and_stops_senders_before_switching():
     order = [text.index(marker) for marker in (
         'rev-parse "$target^{tree}")" == "$tree"', "mariadb-dump", "compose stop scheduler bot",
         'docker stop "$MCP_CONTAINER"', "checkout --quiet --detach", "up -d --no-build app console",
-        "up -d --no-build scheduler bot")]
+        "compose restart app console", "up -d --no-build scheduler bot")]
     assert order == sorted(order)
     assert "if ((dry_run)); then" in text and text.index("if ((dry_run)); then") < text.index("mariadb-dump")
+
+
+def test_services_that_mount_the_code_are_restarted_after_the_checkout():
+    """app and console keep running through a switch; "up -d" alone would leave the old code loaded."""
+    upgrade = (DEPLOY / "upgrade.sh").read_text(encoding="utf-8")
+    assert upgrade.index("checkout --quiet --detach") < upgrade.index("compose restart app console")
+    rollback = (DEPLOY / "rollback.sh").read_text(encoding="utf-8")
+    assert rollback.index("checkout --quiet --detach") < rollback.index('-- restart app') < rollback.index('"app /health"')
