@@ -24,6 +24,16 @@ def write_private(path, value):
         os.chmod(path, 0o600)
 
 
+@pytest.fixture(autouse=True)
+def fresh_tool_catalog():
+    """The SparkX tool catalog is cached per token for 30 minutes; every test starts without it."""
+    from jx_alert.ai import agent
+
+    agent._catalog.clear()
+    yield
+    agent._catalog.clear()
+
+
 @pytest.fixture
 def session_factory():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -55,4 +65,5 @@ def settings(tmp_path, routing):
                     notification_settings_file=str(tmp_path / "jx-notifications.json"),
                     deepseek_credentials_file=str(secrets / "deepseek.json"),
                     runtime_settings_file=str(tmp_path / "runtime-settings.json"),
-                    sparkx_ai_token="synthetic-sparkx-token", deepseek_api_key="")
+                    sparkx_skills_dir=str(tmp_path / "sparkx-skills"),
+                    sparkx_ai_token="synthetic-sparkx-token", deepseek_api_key="sk-synthetic-deepseek")

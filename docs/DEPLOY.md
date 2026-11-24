@@ -23,7 +23,7 @@
 
 ## 升级（`deploy/upgrade.sh`）
 
-脚本依次执行：只读检查 → 备份数据库与 `data/*.json` → 停止 scheduler、bot 和旧 mcp 容器（容器保留，不删除）→ 切换到指定提交并核对 tree → 启动 app、console → 检查 `/health`、8002 与兼容端口上的登录页、旧 `/mcp` 返回 410 → 启动 scheduler、bot → 核对消息与任务表行数没有减少。任何一步失败都会停下并打印回滚命令。
+脚本依次执行：只读检查 → 备份数据库与 `data/*.json` → 停止 scheduler、bot 和旧 mcp 容器（容器保留，不删除）→ 切换到指定提交并核对 tree → 启动 app、console → 检查 `/health`、8002 与兼容端口上的登录页、旧 `/mcp` 返回 410 → 从 GitHub 安装 SparkX 官方只读 Skills 到 `data/sparkx-skills/`（失败只警告，之后可在管理台安装）→ 启动 scheduler、bot → 核对消息与任务表行数没有减少。任何一步失败都会停下并打印回滚命令。
 
 以下检查会让脚本拒绝执行（`--force` 可跳过后两项）：
 
@@ -34,21 +34,15 @@
 
 ### 1. 把提交带到服务器
 
-代码在 GitHub 上时，在服务器执行 `git fetch origin`。仅在本地的提交用 git bundle 传送（服务器已有 `29055f7`，bundle 只含之后的提交）：
-
-```powershell
-# 工作站（PowerShell）
-git bundle create $env:TEMP\jx-sparkx.bundle 29055f7..local/sparkx-only
-git rev-parse local/sparkx-only; git rev-parse "local/sparkx-only^{tree}"   # 记下提交与 tree
-scp $env:TEMP\jx-sparkx.bundle ubuntu@43.153.88.94:/tmp/
-```
+推送到 GitHub 的分支在服务器上直接拉取（仓库为公开仓库，不需要凭据）：
 
 ```sh
-# 服务器
 cd /opt/jx-alert-system
-sudo git -c safe.directory=$PWD bundle verify /tmp/jx-sparkx.bundle
-sudo git -c safe.directory=$PWD fetch /tmp/jx-sparkx.bundle local/sparkx-only:refs/jx/sparkx-only
+sudo git -c safe.directory=$PWD fetch origin feat/sparkx-deepseek-agent
+sudo git -c safe.directory=$PWD rev-parse FETCH_HEAD "FETCH_HEAD^{tree}"   # 与测试通过的提交、tree 核对
 ```
+
+没有推送的本地提交可以用 git bundle 传送：工作站 `git bundle create <文件> <服务器已有的提交>..<分支>`，复制到服务器后 `git bundle verify`，再 `git fetch <文件> <分支>:refs/jx/<名称>`。
 
 ### 2. 预检，再执行
 
@@ -62,7 +56,9 @@ tail -f /tmp/jx-upgrade.log                            # SSH 断开不影响脚�
 
 ### 3. 升级后
 
-三条通知默认开启，但 SparkX Token 保存之前不会运行，所以升级本身不会发送消息。保存 Token 后：实时监控最迟约 10 分钟内开始发到通知群（北京时间 09:00–24:00），日报和复盘在 08:30–10:00 之间发送；没有指定运营的店铺照常通知，不 @ 人。想先核对内容：先在「通知设置」关闭通知，再保存 Token，预览确认后重新打开（预览需要 Token）。按 [管理台首次配置顺序](CONSOLE.md#首次配置顺序) 操作。问答机器人在 SparkX Token 保存前会回复「尚未配置 SparkX MCP Token」。
+三条通知默认开启，SparkX Token 和 DeepSeek Key 都保存后才运行。两者已保存时，升级后实时监控最迟约 10 分钟内开始发到通知群（北京时间 09:00–24:00），日报和复盘在下一个 08:30–10:00 生成；没有指定运营的店铺照常通知，不 @ 人。想先核对内容：先在「通知与报告」关闭通知，预览确认后重新打开。按 [管理台首次配置顺序](CONSOLE.md#首次配置顺序) 操作。飞书机器人在 SparkX 未配置时仍可聊天，只是查不了数据。
+
+升级前可以在服务器上做只读演练：把目标提交的 `src` 解压到临时目录，用现有 `jx-alert-app` 镜像挂载它和只读的 `data/`，运行 `scripts/preview_reports.py <daily|review|hourly>`，DeepSeek 会真实调用 SparkX 生成卡片文本，但不排队、不发送。
 
 ## 回滚（`deploy/rollback.sh`）
 

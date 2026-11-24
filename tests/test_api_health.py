@@ -9,7 +9,7 @@ def test_health_reports_sources_without_secrets(monkeypatch, settings, session_f
     monkeypatch.setattr(api, "get_settings", lambda: settings)
     with TestClient(api.app) as client:
         body = client.get("/health").json()
-    assert body == {"status": "ok", "service": "jx-alert-system", "data_source": "sparkx", "dry_run": False,
-                    "scheduler_enabled": False, "feishu_delivery_enabled": True, "sparkx_configured": True,
-                    "deepseek_configured": False}
-    assert "synthetic-sparkx-token" not in str(body)
+    assert body == {"status": "ok", "service": "jx-alert-system", "data_source": "sparkx", "analysis": "deepseek_agent",
+                    "dry_run": False, "scheduler_enabled": False, "feishu_delivery_enabled": True,
+                    "sparkx_configured": True, "deepseek_configured": True, "sparkx_skills": None}
+    assert "synthetic-sparkx-token" not in str(body) and "sk-synthetic" not in str(body)

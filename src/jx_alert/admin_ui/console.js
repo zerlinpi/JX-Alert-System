@@ -1,5 +1,5 @@
 "use strict";
-/* JX owner console. All provider and Feishu text is rendered with textContent only. */
+/* JX owner console. All provider, model and Feishu text is rendered with textContent only. */
 (function (root, factory) {
   const api = factory();
   if (typeof module === "object" && module.exports) module.exports = api;
@@ -12,22 +12,22 @@
   const LANES = {
     daily: { label: "08:30 广告日报", when: "每天 08:30" },
     review: { label: "广告异常复盘", when: "每天 08:30（可选仅周一）" },
-    hourly: { label: "实时监控", when: "每小时（发送时段内）" },
+    hourly: { label: "每小时实时监控", when: "发送时段内每小时" },
   };
   const OUTBOX = {
-    DELIVERED: ["已送达", "ok"], PENDING: ["等待发送", ""], RETRY: ["等待重试", "warn"],
-    PRE_SEND_RETRY: ["等待重试", "warn"], PREPARING: ["发送中", ""], SUBMITTING: ["发送中", ""],
-    SENDING: ["发送中", ""], DELIVERY_UNKNOWN: ["可能已提交（不自动重发）", "warn"], SKIPPED: ["已跳过", ""],
+    DELIVERED: ["已送达", "ok"], PENDING: ["等待发送", "info"], RETRY: ["等待重试", "warn"],
+    PRE_SEND_RETRY: ["等待重试", "warn"], PREPARING: ["发送中", "info"], SUBMITTING: ["发送中", "info"],
+    SENDING: ["发送中", "info"], DELIVERY_UNKNOWN: ["可能已提交（不自动重发）", "warn"], SKIPPED: ["已跳过", ""],
     EXPIRED: ["已过发送时段", ""], DEAD: ["发送失败", "bad"], REJECTED: ["飞书拒绝", "bad"],
   };
   const RUNS = { SUCCEEDED: ["成功", "ok"], FAILED: ["失败", "bad"], SKIPPED: ["跳过", "warn"] };
-  const NARRATIVE = { deepseek: "DeepSeek 撰写", rules: "系统规则", unavailable: "DeepSeek 不可用，规则兜底",
-                      rejected: "DeepSeek 未通过核对，规则兜底" };
-  const TOGGLES = { daily: ["enabled", "to_group", "to_lead", "ai"],
-                    review: ["enabled", "to_group", "mention_operators", "to_lead", "to_operators", "ai", "weekly"],
+  const TOGGLES = { daily: ["enabled", "to_group", "to_lead"],
+                    review: ["enabled", "to_group", "mention_operators", "to_lead", "to_operators", "weekly"],
                     hourly: ["enabled", "to_group", "mention_operators", "to_lead", "to_operators"] };
   const NUMBERS = ["start_hour", "end_hour", "high_spend", "low_spend", "min_clicks", "acos_high", "cvr_low",
                    "acos_good", "min_orders_good"];
+  const INTEGERS = ["start_hour", "end_hour", "min_clicks", "min_orders_good"];
+  const MAX_OPERATORS = 10;
 
   function statusLabel(status) {
     const found = OUTBOX[status];
@@ -66,29 +66,62 @@
     return lines.join("\n");
   }
 
-  function filterStores(rows, query) {
-    const needle = String(query || "").trim().toLowerCase();
-    if (!needle) return rows;
-    return rows.filter((row) => [row.name, row.short_name, row.country_label, row.profile_id,
-      ...(row.operators || []).map((person) => person.name)].some((value) => String(value || "").toLowerCase().includes(needle)));
+  function storeCounts(rows) {
+    const list = rows || [];
+    return { all: list.length, unmapped: list.filter((row) => row.monitored && !(row.operators || []).length).length,
+             paused: list.filter((row) => !row.monitored).length };
   }
 
-  function lanePayload(values) {
+  function filterStores(rows, query, kind) {
+    const needle = String(query || "").trim().toLowerCase();
+    return (rows || []).filter((row) => {
+      if (kind === "unmapped" && !(row.monitored && !(row.operators || []).length)) return false;
+      if (kind === "paused" && row.monitored) return false;
+      if (!needle) return true;
+      return [row.name, row.short_name, row.country_label, row.profile_id, ...(row.operators || []).map((person) => person.name)]
+        .some((value) => String(value || "").toLowerCase().includes(needle));
+    });
+  }
+
+  function promptValue(text, fallback) {
+    const value = String(text || "").trim();
+    return value === String(fallback || "").trim() ? "" : value;
+  }
+
+  function lanePayload(values, defaults) {
     const lanes = {};
     for (const [lane, keys] of Object.entries(TOGGLES)) {
       lanes[lane] = {};
       for (const key of keys) lanes[lane][key] = Boolean(values[lane] && values[lane][key]);
+      lanes[lane].prompt = promptValue(values[lane] && values[lane].prompt, defaults && defaults[lane]);
+      if (lanes[lane].prompt.length > 4000) throw new Error("任务说明不能超过 4000 字。");
     }
     for (const key of NUMBERS) {
       const raw = values.hourly ? values.hourly[key] : undefined;
       const number = Number(raw);
-      if (raw === "" || raw === undefined || !Number.isFinite(number)) throw new Error("请填写完整的监控阈值。");
-      lanes.hourly[key] = ["start_hour", "end_hour", "min_clicks", "min_orders_good"].includes(key)
-        ? Math.trunc(number) : number;
+      if (raw === "" || raw === undefined || raw === null || !Number.isFinite(number)) throw new Error("请填写完整的监控阈值。");
+      lanes.hourly[key] = INTEGERS.includes(key) ? Math.trunc(number) : number;
     }
     if (lanes.hourly.start_hour >= lanes.hourly.end_hour) throw new Error("发送时段的开始须早于结束。");
     if (lanes.hourly.low_spend >= lanes.hourly.high_spend) throw new Error("低花费起算须小于高花费线。");
     return lanes;
+  }
+
+  function setupSteps(overview) {
+    const data = overview || {};
+    const sparkx = data.sparkx || {}, deepseek = data.deepseek || {}, feishu = data.feishu || {};
+    const skills = data.skills || {}, stores = data.stores || {};
+    return [
+      { key: "sparkx", title: "保存 SparkX MCP Token", detail: "DeepSeek 通过它读取广告数据（只读）", done: Boolean(sparkx.configured), view: "sparkx" },
+      { key: "skills", title: "安装 SparkX 官方 Skills", detail: "让 DeepSeek 按官方方法查询和分析", done: Boolean(skills.installed), view: "sparkx" },
+      { key: "deepseek", title: "配置 DeepSeek", detail: "三条通知和飞书问答都由 DeepSeek 完成", done: Boolean(deepseek.configured), view: "deepseek" },
+      { key: "recipients", title: "确认通知群和负责人", detail: "通知群、总负责人、广告负责人",
+        done: Boolean(feishu.group && feishu.company_lead && feishu.ad_lead), view: "notifications" },
+      { key: "operators", title: "为店铺指定运营（可选）", detail: "指定后群消息会 @ 出问题店铺的运营",
+        done: Boolean(stores.mapped), view: "stores", optional: true },
+      { key: "delivery", title: "开启飞书发送", detail: "服务器配置 FEISHU_ENABLED、APP_DRY_RUN、SCHEDULER_ENABLED",
+        done: Boolean(feishu.delivery_enabled && feishu.scheduler_enabled), view: null },
+    ];
   }
 
   function start(doc, win) {
@@ -96,8 +129,11 @@
     doc.documentElement.dataset.jxStarted = "1";
     const $ = (id) => doc.getElementById(id);
     const csrf = doc.querySelector('meta[name="jx-console-csrf"]').content;
-    const state = { stores: null, members: null, picker: null, lead: null, reports: null, recipients: null, groups: null };
+    const state = { view: "overview", overview: null, stores: null, filter: "all", selected: new Set(), members: null,
+                    dialog: null, reports: null, saved: null, recipients: null, groups: null, sparkx: null,
+                    deepseek: null, preview: null };
 
+    // ---------------------------------------------------------------- helpers
     function el(tag, text, className) {
       const node = doc.createElement(tag);
       if (text !== undefined && text !== null) node.textContent = String(text);
@@ -107,6 +143,11 @@
 
     function badge(label) {
       return el("span", label.text, "badge" + (label.tone ? " " + label.tone : ""));
+    }
+
+    function setBadge(node, label) {
+      node.textContent = label.text;
+      node.className = "badge" + (label.tone ? " " + label.tone : "");
     }
 
     function row(cells) {
@@ -138,6 +179,13 @@
       node.hidden = !text;
     }
 
+    function toast(text, tone) {
+      const node = el("div", text, "toast" + (tone ? " " + tone : ""));
+      node.setAttribute("role", tone === "error" ? "alert" : "status");
+      $("toasts").append(node);
+      win.setTimeout(() => node.remove(), tone === "error" ? 7000 : 3500);
+    }
+
     async function api(path, options) {
       const init = { method: (options && options.method) || "GET", credentials: "same-origin", headers: {} };
       if (init.method === "POST") {
@@ -153,47 +201,109 @@
       return data;
     }
 
-    async function guarded(statusId, action, busy) {
-      if (busy) busy.disabled = true;
+    async function guarded(action, busy) {
+      if (busy) { busy.disabled = true; busy.setAttribute("aria-busy", "true"); }
       try { return await action(); }
-      catch (error) { notice(statusId, error.message, "error"); return null; }
-      finally { if (busy) busy.disabled = false; }
+      catch (error) { toast(error.message, "error"); return null; }
+      finally { if (busy) { busy.disabled = false; busy.removeAttribute("aria-busy"); } }
     }
 
+    // ---------------------------------------------------------------- dialogs
+    function openOverlay(id, focus) {
+      const overlay = $(id);
+      overlay.hidden = false;
+      const target = focus || overlay.querySelector("input, select, textarea, button");
+      if (target && target.focus) target.focus();
+    }
+
+    function closeOverlay(id) {
+      $(id).hidden = true;
+      if (id === "preview-drawer" && state.preview) state.preview.closed = true;
+    }
+
+    for (const overlay of doc.querySelectorAll(".overlay")) {
+      overlay.addEventListener("click", (event) => {
+        if (event.target === overlay || event.target.closest("[data-close]")) closeOverlay(overlay.id);
+      });
+    }
+    doc.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      for (const overlay of doc.querySelectorAll(".overlay")) if (!overlay.hidden) closeOverlay(overlay.id);
+    });
+
     // ---------------------------------------------------------------- overview
-    function card(title, value, detail, tone) {
-      const node = el("article", null, "card");
-      node.append(el("h2", title));
-      const strong = el("strong", value);
-      if (tone) strong.append(" ", badge({ text: tone.text, tone: tone.tone }));
-      node.append(strong, el("span", detail, "detail"));
+    function stat(title, value, detail, tone, view) {
+      const node = el("article", null, "stat");
+      const head = el("div", null, "stat-head");
+      head.append(el("h2", title));
+      if (tone) head.append(badge(tone));
+      node.append(head, el("strong", value), el("span", detail, "detail"));
+      if (view) {
+        const link = el("button", "设置", "button ghost small link");
+        link.type = "button";
+        link.addEventListener("click", () => show(view));
+        node.append(link);
+      }
       return node;
     }
 
+    function renderSetup(data) {
+      const steps = setupSteps(data);
+      const required = steps.filter((step) => !step.optional);
+      const done = required.filter((step) => step.done).length;
+      $("setup-panel").hidden = done === required.length;
+      setBadge($("setup-progress"), { text: `已完成 ${done}/${required.length}`, tone: done === required.length ? "ok" : "info" });
+      $("setup-steps").replaceChildren(...steps.map((step, index) => {
+        const item = el("li", null, "step" + (step.done ? " done" : ""));
+        const text = doc.createElement("div");
+        text.append(el("strong", step.title), el("span", step.detail, "muted"));
+        let action;
+        if (step.done) action = badge({ text: "已完成", tone: "ok" });
+        else if (step.view) {
+          action = el("button", "去设置", "button secondary small");
+          action.type = "button";
+          action.addEventListener("click", () => show(step.view));
+        } else action = badge({ text: "需服务器配置", tone: "warn" });
+        item.append(el("span", step.done ? "✓" : String(index + 1), "step-mark"), text, action);
+        return item;
+      }));
+    }
+
+    function laneResult(last) {
+      if (!last) return "—";
+      const parts = [runLabel(last.status).text];
+      if (last.queued) parts.push(`排队 ${last.queued} 条`);
+      if (last.findings !== undefined && last.findings !== null) parts.push(`提醒 ${last.findings} 个`);
+      if (last.sparkx_calls) parts.push(`查询 SparkX ${last.sparkx_calls} 次`);
+      if (last.message) parts.push(last.message);
+      return parts.join("；");
+    }
+
     async function loadOverview() {
-      const data = await guarded("global-status", () => api("/console/api/overview"));
+      const data = await guarded(() => api("/console/api/overview"));
       if (!data) return;
-      notice("global-status", "");
+      state.overview = data;
       const sparkx = data.sparkx || {}, deepseek = data.deepseek || {}, feishu = data.feishu || {}, stores = data.stores || {};
+      const skills = data.skills || {};
+      renderSetup(data);
       $("status-cards").replaceChildren(
-        card("SparkX MCP", sparkx.configured ? "已配置" : "未配置",
-          sparkx.configured ? (sparkx.token_source === "console" ? "Token 来自控制台" : "Token 来自环境变量") : "请在「SparkX 连接」保存 Token",
-          sparkx.configured ? { text: "只读", tone: "ok" } : { text: "待配置", tone: "warn" }),
-        card("DeepSeek", deepseek.configured ? (deepseek.model || "已配置") : "未配置",
-          deepseek.configured ? "撰写须知、复盘建议与飞书问答" : "未配置时使用系统规则文字",
-          deepseek.configured ? null : { text: "待配置", tone: "warn" }),
-        card("飞书发送", feishu.delivery_enabled ? "已开启" : (feishu.dry_run ? "演练模式（不发送）" : "未开启"),
-          "通知群：" + (feishu.group || "未设置") + (feishu.bot_enabled ? " · 问答机器人已开启" : ""),
-          feishu.delivery_enabled ? { text: "正常", tone: "ok" } : { text: "不发送", tone: "warn" }),
-        card("店铺", `${stores.monitored || 0} / ${stores.authorized || 0}`,
-          `监控 / Token 授权；${stores.mapped || 0} 家已指定运营；店铺列表更新于 ${formatTime(stores.roster_at)}`));
+        stat("SparkX MCP", sparkx.configured ? "已连接" : "未配置",
+          skills.installed ? `官方 Skills ${skills.release || ""}（${skills.count} 个）` : "官方 Skills 未安装",
+          sparkx.configured ? { text: "只读", tone: "ok" } : { text: "待配置", tone: "warn" }, "sparkx"),
+        stat("DeepSeek", deepseek.configured ? (deepseek.model || "已配置") : "未配置",
+          deepseek.configured ? (deepseek.thinking === false ? "深度思考已关闭" : "深度思考已开启") : "未配置时三条通知不会运行",
+          deepseek.configured ? { text: "可用", tone: "ok" } : { text: "待配置", tone: "warn" }, "deepseek"),
+        stat("飞书发送", feishu.delivery_enabled ? "已开启" : (feishu.dry_run ? "演练模式" : "未开启"),
+          "通知群：" + (feishu.group || "未设置") + (feishu.bot_enabled ? " · 机器人已开启" : " · 机器人未开启"),
+          feishu.delivery_enabled ? { text: "正常", tone: "ok" } : { text: "不发送", tone: "warn" }, "notifications"),
+        stat("店铺", `${stores.monitored || 0} / ${stores.authorized || 0}`,
+          `纳入通知 / Token 授权；${stores.mapped || 0} 家已指定运营；更新于 ${formatTime(stores.roster_at)}`, null, "stores"));
       const lanes = data.lanes || {};
       fill("lane-rows", Object.entries(LANES).map(([key, meta]) => {
         const lane = lanes[key] || {}, last = lane.last || null;
-        const result = last ? [runLabel(last.status).text, last.queued ? `排队 ${last.queued} 条` : "",
-          last.narrative ? NARRATIVE[last.narrative] || "" : "", last.message || ""].filter(Boolean).join("；") : "—";
-        return row([meta.label, meta.when, badge(lane.enabled ? { text: "开启", tone: "ok" } : { text: "关闭", tone: "" }),
-          last ? formatTime(last.at) : "—", result]);
+        const when = key === "hourly" && lane.start_hour !== undefined ? `每小时 ${lane.start_hour}:05–${lane.end_hour}:00` : meta.when;
+        return row([meta.label, when, badge(lane.enabled ? { text: "开启", tone: "ok" } : { text: "关闭", tone: "" }),
+          last ? formatTime(last.at) : "—", laneResult(last)]);
       }), "", 5);
       fill("recent-rows", (data.recent || []).map((item) => row([formatTime(item.created_at), item.lane, item.recipient,
         badge(statusLabel(item.status))])), "还没有发送记录。", 4);
@@ -201,47 +311,88 @@
 
     // ---------------------------------------------------------------- stores
     function chips(people, emptyText) {
-      const span = doc.createElement("span");
+      const span = el("span", null, "chips");
       if (!people || !people.length) { span.append(el("span", emptyText, "chip empty")); return span; }
-      for (const person of people) span.append(el("span", person.name || person.id || person.open_id, "chip"));
+      for (const person of people) span.append(el("span", person.name || person.id, "chip"));
       return span;
+    }
+
+    function visibleStores() {
+      return state.stores ? filterStores(state.stores.rows, $("store-search").value, state.filter) : [];
+    }
+
+    function renderBulk() {
+      const count = state.selected.size;
+      $("bulk-bar").hidden = count === 0;
+      $("bulk-count").textContent = `已选 ${count} 家店铺`;
+      const visible = visibleStores();
+      const all = $("select-all");
+      const chosen = visible.filter((store) => state.selected.has(store.profile_id)).length;
+      all.checked = visible.length > 0 && chosen === visible.length;
+      all.indeterminate = chosen > 0 && chosen < visible.length;
     }
 
     function renderStores() {
       const data = state.stores;
       if (!data) return;
-      $("roster-time").textContent = "SparkX 店铺列表更新于 " + formatTime(data.roster_at);
-      const rows = filterStores(data.rows, $("store-search").value).map((store) => {
-        const name = doc.createElement("div");
-        name.append(el("strong", store.short_name), el("div", store.name + (store.authorized ? "" : "（Token 已不再授权）"), "muted"));
-        const monitor = doc.createElement("input");
-        monitor.type = "checkbox";
-        monitor.checked = store.monitored;
-        monitor.setAttribute("aria-label", "监控 " + store.short_name);
-        monitor.addEventListener("change", () => saveStore(store, { monitored: monitor.checked }, monitor));
-        const people = doc.createElement("div");
-        people.append(chips(store.operators, "未映射运营"));
-        const edit = el("button", "编辑", "link-button");
+      $("roster-time").textContent = "店铺列表更新于 " + formatTime(data.roster_at);
+      const counts = storeCounts(data.rows);
+      for (const span of doc.querySelectorAll("[data-count]")) span.textContent = String(counts[span.dataset.count]);
+      for (const button of doc.querySelectorAll("[data-filter]")) button.setAttribute("aria-pressed", String(button.dataset.filter === state.filter));
+      const rows = visibleStores().map((store) => {
+        const check = doc.createElement("input");
+        check.type = "checkbox";
+        check.checked = state.selected.has(store.profile_id);
+        check.setAttribute("aria-label", "选择 " + store.short_name);
+        check.addEventListener("change", () => {
+          if (check.checked) state.selected.add(store.profile_id); else state.selected.delete(store.profile_id);
+          check.closest("tr").classList.toggle("selected", check.checked);
+          renderBulk();
+        });
+        const name = el("div", null, "store-name");
+        name.append(el("strong", store.short_name), el("span", store.name + (store.authorized ? "" : "（Token 已不再授权）")));
+        const toggle = el("label", null, "switch");
+        const input = doc.createElement("input");
+        input.type = "checkbox"; input.setAttribute("role", "switch"); input.checked = store.monitored;
+        input.setAttribute("aria-label", "纳入通知 " + store.short_name);
+        input.addEventListener("change", () => saveStores({ [store.profile_id]: { monitored: input.checked } }, input,
+          input.checked ? `${store.short_name} 已纳入通知。` : `${store.short_name} 已暂停通知。`));
+        toggle.append(input, el("span", null, "switch-track"));
+        const edit = el("button", "编辑运营", "button ghost small");
         edit.type = "button";
-        edit.addEventListener("click", () => openPicker(store));
-        people.append(edit);
-        return row([name, store.country_label, store.store_type === "vendor" ? "Vendor" : store.store_type === "seller" ? "Seller" : "—",
-          monitor, people]);
+        edit.addEventListener("click", () => openMembers({ mode: "operators", stores: [store] }));
+        const tr = row([check, name, store.country_label, store.store_type === "vendor" ? "Vendor" : store.store_type === "seller" ? "Seller" : "—",
+          chips(store.operators, "未映射运营"), toggle, edit]);
+        tr.cells[0].className = "col-check";
+        tr.cells[6].className = "col-actions";
+        if (check.checked) tr.classList.add("selected");
+        return tr;
       });
-      fill("store-rows", rows, data.rows.length ? "没有匹配的店铺。" : "还没有店铺：请先在「SparkX 连接」保存 Token，再点击「从 SparkX 刷新店铺」。", 5);
+      fill("store-rows", rows, data.rows.length ? "没有符合条件的店铺。" : "还没有店铺：请先在「SparkX MCP」保存 Token，再点「从 SparkX 刷新店铺」。", 7);
+      renderBulk();
     }
 
     async function loadStores() {
-      const data = await guarded("stores-status", () => api("/console/api/stores"));
-      if (data) { state.stores = data; renderStores(); }
+      const data = await guarded(() => api("/console/api/stores"));
+      if (data) {
+        state.stores = data;
+        const known = new Set(data.rows.map((store) => store.profile_id));
+        for (const key of [...state.selected]) if (!known.has(key)) state.selected.delete(key);
+        renderStores();
+      }
     }
 
-    async function saveStore(store, change, control) {
-      const operatorIds = (change.operator_ids || store.operators.map((person) => person.id));
-      const body = { revision: state.stores.revision, changes: { [store.profile_id]: {
-        monitored: change.monitored === undefined ? store.monitored : change.monitored, operator_ids: operatorIds } } };
-      const data = await guarded("stores-status", () => api("/console/api/stores/save", { method: "POST", body }), control);
-      if (data) { state.stores = data; renderStores(); notice("stores-status", "已保存 " + store.short_name + "。"); }
+    async function saveStores(changes, control, message) {
+      const rows = new Map((state.stores.rows || []).map((store) => [store.profile_id, store]));
+      const body = { revision: state.stores.revision, changes: {} };
+      for (const [key, change] of Object.entries(changes)) {
+        const store = rows.get(key);
+        if (!store) continue;
+        body.changes[key] = { monitored: change.monitored === undefined ? store.monitored : change.monitored,
+                              operator_ids: change.operator_ids || store.operators.map((person) => person.id) };
+      }
+      const data = await guarded(() => api("/console/api/stores/save", { method: "POST", body }), control);
+      if (data) { state.stores = data; renderStores(); toast(message || "已保存。"); }
       else await loadStores();
       return data;
     }
@@ -254,33 +405,48 @@
       return state.members;
     }
 
-    function renderMembers(containerId, query, selected, type, name) {
-      const container = $(containerId);
-      const needle = String(query || "").trim().toLowerCase();
+    function renderMembers() {
+      const dialog = state.dialog;
+      const container = $("member-list");
+      const needle = $("member-search").value.trim().toLowerCase();
       const items = (state.members || []).filter((person) => !needle || person.name.toLowerCase().includes(needle));
       const legend = container.querySelector("legend");
       container.replaceChildren(...(legend ? [legend] : []), ...items.map((person) => {
         const label = el("label", null, "check");
         const input = doc.createElement("input");
-        input.type = type; input.name = name; input.value = person.id; input.checked = selected.has(person.id);
+        input.type = dialog.mode === "lead" ? "radio" : "checkbox";
+        input.name = "member"; input.value = person.id; input.checked = dialog.selected.has(person.id);
         input.addEventListener("change", () => {
-          if (type === "radio") { selected.clear(); selected.add(person.id); }
-          else if (input.checked) selected.add(person.id); else selected.delete(person.id);
+          if (input.type === "radio") { dialog.selected.clear(); dialog.selected.add(person.id); }
+          else if (input.checked) dialog.selected.add(person.id); else dialog.selected.delete(person.id);
+          renderMemberHint();
         });
-        label.append(input, person.name);
+        label.append(input, doc.createTextNode(person.name));
         return label;
       }));
       if (!items.length) container.append(el("p", "没有匹配的群成员。", "muted"));
+      renderMemberHint();
     }
 
-    async function openPicker(store) {
-      try { await members(); } catch (error) { notice("stores-status", error.message, "error"); return; }
-      state.picker = { store, selected: new Set(store.operators.map((person) => person.id)) };
-      $("picker-store").textContent = store.short_name + " · " + store.country_label;
-      $("picker-search").value = "";
-      renderMembers("picker-members", "", state.picker.selected, "checkbox", "operator");
-      $("operator-picker").hidden = false;
-      $("operator-picker").scrollIntoView({ block: "nearest" });
+    function renderMemberHint() {
+      const dialog = state.dialog;
+      const count = dialog.selected.size;
+      $("member-hint").textContent = dialog.mode === "lead" ? "只能选择一位通知群成员。"
+        : `已选 ${count} 位（每家店最多 ${MAX_OPERATORS} 位）` + (dialog.stores.length > 1 ? "；保存后替换所选店铺的运营。" : "");
+    }
+
+    async function openMembers(options) {
+      try { await members(options.mode === "lead"); } catch (error) { toast(error.message, "error"); return; }
+      const initial = options.mode === "lead" ? (options.current ? [options.current.id] : [])
+        : options.stores.length === 1 ? options.stores[0].operators.map((person) => person.id) : [];
+      state.dialog = { ...options, selected: new Set(initial) };
+      $("member-dialog-title").textContent = options.mode === "lead" ? (options.kind === "company" ? "选择总负责人" : "选择广告负责人") : "指定运营";
+      $("member-dialog-subtitle").textContent = options.mode === "lead" ? "从通知群成员中选择，私聊接收。"
+        : options.stores.length === 1 ? `${options.stores[0].short_name} · ${options.stores[0].country_label}` : `批量设置 ${options.stores.length} 家店铺`;
+      $("member-clear").hidden = options.mode !== "lead";
+      $("member-search").value = "";
+      renderMembers();
+      openOverlay("member-dialog", $("member-search"));
     }
 
     // ---------------------------------------------------------------- notifications
@@ -295,24 +461,31 @@
       }
     }
 
+    function defaultPrompt(lane) {
+      return ((state.reports && state.reports.default_prompts) || {})[lane] || "";
+    }
+
+    function renderPromptState(lane) {
+      const area = doc.querySelector(`#lanes-form [data-lane="${lane}"] textarea[name="prompt"]`);
+      const custom = promptValue(area.value, defaultPrompt(lane));
+      doc.querySelector(`[data-prompt-state="${lane}"]`).textContent = custom ? "已自定义" : (defaultPrompt(lane) ? "使用默认说明" : "未填写");
+    }
+
     function renderLanes() {
       const lanes = state.reports.lanes;
       for (const section of doc.querySelectorAll("#lanes-form [data-lane]")) {
         const lane = section.dataset.lane;
-        for (const input of section.querySelectorAll("input")) {
+        for (const input of section.querySelectorAll("input, textarea")) {
           if (input.type === "checkbox") input.checked = Boolean(lanes[lane][input.name]);
+          else if (input.name === "prompt") input.value = lanes[lane].prompt || defaultPrompt(lane);
           else input.value = lanes[lane][input.name];
         }
+        section.classList.toggle("off", !lanes[lane].enabled);
+        renderPromptState(lane);
       }
-      $("lanes-updated").textContent = state.reports.updated_at ? "上次保存：" + formatTime(state.reports.updated_at) : "尚未修改，使用默认设置（全部开启）";
-    }
-
-    async function loadNotifications() {
-      const [recipients, reports] = await Promise.all([
-        guarded("notifications-status", () => api("/console/api/recipients")),
-        guarded("notifications-status", () => api("/console/api/reports"))]);
-      if (recipients) { state.recipients = recipients; renderRecipients(); }
-      if (reports) { state.reports = reports; renderLanes(); }
+      state.saved = JSON.stringify(formValues());
+      $("lanes-updated").textContent = state.reports.updated_at ? "上次保存：" + formatTime(state.reports.updated_at) : "当前为默认设置";
+      renderDirty();
     }
 
     function formValues() {
@@ -320,16 +493,26 @@
       for (const section of doc.querySelectorAll("#lanes-form [data-lane]")) {
         const lane = section.dataset.lane;
         values[lane] = {};
-        for (const input of section.querySelectorAll("input")) {
+        for (const input of section.querySelectorAll("input, textarea")) {
           values[lane][input.name] = input.type === "checkbox" ? input.checked : input.value;
         }
       }
       return values;
     }
 
-    function renderCard(container, value) {
-      container.replaceChildren();
-      if (!value) return;
+    function renderDirty() {
+      $("lanes-savebar").hidden = !state.reports || JSON.stringify(formValues()) === state.saved;
+    }
+
+    async function loadNotifications() {
+      const [recipients, reports] = await Promise.all([
+        guarded(() => api("/console/api/recipients")), guarded(() => api("/console/api/reports"))]);
+      if (recipients) { state.recipients = recipients; renderRecipients(); }
+      if (reports) { state.reports = reports; renderLanes(); }
+    }
+
+    function renderCard(value) {
+      const container = el("article", null, "feishu-card");
       const header = el("header", value.header.title.content, value.header.template || "");
       const body = el("div", null, "card-body");
       for (const element of value.body.elements) {
@@ -354,22 +537,59 @@
         } else if (element.tag === "hr") body.append(doc.createElement("hr"));
       }
       container.append(header, body);
+      return container;
+    }
+
+    function previewInfo(info) {
+      return [info.report_date ? "数据日 " + info.report_date : "", info.window ? "近 7 日 " + info.window.join(" ~ ") : "",
+        info.day ? "美西 " + info.day : "", info.profiles !== undefined ? `店铺 ${info.profiles} 家` : "",
+        info.sparkx_calls !== undefined && info.sparkx_calls !== null ? `SparkX 查询 ${info.sparkx_calls} 次` : "",
+        info.findings !== undefined ? `提醒 ${info.findings} 个` : "", info.seconds !== undefined ? `用时 ${info.seconds} 秒` : "",
+        info.model || ""].filter(Boolean).join(" · ");
+    }
+
+    function showPreview(result) {
+      $("preview-progress").hidden = true;
+      const cards = result.cards || [];
+      $("preview-info").textContent = previewInfo(result.info || {});
+      $("preview-cards").replaceChildren(...(cards.length ? cards.map(renderCard) : [el("p", result.text || "没有内容。", "muted")]));
+      $("preview-text").textContent = result.text || "";
+      $("preview-plain").hidden = !cards.length;
+    }
+
+    async function pollPreview(job, started) {
+      const current = state.preview;
+      while (current && !current.closed && state.preview === current) {
+        await new Promise((resolve) => win.setTimeout(resolve, current.interval));
+        if (current.closed || state.preview !== current) return;
+        let data;
+        try { data = await api("/console/api/reports/preview?job=" + encodeURIComponent(job)); }
+        catch (error) { $("preview-progress").hidden = true; notice("preview-error", error.message, "error"); return; }
+        if (data.status === "running") {
+          $("preview-progress-text").textContent = `DeepSeek 正在调用 SparkX 查询并撰写…（已用 ${Math.round((Date.now() - started) / 1000)} 秒，通常需要 1–5 分钟）`;
+          continue;
+        }
+        if (data.status === "failed") { $("preview-progress").hidden = true; notice("preview-error", data.error || "预览失败。", "error"); return; }
+        showPreview(data.result || {});
+        return;
+      }
     }
 
     async function preview(lane, button) {
-      notice("notifications-status", "正在从 SparkX 读取数据并生成预览（只读，不会发送）…");
-      const data = await guarded("notifications-status", () => api("/console/api/reports/preview", { method: "POST", body: { lane } }), button);
+      let lanes;
+      try { lanes = lanePayload(formValues(), state.reports.default_prompts); } catch (error) { toast(error.message, "error"); return; }
+      const data = await guarded(() => api("/console/api/reports/preview", { method: "POST", body: { lane, draft: lanes[lane] } }), button);
       if (!data) return;
-      notice("notifications-status", "");
-      const info = data.info || {};
+      state.preview = { job: data.job, closed: false, interval: win.JX_PREVIEW_INTERVAL || 3000 };
       $("preview-title").textContent = "预览 · " + LANES[lane].label;
-      $("preview-info").textContent = [`监控店铺 ${info.profiles ?? "—"} 家`, info.report_date ? "数据日 " + info.report_date : "",
-        info.window ? "近 7 日 " + info.window.join(" ~ ") : "", info.narrative ? NARRATIVE[info.narrative] || "" : "",
-        info.errors && Object.keys(info.errors).length ? "部分数据缺失：" + Object.keys(info.errors).join("、") : ""].filter(Boolean).join(" · ");
-      renderCard($("preview-card"), data.card);
-      $("preview-text").textContent = data.text || "";
-      $("preview-panel").hidden = false;
-      $("preview-panel").scrollIntoView({ block: "start" });
+      $("preview-info").textContent = "只读：不会排队或发送消息。";
+      $("preview-progress-text").textContent = "DeepSeek 正在调用 SparkX 查询并撰写…（通常需要 1–5 分钟）";
+      $("preview-progress").hidden = false;
+      notice("preview-error", "");
+      $("preview-cards").replaceChildren();
+      $("preview-plain").hidden = true;
+      openOverlay("preview-drawer", doc.querySelector("#preview-drawer [data-close]"));
+      pollPreview(data.job, Date.now());
     }
 
     // ---------------------------------------------------------------- sparkx & deepseek
@@ -379,29 +599,58 @@
       for (const [term, value] of entries) list.append(el("dt", term), el("dd", value));
     }
 
+    function renderSkills(data) {
+      const installed = data.installed;
+      setBadge($("skills-badge"), installed ? { text: "已安装", tone: "ok" } : { text: "未安装", tone: "warn" });
+      const entries = [["来源", "GitHub " + (data.source || "SparkXAI/SparkXAI-MCP")]];
+      if (installed) {
+        entries.push(["版本", `${installed.release || installed.ref || "—"}` + (installed.commit ? `（${installed.commit.slice(0, 7)}）` : "")],
+          ["安装时间", formatTime(installed.installed_at)]);
+      }
+      if (data.latest) {
+        entries.push(["官方最新", `${data.latest.release || "—"}（${data.latest.updated_at || "—"}）` +
+          (data.latest.outdated && data.latest.outdated.length ? `，可更新：${data.latest.outdated.join("、")}` : "，已是最新")]);
+      }
+      if (data.error) entries.push(["检查结果", data.error]);
+      facts("skills-facts", entries);
+      fill("skills-rows", (data.skills || []).map((skill) => row([skill.name, skill.version || "—", (skill.mcp_tools || []).join("、"),
+        skill.description || "—"])), "尚未安装：点「安装 / 更新」从 GitHub 获取官方只读 Skills。", 4);
+      $("tool-chips").replaceChildren(...(data.read_tools || []).map((name) => el("span", name, "chip mono")));
+    }
+
     async function loadSparkx() {
-      const data = await guarded("sparkx-status", () => api("/console/api/sparkx"));
-      if (!data) return;
-      state.sparkx = data;
-      facts("sparkx-facts", [["接口", data.endpoint], ["Token", data.configured ? (data.token_source === "console" ? "已保存（控制台）" : "来自环境变量") : "未配置"],
-        ["更新时间", formatTime(data.updated_at)]]);
+      const [data, skills] = await Promise.all([guarded(() => api("/console/api/sparkx")), guarded(() => api("/console/api/skills"))]);
+      if (data) {
+        state.sparkx = data;
+        setBadge($("sparkx-badge"), data.configured ? { text: "已配置", tone: "ok" } : { text: "未配置", tone: "warn" });
+        facts("sparkx-facts", [["接口", data.endpoint], ["Token", data.configured ? (data.token_source === "console" ? "已保存（管理台）" : "来自环境变量") : "未配置"],
+          ["更新时间", formatTime(data.updated_at)]]);
+      }
+      if (skills) renderSkills(skills);
     }
 
     async function loadDeepseek() {
-      const data = await guarded("deepseek-status", () => api("/console/api/deepseek"));
+      const [data, overview] = await Promise.all([guarded(() => api("/console/api/deepseek")),
+        state.overview ? Promise.resolve(state.overview) : guarded(() => api("/console/api/overview"))]);
+      if (overview) {
+        state.overview = overview;
+        setBadge($("bot-badge"), overview.feishu && overview.feishu.bot_enabled ? { text: "已开启", tone: "ok" } : { text: "未开启", tone: "warn" });
+      }
       if (!data) return;
       state.deepseek = data;
+      setBadge($("deepseek-badge"), data.configured ? { text: "可用", tone: "ok" } : { text: "未配置", tone: "warn" });
       facts("deepseek-facts", [["状态", data.configured ? "已配置" : "未配置"],
-        ["密钥来源", data.key_source === "console" ? "控制台" : data.key_source === "environment" ? "环境变量" : data.key_source ? "私有文件" : "—"],
+        ["密钥来源", data.key_source === "console" ? "管理台" : data.key_source === "environment" ? "环境变量" : data.key_source ? "私有文件" : "—"],
         ["更新时间", formatTime(data.updated_at)]]);
       $("deepseek-model").replaceChildren(...(data.models || []).map((model) => {
         const option = el("option", model); option.value = model; option.selected = model === data.model; return option;
       }));
-      $("deepseek-timeout").value = data.timeout || 45;
+      $("deepseek-timeout").value = data.timeout || 120;
+      $("deepseek-thinking").checked = data.thinking !== false;
     }
 
     async function loadDeliveries() {
-      const data = await guarded("global-status", () => api("/console/api/deliveries"));
+      const data = await guarded(() => api("/console/api/deliveries"));
       if (!data) return;
       fill("delivery-rows", data.rows.map((item) => row([formatTime(item.created_at), item.lane, item.recipient, item.title,
         badge(statusLabel(item.status)), item.error || (item.delivered_at ? "送达 " + formatTime(item.delivered_at) : "—")])),
@@ -413,110 +662,179 @@
                       deepseek: loadDeepseek, deliveries: loadDeliveries };
 
     function show(view) {
+      if (!loaders[view]) return;
+      state.view = view;
       for (const button of doc.querySelectorAll("[data-view]")) {
         if (button.dataset.view === view) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
       }
-      for (const panel of doc.querySelectorAll("[data-panel]")) panel.hidden = panel.dataset.panel !== view;
+      let active = null;
+      for (const panel of doc.querySelectorAll("[data-panel]")) {
+        panel.hidden = panel.dataset.panel !== view;
+        if (!panel.hidden) active = panel;
+      }
+      $("page-title").textContent = active.dataset.title || "";
+      $("page-subtitle").textContent = active.dataset.subtitle || "";
+      for (const button of doc.querySelectorAll("#page-actions [data-for]")) button.hidden = button.dataset.for !== view;
       notice("global-status", "");
       loaders[view]();
     }
 
     for (const button of doc.querySelectorAll("[data-view]")) button.addEventListener("click", () => show(button.dataset.view));
+    for (const button of doc.querySelectorAll("[data-go]")) button.addEventListener("click", () => show(button.dataset.go));
     for (const button of doc.querySelectorAll("[data-refresh]")) button.addEventListener("click", () => loaders[button.dataset.refresh]());
     $("logout").addEventListener("click", async () => {
       try { await win.fetch("/console/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf } }); }
       finally { win.location.assign("/console/login"); }
     });
 
+    // stores
     $("store-search").addEventListener("input", renderStores);
-    $("refresh-roster").addEventListener("click", async (event) => {
-      notice("stores-status", "正在读取 SparkX 授权店铺…");
-      const data = await guarded("stores-status", () => api("/console/api/stores/refresh", { method: "POST" }), event.currentTarget);
-      if (data) { state.stores = data; renderStores(); notice("stores-status", `已更新：${data.rows.length} 家店铺。`); }
+    for (const button of doc.querySelectorAll("[data-filter]")) {
+      button.addEventListener("click", () => { state.filter = button.dataset.filter; renderStores(); });
+    }
+    $("select-all").addEventListener("change", (event) => {
+      for (const store of visibleStores()) {
+        if (event.currentTarget.checked) state.selected.add(store.profile_id); else state.selected.delete(store.profile_id);
+      }
+      renderStores();
     });
-    $("picker-search").addEventListener("input", () => renderMembers("picker-members", $("picker-search").value, state.picker.selected, "checkbox", "operator"));
-    $("picker-close").addEventListener("click", () => { $("operator-picker").hidden = true; });
-    $("picker-save").addEventListener("click", async (event) => {
-      if (state.picker.selected.size > 10) { notice("stores-status", "每家店最多 10 位运营。", "error"); return; }
-      const data = await saveStore(state.picker.store, { operator_ids: [...state.picker.selected] }, event.currentTarget);
-      if (data) $("operator-picker").hidden = true;
+    $("bulk-clear").addEventListener("click", () => { state.selected.clear(); renderStores(); });
+    $("bulk-assign").addEventListener("click", () => {
+      const stores = state.stores.rows.filter((store) => state.selected.has(store.profile_id));
+      if (stores.length) openMembers({ mode: "operators", stores });
+    });
+    for (const [id, monitored] of [["bulk-include", true], ["bulk-exclude", false]]) {
+      $(id).addEventListener("click", (event) => {
+        const changes = {};
+        for (const key of state.selected) changes[key] = { monitored };
+        saveStores(changes, event.currentTarget, `${state.selected.size} 家店铺已${monitored ? "纳入" : "暂停"}通知。`);
+      });
+    }
+    $("refresh-roster").addEventListener("click", async (event) => {
+      const data = await guarded(() => api("/console/api/stores/refresh", { method: "POST" }), event.currentTarget);
+      if (data) { state.stores = data; renderStores(); toast(`已从 SparkX 更新：${data.rows.length} 家店铺。`); }
     });
 
+    // member dialog (operators and leads)
+    $("member-search").addEventListener("input", renderMembers);
+    $("member-save").addEventListener("click", async (event) => {
+      const dialog = state.dialog;
+      if (!dialog) return;
+      const ids = [...dialog.selected];
+      if (dialog.mode === "lead") {
+        const data = await guarded(() => api("/console/api/recipients/" + dialog.kind, {
+          method: "POST", body: { open_ids: ids.slice(0, 1), revision: state.recipients.revision } }), event.currentTarget);
+        if (data) { closeOverlay("member-dialog"); toast("负责人已保存。"); loadNotifications(); }
+        return;
+      }
+      if (ids.length > MAX_OPERATORS) { toast(`每家店最多 ${MAX_OPERATORS} 位运营。`, "warn"); return; }
+      const changes = {};
+      for (const store of dialog.stores) changes[store.profile_id] = { operator_ids: ids };
+      const data = await saveStores(changes, event.currentTarget,
+        dialog.stores.length > 1 ? `已为 ${dialog.stores.length} 家店铺指定运营。` : `已保存 ${dialog.stores[0].short_name} 的运营。`);
+      if (data) { closeOverlay("member-dialog"); if (dialog.stores.length > 1) { state.selected.clear(); renderStores(); } }
+    });
+    $("member-clear").addEventListener("click", async (event) => {
+      const dialog = state.dialog;
+      if (!dialog || dialog.mode !== "lead") return;
+      const data = await guarded(() => api("/console/api/recipients/" + dialog.kind, {
+        method: "POST", body: { open_ids: [], revision: state.recipients.revision } }), event.currentTarget);
+      if (data) { closeOverlay("member-dialog"); toast("已清空负责人。"); loadNotifications(); }
+    });
+    for (const button of doc.querySelectorAll("[data-lead]")) {
+      button.addEventListener("click", () => openMembers({ mode: "lead", kind: button.dataset.lead, stores: [],
+        current: state.recipients && state.recipients[button.dataset.lead] }));
+    }
+
+    // notifications
     $("load-groups").addEventListener("click", async (event) => {
-      const data = await guarded("notifications-status", () => api("/console/api/groups"), event.currentTarget);
+      const data = await guarded(() => api("/console/api/groups"), event.currentTarget);
       if (!data) return;
       state.groups = data;
       $("group-select").replaceChildren(...data.chats.map((chat) => {
         const option = el("option", chat.name); option.value = chat.id; option.selected = chat.id === data.chat_id; return option;
       }));
-      $("group-select").disabled = false;
-      $("save-group").disabled = false;
+      $("group-confirm").checked = false;
+      $("group-change").hidden = false;
     });
+    $("group-cancel").addEventListener("click", () => { $("group-change").hidden = true; });
     $("save-group").addEventListener("click", async (event) => {
-      if (!$("group-confirm").checked) { notice("notifications-status", "请先勾选确认更换范围。", "warn"); return; }
+      if (!$("group-confirm").checked) { toast("请先勾选确认更换范围。", "warn"); return; }
       const body = { chat_id: $("group-select").value, revision: state.groups.revision, confirmed: true };
-      const data = await guarded("notifications-status", () => api("/console/api/groups", { method: "POST", body }), event.currentTarget);
-      if (data) { notice("notifications-status", "通知群已保存：" + data.name); state.members = null; loadNotifications(); }
+      const data = await guarded(() => api("/console/api/groups", { method: "POST", body }), event.currentTarget);
+      if (data) { $("group-change").hidden = true; toast("通知群已保存：" + data.name); state.members = null; loadNotifications(); }
     });
-    for (const button of doc.querySelectorAll("[data-lead]")) {
-      button.addEventListener("click", async () => {
-        try { await members(true); } catch (error) { notice("notifications-status", error.message, "error"); return; }
-        const kind = button.dataset.lead, current = state.recipients[kind];
-        state.lead = { kind, selected: new Set(current ? [current.id] : []) };
-        $("lead-search").value = "";
-        renderMembers("lead-members", "", state.lead.selected, "radio", "lead");
-        $("lead-picker").hidden = false;
+    $("lanes-form").addEventListener("input", (event) => {
+      const section = event.target.closest("[data-lane]");
+      if (section && event.target.name === "prompt") renderPromptState(section.dataset.lane);
+      renderDirty();
+    });
+    $("lanes-form").addEventListener("change", (event) => {
+      const section = event.target.closest("[data-lane]");
+      if (section && event.target.name === "enabled") section.classList.toggle("off", !event.target.checked);
+      renderDirty();
+    });
+    for (const button of doc.querySelectorAll("[data-reset-prompt]")) {
+      button.addEventListener("click", () => {
+        const lane = button.dataset.resetPrompt;
+        doc.querySelector(`#lanes-form [data-lane="${lane}"] textarea[name="prompt"]`).value = defaultPrompt(lane);
+        renderPromptState(lane);
+        renderDirty();
       });
     }
-    $("lead-search").addEventListener("input", () => renderMembers("lead-members", $("lead-search").value, state.lead.selected, "radio", "lead"));
-    async function saveLead(ids, button) {
-      const body = { open_ids: ids, revision: state.recipients.revision };
-      const data = await guarded("notifications-status", () => api("/console/api/recipients/" + state.lead.kind, { method: "POST", body }), button);
-      if (data) { $("lead-picker").hidden = true; notice("notifications-status", "负责人已保存。"); loadNotifications(); }
-    }
-    $("lead-save").addEventListener("click", (event) => saveLead([...state.lead.selected].slice(0, 1), event.currentTarget));
-    $("lead-clear").addEventListener("click", (event) => saveLead([], event.currentTarget));
+    $("lanes-revert").addEventListener("click", () => renderLanes());
     $("lanes-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       let lanes;
-      try { lanes = lanePayload(formValues()); } catch (error) { notice("notifications-status", error.message, "error"); return; }
-      const data = await guarded("notifications-status", () => api("/console/api/reports", {
+      try { lanes = lanePayload(formValues(), state.reports.default_prompts); } catch (error) { toast(error.message, "error"); return; }
+      const data = await guarded(() => api("/console/api/reports", {
         method: "POST", body: { revision: state.reports.revision, lanes } }), $("save-lanes"));
-      if (data) { state.reports = data; renderLanes(); notice("notifications-status", "通知设置已保存，下次运行生效。"); }
+      if (data) { state.reports = data; renderLanes(); toast("通知设置已保存，下次运行生效。"); }
     });
     for (const button of doc.querySelectorAll("[data-preview]")) button.addEventListener("click", () => preview(button.dataset.preview, button));
-    $("preview-close").addEventListener("click", () => { $("preview-panel").hidden = true; });
 
+    // sparkx
     $("sparkx-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const token = $("sparkx-token").value.trim();
-      if (!token) { notice("sparkx-status", "请填写新的 Token。", "warn"); return; }
-      const data = await guarded("sparkx-status", () => api("/console/api/sparkx", { method: "POST", body: { revision: state.sparkx.revision, token } }));
-      if (data) { $("sparkx-token").value = ""; notice("sparkx-status", "Token 已保存，可点击「测试连接」。"); loadSparkx(); }
+      if (!token) { toast("请填写新的 Token。", "warn"); return; }
+      const data = await guarded(() => api("/console/api/sparkx", { method: "POST", body: { revision: state.sparkx.revision, token } }),
+        event.submitter || null);
+      if (data) { $("sparkx-token").value = ""; toast("Token 已保存，可以点「测试连接」。"); loadSparkx(); }
     });
-    $("sparkx-clear").addEventListener("click", async () => {
-      const data = await guarded("sparkx-status", () => api("/console/api/sparkx", { method: "POST", body: { revision: state.sparkx.revision, clear: true } }));
-      if (data) { notice("sparkx-status", "已清除控制台 Token（如环境变量中有 Token，将改用环境变量）。"); loadSparkx(); }
+    $("sparkx-clear").addEventListener("click", async (event) => {
+      const data = await guarded(() => api("/console/api/sparkx", { method: "POST", body: { revision: state.sparkx.revision, clear: true } }),
+        event.currentTarget);
+      if (data) { toast("已清除管理台 Token（如环境变量中有 Token，将改用环境变量）。"); loadSparkx(); }
     });
     $("sparkx-test").addEventListener("click", async (event) => {
-      notice("sparkx-status", "正在连接 mcp.sparkx.cn …");
-      const data = await guarded("sparkx-status", () => api("/console/api/sparkx/test", { method: "POST" }), event.currentTarget);
+      const data = await guarded(() => api("/console/api/sparkx/test", { method: "POST" }), event.currentTarget);
       if (!data) return;
       if (data.status !== "OK") { notice("sparkx-status", data.message || ("连接失败：" + data.status), "error"); return; }
       notice("sparkx-status", `连接成功：Token 授权 ${data.profile_count} 家店铺。`);
-      fill("sparkx-profiles", data.profiles.map((item) => row([item.profile_id, item.name, item.country, item.store_type || "—"])), "Token 没有授权任何店铺。", 4);
+      fill("sparkx-profiles", data.profiles.map((item) => row([item.profile_id, item.name, item.country, item.store_type || "—"])),
+        "Token 没有授权任何店铺。", 4);
       $("sparkx-profiles-panel").hidden = false;
     });
+    $("skills-install").addEventListener("click", async (event) => {
+      const data = await guarded(() => api("/console/api/skills/install", { method: "POST" }), event.currentTarget);
+      if (data) { renderSkills(data); toast("官方 Skills 已安装。"); }
+    });
+    $("skills-check").addEventListener("click", async (event) => {
+      const data = await guarded(() => api("/console/api/skills/check", { method: "POST" }), event.currentTarget);
+      if (data) renderSkills(data);
+    });
 
+    // deepseek
     $("deepseek-form").addEventListener("submit", async (event) => {
       event.preventDefault();
-      const body = { revision: state.deepseek.revision, api_key: $("deepseek-key").value.trim(),
-                     model: $("deepseek-model").value, timeout: Number($("deepseek-timeout").value) };
-      const data = await guarded("deepseek-status", () => api("/console/api/deepseek", { method: "POST", body }));
-      if (data) { $("deepseek-key").value = ""; notice("deepseek-status", "DeepSeek 设置已保存。"); loadDeepseek(); }
+      const body = { revision: state.deepseek.revision, api_key: $("deepseek-key").value.trim(), model: $("deepseek-model").value,
+                     timeout: Number($("deepseek-timeout").value), thinking: $("deepseek-thinking").checked };
+      const data = await guarded(() => api("/console/api/deepseek", { method: "POST", body }), event.submitter || null);
+      if (data) { $("deepseek-key").value = ""; toast("DeepSeek 设置已保存。"); state.overview = null; loadDeepseek(); }
     });
     $("deepseek-test").addEventListener("click", async (event) => {
-      const data = await guarded("deepseek-status", () => api("/console/api/deepseek/test", { method: "POST" }), event.currentTarget);
+      const data = await guarded(() => api("/console/api/deepseek/test", { method: "POST" }), event.currentTarget);
       if (!data) return;
       const messages = { OK: "连接成功，模型可用。", NOT_CONFIGURED: "尚未配置密钥。", INVALID_KEY: "密钥无效。",
         INSUFFICIENT_BALANCE: "账户余额不足。", MODEL_UNAVAILABLE: "当前模型不可用，请更换模型。", TIMEOUT: "连接超时。",
@@ -527,5 +845,6 @@
     show("overview");
   }
 
-  return { start, statusLabel, runLabel, formatTime, parseBold, cardText, filterStores, lanePayload, LANES };
+  return { start, statusLabel, runLabel, formatTime, parseBold, cardText, filterStores, storeCounts, promptValue,
+           lanePayload, setupSteps, LANES };
 });

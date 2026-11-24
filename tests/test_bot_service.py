@@ -1,4 +1,4 @@
-"""Feishu question intake, private-reader checks and DeepSeek answer rendering."""
+"""Feishu message intake, private-reader checks, conversation memory and answer rendering."""
 import json
 
 import pytest
@@ -9,6 +9,7 @@ from jx_alert import bot_service
 from jx_alert.ai.deepseek import DeepSeekError
 from jx_alert.notifications.cards import plain_text
 from jx_alert.notifications.outbox import NotificationOutbox
+from jx_alert.sparkx.client import SparkXError
 from jx_alert.storage.models import SyncJob
 
 
@@ -33,10 +34,10 @@ def test_group_mentions_in_the_report_group_are_queued_once(bot_settings, sessio
         assert bot_service.enqueue_group_question(db, bot_settings, event())["status"] == "REUSED"
         assert bot_service.enqueue_group_question(db, bot_settings, event(chat="oc_other", message="om_2"))["status"] == "IGNORED"
         assert bot_service.enqueue_group_question(db, bot_settings, event(mention=False, message="om_3"))["status"] == "IGNORED"
-        assert bot_service.enqueue_group_question(db, bot_settings, event("昨天各店花费", chat="oc_dm", kind="p2p",
+        assert bot_service.enqueue_group_question(db, bot_settings, event("你好", chat="oc_dm", kind="p2p",
                                                                           mention=False, message="om_4"))["status"] == "QUEUED"
         jobs = list(db.scalars(select(SyncJob).where(SyncJob.job_type == "feishu_question")))
-        assert [job.metadata_json["question"] for job in jobs] == ["昨天各店花费", "昨天各店花费"]
+        assert [job.metadata_json["question"] for job in jobs] == ["昨天各店花费", "你好"]
         assert jobs[0].metadata_json["question_route"]["receive_id"] == "oc_reports"
     disabled = bot_settings.model_copy(update={"feishu_bot_enabled": False})
     with session_factory() as db:
@@ -55,64 +56,71 @@ def test_private_readers_are_leads_operators_or_report_group_members(bot_setting
     assert not bot_service.validate_question_delivery(bot_settings, {**delivery, "receive_id": "oc_reports"})
 
 
-def queue(db, settings, text):
-    bot_service.enqueue_group_question(db, settings, event(text))
+def queue(db, settings, text, **kwargs):
+    bot_service.enqueue_group_question(db, settings, event(text, **kwargs))
     db.commit()
 
 
-def test_answers_are_replied_to_the_original_message(bot_settings, session_factory):
+def reply_card(session_factory, result):
+    with session_factory() as db:
+        return db.get(NotificationOutbox, result["outbox_ids"][0])
+
+
+def test_data_answers_are_replied_with_tables_and_a_source_line(bot_settings, session_factory):
     with session_factory() as db:
         queue(db, bot_settings, "@机器人 昨天各店花费")
 
-    def answer(settings, question):
-        assert question == "昨天各店花费"
+    def answer(settings, question, *, history, roster):
+        assert question == "昨天各店花费" and history == []
         return {"answer": "**结论**：昨天花费最高的是香港川页。\n\n| 店铺 | 花费 |\n|---|---|\n| 香港川页 | $3,217.70 |",
                 "provider": "deepseek", "calls": 2}
 
     result = bot_service.process_one_question(bot_settings, session_factory, session_factory.engine, answer=answer)
     assert result["status"] == "SUCCEEDED" and len(result["outbox_ids"]) == 1
-    with session_factory() as db:
-        reply = db.get(NotificationOutbox, result["outbox_ids"][0])
-        assert reply.idempotency_key == "group-question:om_1:0"
-        assert reply.payload["delivery"]["reply_to_message_id"] == "om_1"
-        card = reply.payload["card"]
-        assert [element["tag"] for element in card["body"]["elements"]][:2] == ["markdown", "table"]
-        assert "香港川页 | $3,217.70" in plain_text(card) and "SparkX MCP 只读查询 2 次" in plain_text(card)
+    reply = reply_card(session_factory, result)
+    assert reply.idempotency_key == "group-question:om_1:0"
+    assert reply.payload["delivery"]["reply_to_message_id"] == "om_1"
+    card = reply.payload["card"]
+    assert [element["tag"] for element in card["body"]["elements"]][:2] == ["markdown", "table"]
+    text = plain_text(card)
+    assert "香港川页 | $3,217.70" in text and "SparkX MCP 只读查询 2 次" in text
 
 
-def test_help_unavailable_model_and_unverified_answers(bot_settings, session_factory):
-    with session_factory() as db:
-        queue(db, bot_settings, "@机器人 你能做什么")
-    result = bot_service.process_one_question(bot_settings, session_factory, session_factory.engine,
-                                              answer=lambda *a: pytest.fail("help needs no model"))
-    with session_factory() as db:
-        assert "SparkX" in plain_text(db.get(NotificationOutbox, result["outbox_ids"][0]).payload["card"])
+def test_free_conversation_remembers_the_same_persons_recent_turns(bot_settings, session_factory):
+    seen = []
 
-    def unavailable(settings, question):
-        raise DeepSeekError("尚未配置DeepSeek凭据。")
+    def answer(settings, question, *, history, roster):
+        seen.append([turn["question"] for turn in history])
+        return {"answer": f"回答：{question}", "provider": "deepseek", "calls": 0}
 
     with session_factory() as db:
-        bot_service.enqueue_group_question(db, bot_settings, event("@机器人 花费", message="om_2"))
-        db.commit()
-    result = bot_service.process_one_question(bot_settings, session_factory, session_factory.engine, answer=unavailable)
+        queue(db, bot_settings, "@机器人 你好", message="om_a")
+    first = bot_service.process_one_question(bot_settings, session_factory, session_factory.engine, answer=answer)
     with session_factory() as db:
-        assert "智能问答暂不可用" in plain_text(db.get(NotificationOutbox, result["outbox_ids"][0]).payload["card"])
+        queue(db, bot_settings, "@机器人 那上周呢", message="om_b")
+        queue(db, bot_settings, "@机器人 我是别人", message="om_c", sender="ou_other")
+    bot_service.process_one_question(bot_settings, session_factory, session_factory.engine, answer=answer)
+    bot_service.process_one_question(bot_settings, session_factory, session_factory.engine, answer=answer)
+    assert seen == [[], ["你好"], []]  # another person's turns in the group are not shared
+    text = plain_text(reply_card(session_factory, first).payload["card"])
+    assert "回答：你好" in text and "SparkX" not in text  # no source line when SparkX was not queried
 
-    def unverified(settings, question):
-        return {"answer": None, "provider": "unverified", "calls": 1, "results": [
-            {"tool": "query_ads_performance", "result": {"rows": [{"campaignName": "A", "Spend": 12.5}]}}]}
 
+@pytest.mark.parametrize("error,expected", [(DeepSeekError("DeepSeek繁忙，请稍后重试。"), "DeepSeek 暂时无法回答"),
+                                            (SparkXError("SPARKX_AUTH_REJECTED"), "暂时无法查询 SparkX")])
+def test_failures_reply_with_a_plain_reason(bot_settings, session_factory, error, expected):
     with session_factory() as db:
-        bot_service.enqueue_group_question(db, bot_settings, event("@机器人 花费多少", message="om_3"))
-        db.commit()
-    result = bot_service.process_one_question(bot_settings, session_factory, session_factory.engine, answer=unverified)
-    with session_factory() as db:
-        text = plain_text(db.get(NotificationOutbox, result["outbox_ids"][0]).payload["card"])
-        assert "未能与 SparkX 结果核对" in text and "A | 12.5" in text
+        queue(db, bot_settings, "@机器人 花费")
+
+    def failing(settings, question, **kwargs):
+        raise error
+
+    result = bot_service.process_one_question(bot_settings, session_factory, session_factory.engine, answer=failing)
+    assert expected in plain_text(reply_card(session_factory, result).payload["card"])
 
 
 def test_model_markdown_cannot_inject_mentions_or_links():
-    cards = bot_service.answer_cards("SparkX 数据助手", "# 标题\n<at id=ou_x></at> 看 [这里](https://evil.example)\n**重点**",
+    cards = bot_service.answer_cards("JX 广告助手", "# 标题\n<at id=ou_x></at> 看 [这里](https://evil.example)\n**重点**",
                                      "footer")
     content = "\n".join(e["content"] for e in cards[0]["body"]["elements"] if e["tag"] == "markdown")
     assert "<at" not in content and "](" not in content and "https://" not in content

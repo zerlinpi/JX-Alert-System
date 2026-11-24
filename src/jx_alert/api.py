@@ -13,7 +13,7 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="JX Alert System", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="JX Alert System", version="0.4.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -31,7 +31,11 @@ def health():
         deepseek = bool(client_settings(settings)[0])
     except DeepSeekConfigError:
         deepseek = False
-    return {"status": "ok", "service": "jx-alert-system", "data_source": "sparkx",
+    from jx_alert.sparkx.skills import installed
+
+    index = installed(settings)
+    return {"status": "ok", "service": "jx-alert-system", "data_source": "sparkx", "analysis": "deepseek_agent",
             "dry_run": settings.app_dry_run, "scheduler_enabled": settings.scheduler_enabled,
             "feishu_delivery_enabled": settings.delivery_enabled(),
-            "sparkx_configured": bool(effective_token(settings)), "deepseek_configured": deepseek}
+            "sparkx_configured": bool(effective_token(settings)), "deepseek_configured": deepseek,
+            "sparkx_skills": (index or {}).get("release") if index else None}

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jx-alert-system"
-version = "0.3.0"
-description = "SparkX MCP advertising monitor: DeepSeek narrative, Feishu notifications and owner console"
+version = "0.4.0"
+description = "SparkX MCP advertising monitor: DeepSeek as a SparkX agent, Feishu notifications and owner console"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1",

@@ -1,7 +1,7 @@
 """Process settings: environment (.env) plus the owner's runtime JSON overrides.
 
-SparkX MCP is the only business data source. DeepSeek writes narrative text and
-answers questions; Feishu (enterprise app) delivers. Runtime fields this release
+SparkX MCP is the only business data source. DeepSeek queries it as an agent and
+chats in Feishu; Feishu (enterprise app) delivers. Runtime fields this release
 does not use (for example ones left by earlier releases) are ignored and named
 in the log once per process; the file itself is never rewritten.
 """
@@ -33,10 +33,12 @@ class Settings(BaseSettings):
     # Owner choices per SparkX profile: monitoring switch and the store's operators (0600).
     sparkx_stores_file: str = "/app/data/sparkx-stores.json"
     sparkx_timeout: float = Field(default=30.0, ge=5, le=120)
+    # Official read-only SparkX Skills installed from SparkXAI/SparkXAI-MCP (never part of this repository).
+    sparkx_skills_dir: str = "/app/data/sparkx-skills"
     # Owner switches, recipients and thresholds of the notification lanes (0600).
     notification_settings_file: str = "/app/data/jx-notifications.json"
 
-    # DeepSeek ("dp"): report narrative and the Feishu question bot.
+    # DeepSeek ("dp"): queries SparkX for the three lanes and chats in the Feishu bot.
     deepseek_api_key: SecretStr = SecretStr("")
     deepseek_credentials_file: str = "/app/data/secrets/deepseek.json"
     deepseek_model: str = "deepseek-flash"
@@ -97,7 +99,7 @@ RUNTIME_KEYS = frozenset({
     "app_dry_run", "scheduler_enabled", "feishu_enabled", "feishu_transport", "feishu_routing_file",
     "feishu_daily_report_chat_id", "feishu_bot_enabled", "feishu_bot_open_id", "feishu_bot_max_pending",
     "feishu_bot_question_max_age_minutes", "deepseek_credentials_file", "deepseek_model",
-    "deepseek_request_timeout", "sparkx_credentials_file", "sparkx_stores_file", "sparkx_timeout",
+    "deepseek_request_timeout", "sparkx_credentials_file", "sparkx_stores_file", "sparkx_timeout", "sparkx_skills_dir",
     "notification_settings_file", "console_public_url", "console_owner_credentials_file",
     "console_sessions_file", "console_forwarded_allow_ips",
 })

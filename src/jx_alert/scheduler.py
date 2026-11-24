@@ -18,7 +18,7 @@ from jx_alert.storage.db import init_db
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("jx_alert.scheduler")
 _QUIET = {"DISABLED", "WAITING", "ALREADY_COMPLETE", "RETRY_LATER", "DELIVERY_DISABLED", "OUTSIDE_HOURS",
-          "NOT_SCHEDULED_TODAY", "NO_RECIPIENT", "NO_FINDINGS", "SPARKX_NOT_CONFIGURED"}
+          "NOT_SCHEDULED_TODAY", "NO_RECIPIENT", "NO_FINDINGS", "SPARKX_NOT_CONFIGURED", "DEEPSEEK_NOT_CONFIGURED"}
 
 
 def _deliver(ids):

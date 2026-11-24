@@ -1,31 +1,27 @@
-# 飞书问答（DeepSeek + SparkX）
+# 飞书机器人（DeepSeek 自由聊天 + SparkX 查询）
 
-## 谁可以问
+## 谁可以用
 
 - 通知群内 @机器人。
 - 私聊机器人：总负责人、广告负责人、通知群管理员、店铺目录里的运营，或当前通知群成员（实时核对群成员）。
 
-问题先写入数据库队列，回调里不做任何模型或 SparkX 请求；独立的工作线程逐条回答，回复挂在原消息下。同一人每分钟最多 3 个问题，排队超过 50 个时群内回复「提问较多」。
+消息先写入数据库队列，回调里不做任何模型或 SparkX 请求；独立的工作线程逐条回答，回复挂在原消息下。同一人每分钟最多 3 条，排队超过 50 条时群内回复「提问较多」。
 
 ## 回答方式
 
-DeepSeek（关闭思考模式，函数调用）在一个 SparkX 会话里最多调用 8 次只读工具：
+- **自由聊天**：任何话题都可以聊（打招呼、写文案、解释概念……），DeepSeek 直接回答，不访问 SparkX。
+- **查数据**：需要数据时，DeepSeek 自己调用 SparkX MCP 的只读工具（工具说明和参数与 SparkX 原样一致），并先阅读对应的官方 Skill（如 `sparkx-query-ads-performance`），用法与 WorkBuddy、Claude 接入 SparkX 时相同。一次回答最多调用 20 次工具。
+- **上下文**：同一段对话记住最近 6 轮（60 分钟内）。私聊按会话；群里按「同一个人」，不会把别人的问题混进来。所以可以直接追问「那前一天呢」「换成 Campx」。
+- **格式**：回答用飞书卡片展示，Markdown 表格会变成飞书表格；查询过 SparkX 时卡片底部注明查询次数。
+- **边界**：DeepSeek 看不到任何凭据，也没有写操作工具；不会声称已修改广告、预算或出价，需要调整时给出建议由运营操作。
 
-| 工具 | 对应 SparkX | 限制 |
-|---|---|---|
-| `list_stores` | 已监控店铺、运营、美西今天与最近完整日 | — |
-| `query_ads_performance` | `get_ads_perf` | 只能查已监控的店铺；日数据跨度 ≤ 90 天，小时数据仅 campaign 且 ≤ 7 天；每次 ≤ 100 行；`compare_previous=true` 时服务端查询前一个等长区间并算出变化 |
-| `query_entities` | `get_entity_metadata` | campaign / adGroup / target / productAd / portfolio 配置，≤ 100 行 |
-
-服务端为每行补算 ACOS、ROAS、CVR、CPC、CTR 和返回行合计，所以回答需要的数字都能直接引用。最终回答中的每个数字都必须出现在工具结果里：不符合时要求 DeepSeek 重写一次，仍不符合就回复最后一次 SparkX 查询的原始结果，并说明未能核对。
-
-DeepSeek 看不到任何凭据，也没有写操作工具；回答不会声称已修改广告、预算或出价。
+DeepSeek 默认开启深度思考（管理台可关闭）：回答更准确，通常 10–60 秒。SparkX 暂时不可用时机器人仍能聊天，并说明暂时查不了数据。
 
 ## 开启
 
-1. 管理台「DeepSeek」保存 Key，「SparkX 连接」保存 Token。
+1. 管理台「DeepSeek 与机器人」保存 Key，「SparkX MCP」保存 Token 并安装官方 Skills。
 2. 飞书开放平台为自建应用开启机器人、订阅 `im.message.receive_v1`（长连接）。
-3. `.env` 设置 `FEISHU_BOT_ENABLED=true`，启动 `bot` 服务：
+3. `.env` 或运行配置设置 `FEISHU_BOT_ENABLED=true`，启动 `bot` 服务：
 
 ```sh
 docker compose -p jx-alert -f docker-compose.yml -f docker-compose.runtime.yml --profile bot up -d bot

@@ -75,7 +75,10 @@ main() {
     || fail "commit $target is not in $REPO; fetch it first (git bundle or origin), see docs/DEPLOY.md"
   target=$(repo_git rev-parse "$target^{commit}")
   [[ "$(repo_git rev-parse "$target^{tree}")" == "$tree" ]] || fail "tree of $target is not the tested tree $tree"
-  repo_git cat-file -e "$target:src/jx_alert/sparkx/collect.py" 2>/dev/null || fail "$target is not a SparkX-only release"
+  if ! repo_git cat-file -e "$target:src/jx_alert/sparkx/client.py" 2>/dev/null \
+      || repo_git cat-file -e "$target:src/jx_alert/mcp_server.py" 2>/dev/null; then
+    fail "$target is not a SparkX-only release"
+  fi
   local previous
   previous=$(repo_git rev-parse HEAD)
   [[ "$previous" != "$target" ]] || fail "server is already at $target"
@@ -149,6 +152,12 @@ main() {
   wait_for 30 "existing vhost route via port $legacy_port" status_is "$legacy_port" /console/login "$host" 200 \
     || fail "legacy port $legacy_port does not reach the console; rollback: $rollback"
   [[ "$(http_status "$legacy_port" /mcp "$host")" == 410 ]] || fail "retired /mcp path does not answer 410; rollback: $rollback"
+  # The official read-only SparkX Skills live in data/ (not in the repository); agents also retry later.
+  if compose exec -T console python -m jx_alert.sparkx.skills install; then
+    say "ok: SparkX Skills installed"
+  else
+    say "warning: SparkX Skills not installed now; install them in the console (SparkX MCP page)"
+  fi
   compose up -d --no-build scheduler bot
   sleep 10
   local service services
@@ -166,9 +175,9 @@ main() {
   say "public https://$host/console/login -> $public (expected 200)"
   say "deployed $target (tree $tree); previous $previous; backup $backup"
   say "rollback: $rollback"
-  say "next: open https://$host/console/. Lanes are ON by default and start once the SparkX token is saved"
-  say "      (hourly alerts within ~10 min, daily report and review at 08:30): to check content first, switch"
-  say "      lanes off in 通知设置, save the token, preview, then switch them back on. Map operators to get @-mentions."
+  say "next: open https://$host/console/. Lanes are ON by default and run once SparkX and DeepSeek are configured"
+  say "      (hourly alerts within ~10 min inside the window, daily report and review at 08:30). To check content"
+  say "      first, switch lanes off in 通知与报告, preview, then switch them back on. Map operators to get @-mentions."
 }
 
 main "$@"

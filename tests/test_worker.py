@@ -8,8 +8,8 @@ from jx_alert.notifications import worker
 from jx_alert.notifications.outbox import DELIVERY_UNKNOWN, NotificationOutbox, enqueue_notification
 from jx_alert.reports import lanes
 from jx_alert.storage.models import NotificationLog
-from test_report_lanes import HOUR, SEND, collector_for, enable, map_operators, rules
-from test_sparkx_analysis import DAILY, HOURLY
+from lane_fakes import HOUR, SEND, runner_for
+from test_report_lanes import enable, map_operators
 
 
 class FakeClient:
@@ -52,7 +52,7 @@ def pin_times(session_factory, when):
 def queue_daily(settings, session_factory):
     """Default settings: the group copy first, then the company lead."""
     with session_factory() as db:
-        result = lanes.queue_morning_lane(db, settings, "daily", now=SEND, collector=collector_for(DAILY), narrator=rules)
+        result = lanes.queue_morning_lane(db, settings, "daily", now=SEND, runner=runner_for())
         db.commit()
     pin_times(session_factory, SEND)
     return result["outbox_ids"][0]
@@ -87,7 +87,7 @@ def test_group_alerts_mention_only_the_operators_still_mapped_when_sending(setti
     monkeypatch.setattr(worker, "_clock", lambda: HOUR + timedelta(minutes=2))
     map_operators(settings, {"101": ("ou_op1", "皮泽霖"), "102": ("ou_op2", "高爽")})
     with session_factory() as db:
-        lanes.run_hourly(db, settings, now=HOUR, collector=collector_for(HOURLY))
+        lanes.run_hourly(db, settings, now=HOUR, runner=runner_for())
         db.commit()
     pin_times(session_factory, HOUR)
     map_operators(settings, {"101": ("ou_new", "新运营")})  # 101 changed hands after queueing

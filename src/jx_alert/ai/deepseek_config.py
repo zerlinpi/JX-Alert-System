@@ -66,6 +66,7 @@ def _read(path):
             or not isinstance(data.get("updated_at"), str)
             or not _TIMESTAMP.fullmatch(data["updated_at"])
             or not isinstance(data.get("api_key", ""), str)
+            or type(data.get("thinking", True)) is not bool
             or (os.name != "nt" and stat.S_IMODE(meta.st_mode) & 0o077)
         ):
             raise ValueError
@@ -75,7 +76,7 @@ def _read(path):
 
 
 def _valid_timeout(value):
-    return type(value) in {int, float} and 1 <= value <= 120 and math.isfinite(value)
+    return type(value) in {int, float} and 1 <= value <= 300 and math.isfinite(value)
 
 
 def _env_key(settings):
@@ -97,6 +98,12 @@ def client_settings(settings):
     """Return the effective key, model and timeout for a runtime request."""
     saved, _ = _read(_path(settings))
     return _effective(settings, saved)
+
+
+def options(settings):
+    """Owner options beyond key/model/timeout. Thinking mode is on unless the owner turned it off."""
+    saved, _ = _read(_path(settings))
+    return {"thinking": saved.get("thinking", True) if saved.get("version") == 1 else True}
 
 
 def cache_identity(settings):
@@ -143,6 +150,7 @@ def _projection(settings, saved, revision):
         "configured": status == "CONFIGURED",
         "model": model if model in MODELS else None,
         "timeout": timeout if _valid_timeout(timeout) else None,
+        "thinking": saved.get("thinking", True) if saved.get("version") == 1 else True,
         "models": list(MODELS),
         "updated_at": saved.get("updated_at") if saved.get("version") == 1 else None,
         "key_source": key_source if key else None,
@@ -261,13 +269,16 @@ def _replace(path, value, expected_revision):
 def save_configuration(settings, payload):
     from jx_alert.ai.deepseek import DeepSeekClient, DeepSeekError
 
-    if set(payload) != {"revision", "api_key", "model", "timeout"}:
+    if not isinstance(payload, dict) or not ({"revision", "api_key", "model", "timeout"} <= set(payload)
+                                             <= {"revision", "api_key", "model", "timeout", "thinking"}):
         raise DeepSeekConfigError("提交的 DeepSeek 设置无效。", 400)
     revision, key, model, timeout = (payload[name] for name in ("revision", "api_key", "model", "timeout"))
+    thinking = payload.get("thinking", True)
     if not isinstance(revision, str) or not _REVISION.fullmatch(revision):
         raise DeepSeekConfigError("页面配置版本无效，请刷新。", 400)
-    if not isinstance(key, str) or len(key) > 512 or model not in MODELS or not _valid_timeout(timeout):
-        raise DeepSeekConfigError("请核对 DeepSeek 密钥、模型和超时设置。", 400)
+    if (not isinstance(key, str) or len(key) > 512 or model not in MODELS or not _valid_timeout(timeout)
+            or type(thinking) is not bool):
+        raise DeepSeekConfigError("请核对 DeepSeek 密钥、模型、超时和深度思考设置。", 400)
     path = _path(settings)
     try:
         with _locked(path):
@@ -282,7 +293,7 @@ def save_configuration(settings, payload):
                 raise DeepSeekConfigError(str(exc), 400) from None
             update = {
                 "version": 1, "revision": secrets.token_hex(32), "model": model,
-                "timeout": timeout, "updated_at": datetime.now(timezone.utc).isoformat(),
+                "timeout": timeout, "thinking": thinking, "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             if key or previous_key:
                 update["api_key"] = effective_key.strip()

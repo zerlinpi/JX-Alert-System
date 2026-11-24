@@ -13,19 +13,25 @@
   unresolved issues, and rollback path. Never claim unexecuted tests or deployment.
 - Preserve `.env`, credentials, historical data, and Docker data volumes. Never
   print or commit secrets. Keep credentials in private 0600 files, separate from code.
-- SparkX MCP is the only business data source, and access is read-only: call only
-  `get_user_authorized_context`, `get_ads_perf` and `get_entity_metadata`. Never
-  change campaigns, budgets, bids, listings, or store settings. Do not add other
-  data sources, collectors or their credentials.
-- Follow the official SparkXAI-MCP skill documentation for query shapes; do not
-  guess undocumented fields or parameters.
-- Every figure in a notification or answer comes from SparkX rows and is computed
-  in code. Missing rows or fields stay missing, never zero. Incomplete paging,
-  unconfirmed or mixed currencies, and duplicate or out-of-scope rows fail the run
-  instead of producing partial numbers.
-- DeepSeek only rephrases computed facts. Text containing a figure, date or store
-  that is not in the facts is rejected and replaced by rule-based text (or by the
-  raw SparkX result for questions).
+- SparkX MCP is the only business data source, and access is read-only: offer only
+  the tools in `sparkx.client.READ_TOOLS` that SparkX also marks
+  `readOnlyHint=true`. Never offer or call write tools (`batch_update_ads`,
+  `create_*`, `save_*`, `delete_*`) and never change campaigns, budgets, bids,
+  listings, or store settings. Do not add other data sources, collectors or their
+  credentials.
+- Owner decision (Nov 2026): DeepSeek queries SparkX itself, as an MCP agent, like
+  WorkBuddy/Claude with SparkX. Pass the tools exactly as SparkX lists them and the
+  results unmodified (only an over-long result is cut, with a note). Install only
+  the official read-only Skills from SparkXAI/SparkXAI-MCP into `data/` (never into
+  this repository) and let DeepSeek read them through `read_skill`.
+- The system fixes each lane's scope (completed dates, monitored stores) and output
+  contract around the owner's editable task text. Hourly findings must name a
+  campaign ID that SparkX returned and satisfy the owner's thresholds, or they are
+  dropped; each campaign/category is alerted once per marketplace day. Missing data
+  stays missing, never zero.
+- The Feishu bot chats freely (any topic) and uses SparkX only when data is needed;
+  it keeps the recent turns of one conversation. Group replies stay in the report
+  group; private replies only for leads, operators and report-group members.
 - The owner set every store's report timezone to `America/Los_Angeles`. Daily
   reports use the latest completed day; recent sales and orders are provisional
   (7–14 day attribution). Reviews compare the last 7 days with the 7 days before.
@@ -39,8 +45,8 @@
 - Re-verify the switch, delivery window and exact recipient (including each
   @-mention) before every send. Never resend a message that may have been
   submitted, and never replay old or retired messages. Lanes do not run until a
-  SparkX token is saved. Test Feishu only in the explicitly selected group and
-  with the owner's recipients.
+  SparkX token and a DeepSeek key are saved. Test Feishu only in the explicitly
+  selected group and with the owner's recipients.
 - Database changes are additive with backups and explicit persistence checks.
   Tables left by earlier releases stay untouched. Code rollback retains new
   historical evidence and never removes Docker volumes.

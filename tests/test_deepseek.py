@@ -60,10 +60,37 @@ def test_unrequested_tool_calls_truncation_and_key_echo_are_rejected():
             client(lambda request, response=response: response).chat([{"role": "user", "content": "hi"}])
 
 
+def test_thinking_mode_sends_effort_and_returns_reasoning_for_passback():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return completion({"content": "", "reasoning_content": "先查店铺", "tool_calls": [{"id": "c1", "type": "function",
+                           "function": {"name": "get_ads_perf", "arguments": "{\"factEntity\": \"campaign\"}"}}]},
+                          finish="tool_calls")
+
+    thinking = DeepSeekClient(KEY, model="deepseek-v4-pro", timeout=300, thinking=True,
+                              transport=httpx.MockTransport(handler))
+    result = thinking.chat([{"role": "user", "content": "hi"}], tools=[{"type": "function", "function": {
+        "name": "get_ads_perf", "parameters": {"type": "object", "properties": {}}}}])
+    assert seen["body"]["thinking"] == {"type": "enabled"} and seen["body"]["reasoning_effort"] == "high"
+    assert "temperature" not in seen["body"]
+    assert result["message"]["reasoning_content"] == "先查店铺" and result["reasoning"] == "先查店铺"
+    with pytest.raises(DeepSeekError):
+        DeepSeekClient(KEY, timeout=301)
+
+
 def test_console_configuration_is_write_only(settings):
-    view = deepseek_config.configuration(settings)
-    assert view["configured"] is False
-    saved = deepseek_config.save_configuration(settings, {"revision": view["revision"], "api_key": KEY,
-                                                         "model": "deepseek-flash", "timeout": 30})
+    keyless = settings.model_copy(update={"deepseek_api_key": ""})
+    view = deepseek_config.configuration(keyless)
+    assert view["configured"] is False and view["thinking"] is True
+    saved = deepseek_config.save_configuration(keyless, {"revision": view["revision"], "api_key": KEY,
+                                                        "model": "deepseek-flash", "timeout": 200, "thinking": False})
     assert saved["configured"] and saved["key_source"] == "console" and KEY not in json.dumps(saved)
-    assert deepseek_config.client_settings(settings) == (KEY, "deepseek-flash", 30)
+    assert deepseek_config.client_settings(keyless) == (KEY, "deepseek-flash", 200)
+    assert deepseek_config.options(keyless) == {"thinking": False} and saved["thinking"] is False
+    client = DeepSeekClient.from_settings(keyless, minimum_timeout=250)
+    assert client.timeout == 250 and client.thinking is False
+    with pytest.raises(deepseek_config.DeepSeekConfigError):
+        deepseek_config.save_configuration(keyless, {"revision": saved["revision"], "api_key": "", "model": "deepseek-flash",
+                                                     "timeout": 30, "thinking": "yes"})

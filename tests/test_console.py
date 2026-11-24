@@ -1,5 +1,6 @@
-"""Owner console: login, CSRF, write-only secrets, store directory and live previews."""
+"""Owner console: login, CSRF, write-only secrets, store directory, Skills and live previews."""
 import re
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -9,25 +10,32 @@ from starlette.testclient import TestClient
 from jx_alert import admin_feishu
 from jx_alert.admin_console import OwnerConsole
 from jx_alert.console_auth import OwnerPassword, SessionStore, create_owner_credentials
+from jx_alert.sparkx import skills as skill_store
 from jx_alert.sparkx import stores
-from test_sparkx_analysis import DAILY
+from lane_fakes import ROSTER, runner_for
 
 ORIGIN = "https://jx.example"
 PASSWORD = "correct horse battery staple"
 
 
 @pytest.fixture
-def console(settings, session_factory, tmp_path):
+def drafts():
+    return []
+
+
+@pytest.fixture
+def console(settings, session_factory, tmp_path, drafts):
     secrets = tmp_path / "secrets"
     create_owner_credentials(secrets / "owner.json", PASSWORD)
     configured = settings.model_copy(update={"console_public_url": ORIGIN})
+    fake = runner_for()
 
-    def collector(settings_, lane, *, now, directory, on_roster):
-        on_roster(DAILY["roster"])
-        return dict(DAILY)
+    def runner(settings_, lane, config, **kwargs):
+        drafts.append(dict(config))
+        return fake(settings_, lane, config, **kwargs)
 
     app = OwnerConsole(configured, OwnerPassword(secrets / "owner.json"), SessionStore(secrets / "sessions.sqlite3"),
-                       session_factory=session_factory, collector=collector)
+                       session_factory=session_factory, runner=runner)
     client = TestClient(Starlette(routes=app.routes()), base_url=ORIGIN)
     return client
 
@@ -57,16 +65,22 @@ def test_login_is_required_and_rejects_wrong_passwords(console):
 def test_overview_and_csrf_protected_writes(console, settings):
     headers = login(console)
     overview = console.get("/console/api/overview").json()
-    assert overview["sparkx"]["configured"] and all(lane["enabled"] for lane in overview["lanes"].values())
-    assert overview["feishu"]["group"] == "日报群" and re.fullmatch(r"[0-9a-f]{64}", overview["csrf"])
+    assert overview["sparkx"]["configured"] and overview["deepseek"]["configured"]
+    assert all(lane["enabled"] for lane in overview["lanes"].values()) and overview["lanes"]["hourly"]["start_hour"] == 9
+    assert overview["skills"] == {"installed": False, "release": None, "count": 0}
+    assert overview["feishu"]["group"] == "日报群" and overview["feishu"]["ad_lead"] is True
+    assert re.fullmatch(r"[0-9a-f]{64}", overview["csrf"])
     reports = console.get("/console/api/reports").json()
     lanes = reports["lanes"]
     assert lanes["review"]["mention_operators"] is True and lanes["review"]["to_operators"] is False
+    assert "高花费零出单" in reports["default_prompts"]["review"] and reports["max_prompt"] == 4000
     lanes["hourly"]["mention_operators"] = False
+    lanes["daily"]["prompt"] = "重点看 TACOS"
     assert console.post("/console/api/reports", json={"revision": reports["revision"], "lanes": lanes},
                         headers={"origin": ORIGIN}).status_code == 403
     saved = console.post("/console/api/reports", json={"revision": reports["revision"], "lanes": lanes}, headers=headers)
     assert saved.status_code == 200 and saved.json()["lanes"]["hourly"]["mention_operators"] is False
+    assert saved.json()["lanes"]["daily"]["prompt"] == "重点看 TACOS"
     lanes["daily"]["unknown_switch"] = True
     rejected = console.post("/console/api/reports", json={"revision": saved.json()["revision"], "lanes": lanes},
                             headers=headers)
@@ -81,13 +95,14 @@ def test_secrets_are_write_only(console):
     assert saved.status_code == 200 and "new-sparkx-token" not in saved.text and saved.json()["token_source"] == "console"
     deepseek = console.get("/console/api/deepseek").json()
     saved = console.post("/console/api/deepseek", json={"revision": deepseek["revision"], "api_key": "sk-new-key-123",
-                                                         "model": "deepseek-flash", "timeout": 30}, headers=headers)
-    assert saved.status_code == 200 and "sk-new-key-123" not in saved.text
+                                                         "model": "deepseek-flash", "timeout": 180, "thinking": False},
+                         headers=headers)
+    assert saved.status_code == 200 and "sk-new-key-123" not in saved.text and saved.json()["thinking"] is False
 
 
 def test_store_directory_lists_the_roster_and_saves_verified_operators(console, session_factory, monkeypatch, settings):
     with session_factory() as db:
-        stores.record_roster(db, DAILY["roster"], datetime.now(timezone.utc))
+        stores.record_roster(db, ROSTER, datetime.now(timezone.utc))
         db.commit()
     headers = login(console)
     view = console.get("/console/api/stores").json()
@@ -119,14 +134,41 @@ def test_existing_vhost_routes_reach_a_clear_answer(console):
     assert console.get("/anything-else").status_code == 404
 
 
-def test_live_preview_is_read_only(console, session_factory):
+def wait_for(console, job):
+    for _ in range(100):
+        state = console.get("/console/api/reports/preview", params={"job": job}).json()
+        if state["status"] != "running":
+            return state
+        time.sleep(0.05)
+    raise AssertionError("preview did not finish")
+
+
+def test_live_preview_runs_in_the_background_and_is_read_only(console, session_factory, drafts):
     headers = login(console)
-    preview = console.post("/console/api/reports/preview", json={"lane": "daily"}, headers=headers)
-    assert preview.status_code == 200
-    body = preview.json()
-    assert body["card"]["header"]["title"]["content"] == "SparkX 广告日报 · 2026-11-22"
-    assert "全公司核心指标" in body["text"] and body["info"]["profiles"] == 7
+    started = console.post("/console/api/reports/preview", json={"lane": "daily"}, headers=headers)
+    assert started.status_code == 200 and started.json()["lane"] == "daily"
+    state = wait_for(console, started.json()["job"])
+    assert state["status"] == "done"
+    result = state["result"]
+    assert result["cards"][0]["header"]["title"]["content"] == "SparkX 广告日报 · 2026-11-22"
+    assert "全公司核心指标" in result["text"] and result["info"]["profiles"] == 7 and result["info"]["sparkx_calls"] == 4
     with session_factory() as db:
         from jx_alert.notifications.outbox import NotificationOutbox
         assert db.query(NotificationOutbox).count() == 0
+    draft = console.post("/console/api/reports/preview", json={"lane": "hourly", "draft": {"high_spend": 55, "prompt": "简短"}},
+                         headers=headers)
+    assert wait_for(console, draft.json()["job"])["status"] == "done"
+    assert drafts[-1]["high_spend"] == 55 and drafts[-1]["prompt"] == "简短"  # unsaved form values are previewed
     assert console.post("/console/api/reports/preview", json={"lane": "other"}, headers=headers).status_code == 400
+    assert console.post("/console/api/reports/preview", json={"lane": "hourly", "draft": {"low_spend": 99}},
+                        headers=headers).status_code == 400  # low spend must stay below high spend
+    assert console.get("/console/api/reports/preview", params={"job": "missing"}).status_code == 404
+
+
+def test_skills_status_and_install(console, monkeypatch):
+    headers = login(console)
+    view = console.get("/console/api/skills").json()
+    assert view["installed"] is None and "get_ads_perf" in view["read_tools"] and "batch_update_ads" not in view["read_tools"]
+    monkeypatch.setattr(skill_store, "install", lambda settings: (_ for _ in ()).throw(skill_store.SkillsError("离线")))
+    failed = console.post("/console/api/skills/install", json={}, headers=headers)
+    assert failed.status_code == 502 and failed.json()["error"] == "离线"

@@ -1,9 +1,9 @@
-"""Durable Feishu questions answered by DeepSeek with read-only SparkX tools.
+"""Durable Feishu messages answered by DeepSeek: free conversation plus SparkX read tools.
 
 The event callback only persists the validated envelope (SyncJob
 "feishu_question"); a separate worker thread answers it and replies to the
 original message through the outbox. No model or SparkX request runs inside
-the event callback.
+the event callback. Answered turns keep their text so follow-ups have context.
 """
 from datetime import datetime, timedelta, timezone
 import json
@@ -13,7 +13,7 @@ import time
 
 from sqlalchemy import func, select
 
-from jx_alert.notifications.cards import card_fits, markdown, md_safe, shell, simple_card, table
+from jx_alert.notifications.cards import simple_card
 from jx_alert.notifications.outbox import QUESTION_REPLY_PREFIX, enqueue_notification
 from jx_alert.notifications.routing import OPEN_ID, load_routing, report_group_delivery
 from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
@@ -21,9 +21,11 @@ from jx_alert.storage.models import SyncJob
 
 _LOG = logging.getLogger("jx_alert.bot")
 JOB = "feishu_question"
-_HELP = re.compile(r"(?:你好|您好|在吗|你能做什么|有什么功能|怎么使用|帮助|help)[？?。!！\s]*", re.IGNORECASE)
-HELP_TEXT = ("可以直接用自己的话问 SparkX 广告数据，例如：\n- 昨天各店花费和 ACOS\n- 川页近 7 天花费最高的 10 个活动\n"
-             "- Campx 本周和上周比 ACOS 有什么变化\n- 今天到现在哪些活动花了钱没出单\n数据来自 SparkX（只读），由 DeepSeek 分析。")
+TITLE = "JX 广告助手"
+# Follow-up questions see the recent turns of the same conversation (p2p chat, or one person in the group).
+HISTORY_TURNS = 6
+HISTORY_WINDOW = timedelta(minutes=60)
+MAX_ANSWER_MEMORY = 4000
 
 
 def _utcnow():
@@ -186,72 +188,33 @@ def enqueue_group_question(db, settings, event_dict):
 
 # ---------------------------------------------------------------- answer rendering
 
-_SEPARATOR = re.compile(r"^\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?$")
-
-
-def _cells(line):
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
-
-
-def _formatted(line):
-    """md_safe text that keeps the model's **bold**; headings become bold lines."""
-    heading = re.match(r"^#{1,6}\s+(.*)$", line)
-    text = md_safe(heading.group(1) if heading else line, 1200).replace("＊＊", "**")
-    return f"**{text.strip('*')}**" if heading else text
-
-
 def answer_cards(title, answer, footer):
-    lines = [line.rstrip() for line in answer.splitlines()]
-    elements, paragraph, index = [], [], 0
-    while index < len(lines):
-        line = lines[index].strip()
-        if (line.startswith("|") and index + 1 < len(lines) and _SEPARATOR.match(lines[index + 1].strip())):
-            if paragraph:
-                elements.append(markdown("\n".join(paragraph)))
-                paragraph = []
-            headers = _cells(line)[:8]
-            rows = []
-            index += 2
-            while index < len(lines) and lines[index].strip().startswith("|"):
-                cells = _cells(lines[index])
-                rows.append([cell.replace("**", "") for cell in (cells + [""] * len(headers))[:len(headers)]])
-                index += 1
-            elements.append(table([header.replace("**", "") for header in headers], rows[:30]))
-            continue
-        if line:
-            paragraph.append(_formatted(line))
-        elif paragraph:
-            elements.append(markdown("\n".join(paragraph)))
-            paragraph = []
-        index += 1
-    if paragraph:
-        elements.append(markdown("\n".join(paragraph)))
-    elements += [{"tag": "hr"}, markdown(md_safe(footer, 300))]
-    cards, current = [], []
-    for element in elements:
-        candidate = shell(title, current + [element])
-        if current and not card_fits(candidate):
-            cards.append(shell(title, current))
-            current = [element]
-        else:
-            current.append(element)
-    if current:
-        cards.append(shell(title, current))
-    return [value for value in cards if card_fits(value)][:3] or [simple_card(title, "回答内容过长，请缩小问题范围。")]
+    """DeepSeek's Markdown answer as at most three reply cards (tables stay tables)."""
+    from jx_alert.reports.cards import report_cards
+
+    return report_cards(title, answer, footer, reserve=0)[:3]
 
 
-def raw_result_cards(results):
-    """When the prose failed verification: the last SparkX result, unedited."""
-    elements = [markdown("DeepSeek 的回答包含未能与 SparkX 结果核对的数字，已停止使用。以下为最后一次 SparkX 查询的原始结果：")]
-    for item in results[-1:]:
-        rows = item["result"].get("rows") if isinstance(item.get("result"), dict) else None
-        if isinstance(rows, list) and rows:
-            headers = list(dict.fromkeys(key for row in rows[:20] for key in row
-                                         if not isinstance(row.get(key), (dict, list))))[:8]
-            elements.append(table(headers, [[row.get(key, "—") for key in headers] for row in rows[:20]]))
-    elements.append(markdown("请换一种更具体的问法（店铺、日期范围、指标），或在控制台查看预览。"))
-    value = shell("SparkX 数据助手", elements)
-    return [value if card_fits(value) else simple_card("SparkX 数据助手", "未能核对回答中的数字，请换一种更具体的问法。")]
+def _conversation(meta):
+    """Turns of one private chat, or of one person inside the group, belong together."""
+    return (meta.get("chat_id"), None if meta.get("chat_type") == "p2p" else meta.get("sender_id"))
+
+
+def history(db, meta, job_id, now):
+    """Recent answered turns of the same conversation, oldest first (no other person's turns)."""
+    since = now.replace(tzinfo=None) - HISTORY_WINDOW
+    rows = db.scalars(select(SyncJob).where(
+        SyncJob.job_type == JOB, SyncJob.status == "SUCCEEDED", SyncJob.id < job_id, SyncJob.started_at >= since,
+        SyncJob.metadata_json["chat_id"].as_string() == meta.get("chat_id"))
+        .order_by(SyncJob.id.desc()).limit(40)).all()
+    turns = []
+    for row in rows:
+        item = row.metadata_json or {}
+        if _conversation(item) == _conversation(meta) and isinstance(item.get("answer_text"), str):
+            turns.append({"question": str(item.get("question") or ""), "answer": item["answer_text"]})
+        if len(turns) >= HISTORY_TURNS:
+            break
+    return list(reversed(turns))
 
 
 # ---------------------------------------------------------------- worker
@@ -286,6 +249,7 @@ def process_one_question(settings, session_factory, engine, *, answer=None):
     from jx_alert.ai.deepseek import DeepSeekError
     from jx_alert.bot_agent import answer_question
     from jx_alert.sparkx.client import SparkXError
+    from jx_alert.sparkx.stores import latest_roster
 
     with database_job_lock(engine, "feishu_question_worker"):
         with session_factory() as db:
@@ -309,26 +273,22 @@ def process_one_question(settings, session_factory, engine, *, answer=None):
                 job.error_message = "会话或读取权限已变更，本次未回复。"
                 db.commit()
                 return {"status": "SKIPPED", "job_id": job_id}
+            turns = history(db, meta, job_id, now)
+            roster, _ = latest_roster(db)
         question = meta["question"]
-        if _HELP.fullmatch(question):
-            cards, provider = [simple_card("SparkX 数据助手", HELP_TEXT)], "help"
+        try:
+            result = (answer or answer_question)(settings, question, history=turns, roster=roster)
+        except DeepSeekError as exc:
+            cards, provider = [simple_card(TITLE, f"DeepSeek 暂时无法回答：{exc}")], "deepseek_unavailable"
+        except SparkXError as exc:
+            cards, provider = [simple_card(TITLE, f"暂时无法查询 SparkX：{exc.message}")], "sparkx_error"
         else:
-            try:
-                result = (answer or answer_question)(settings, question)
-            except DeepSeekError as exc:
-                cards, provider = [simple_card("SparkX 数据助手", f"智能问答暂不可用：{exc}")], "deepseek_unavailable"
-            except SparkXError as exc:
-                cards, provider = [simple_card("SparkX 数据助手", f"暂时无法查询 SparkX：{exc.message}")], "sparkx_error"
-            else:
-                provider = result["provider"]
-                if result.get("answer"):
-                    footer = f"数据来源：SparkX MCP 只读查询 {result['calls']} 次；DeepSeek 撰写，数字已与查询结果核对。"
-                    cards = answer_cards("SparkX 数据助手", result["answer"], footer)
-                elif provider == "deepseek_unavailable":
-                    cards = [simple_card("SparkX 数据助手", f"智能问答暂不可用：{result.get('error') or ''}")]
-                else:
-                    cards = raw_result_cards(result.get("results") or [])
-                meta["sparkx_calls"] = result["calls"]
+            provider = result["provider"]
+            footer = (f"数据来源：SparkX MCP 只读查询 {result['calls']} 次 · DeepSeek 分析" if result.get("calls")
+                      else None)
+            cards = answer_cards(TITLE, result["answer"], footer)
+            meta["sparkx_calls"] = result.get("calls", 0)
+            meta["answer_text"] = result["answer"][:MAX_ANSWER_MEMORY]
         with session_factory() as db:
             return _complete(db, settings, job_id, meta, cards, provider)
 

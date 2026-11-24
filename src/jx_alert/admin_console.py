@@ -1,8 +1,9 @@
-"""Owner console: SparkX connection, store directory, recipients, lanes and DeepSeek.
+"""Owner console: SparkX connection and Skills, store directory, recipients, lanes and DeepSeek.
 
 A single owner password (PBKDF2 file) opens a 30-minute browser session. Every
 POST needs the same-origin header and the session-bound CSRF token. Secrets
-are write-only: tokens and keys are never returned to the browser.
+are write-only: tokens and keys are never returned to the browser. Previews run
+DeepSeek against live SparkX data in a background job and never queue a message.
 """
 import asyncio
 from datetime import datetime, timezone
@@ -29,12 +30,14 @@ from jx_alert.console_auth import SESSION_TTL, OwnerPassword, SessionStore
 from jx_alert.notifications.cards import plain_text
 from jx_alert.notifications.outbox import QUESTION_REPLY_PREFIX, NotificationOutbox
 from jx_alert.notifications.receipt import unique_json_fields
+from jx_alert.ai.deepseek import DeepSeekError
 from jx_alert.reports import lanes
 from jx_alert.reports import settings as lane_settings
+from jx_alert.reports import tasks as lane_tasks
 from jx_alert.sparkx import credentials as sparkx_credentials
+from jx_alert.sparkx import skills as skill_store
 from jx_alert.sparkx import stores as directory_module
-from jx_alert.sparkx.client import SparkXError
-from jx_alert.sparkx.collect import fetch_roster
+from jx_alert.sparkx.client import READ_TOOLS, SparkXError, fetch_roster
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import SyncJob
 
@@ -110,8 +113,53 @@ async def _body(request, media, limit=16384):
         raise ConsoleError("请求格式无效。", 400) from None
 
 
+class PreviewJobs:
+    """Background previews: a DeepSeek run takes minutes, longer than a proxy request may stay open.
+
+    One preview runs at a time; finished results are kept for 30 minutes.
+    """
+
+    TTL = 30 * 60
+
+    def __init__(self):
+        self._jobs, self._lock = {}, threading.Lock()
+
+    def start(self, lane, work):
+        with self._lock:
+            now = time.monotonic()
+            self._jobs = {key: job for key, job in self._jobs.items() if now - job["at"] < self.TTL}
+            if any(job["status"] == "running" for job in self._jobs.values()):
+                raise ConsoleError("已有一个预览正在生成，请等它完成。", 409)
+            key = secrets.token_urlsafe(12)
+            self._jobs[key] = {"at": now, "status": "running", "lane": lane, "result": None, "error": None,
+                               "started_at": datetime.now(timezone.utc).isoformat()}
+
+        def target():
+            try:
+                result, status, error = work(), "done", None
+            except ConsoleError as exc:
+                result, status, error = None, "failed", exc.detail
+            except Exception as exc:  # noqa: BLE001 - never echo internal errors to the browser.
+                _LOG.warning("Console preview failed (%s)", type(exc).__name__)
+                result, status, error = None, "failed", "预览生成失败，请稍后重试。"
+            with self._lock:
+                if key in self._jobs:
+                    self._jobs[key].update(status=status, result=result, error=error,
+                                           finished_at=datetime.now(timezone.utc).isoformat())
+
+        threading.Thread(target=target, name="console-preview", daemon=True).start()
+        return key
+
+    def get(self, key):
+        with self._lock:
+            job = self._jobs.get(key) if isinstance(key, str) else None
+            if job is None:
+                raise ConsoleError("预览已过期，请重新生成。", 404)
+            return {name: job.get(name) for name in ("status", "lane", "result", "error", "started_at", "finished_at")}
+
+
 class OwnerConsole:
-    def __init__(self, settings, password, sessions, *, session_factory=SessionLocal, collector=None):
+    def __init__(self, settings, password, sessions, *, session_factory=SessionLocal, runner=None):
         self.settings = settings
         self.password = password
         self.sessions = sessions
@@ -121,7 +169,8 @@ class OwnerConsole:
         self.origin = f"{url.scheme}://{url.netloc}"
         self.host = url.netloc.lower()
         self.session_factory = session_factory
-        self.collector = collector
+        self.runner = runner
+        self.previews = PreviewJobs()
         self._limits = {}
         self._limit_lock = threading.Lock()
 
@@ -216,10 +265,12 @@ class OwnerConsole:
             job = db.scalar(select(SyncJob).where(SyncJob.job_type == job_type).order_by(SyncJob.id.desc()).limit(1))
             if job is not None:
                 meta = job.metadata_json or {}
+                message = meta.get("message") if isinstance(meta.get("message"), str) else (
+                    SparkXError(meta["error"]).message if isinstance(meta.get("error"), str) else None)
                 result[lane] = {"status": job.status, "at": _iso(job.started_at), "error": meta.get("error"),
-                                "queued": len(meta.get("outbox_ids") or []), "narrative": meta.get("narrative"),
-                                "findings": meta.get("findings"), "message": SparkXError(meta["error"]).message
-                                if isinstance(meta.get("error"), str) else None}
+                                "queued": len(meta.get("outbox_ids") or []), "findings": meta.get("findings"),
+                                "sparkx_calls": meta.get("sparkx_calls"), "message": message,
+                                "reason": meta.get("reason")}
         return result
 
     def _deliveries(self, db, limit=30):
@@ -267,11 +318,21 @@ class OwnerConsole:
             roster, roster_at = directory_module.latest_roster(db)
             runs, recent = self._last_runs(db), self._deliveries(db, 10)
         monitored = [key for key in roster if directory_module.monitored(directory, key)]
+        index = skill_store.installed(settings)
+        try:
+            leads = admin_feishu.leads(settings)
+        except admin_feishu.MappingError:
+            leads = {}
         return {"sparkx": sparkx, "deepseek": deepseek,
+                "skills": {"installed": bool(index), "release": (index or {}).get("release"),
+                           "count": len((index or {}).get("skills") or [])},
                 "feishu": {"enabled": settings.feishu_enabled, "dry_run": settings.app_dry_run,
                            "delivery_enabled": settings.delivery_enabled(), "group": group,
+                           "company_lead": bool(leads.get("company")), "ad_lead": bool(leads.get("ad")),
                            "bot_enabled": settings.feishu_bot_enabled, "scheduler_enabled": settings.scheduler_enabled},
-                "lanes": {lane: {"enabled": (config.get(lane) or {}).get("enabled", False), "last": runs.get(lane)}
+                "lanes": {lane: {"enabled": (config.get(lane) or {}).get("enabled", False), "last": runs.get(lane),
+                                 **({"start_hour": config["hourly"]["start_hour"], "end_hour": config["hourly"]["end_hour"]}
+                                    if lane == "hourly" and "hourly" in config else {})}
                           for lane in lanes.LANES},
                 "stores": {"authorized": len(roster), "monitored": len(monitored),
                            "mapped": sum(bool(directory_module.operators(directory, key)) for key in monitored),
@@ -341,20 +402,58 @@ class OwnerConsole:
     def _reports(self):
         data = lane_settings.load(self.settings)
         return {"revision": data["revision"], "updated_at": data.get("updated_at"), "lanes": data["lanes"],
-                "defaults": lane_settings.DEFAULTS}
+                "defaults": lane_settings.DEFAULTS, "default_prompts": lane_tasks.DEFAULT_PROMPTS,
+                "max_prompt": lane_settings.MAX_PROMPT}
 
-    def _preview(self, lane):
+    def _preview_config(self, payload):
+        """The saved lane settings, or the unsaved form values when the owner previews a draft."""
+        if set(payload) - {"lane", "draft"} or payload.get("lane") not in lanes.LANES:
+            raise ConsoleError("预览类型无效。", 400)
+        lane, saved = payload["lane"], lane_settings.load(self.settings)["lanes"]
+        draft = payload.get("draft")
+        if draft is None:
+            return lane, saved[lane]
+        if not isinstance(draft, dict) or set(draft) - set(lane_settings.DEFAULTS[lane]):
+            raise ConsoleError("预览参数无效。", 400)
+        try:
+            checked = lane_settings.validate({**saved, lane: {**saved[lane], **draft}})
+        except (ValueError, TypeError, KeyError):
+            raise ConsoleError("请先核对阈值和任务说明再预览。", 400) from None
+        return lane, checked[lane]
+
+    def _run_preview(self, lane, config):
+        if not lanes.sparkx_ready(self.settings):
+            raise ConsoleError("请先在「SparkX MCP」保存 Token。", 409)
+        if not lanes.deepseek_ready(self.settings) and self.runner is None:
+            raise ConsoleError("请先在「DeepSeek」保存 API Key。", 409)
         now = datetime.now(timezone.utc)
+        started = time.monotonic()
         with self.session_factory() as db:
             try:
-                value, info = lanes.preview(self.settings, lane, now=now, db=db, collector=self.collector)
+                values, info = lanes.preview(self.settings, lane, now=now, db=db, runner=self.runner, config=config)
             except SparkXError as exc:
                 raise ConsoleError(exc.message, 409 if exc.status_code == 409 else 502) from None
+            except DeepSeekError as exc:
+                raise ConsoleError(f"DeepSeek：{exc}", 502) from None
+            except ValueError:
+                raise ConsoleError("DeepSeek 的输出不符合约定格式，请重试或调整任务说明。", 502) from None
             db.commit()
-        if value is None:
-            message = "当前没有触发提醒的广告活动。" if lane == "hourly" else "内容超过飞书卡片上限，请缩小监控店铺范围。"
-            return {"card": None, "text": message, "info": info}
-        return {"card": value, "text": plain_text(value), "info": info}
+        info["seconds"] = round(time.monotonic() - started)
+        if not values:
+            text = "当前没有需要提醒的广告活动。" if lane == "hourly" else "没有生成内容。"
+            return {"cards": [], "text": text, "info": info}
+        return {"cards": values, "text": "\n\n".join(plain_text(value) for value in values), "info": info}
+
+    def _skills(self, check=False):
+        view = skill_store.status(self.settings, check=check)
+        return {**view, "read_tools": sorted(READ_TOOLS), "source": skill_store.REPOSITORY}
+
+    def _install_skills(self):
+        try:
+            skill_store.install(self.settings)
+        except skill_store.SkillsError as exc:
+            raise ConsoleError(exc.detail, exc.status_code) from None
+        return self._skills()
 
     # ------------------------------------------------------------ dispatch
 
@@ -406,6 +505,10 @@ class OwnerConsole:
             return await run(self._reports)
         if path == "/console/api/deepseek":
             return await run(deepseek_config.configuration, self.settings)
+        if path == "/console/api/skills":
+            return await run(self._skills)
+        if path == "/console/api/reports/preview":
+            return self.previews.get(request.query_params.get("job"))
         if path == "/console/api/deliveries":
             def deliveries():
                 with self.session_factory() as db:
@@ -428,7 +531,8 @@ class OwnerConsole:
             response = RedirectResponse("/console/login", 303, headers=_HEADERS)
             _cookie(response, SESSION, "", 0)
             return response
-        payload = await _body(request, "application/json", limit=65536 if path == "/console/api/stores/save" else 16384)
+        large = {"/console/api/stores/save", "/console/api/reports", "/console/api/reports/preview"}
+        payload = await _body(request, "application/json", limit=98304 if path in large else 16384)
         run = asyncio.to_thread
         if path == "/console/api/sparkx":
             self._limit(request, "sparkx-write", 6, 12)
@@ -468,10 +572,9 @@ class OwnerConsole:
             await run(lane_settings.save, self.settings, payload)
             return await run(self._reports)
         if path == "/console/api/reports/preview":
-            if set(payload) != {"lane"} or payload["lane"] not in lanes.LANES:
-                raise ConsoleError("预览类型无效。", 400)
+            lane, config = await run(self._preview_config, payload)
             self._limit(request, "preview", 3, 6, "预览太频繁，请一分钟后重试。")
-            return await run(self._preview, payload["lane"])
+            return {"job": self.previews.start(lane, lambda: self._run_preview(lane, config)), "lane": lane}
         if path == "/console/api/deepseek":
             self._limit(request, "deepseek-write", 6, 12)
             return await run(deepseek_config.save_configuration, self.settings, payload)
@@ -480,13 +583,24 @@ class OwnerConsole:
                 raise ConsoleError("连接测试不接受额外参数。", 400)
             self._limit(request, "deepseek-test", 4, 8, "连接测试太频繁，请稍后重试。")
             return await run(deepseek_config.check_connection, self.settings)
+        if path == "/console/api/skills/install":
+            if payload:
+                raise ConsoleError("安装不接受额外参数。", 400)
+            self._limit(request, "skills-install", 2, 4, "安装太频繁，请一分钟后重试。")
+            return await run(self._install_skills)
+        if path == "/console/api/skills/check":
+            if payload:
+                raise ConsoleError("检查不接受额外参数。", 400)
+            self._limit(request, "skills-check", 4, 8, "检查太频繁，请稍后重试。")
+            return await run(self._skills, True)
         raise ConsoleError("接口不存在。", 404)
 
     def routes(self):
-        api_get = ["overview", "sparkx", "stores", "members", "recipients", "groups", "reports", "deepseek",
-                   "deliveries"]
+        api_get = ["overview", "sparkx", "stores", "members", "recipients", "groups", "reports", "reports/preview",
+                   "deepseek", "skills", "deliveries"]
         api_post = ["sparkx", "sparkx/test", "stores/refresh", "stores/save", "recipients/company", "recipients/ad",
-                    "groups", "members/refresh", "reports", "reports/preview", "deepseek", "deepseek/test"]
+                    "groups", "members/refresh", "reports", "reports/preview", "deepseek", "deepseek/test",
+                    "skills/install", "skills/check"]
         routes = [Route("/", self.root), Route("/console", self.home), Route("/console/", self.home),
                   Route("/console/login", self.login, methods=["GET", "POST"]),
                   Route("/console/assets/{asset}", self.asset),

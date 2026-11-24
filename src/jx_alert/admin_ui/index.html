@@ -9,185 +9,334 @@
   <link rel="stylesheet" href="/console/assets/console.css">
   <script src="/console/assets/console.js" defer></script>
 </head>
-<body>
-  <a class="skip" href="#workspace">跳到工作区</a>
-  <header class="masthead">
-    <div class="masthead-inner">
-      <a class="brand" href="/console/"><span class="brand-mark" aria-hidden="true">JX</span>
-        <span><strong>JX 广告监控台</strong><small>SparkX 数据 · DeepSeek 分析 · 飞书通知</small></span></a>
-      <nav class="navigation" aria-label="工作区">
-        <button type="button" data-view="overview" aria-current="page">总览</button>
-        <button type="button" data-view="stores">店铺与运营</button>
-        <button type="button" data-view="notifications">通知设置</button>
-        <button type="button" data-view="sparkx">SparkX 连接</button>
-        <button type="button" data-view="deepseek">DeepSeek</button>
-        <button type="button" data-view="deliveries">发送记录</button>
-      </nav>
-      <button type="button" id="logout" class="logout">退出</button>
-    </div>
-  </header>
+<body class="app">
+  <a class="skip" href="#workspace">跳到主要内容</a>
+  <aside class="sidebar" aria-label="导航">
+    <a class="brand" href="/console/"><span class="brand-mark" aria-hidden="true">JX</span>
+      <span><strong>JX 广告监控台</strong><small>SparkX · DeepSeek · 飞书</small></span></a>
+    <nav class="nav" aria-label="工作区">
+      <p class="nav-group">工作台</p>
+      <button type="button" data-view="overview" aria-current="page"><span class="nav-icon" aria-hidden="true">◎</span>概览</button>
+      <p class="nav-group">运营</p>
+      <button type="button" data-view="stores"><span class="nav-icon" aria-hidden="true">▦</span>店铺与运营</button>
+      <button type="button" data-view="notifications"><span class="nav-icon" aria-hidden="true">✉</span>通知与报告</button>
+      <p class="nav-group">连接</p>
+      <button type="button" data-view="sparkx"><span class="nav-icon" aria-hidden="true">⇄</span>SparkX MCP</button>
+      <button type="button" data-view="deepseek"><span class="nav-icon" aria-hidden="true">✦</span>DeepSeek 与机器人</button>
+      <p class="nav-group">记录</p>
+      <button type="button" data-view="deliveries"><span class="nav-icon" aria-hidden="true">☰</span>发送记录</button>
+    </nav>
+    <button type="button" id="logout" class="nav-logout">退出登录</button>
+  </aside>
 
-  <main class="workspace" id="workspace" tabindex="-1">
-    <div id="global-status" class="notice" role="status" hidden></div>
-
-    <section data-panel="overview" aria-labelledby="overview-title">
-      <div class="page-heading"><div><h1 id="overview-title">总览</h1>
-        <p class="muted">数据只来自 SparkX MCP（只读）；DeepSeek 负责撰写说明和回答问题；飞书自建应用负责发送。</p></div>
-        <button type="button" class="button secondary" data-refresh="overview">刷新</button></div>
-      <div class="cards" id="status-cards"></div>
-      <section class="panel"><div class="section-heading"><h2>通知计划</h2>
-        <p class="muted">北京时间。每次运行都会重新读取开关和接收人，修改后无需重启。</p></div>
-        <div class="table-scroll"><table><thead><tr><th scope="col">通知</th><th scope="col">时间</th><th scope="col">开关</th>
-          <th scope="col">最近一次运行</th><th scope="col">结果</th></tr></thead><tbody id="lane-rows"></tbody></table></div></section>
-      <section class="panel"><div class="section-heading"><h2>最近发送</h2></div>
-        <div class="table-scroll"><table><thead><tr><th scope="col">时间</th><th scope="col">通知</th><th scope="col">接收人</th>
-          <th scope="col">状态</th></tr></thead><tbody id="recent-rows"></tbody></table></div></section>
-    </section>
-
-    <section data-panel="stores" aria-labelledby="stores-title" hidden>
-      <div class="page-heading"><div><h1 id="stores-title">店铺与运营</h1>
-        <p class="muted">店铺来自 SparkX Token 授权的 Profile。每家店可指定运营（通知群成员）：未指定时通知照常发到群里，标注「未映射运营」；指定后，这家店出现异常时群消息会 @ 对应运营。关闭监控的店铺不进入任何通知。</p></div>
-        <div class="control-actions"><button type="button" class="button secondary" id="refresh-roster">从 SparkX 刷新店铺</button></div></div>
-      <div id="stores-status" class="notice" role="status" hidden></div>
-      <section class="panel">
-        <div class="toolbar"><label class="sr-only" for="store-search">搜索店铺或运营</label>
-          <input id="store-search" type="search" placeholder="搜索店铺、站点或运营" autocomplete="off">
-          <span id="roster-time" class="muted"></span></div>
-        <div class="table-scroll"><table class="stores-table"><thead><tr><th scope="col">店铺</th><th scope="col">站点</th>
-          <th scope="col">类型</th><th scope="col">监控</th><th scope="col">运营</th></tr></thead>
-          <tbody id="store-rows"></tbody></table></div>
-      </section>
-      <section class="panel picker" id="operator-picker" hidden aria-labelledby="picker-title">
-        <div class="section-heading"><div><h2 id="picker-title">选择运营</h2><p class="muted" id="picker-store"></p></div>
-          <button type="button" class="link-button" id="picker-close">关闭</button></div>
-        <div class="picker-body"><input id="picker-search" type="search" placeholder="搜索通知群成员" autocomplete="off">
-          <fieldset id="picker-members" class="members"><legend class="sr-only">通知群成员</legend></fieldset>
-          <div class="save-bar"><span class="muted">最多 10 位；只能选择通知群内的成员。</span>
-            <button type="button" class="button primary" id="picker-save">保存运营</button></div></div>
-      </section>
-    </section>
-
-    <section data-panel="notifications" aria-labelledby="notifications-title" hidden>
-      <div class="page-heading"><div><h1 id="notifications-title">通知设置</h1>
-        <p class="muted">三类通知均由 SparkX 直出数据生成，默认全部开启：始终发到通知群，店铺还没有运营时也照常发送；为店铺指定运营后，群消息会 @ 出问题店铺的对应运营。</p></div></div>
-      <div id="notifications-status" class="notice" role="status" hidden></div>
-      <div class="grid-2">
-        <section class="panel" aria-labelledby="group-title"><div class="section-heading"><div><h2 id="group-title">通知群</h2>
-          <p class="muted">群消息与群内 @机器人 问答使用此群；负责人和运营从此群成员中选择。</p></div></div>
-          <div class="panel-body"><p>当前：<strong id="current-group">—</strong></p>
-            <div class="inline-form"><label for="group-select">更换为</label><select id="group-select" disabled><option value="">先读取群列表</option></select>
-              <button type="button" class="button secondary" id="load-groups">读取群列表</button></div>
-            <label class="check"><input type="checkbox" id="group-confirm">我确认更换：旧群里尚未发送的消息将停止发送，不会补发到新群。</label>
-            <div class="save-bar"><span></span><button type="button" class="button primary" id="save-group" disabled>保存通知群</button></div></div>
-        </section>
-        <section class="panel" aria-labelledby="leads-title"><div class="section-heading"><div><h2 id="leads-title">负责人</h2>
-          <p class="muted">私聊接收，只能是通知群成员。</p></div></div>
-          <div class="panel-body lead-list">
-            <div class="lead"><div><strong>总负责人</strong><span class="muted">接收 08:30 全公司日报</span></div>
-              <span class="chip" id="lead-company">未设置</span><button type="button" class="link-button" data-lead="company">选择</button></div>
-            <div class="lead"><div><strong>广告负责人</strong><span class="muted">接收异常复盘与实时监控（全部店铺，标注对应运营）</span></div>
-              <span class="chip" id="lead-ad">未设置</span><button type="button" class="link-button" data-lead="ad">选择</button></div>
-            <div id="lead-picker" hidden><input id="lead-search" type="search" placeholder="搜索通知群成员" autocomplete="off">
-              <fieldset id="lead-members" class="members"><legend class="sr-only">选择一位负责人</legend></fieldset>
-              <div class="save-bar"><button type="button" class="link-button" id="lead-clear">清空</button>
-                <button type="button" class="button primary" id="lead-save">保存负责人</button></div></div>
-          </div>
-        </section>
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-title"><h1 id="page-title">概览</h1><p id="page-subtitle" class="muted"></p></div>
+      <div class="topbar-actions" id="page-actions">
+        <button type="button" class="button secondary" data-for="overview" data-refresh="overview">刷新</button>
+        <button type="button" class="button primary" data-for="stores" id="refresh-roster">从 SparkX 刷新店铺</button>
+        <button type="button" class="button secondary" data-for="deliveries" data-refresh="deliveries">刷新</button>
       </div>
-      <form id="lanes-form" class="lanes" autocomplete="off">
-        <section class="panel lane" data-lane="daily"><div class="section-heading"><div><h2>08:30 广告日报</h2>
-          <p class="muted">昨日（美西完整日）全公司销售额、订单量、广告花费、ACOS、TACOS、CVR、PPC，站点汇总与有花费店铺明细，加「须知」。</p></div>
-          <button type="button" class="button secondary" data-preview="daily">预览</button></div>
-          <div class="panel-body switches">
-            <label class="check"><input type="checkbox" name="enabled">开启</label>
-            <label class="check"><input type="checkbox" name="to_group">发到通知群</label>
-            <label class="check"><input type="checkbox" name="to_lead">私聊总负责人</label>
-            <label class="check"><input type="checkbox" name="ai">DeepSeek 撰写须知（数字逐项核对）</label></div></section>
-        <section class="panel lane" data-lane="review"><div class="section-heading"><div><h2>08:30 广告异常复盘</h2>
-          <p class="muted">近 7 日对比前 7 日，campaign 级：全店零曝光、高花费零出单、ACOS 恶化、加预算后销售下滑、异常停摆，附建议出价。</p></div>
-          <button type="button" class="button secondary" data-preview="review">预览</button></div>
-          <div class="panel-body switches">
-            <label class="check"><input type="checkbox" name="enabled">开启</label>
-            <label class="check"><input type="checkbox" name="weekly">仅每周一发送</label>
-            <label class="check"><input type="checkbox" name="to_group">发到通知群</label>
-            <label class="check"><input type="checkbox" name="mention_operators">群内 @ 出问题店铺的对应运营</label>
-            <label class="check"><input type="checkbox" name="to_lead">私聊广告负责人</label>
-            <label class="check"><input type="checkbox" name="to_operators">另外私聊对应运营（只含其店铺）</label>
-            <label class="check"><input type="checkbox" name="ai">DeepSeek 撰写判断与建议</label></div></section>
-        <section class="panel lane" data-lane="hourly"><div class="section-heading"><div><h2>每小时实时监控</h2>
-          <p class="muted">美西当日截至目前的 campaign 数据：高花费无转化、高花费低转化、低花费无转化、低花费高转化。同一活动同类提醒每天一次。</p></div>
-          <button type="button" class="button secondary" data-preview="hourly">预览</button></div>
-          <div class="panel-body switches">
-            <label class="check"><input type="checkbox" name="enabled">开启</label>
-            <label class="check"><input type="checkbox" name="to_group">发到通知群</label>
-            <label class="check"><input type="checkbox" name="mention_operators">群内 @ 出问题店铺的对应运营</label>
-            <label class="check"><input type="checkbox" name="to_lead">私聊广告负责人</label>
-            <label class="check"><input type="checkbox" name="to_operators">另外私聊对应运营（只含其店铺）</label></div>
-          <div class="panel-body thresholds">
-            <label>发送时段（北京）<span class="pair"><input type="number" name="start_hour" min="0" max="23" step="1"> 点至
-              <input type="number" name="end_hour" min="1" max="24" step="1"> 点</span></label>
-            <label>高花费线（$）<input type="number" name="high_spend" min="1" step="1"></label>
-            <label>低花费起算（$）<input type="number" name="low_spend" min="0" step="1"></label>
-            <label>低花费无转化最少点击<input type="number" name="min_clicks" min="1" step="1"></label>
-            <label>低转化：ACOS ≥（%）<input type="number" name="acos_high" min="1" step="1"></label>
-            <label>低转化：CVR &lt;（%）<input type="number" name="cvr_low" min="0" step="0.5"></label>
-            <label>高转化：ACOS ≤（%）<input type="number" name="acos_good" min="1" step="1"></label>
-            <label>高转化：最少订单<input type="number" name="min_orders_good" min="1" step="1"></label></div></section>
-        <div class="save-bar sticky"><span class="muted" id="lanes-updated"></span>
-          <button type="submit" class="button primary" id="save-lanes">保存通知设置</button></div>
-      </form>
-      <section class="panel" id="preview-panel" hidden aria-labelledby="preview-title">
-        <div class="section-heading"><div><h2 id="preview-title">预览</h2><p class="muted" id="preview-info"></p></div>
-          <button type="button" class="link-button" id="preview-close">关闭</button></div>
-        <div class="panel-body"><div id="preview-card" class="feishu-card"></div>
-          <details><summary>纯文本</summary><pre id="preview-text"></pre></details></div>
+    </header>
+
+    <main class="workspace" id="workspace" tabindex="-1">
+      <div id="global-status" class="notice" role="status" hidden></div>
+
+      <!-- ============================================================ 概览 -->
+      <section data-panel="overview" data-title="概览" data-subtitle="三条通知由 DeepSeek 调用 SparkX MCP（只读）生成，飞书自建应用发送。">
+        <section class="panel setup" id="setup-panel" hidden aria-labelledby="setup-title">
+          <div class="panel-head"><div><h2 id="setup-title">开始使用</h2>
+            <p class="muted">按顺序完成下面几步，通知就会按计划发出。</p></div>
+            <span class="badge" id="setup-progress"></span></div>
+          <ol class="steps" id="setup-steps"></ol>
+        </section>
+        <div class="stat-grid" id="status-cards"></div>
+        <section class="panel" aria-labelledby="plan-title">
+          <div class="panel-head"><div><h2 id="plan-title">通知计划</h2>
+            <p class="muted">北京时间。每次运行都会重新读取开关和接收人，修改后无需重启。</p></div>
+            <button type="button" class="button ghost" data-go="notifications">管理通知</button></div>
+          <div class="table-scroll"><table><thead><tr><th scope="col">通知</th><th scope="col">时间</th><th scope="col">状态</th>
+            <th scope="col">最近一次运行</th><th scope="col">结果</th></tr></thead><tbody id="lane-rows"></tbody></table></div>
+        </section>
+        <section class="panel" aria-labelledby="recent-title">
+          <div class="panel-head"><h2 id="recent-title">最近发送</h2>
+            <button type="button" class="button ghost" data-go="deliveries">全部记录</button></div>
+          <div class="table-scroll"><table><thead><tr><th scope="col">时间</th><th scope="col">通知</th><th scope="col">接收人</th>
+            <th scope="col">状态</th></tr></thead><tbody id="recent-rows"></tbody></table></div>
+        </section>
       </section>
-    </section>
 
-    <section data-panel="sparkx" aria-labelledby="sparkx-title" hidden>
-      <div class="page-heading"><div><h1 id="sparkx-title">SparkX 连接</h1>
-        <p class="muted">只调用只读工具 get_user_authorized_context、get_ads_perf、get_entity_metadata；写操作工具不可达。</p></div></div>
-      <div id="sparkx-status" class="notice" role="status" hidden></div>
-      <section class="panel"><div class="panel-body">
-        <dl class="facts" id="sparkx-facts"></dl>
-        <form id="sparkx-form" class="stack" autocomplete="off">
-          <label for="sparkx-token">SparkX MCP Token</label>
-          <input id="sparkx-token" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false"
-                 placeholder="在 SparkX 后台「MCP &amp; Skills」生成；填写新值后保存，原值不回显">
-          <div class="control-actions"><button type="submit" class="button primary">保存 Token</button>
-            <button type="button" class="button secondary" id="sparkx-test">测试连接</button>
-            <button type="button" class="link-button" id="sparkx-clear">清除控制台 Token</button></div>
-        </form></div></section>
-      <section class="panel" id="sparkx-profiles-panel" hidden><div class="section-heading"><h2>Token 已授权的店铺</h2></div>
-        <div class="table-scroll"><table><thead><tr><th scope="col">Profile ID</th><th scope="col">店铺</th><th scope="col">站点</th>
-          <th scope="col">类型</th></tr></thead><tbody id="sparkx-profiles"></tbody></table></div></section>
-    </section>
+      <!-- ============================================================ 店铺与运营 -->
+      <section data-panel="stores" hidden data-title="店铺与运营"
+               data-subtitle="店铺来自 SparkX Token 授权的 Profile。为店铺指定运营后，这家店出现问题时群消息会 @ 对应运营；未指定时照常发送，标注「未映射运营」。">
+        <div id="stores-status" class="notice" role="status" hidden></div>
+        <section class="panel">
+          <div class="toolbar">
+            <label class="search"><span class="sr-only">搜索店铺或运营</span>
+              <input id="store-search" type="search" placeholder="搜索店铺、站点、Profile ID 或运营" autocomplete="off"></label>
+            <div class="segmented" role="group" aria-label="筛选店铺" id="store-filter">
+              <button type="button" data-filter="all" aria-pressed="true">全部 <span data-count="all"></span></button>
+              <button type="button" data-filter="unmapped" aria-pressed="false">未指定运营 <span data-count="unmapped"></span></button>
+              <button type="button" data-filter="paused" aria-pressed="false">未纳入通知 <span data-count="paused"></span></button>
+            </div>
+            <span id="roster-time" class="muted toolbar-end"></span>
+          </div>
+          <div class="bulkbar" id="bulk-bar" hidden>
+            <strong id="bulk-count"></strong>
+            <button type="button" class="button primary small" id="bulk-assign">指定运营</button>
+            <button type="button" class="button secondary small" id="bulk-include">纳入通知</button>
+            <button type="button" class="button secondary small" id="bulk-exclude">暂停通知</button>
+            <button type="button" class="button ghost small" id="bulk-clear">取消选择</button>
+          </div>
+          <div class="table-scroll"><table class="stores-table"><thead><tr>
+            <th scope="col" class="col-check"><input type="checkbox" id="select-all" aria-label="选择全部显示的店铺"></th>
+            <th scope="col">店铺</th><th scope="col">站点</th><th scope="col">类型</th><th scope="col">运营</th>
+            <th scope="col">纳入通知</th><th scope="col" class="col-actions"><span class="sr-only">操作</span></th></tr></thead>
+            <tbody id="store-rows"></tbody></table></div>
+        </section>
+      </section>
 
-    <section data-panel="deepseek" aria-labelledby="deepseek-title" hidden>
-      <div class="page-heading"><div><h1 id="deepseek-title">DeepSeek</h1>
-        <p class="muted">用于日报「须知」、复盘建议和飞书问答。测试连接只调用免费的模型列表与余额接口。</p></div></div>
-      <div id="deepseek-status" class="notice" role="status" hidden></div>
-      <section class="panel"><div class="panel-body">
-        <dl class="facts" id="deepseek-facts"></dl>
-        <form id="deepseek-form" class="stack" autocomplete="off">
-          <label for="deepseek-key">API Key</label>
-          <input id="deepseek-key" type="password" maxlength="512" autocomplete="new-password" spellcheck="false"
-                 placeholder="填写新值；留空保留当前密钥">
-          <label for="deepseek-model">模型</label><select id="deepseek-model"></select>
-          <label for="deepseek-timeout">超时（秒）</label><input id="deepseek-timeout" type="number" min="1" max="120" step="1">
-          <div class="control-actions"><button type="submit" class="button primary">保存</button>
-            <button type="button" class="button secondary" id="deepseek-test">测试连接</button></div>
-        </form></div></section>
-    </section>
+      <!-- ============================================================ 通知与报告 -->
+      <section data-panel="notifications" hidden data-title="通知与报告"
+               data-subtitle="三条通知默认全部开启：DeepSeek 按下面的任务说明调用 SparkX 查询并撰写，结果发到通知群和负责人。">
+        <div id="notifications-status" class="notice" role="status" hidden></div>
+        <h2 class="section-title">接收对象</h2>
+        <div class="grid-2">
+          <section class="panel" aria-labelledby="group-title">
+            <div class="panel-head"><div><h2 id="group-title">通知群</h2>
+              <p class="muted">群消息和群内 @机器人 问答都用这个群；负责人和运营从群成员中选择。</p></div></div>
+            <div class="panel-body">
+              <div class="kv"><span class="muted">当前</span><strong id="current-group">—</strong>
+                <button type="button" class="button secondary small" id="load-groups">更换</button></div>
+              <div id="group-change" class="stack" hidden>
+                <label class="field"><span>选择机器人已加入的群</span><select id="group-select"></select></label>
+                <label class="check"><input type="checkbox" id="group-confirm">我确认更换：旧群里尚未发出的消息将停止发送，不会补发到新群。</label>
+                <div class="actions-end"><button type="button" class="button ghost" id="group-cancel">取消</button>
+                  <button type="button" class="button primary" id="save-group">保存通知群</button></div>
+              </div>
+            </div>
+          </section>
+          <section class="panel" aria-labelledby="leads-title">
+            <div class="panel-head"><div><h2 id="leads-title">负责人</h2><p class="muted">私聊接收，只能是通知群成员。</p></div></div>
+            <div class="panel-body list">
+              <div class="list-row"><div><strong>总负责人</strong><span class="muted">接收 08:30 广告日报</span></div>
+                <span class="chip" id="lead-company">未设置</span>
+                <button type="button" class="button secondary small" data-lead="company">选择</button></div>
+              <div class="list-row"><div><strong>广告负责人</strong><span class="muted">接收异常复盘和实时监控（全部店铺，标注运营）</span></div>
+                <span class="chip" id="lead-ad">未设置</span>
+                <button type="button" class="button secondary small" data-lead="ad">选择</button></div>
+            </div>
+          </section>
+        </div>
 
-    <section data-panel="deliveries" aria-labelledby="deliveries-title" hidden>
-      <div class="page-heading"><div><h1 id="deliveries-title">发送记录</h1>
-        <p class="muted">最近 30 条日报、复盘、实时监控与问答回复。「可能已提交」的消息不会自动重发。</p></div>
-        <button type="button" class="button secondary" data-refresh="deliveries">刷新</button></div>
-      <section class="panel"><div class="table-scroll"><table><thead><tr><th scope="col">时间</th><th scope="col">通知</th>
-        <th scope="col">接收人</th><th scope="col">标题</th><th scope="col">状态</th><th scope="col">说明</th></tr></thead>
-        <tbody id="delivery-rows"></tbody></table></div></section>
-    </section>
-  </main>
+        <h2 class="section-title">通知</h2>
+        <form id="lanes-form" class="lanes" autocomplete="off" novalidate>
+          <section class="panel lane" data-lane="daily" aria-labelledby="lane-daily-title">
+            <div class="panel-head"><div><h2 id="lane-daily-title">08:30 广告日报</h2>
+              <p class="muted">每天 08:30（北京）· 美西最近一个完整日的全公司与各店铺数据</p></div>
+              <label class="switch"><input type="checkbox" name="enabled" role="switch"><span class="switch-track" aria-hidden="true"></span><span class="switch-text">开启</span></label></div>
+            <div class="panel-body lane-grid">
+              <fieldset class="field-group"><legend>发送给</legend>
+                <label class="check"><input type="checkbox" name="to_group">通知群</label>
+                <label class="check"><input type="checkbox" name="to_lead">总负责人（私聊）</label></fieldset>
+              <div class="prompt-field"><div class="prompt-head"><label for="prompt-daily">DeepSeek 任务说明</label>
+                <span class="muted prompt-state" data-prompt-state="daily"></span>
+                <button type="button" class="button ghost small" data-reset-prompt="daily">恢复默认</button></div>
+                <textarea id="prompt-daily" name="prompt" rows="8" maxlength="4000" spellcheck="false"></textarea>
+                <p class="hint">统计日期、店铺范围和输出格式由系统自动附加；这里写希望 DeepSeek 关注和呈现的内容。</p></div>
+            </div>
+            <div class="panel-foot"><button type="button" class="button secondary" data-preview="daily">预览</button></div>
+          </section>
+
+          <section class="panel lane" data-lane="review" aria-labelledby="lane-review-title">
+            <div class="panel-head"><div><h2 id="lane-review-title">08:30 广告异常复盘</h2>
+              <p class="muted">每天 08:30（北京）· 近 7 日对比前 7 日，campaign 级异常和建议出价</p></div>
+              <label class="switch"><input type="checkbox" name="enabled" role="switch"><span class="switch-track" aria-hidden="true"></span><span class="switch-text">开启</span></label></div>
+            <div class="panel-body lane-grid">
+              <fieldset class="field-group"><legend>发送给</legend>
+                <label class="check"><input type="checkbox" name="to_group">通知群</label>
+                <label class="check"><input type="checkbox" name="mention_operators">群内 @ 出问题店铺的运营</label>
+                <label class="check"><input type="checkbox" name="to_lead">广告负责人（私聊）</label>
+                <label class="check"><input type="checkbox" name="to_operators">运营私聊（只含其店铺）</label></fieldset>
+              <fieldset class="field-group"><legend>频率</legend>
+                <label class="check"><input type="checkbox" name="weekly">仅每周一发送</label></fieldset>
+              <div class="prompt-field"><div class="prompt-head"><label for="prompt-review">DeepSeek 任务说明</label>
+                <span class="muted prompt-state" data-prompt-state="review"></span>
+                <button type="button" class="button ghost small" data-reset-prompt="review">恢复默认</button></div>
+                <textarea id="prompt-review" name="prompt" rows="10" maxlength="4000" spellcheck="false"></textarea>
+                <p class="hint">时间窗口、店铺范围和 @ 运营所需的信息由系统自动附加。</p></div>
+            </div>
+            <div class="panel-foot"><button type="button" class="button secondary" data-preview="review">预览</button></div>
+          </section>
+
+          <section class="panel lane" data-lane="hourly" aria-labelledby="lane-hourly-title">
+            <div class="panel-head"><div><h2 id="lane-hourly-title">每小时实时监控</h2>
+              <p class="muted">发送时段内每小时 · 美西今日截至目前，同一活动同类提醒每天一次</p></div>
+              <label class="switch"><input type="checkbox" name="enabled" role="switch"><span class="switch-track" aria-hidden="true"></span><span class="switch-text">开启</span></label></div>
+            <div class="panel-body lane-grid">
+              <fieldset class="field-group"><legend>发送给</legend>
+                <label class="check"><input type="checkbox" name="to_group">通知群</label>
+                <label class="check"><input type="checkbox" name="mention_operators">群内 @ 出问题店铺的运营</label>
+                <label class="check"><input type="checkbox" name="to_lead">广告负责人（私聊）</label>
+                <label class="check"><input type="checkbox" name="to_operators">运营私聊（只含其店铺）</label></fieldset>
+              <fieldset class="field-group"><legend>发送时段（北京）</legend>
+                <div class="pair"><input type="number" name="start_hour" min="0" max="23" step="1" aria-label="开始">
+                  <span>点至</span><input type="number" name="end_hour" min="1" max="24" step="1" aria-label="结束"><span>点</span></div></fieldset>
+              <fieldset class="field-group thresholds"><legend>提醒规则</legend>
+                <label class="field"><span>高花费线（$）</span><input type="number" name="high_spend" min="1" step="1"></label>
+                <label class="field"><span>低花费起算（$）</span><input type="number" name="low_spend" min="0" step="1"></label>
+                <label class="field"><span>低花费无转化 · 最少点击</span><input type="number" name="min_clicks" min="1" step="1"></label>
+                <label class="field"><span>低转化 · ACOS ≥（%）</span><input type="number" name="acos_high" min="1" step="1"></label>
+                <label class="field"><span>低转化 · CVR &lt;（%）</span><input type="number" name="cvr_low" min="0" step="0.5"></label>
+                <label class="field"><span>高转化 · ACOS ≤（%）</span><input type="number" name="acos_good" min="1" step="1"></label>
+                <label class="field"><span>高转化 · 最少订单</span><input type="number" name="min_orders_good" min="1" step="1"></label></fieldset>
+              <div class="prompt-field"><div class="prompt-head"><label for="prompt-hourly">补充说明（可选）</label>
+                <span class="muted prompt-state" data-prompt-state="hourly"></span>
+                <button type="button" class="button ghost small" data-reset-prompt="hourly">清空</button></div>
+                <textarea id="prompt-hourly" name="prompt" rows="3" maxlength="4000" spellcheck="false"
+                          placeholder="例如：建议写得更具体，优先提醒花费最高的活动。"></textarea>
+                <p class="hint">提醒规则由上面的阈值决定；DeepSeek 只返回符合规则、能在 SparkX 结果中找到的活动。</p></div>
+            </div>
+            <div class="panel-foot"><button type="button" class="button secondary" data-preview="hourly">预览</button></div>
+          </section>
+
+          <div class="savebar" id="lanes-savebar" hidden>
+            <span><strong>有未保存的修改</strong><span class="muted" id="lanes-updated"></span></span>
+            <span class="actions-end"><button type="button" class="button ghost" id="lanes-revert">撤销修改</button>
+              <button type="submit" class="button primary" id="save-lanes">保存通知设置</button></span>
+          </div>
+        </form>
+      </section>
+
+      <!-- ============================================================ SparkX MCP -->
+      <section data-panel="sparkx" hidden data-title="SparkX MCP"
+               data-subtitle="DeepSeek 通过 SparkX AI MCP 读取广告数据，并按 SparkX 官方 Skills 的方法查询和分析。只提供只读工具。">
+        <div id="sparkx-status" class="notice" role="status" hidden></div>
+        <div class="grid-2">
+          <section class="panel" aria-labelledby="sparkx-conn-title">
+            <div class="panel-head"><div><h2 id="sparkx-conn-title">连接</h2><p class="muted">MCP Token 只写不读，保存后不会回显。</p></div>
+              <span class="badge" id="sparkx-badge"></span></div>
+            <div class="panel-body">
+              <dl class="facts" id="sparkx-facts"></dl>
+              <form id="sparkx-form" class="stack" autocomplete="off">
+                <label class="field"><span>新的 SparkX MCP Token</span>
+                  <input id="sparkx-token" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false"
+                         placeholder="在 SparkX 后台「MCP &amp; Skills」生成"></label>
+                <div class="actions-end"><button type="button" class="button ghost" id="sparkx-clear">清除控制台 Token</button>
+                  <button type="button" class="button secondary" id="sparkx-test">测试连接</button>
+                  <button type="submit" class="button primary">保存 Token</button></div>
+              </form>
+            </div>
+          </section>
+          <section class="panel" aria-labelledby="skills-title">
+            <div class="panel-head"><div><h2 id="skills-title">官方 Skills</h2>
+              <p class="muted">从 GitHub SparkXAI/SparkXAI-MCP 安装只读 Skills（查询方法、口径和分析流程），写操作 Skill 不会安装。</p></div>
+              <span class="badge" id="skills-badge"></span></div>
+            <div class="panel-body">
+              <dl class="facts" id="skills-facts"></dl>
+              <div class="actions-end"><button type="button" class="button secondary" id="skills-check">检查更新</button>
+                <button type="button" class="button primary" id="skills-install">安装 / 更新</button></div>
+            </div>
+          </section>
+        </div>
+        <section class="panel" aria-labelledby="skills-list-title">
+          <div class="panel-head"><h2 id="skills-list-title">已安装的 Skills</h2></div>
+          <div class="table-scroll"><table class="skills-table"><thead><tr><th scope="col">Skill</th><th scope="col">版本</th><th scope="col">用到的工具</th>
+            <th scope="col">用途</th></tr></thead><tbody id="skills-rows"></tbody></table></div>
+        </section>
+        <section class="panel" aria-labelledby="tools-title">
+          <div class="panel-head"><div><h2 id="tools-title">提供给 DeepSeek 的工具</h2>
+            <p class="muted">只有 SparkX 标记为只读、且在白名单内的工具会提供给 DeepSeek；工具说明和返回结果与 SparkX 原样一致。</p></div></div>
+          <div class="panel-body"><div class="chips" id="tool-chips"></div></div>
+        </section>
+        <section class="panel" id="sparkx-profiles-panel" hidden aria-labelledby="profiles-title">
+          <div class="panel-head"><h2 id="profiles-title">Token 已授权的店铺</h2></div>
+          <div class="table-scroll"><table><thead><tr><th scope="col">Profile ID</th><th scope="col">店铺</th><th scope="col">站点</th>
+            <th scope="col">类型</th></tr></thead><tbody id="sparkx-profiles"></tbody></table></div>
+        </section>
+      </section>
+
+      <!-- ============================================================ DeepSeek 与机器人 -->
+      <section data-panel="deepseek" hidden data-title="DeepSeek 与机器人"
+               data-subtitle="DeepSeek 负责调用 SparkX、撰写三条通知，并在飞书机器人里自由聊天。">
+        <div id="deepseek-status" class="notice" role="status" hidden></div>
+        <div class="grid-2">
+          <section class="panel" aria-labelledby="deepseek-title">
+            <div class="panel-head"><div><h2 id="deepseek-title">DeepSeek</h2><p class="muted">API Key 只写不读；测试连接只调用免费的模型列表与余额接口。</p></div>
+              <span class="badge" id="deepseek-badge"></span></div>
+            <div class="panel-body">
+              <dl class="facts" id="deepseek-facts"></dl>
+              <form id="deepseek-form" class="stack" autocomplete="off">
+                <label class="field"><span>API Key</span>
+                  <input id="deepseek-key" type="password" maxlength="512" autocomplete="new-password" spellcheck="false"
+                         placeholder="填写新值；留空保留当前密钥"></label>
+                <div class="grid-fields">
+                  <label class="field"><span>模型</span><select id="deepseek-model"></select></label>
+                  <label class="field"><span>单次请求超时（秒）</span>
+                    <input id="deepseek-timeout" type="number" min="1" max="300" step="1"></label></div>
+                <label class="switch"><input type="checkbox" id="deepseek-thinking" role="switch"><span class="switch-track" aria-hidden="true"></span>
+                  <span class="switch-text">深度思考（更准确，稍慢）</span></label>
+                <p class="hint">定时通知在后台运行，每次请求至少等待 180 秒；问答至少等待 90 秒。</p>
+                <div class="actions-end"><button type="button" class="button secondary" id="deepseek-test">测试连接</button>
+                  <button type="submit" class="button primary">保存</button></div>
+              </form>
+            </div>
+          </section>
+          <section class="panel" aria-labelledby="bot-title">
+            <div class="panel-head"><div><h2 id="bot-title">飞书机器人</h2><p class="muted">由服务器配置开启（FEISHU_BOT_ENABLED）。</p></div>
+              <span class="badge" id="bot-badge"></span></div>
+            <div class="panel-body">
+              <ul class="bullets">
+                <li>群里 @机器人，或私聊机器人，都可以自由聊天；需要数据时 DeepSeek 会自己调用 SparkX 查询。</li>
+                <li>同一段对话会记住最近 6 轮（60 分钟内），可以直接追问「那上周呢」。</li>
+                <li>群内只回复通知群；私聊限负责人、运营和通知群成员。</li>
+                <li>只能查询，不能修改广告、预算或出价。</li>
+              </ul>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ============================================================ 发送记录 -->
+      <section data-panel="deliveries" hidden data-title="发送记录" data-subtitle="最近 30 条通知和问答回复。「可能已提交」的消息不会自动重发。">
+        <section class="panel"><div class="table-scroll"><table><thead><tr><th scope="col">时间</th><th scope="col">通知</th>
+          <th scope="col">接收人</th><th scope="col">标题</th><th scope="col">状态</th><th scope="col">说明</th></tr></thead>
+          <tbody id="delivery-rows"></tbody></table></div></section>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============================================================ dialogs -->
+  <div class="overlay" id="member-dialog" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="member-dialog-title">
+      <header class="dialog-head"><div><h2 id="member-dialog-title">指定运营</h2><p class="muted" id="member-dialog-subtitle"></p></div>
+        <button type="button" class="icon-button" data-close aria-label="关闭">×</button></header>
+      <div class="dialog-body">
+        <label class="search"><span class="sr-only">搜索通知群成员</span>
+          <input id="member-search" type="search" placeholder="搜索通知群成员" autocomplete="off"></label>
+        <fieldset id="member-list" class="members"><legend class="sr-only">通知群成员</legend></fieldset>
+      </div>
+      <footer class="dialog-foot"><span class="muted" id="member-hint"></span>
+        <span class="actions-end"><button type="button" class="button ghost" id="member-clear" hidden>清空</button>
+          <button type="button" class="button ghost" data-close>取消</button>
+          <button type="button" class="button primary" id="member-save">保存</button></span></footer>
+    </div>
+  </div>
+
+  <div class="overlay drawer-overlay" id="preview-drawer" hidden>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+      <header class="dialog-head"><div><h2 id="preview-title">预览</h2><p class="muted" id="preview-info"></p></div>
+        <button type="button" class="icon-button" data-close aria-label="关闭">×</button></header>
+      <div class="dialog-body">
+        <div class="progress" id="preview-progress" hidden><span class="spinner" aria-hidden="true"></span>
+          <span id="preview-progress-text">DeepSeek 正在调用 SparkX 查询并撰写…</span></div>
+        <div id="preview-error" class="notice error" role="alert" hidden></div>
+        <div id="preview-cards" class="preview-cards"></div>
+        <details id="preview-plain" hidden><summary>纯文本</summary><pre id="preview-text"></pre></details>
+      </div>
+    </aside>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 </body>
 </html>
