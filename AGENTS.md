@@ -29,7 +29,9 @@
   contract around the owner's editable task text. Hourly findings must name a
   campaign ID that SparkX returned and satisfy the owner's thresholds, or they are
   dropped; each campaign/category is alerted once per marketplace day. Missing data
-  stays missing, never zero.
+  stays missing, never zero. The daily report's line of stores without data is
+  written by the system from that run's SparkX rows (`reports/coverage.py`), not
+  by the model.
 - The Feishu bot chats freely (any topic) and uses SparkX only when data is needed;
   it keeps the recent turns of one conversation. Group replies stay in the report
   group; private replies only for leads, operators and report-group members.

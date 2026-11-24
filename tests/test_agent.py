@@ -33,6 +33,9 @@ def test_tool_results_reach_the_model_verbatim_and_unknown_tools_are_refused(mon
                                reply("花费 $3.50。")])
     summary, _ = run(settings, client, [{"role": "user", "content": "花了多少"}])
     assert summary["content"] == "花费 $3.50。" and summary["sparkx_calls"] == 1
+    # Each SparkX result is kept with the call and arguments it answered (checks read them later).
+    assert summary["tools_used"] == ["get_ads_perf"] and summary["requests"] == [{"factEntity": "campaign"}]
+    assert len(summary["evidence"]) == 1
     tool_messages = [m for m in client.requests[1]["messages"] if m["role"] == "tool"]
     returned = json.loads(tool_messages[0]["content"])
     assert returned["data"]["rows"] == [{"campaignId": 1, "Spend": 3.5}] and returned["meta"]["hint"]

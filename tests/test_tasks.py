@@ -66,6 +66,8 @@ def test_the_daily_report_tells_ad_and_store_totals_apart():
     # Owner (Nov 2026): lean texts, but what the SparkX Skills require readers to be told stays, in one phrase.
     assert "注明金额为 USD、广告订单和广告销售额等转化数据是暂定值" in daily and "不超过 60 字" in daily
     assert "暂定值" in tasks.DEFAULT_PROMPTS["review"]
+    # Stores without data are listed once, under the store table, by the system (see test_coverage).
+    assert "「暂无广告数据：…」" in daily and "缺数据或数据未更新的店铺不写进开头和须知" in daily
 
 
 def test_sparkx_data_and_skills_rank_above_the_jx_task_text():
@@ -158,6 +160,31 @@ def test_daily_run_lets_deepseek_query_sparkx_with_the_servers_own_tools(monkeyp
     tool_reply = second[3]
     assert tool_reply["role"] == "tool" and json.loads(tool_reply["content"])["data"]["rows"] == ROWS  # verbatim
     assert fake.calls[-1] == ("get_ads_perf", query)
+
+
+def test_the_daily_stores_without_data_are_named_from_sparkx_rows(monkeypatch, settings):
+    """Live slip (Nov 2026): the model's own list missed a store and called a store with sales 「暂无数据」."""
+    ads = [{"profileId": 101, "date": "20261122", "Spend": 300.0, "Sales": 900.0},
+           {"profileId": 102, "date": "20261122", "Spend": 41.2, "Sales": 0},
+           {"profileId": 106, "date": "20261121", "Spend": 35.3, "Sales": 0}]
+    totals = [{"profileId": 101, "date": "20261122", "TotalSalesAmount": 1500.0, "OrderCount": 30, "UnitCount": 32},
+              {"profileId": 102, "date": "20261122", "TotalSalesAmount": 27.99, "OrderCount": 1, "UnitCount": 1}]
+    install(monkeypatch, FakeSparkX(rows={"campaign": ads, "asin": totals}), agent)
+    window = {"profileIds": [101, 102, 103, 104, 105, 106, 201], "dateStart": "2026-11-21", "dateEnd": "2026-11-22",
+              "select": ["profile.profileId_", "date"], "userContext": "JX 日报"}
+    written = ("**有花费店铺明细**\n| 店铺 | 广告花费 | 总销售额 | 运营 |\n|---|---|---|---|\n"
+               "| 香港川页 | $300.00 | $1,500.00 | 未映射运营 |\n| Campx | $41.20 | $27.99 | 未映射运营 |\n"
+               "当日无广告花费：FITFIZZ、陈子俊。\n\n**须知**\n1. 花费集中在香港川页。\n"
+               "2. Campx 总销售额暂无数据，昌泉也暂无数据。\nJX_STORES: 102")
+    client = ScriptedDeepSeek([reply(calls=[("get_ads_perf", {**window, "factEntity": "campaign"}),
+                                            ("get_ads_perf", {**window, "factEntity": "asin"})]), reply(written)])
+    result = tasks.run_lane(settings, "daily", lane_settings.DEFAULTS["daily"], now=SEND,
+                            directory=stores.load(settings), client_factory=lambda s: client)
+    assert result["content"] == (
+        "**有花费店铺明细**\n| 店铺 | 广告花费 | 总销售额 | 运营 |\n|---|---|---|---|\n"
+        "| 香港川页 | $300.00 | $1,500.00 | 未映射运营 |\n| Campx | $41.20 | $27.99 | 未映射运营 |\n"
+        "暂无广告数据：FITFIZZ、OCTORA、川页（加拿大）、昌泉、陈子俊。\n\n**须知**\n1. 花费集中在香港川页。")
+    assert result["stores"] == ["102"] and "requests" not in result["summary"] and "evidence" not in result["summary"]
 
 
 def test_a_daily_report_without_the_store_line_asks_which_stores_it_flags(monkeypatch, settings):

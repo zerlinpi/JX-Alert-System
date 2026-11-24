@@ -79,6 +79,15 @@ def test_display_names_follow_the_agent_style():
     names = stores.display_names({"1": {"name": "XPE-主账号", "country": "US"}, "2": {"name": "川页-CA", "country": "CA"},
                                   "3": {"name": "川页-US", "country": "US"}})
     assert names == {"1": "XPE", "2": "川页（加拿大）", "3": "川页"}
+    # Live case: a seller and a vendor account whose names differ only in case and punctuation.
+    twins = stores.display_names({
+        "4": {"name": "聚星同创_Hong Kong Juxing Tongchuang Technology CO., Limited", "country": "US",
+              "store_type": "seller"},
+        "5": {"name": "聚星同创_HONG KONG JUXING TONGCHUANG TECHNOLOGY CO.,LIMITED", "country": "US",
+              "store_type": "vendor"},
+        "6": {"name": "XPE", "country": "US", "store_type": "vendor"}})
+    assert twins == {"4": "聚星同创_Hong Kong Juxing Tongchuang Technology CO., Limited",
+                     "5": "聚星同创_HONG KONG JUXING TONGCHUANG TECHNOLOGY CO.,LIMITED（Vendor）", "6": "XPE"}
 
 
 def test_private_helper_refuses_group_readable_files(settings, tmp_path):

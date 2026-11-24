@@ -182,11 +182,15 @@ async def catalog(link):
 
 async def converse(client, messages, *, link, specs, settings, skills_index, max_tool_calls, max_rounds,
                    max_tokens=8000, on_step=None):
-    """Run the tool loop until the model answers. Returns a summary dict (content + evidence)."""
+    """Run the tool loop until the model answers. Returns a summary dict (content + evidence).
+
+    ``evidence[i]`` is the raw text SparkX returned for the call ``tools_used[i]`` made with
+    the arguments ``requests[i]``.
+    """
     sparkx_names = {spec["function"]["name"] for spec in specs}
     tools = list(specs) + ([READ_SKILL] if skills_index else [])
     calls, sparkx_calls, skill_reads, rounds = 0, 0, 0, 0
-    evidence, used, usage = [], [], {}
+    evidence, used, requests, usage = [], [], [], {}
 
     def add_usage():
         for key, value in (client.last_usage or {}).items():
@@ -222,6 +226,7 @@ async def converse(client, messages, *, link, specs, settings, skills_index, max
                     on_step(name)
                 text, failed = await call_raw(await link.get(), name, arguments)
                 evidence.append(text)
+                requests.append(dict(arguments) if isinstance(arguments, dict) else {})
                 output = clip(text if not failed or text else "工具返回错误（无详细信息）。")
             else:
                 output = f"工具 {name[:64]} 不可用。可用工具：" + "、".join(sorted(sparkx_names | {"read_skill"}))
@@ -232,7 +237,7 @@ async def converse(client, messages, *, link, specs, settings, skills_index, max
         reply = await ask("none")
         messages.append(reply["message"])
     return {"content": reply["content"], "sparkx_calls": sparkx_calls, "skill_reads": skill_reads,
-            "rounds": rounds, "tools_used": used, "evidence": evidence, "usage": usage,
+            "rounds": rounds, "tools_used": used, "evidence": evidence, "requests": requests, "usage": usage,
             "model": getattr(client, "model", None), "thinking": getattr(client, "thinking", None)}
 
 

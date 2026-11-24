@@ -14,6 +14,7 @@ import re
 
 from jx_alert.ai import agent
 from jx_alert.ai.deepseek import DeepSeekError
+from jx_alert.reports import coverage, figures
 from jx_alert.sparkx import skills as skill_store
 from jx_alert.sparkx import stores as directory_module
 from jx_alert.sparkx.client import SparkXError, run
@@ -39,8 +40,8 @@ DEFAULT_PROMPTS = {
 1. 开头一句话：对比日、监控店铺数、当日有广告花费的店铺数，并按 Skill 要求注明金额为 USD、广告订单和广告销售额等转化数据是暂定值。
 2. **全公司核心指标**：表格「指标 | 当日 | 前一日 | 环比」，依次为总销售额、广告销售额、总订单、广告订单、总销量、广告销量、广告花费、ACOS、TACOS、CVR、PPC（CPC）、ROAS。
 3. **站点汇总**（监控店铺分布在两个及以上站点时才写，只有一个站点时省略）：表格「站点 | 店铺数 | 有数据 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费环比」。
-4. **有花费店铺明细**：表格「店铺 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费日环比 | 运营」，按广告花费从高到低；当日无广告花费或没有数据的店铺，在表格下方用一行列出名单。
-5. **须知**：2–4 条编号短评，每条一两句话、不超过 60 字，先下结论再给关键数字：花费是否集中、ACOS 明显偏高的店铺、有广告花费但没有广告订单的店铺；有店铺缺数据时用一条点名（写「暂无数据」，不推断原因，也不当成没有销售）。
+4. **有花费店铺明细**：表格「店铺 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费日环比 | 运营」，按广告花费从高到低；表格下方一行写「暂无广告数据：…」（SparkX 没有返回当日广告数据的店铺）和「当日无广告花费：…」（有数据但当日没有花费的店铺）。
+5. **须知**：2–4 条编号短评，每条一两句话、不超过 60 字，先下结论再给关键数字：花费是否集中、ACOS 明显偏高的店铺、有广告花费但没有广告订单的店铺。缺数据或数据未更新的店铺不写进开头和须知：系统会按 SparkX 返回的数据，在明细表下方统一列出。
 订单和销量写整数，百分比保留一位小数。""",
     "review": """判定口径（金额 USD，campaign 级）：
 - 全店零曝光：两周内没有任何曝光，但仍有开启的 campaign（用 get_entity_metadata 统计开启数量），放在「最严重」。
@@ -238,7 +239,18 @@ def _client(settings, client_factory):
 
 
 def _strip(summary):
-    return {key: value for key, value in summary.items() if key != "evidence"}
+    return {key: value for key, value in summary.items() if key not in {"evidence", "requests"}}
+
+
+def state_coverage(text, summary, *, monitored, roster, day):
+    """The daily report with the stores without data named by the system from SparkX's rows (see coverage)."""
+    found = coverage.classify(summary, monitored=monitored, day=day)
+    if found is None:
+        _LOG.info("Daily report: SparkX rows do not settle every store; the store list stays as written")
+        return text
+    _LOG.info("Daily report coverage: %d with spend, %d idle, %d without ad data, %d without store totals",
+              len(found["spent"]), len(found["idle"]), len(found["missing"]), len(found["totals_missing"]))
+    return coverage.apply(text, coverage.note(found, directory_module.display_names(roster)))
 
 
 def run_lane(settings, lane, config, *, now, directory, alerted=frozenset(), on_roster=None, token=None,
@@ -296,9 +308,14 @@ def run_lane(settings, lane, config, *, now, directory, alerted=frozenset(), on_
     text, stores = split_stores(summary["content"], monitored)
     if not text:
         raise ValueError("empty report")
+    dates = report_dates(now)
+    if lane == "daily":
+        text, corrected = figures.check_changes(text)
+        if corrected:
+            _LOG.info("Daily report: corrected %d 环比 figure(s) that did not match their own row", corrected)
+        text = state_coverage(text, summary, monitored=monitored, roster=context["roster"], day=dates["report_date"])
     if stores is None:
         stores = affected_stores(client, text, context["roster"], monitored, lane=lane)
-    dates = report_dates(now)
     result.update(content=text, stores=stores or [], report_date=dates["report_date"].isoformat(),
                   window=[value.isoformat() for value in dates["window"]])
     return result

@@ -158,8 +158,17 @@ def short_name(name):
     return text.strip(" -_") or str(name or "")
 
 
+def _look(value):
+    """What a reader tells names apart by: not case, spacing or punctuation."""
+    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", value)).casefold()
+
+
 def display_names(profiles):
-    """Short names (non-US keep their site), falling back to full names on collision."""
+    """Short names (non-US keep their site), falling back to full names on collision.
+
+    A Vendor account whose name reads like another store's (for example the same company
+    name in capitals) is marked （Vendor）, so a report never seems to list one store twice.
+    """
     short = {}
     for pid, profile in profiles.items():
         value = short_name(profile["name"])
@@ -169,5 +178,14 @@ def display_names(profiles):
     counts = defaultdict(int)
     for value in short.values():
         counts[value] += 1
-    return {pid: (value if counts[value] == 1 else profiles[pid]["name"]) for pid, value in short.items()}
+    names = {pid: (value if counts[value] == 1 else profiles[pid]["name"]) for pid, value in short.items()}
+    alike = defaultdict(list)
+    for pid, value in names.items():
+        alike[_look(value)].append(pid)
+    for pids in alike.values():
+        if len(pids) > 1:
+            for pid in pids:
+                if profiles[pid].get("store_type") == "vendor":
+                    names[pid] += "（Vendor）"
+    return names
 
