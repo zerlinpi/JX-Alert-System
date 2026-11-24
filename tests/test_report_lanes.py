@@ -58,7 +58,7 @@ def test_daily_report_goes_to_the_group_and_the_company_lead_once(settings, sess
         row = rows(db)[1]
         assert row.payload["jx_lane"] == "daily" and row.payload["jx_day"] == "2026-11-24"
         card = row.payload["card"]
-        assert card["header"]["title"]["content"] == "SparkX 广告日报 · 2026-11-22"
+        assert card["header"]["title"]["content"] == "广告日报 · 2026-11-22"
         tags = [element["tag"] for element in card["body"]["elements"]]
         assert tags.count("table") == 2  # the agent's Markdown tables became Feishu tables
         detail = [element for element in card["body"]["elements"] if element["tag"] == "table"][1]
@@ -66,7 +66,8 @@ def test_daily_report_goes_to_the_group_and_the_company_lead_once(settings, sess
         assert headers[-1] == "运营" and headers[headers.index("广告销量"):headers.index("广告销量") + 2] == [
             "广告销量", "总销量"]
         assert detail["rows"][0][f"c{headers.index('总订单')}"] == "—"  # not yet updated: missing, not 0
-        assert "SparkX MCP 只读查询 4 次" in json.dumps(card, ensure_ascii=False)
+        dumped = json.dumps(card, ensure_ascii=False)
+        assert not any(word in dumped for word in ("SparkX", "DeepSeek", "只读"))  # no source or method footer
         again = lanes.queue_morning_lane(db, settings, "daily", now=SEND + timedelta(minutes=5),
                                          runner=runner_for(calls=calls))
         assert again["status"] == "ALREADY_COMPLETE" and calls == ["daily"]
@@ -328,7 +329,7 @@ def test_settings_validation(settings):
 def test_a_test_send_queues_marked_copies_outside_the_lane_schedule(settings, session_factory):
     map_operators(settings, {"102": ("ou_op2", "高爽")})
     enable(settings, daily={"enabled": False, "to_group": False})  # a test is the owner's explicit choice
-    values = cards.report_cards("SparkX 广告日报 · 2026-11-22", "**全公司核心指标**\n正文", "由 DeepSeek 生成。")
+    values = cards.report_cards("广告日报 · 2026-11-22", "**全公司核心指标**\n正文")
     later = SEND + timedelta(hours=6)  # 14:30 Beijing, after the 08:30–12:00 window of the daily report
     with session_factory() as db:
         result = lanes.queue_test(db, settings, "daily", values, now=later, preview_id="job-1",
@@ -338,8 +339,8 @@ def test_a_test_send_queues_marked_copies_outside_the_lane_schedule(settings, se
         assert routes(db) == [("jx_daily_group", GROUP_CHAT, ["ou_op2"]), ("jx_daily_lead", LEAD, [])]
         group, lead = rows(db)
         assert group.idempotency_key.startswith("jx:test:daily:job-1:") and group.payload["jx_test"] is True
-        assert group.payload["card"]["header"]["title"]["content"] == "【测试】SparkX 广告日报 · 2026-11-22"
-        assert "测试消息" in json.dumps(group.payload["card"], ensure_ascii=False)
+        assert group.payload["card"]["header"]["title"]["content"] == "【测试】广告日报 · 2026-11-22"
+        assert group.payload["card"]["body"] == values[0]["body"]  # only the title says it is a test
         again = lanes.queue_test(db, settings, "daily", values, now=later, preview_id="job-1",
                                  stores={"102": "Campx"}, to_group=True, to_lead=False, mention=False)
         assert again["status"] == "ALREADY_QUEUED" and len(rows(db)) == 2
@@ -357,8 +358,7 @@ def test_a_test_send_queues_marked_copies_outside_the_lane_schedule(settings, se
 
 
 def test_a_hourly_test_send_never_counts_as_an_alert(settings, session_factory, routing):
-    value = cards.hourly_card(HOURLY_FINDINGS, day="2026-11-23", time="22:05", names={}, operators={},
-                              config=lane_settings.DEFAULTS["hourly"], footer="")
+    value = cards.hourly_card(HOURLY_FINDINGS, day="2026-11-23", time="22:05", names={}, operators={})
     with session_factory() as db:
         queued = lanes.queue_test(db, settings, "hourly", [value], now=HOUR, preview_id="job-2", stores={},
                                   to_group=True, to_lead=False, mention=True)

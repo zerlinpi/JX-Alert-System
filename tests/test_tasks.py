@@ -63,6 +63,16 @@ def test_the_daily_report_tells_ad_and_store_totals_apart():
     assert "总订单为 0 但总销量大于 0" in daily and "写「—」，不当成 0" in daily
     # A store without store totals must not inflate TACOS: its ad spend stays out of the numerator too.
     assert "全公司 TACOS = 有总销售额数据的店铺的广告花费合计 ÷ 这些店铺的总销售额合计" in daily
+    # Owner (Nov 2026): only conclusions, data and suggestions; no closing caveats, short notes.
+    assert "回补" not in daily and "金额单位" not in daily and "不超过 60 字" in daily
+
+
+def test_every_report_lane_leaves_out_sources_and_methods():
+    for lane in ("daily", "review"):
+        message = tasks.task_message(lane, {"prompt": "自定义说明"}, now=SEND, monitored={"101"})
+        assert "不写数据来源、查询过程、分析方法、口径或算法说明和数据回补的提醒" in message
+        assert "不重复标题里已有的报告名称和日期" in message
+    assert "不重复判定条件" in tasks.DEFAULT_PROMPTS["review"]  # section titles name the problem type only
 
 
 def test_hourly_task_carries_the_thresholds_and_what_was_already_alerted():

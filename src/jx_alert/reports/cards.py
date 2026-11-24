@@ -131,10 +131,9 @@ def split_cards(title, elements, *, color="blue", reserve=MENTION_RESERVE, max_c
     return [shell(f"{title}（{index}/{len(groups)}）", group, color) for index, group in enumerate(groups, 1)]
 
 
-def report_cards(title, text, footer, *, color="blue", reserve=MENTION_RESERVE):
+def report_cards(title, text, *, color="blue", reserve=MENTION_RESERVE):
+    """The report itself: no footer about where the data came from or how it was written (owner, Nov 2026)."""
     elements = markdown_elements(text)
-    if footer:
-        elements += [{"tag": "hr"}, markdown(md_safe(footer, 400))]
     cards = [card for index, card in enumerate(split_cards(title, elements, color=color, reserve=reserve))
              if card_fits(card, reserve if index == 0 else 0)]
     return cards or [shell(title, [markdown("内容过长，无法在飞书卡片中展示，请在管理台预览查看。")], color)]
@@ -160,14 +159,16 @@ def _percent(value):
     return "—" if value is None else f"{value:.1f}%"
 
 
-def hourly_card(findings, *, day, time, names, operators, config, footer, scoped=False, cap=10):
-    """The alert table of new findings, grouped by category; None when there is nothing to send."""
+def hourly_card(findings, *, day, time, names, operators, scoped=False, cap=10):
+    """The alert table of new findings, grouped by category; None when there is nothing to send.
+
+    The title carries the marketplace day and time; the body is only the alerts.
+    """
     if not findings:
         return None
     stores = len({item["pid"] for item in findings})
     lead = ("你负责的店铺中，" if scoped else "") + f"{stores} 个店铺 {len(findings)} 个广告活动触发提醒。"
-    elements = [markdown(f"美西 {md_safe(day, 12)} 今日截至 {md_safe(time, 8)}（SparkX 当日累计，订单归因会延迟数小时）："
-                         + lead)]
+    elements = [markdown(lead)]
     headers = ["店铺", "广告活动", "花费", "点击", "广告订单", "ACOS", "CVR", "建议", "运营"]
     for code in HOURLY_ORDER:
         items = [item for item in findings if item["category"] == code]
@@ -180,18 +181,13 @@ def hourly_card(findings, *, day, time, names, operators, config, footer, scoped
         elements += [markdown(f"**{HOURLY_LABELS[code]}（{len(items)}）**"), table(headers, rows)]
         if len(items) > cap:
             elements.append(markdown(f"另有 {len(items) - cap} 个{HOURLY_LABELS[code]}活动未展开。"))
-    rule = (f"判定：高花费 ≥ ${config['high_spend']:g}；低转化 = ACOS ≥ {config['acos_high']:g}% 或 "
-            f"CVR < {config['cvr_low']:g}%；低花费无转化 = 花费 ≥ ${config['low_spend']:g} 且点击 ≥ "
-            f"{config['min_clicks']:g}；高转化 = 广告订单 ≥ {config['min_orders_good']:g} 且 ACOS ≤ {config['acos_good']:g}%。"
-            "同一活动同类提醒每天只发一次。")
-    elements += [{"tag": "hr"}, markdown(md_safe(rule, 400)), markdown(md_safe(footer, 300))]
     color = "red" if any(item["category"].startswith("high_spend") for item in findings) else "orange"
     value = shell(f"广告实时监控 · 美西 {day} {time}", elements, color)
     if card_fits(value, MENTION_RESERVE):
         return value
     if cap > 2:
-        return hourly_card(findings, day=day, time=time, names=names, operators=operators, config=config,
-                           footer=footer, scoped=scoped, cap=cap // 2)
+        return hourly_card(findings, day=day, time=time, names=names, operators=operators, scoped=scoped,
+                           cap=cap // 2)
     return None
 
 
@@ -200,22 +196,14 @@ def hourly_card(findings, *, day, time, names, operators, config, footer, scoped
 TEST_MARK = "【测试】"
 
 
-def mark_as_test(values, note):
-    """The previewed cards as a test message: 【测试】 in each title and a note on top when it fits.
-
-    ``note`` is template text (any interpolated value must already be md_safe).
-    """
+def mark_as_test(values):
+    """The previewed cards as a test message: only 【测试】 in front of each title, the body is unchanged."""
     copies = []
     for index, value in enumerate(values):
-        reserve = MENTION_RESERVE if index == 0 else 0
         card = copy.deepcopy(value)
         title = card["header"]["title"]
         title["content"] = plain(TEST_MARK + title["content"], 120)
-        noted = copy.deepcopy(card)
-        noted["body"]["elements"].insert(0, markdown(note[:300]))
-        if index == 0 and card_fits(noted, reserve):
-            card = noted
-        if not card_fits(card, reserve):
+        if not card_fits(card, MENTION_RESERVE if index == 0 else 0):
             raise ValueError("test card does not fit")
         copies.append(card)
     return copies

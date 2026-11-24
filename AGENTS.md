@@ -45,6 +45,11 @@
   (daily: stores the report flags; review: anomalies; hourly: new alerts), naming
   their stores. Private operator copies are optional. Never route to or mention
   guessed people.
+- Owner decision (Nov 2026): notification and bot texts hold only conclusions, data
+  and suggestions. No footer or line about the data source, how the text was
+  generated, query counts, analysis method, formulas or backfill caveats; titles do
+  not say "SparkX". The bot puts an 「OK」 reaction on each question it is about to
+  answer (once per question, never on one it will not answer).
 - Console previews never queue anything. A test send (owner's explicit click)
   queues the server-side copy of a finished preview, marked 【测试】, under
   `jx:test:` keys and `jx_test` receipts: it never counts as a lane run or an

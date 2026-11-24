@@ -139,7 +139,7 @@ class FeishuAppClient:
         if not 200 <= response.status_code < 300:
             # An expired token can be reported with a non-2xx HTTP status.
             message_path = path == self._MESSAGE_PATH or re.fullmatch(
-                re.escape(self._MESSAGE_PATH) + r"/om_[A-Za-z0-9_-]+/reply", path)
+                re.escape(self._MESSAGE_PATH) + r"/om_[A-Za-z0-9_-]+/(?:reply|reactions)", path)
             if not (message_path and response.status_code in (400, 401) and code == self._EXPIRED_TOKEN_CODE):
                 message = f"Feishu app HTTP request rejected: HTTP {response.status_code}, code={code}"
                 # A 4xx answer with an error code is a definite refusal; a 5xx answer may not be.
@@ -252,6 +252,32 @@ class FeishuAppClient:
                    "reply_in_thread": reply_in_thread}
         return self._send_message_payload(payload, None, path=f"{self._MESSAGE_PATH}/{message_id}/reply",
                                           before_submit=before_submit)
+
+    def add_reaction(self, message_id: str, emoji_type: str = "OK") -> str:
+        """Put one emoji reaction on a message and return its reaction_id.
+
+        https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create
+        A reaction is not a message: it mentions no one and carries no content.
+        """
+        if not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]{1,197}", message_id):
+            raise ValueError("Feishu reaction requires a valid original message ID")
+        if not isinstance(emoji_type, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,40}", emoji_type):
+            raise ValueError("Feishu reaction requires a valid emoji type")
+        path = f"{self._MESSAGE_PATH}/{message_id}/reactions"
+        token = self._get_token()
+        for attempt in range(2):
+            data = self._post_json(path, {"reaction_type": {"emoji_type": emoji_type}}, token=token)
+            if data["code"] == self._EXPIRED_TOKEN_CODE and attempt == 0:
+                token = self._get_token(rejected_token=token)
+                continue
+            if data["code"] != 0:
+                raise FeishuRejected(f"Feishu reaction rejected: code={data['code']}", data["code"])
+            result = data.get("data")
+            reaction = result.get("reaction_id") if isinstance(result, dict) else None
+            if not isinstance(reaction, str) or not reaction.strip():
+                raise FeishuAppError("Feishu reaction response did not contain a reaction_id")
+            return reaction
+        raise FeishuAppError("Feishu reaction could not be added")
 
     def _send_message_payload(self, payload, receive_id_type, *, path=None, before_submit=None):
         # Bound operational alerts conservatively, including JSON escaping.

@@ -134,7 +134,8 @@ def system_prompt(*, now, tool_names, skills_index, roster, directory, instructi
     if mode == "chat":
         parts.append(
             "对话方式：你在飞书里与同事自由交流，可以回答任何问题，不限于广告；只有需要数据时才调用 SparkX 工具。"
-            "用自然、简洁的中文回答，先说结论；展示数据时用 Markdown 表格（每张不超过 20 行）。"
+            "用自然、简洁的中文回答，先说结论；不介绍数据来源、查询过程和分析方法，除非对方问起；"
+            "展示数据时用 Markdown 表格（每张不超过 20 行）。"
             "不要输出代码块或 JSON，不要 @ 任何人，不要附链接。")
     return "\n\n".join(parts)
 

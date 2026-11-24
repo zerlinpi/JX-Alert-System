@@ -195,6 +195,38 @@ def test_only_feishus_own_error_answers_count_as_a_definite_refusal(monkeypatch,
     assert getattr(error.value, "code", None) == code
 
 
+def test_a_reaction_puts_the_emoji_on_the_original_message(monkeypatch):
+    seen = []
+
+    def handler(request):
+        if request.url.path.endswith("/internal"):
+            return token_response()
+        seen.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"code": 0, "data": {"reaction_id": "ZCaCIjUBVVWSrm5L",
+                                                             "reaction_type": {"emoji_type": "OK"}}})
+
+    mock_http(monkeypatch, handler)
+    assert FeishuAppClient("cli_test", "secret").add_reaction("om_question") == "ZCaCIjUBVVWSrm5L"
+    assert seen == [("POST", "/open-apis/im/v1/messages/om_question/reactions",
+                     {"reaction_type": {"emoji_type": "OK"}})]
+
+
+@pytest.mark.parametrize("response", [httpx.Response(400, json={"code": 231002, "msg": "no permission"}),
+                                      httpx.Response(200, json={"code": 231002, "msg": "no permission"})])
+def test_a_refused_reaction_is_a_definite_rejection(monkeypatch, response):
+    mock_http(monkeypatch, lambda request: token_response() if request.url.path.endswith("/internal") else response)
+    with pytest.raises(FeishuRejected) as error:
+        FeishuAppClient("cli_test", "secret").add_reaction("om_question")
+    assert error.value.code == 231002
+
+
+@pytest.mark.parametrize("message_id,emoji", [("../chats", "OK"), ("om_question", "OK; DROP"), (None, "OK")])
+def test_reactions_validate_their_target_before_any_http_call(monkeypatch, message_id, emoji):
+    mock_http(monkeypatch, lambda request: pytest.fail("no HTTP call"))
+    with pytest.raises(ValueError):
+        FeishuAppClient("cli_test", "secret").add_reaction(message_id, emoji)
+
+
 @pytest.mark.parametrize("response", [
     {"code": 10003, "msg": "secret"},
     {"code": 0, "tenant_access_token": "t-test-token"},

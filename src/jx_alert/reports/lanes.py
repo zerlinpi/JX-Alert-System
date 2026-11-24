@@ -234,14 +234,6 @@ def _run(settings, lane, config, *, now, directory, db, runner, alerted=frozense
                                       on_roster=_remember(db, now))
 
 
-def _footer(result):
-    summary = result["summary"]
-    model = summary.get("model") or "DeepSeek"
-    skills = f"，按 SparkX 官方 Skills {result['skills']}" if result.get("skills") else ""
-    return (f"由 DeepSeek（{model}）调用 SparkX MCP 只读查询 {summary.get('sparkx_calls', 0)} 次生成{skills}。"
-            "只读分析，不会修改任何广告、预算或出价。")
-
-
 def _summary(result):
     summary = result["summary"]
     return {"sparkx_calls": summary.get("sparkx_calls"), "skill_reads": summary.get("skill_reads"),
@@ -251,9 +243,9 @@ def _summary(result):
 
 def _title(lane, result):
     if lane == "daily":
-        return f"SparkX 广告日报 · {result['report_date']}"
+        return f"广告日报 · {result['report_date']}"
     start, end = result["window"]
-    return f"SparkX 广告异常复盘 · {start[5:]}~{end[5:]} 对比前 7 日"
+    return f"广告异常复盘 · {start[5:]}~{end[5:]} 对比前 7 日"
 
 
 # ---------------------------------------------------------------- 08:30 lanes
@@ -329,9 +321,8 @@ def queue_morning_lane(db, settings, lane, *, now, runner=None, scoper=None):
         failure = _failure(exc)
         _receipt(db, lane, "FAILED", now, day=day, **failure)
         return {"status": "FAILED", **failure}
-    footer = _footer(result)
     color = "blue" if lane == "daily" else ("orange" if result["stores"] else "green")
-    values = cards.report_cards(_title(lane, result), result["content"], footer, color=color)
+    values = cards.report_cards(_title(lane, result), result["content"], color=color)
     extra = {"jx_day": day, "jx_profiles": result["profiles"]}
     names = _names(result)
     plans = _mention_operators(plans, settings, routing_data, directory, config, lane, set(result["stores"]), names)
@@ -352,7 +343,7 @@ def queue_morning_lane(db, settings, lane, *, now, runner=None, scoper=None):
                 continue
             scoped += 1
             ids += _enqueue_cards(db, lane, day, delivery, cards.report_cards(
-                _title(lane, result) + " · 你负责的店铺", text, footer, color=color), now,
+                _title(lane, result) + " · 你负责的店铺", text, color=color), now,
                 {**extra, "jx_profiles": delivery["profiles"]})
     db.flush()
     _receipt(db, lane, "SUCCEEDED", now, day=day, outbox_ids=ids, cards=len(values), stores=result["stores"],
@@ -416,12 +407,11 @@ def run_hourly(db, settings, *, now, runner=None):
         return {"status": "FAILED", **failure}
     findings = result["findings"]
     names, operators = _labels(result, directory)
-    footer = _footer(result)
     extra = {"jx_slot": slot, "jx_marketplace_day": marketplace_day}
     ids, alerted = [], set()
     if findings:
         value = cards.hourly_card(findings, day=result["day"], time=result["time"], names=names,
-                                  operators=operators, config=config, footer=footer)
+                                  operators=operators)
         affected = {item["pid"] for item in findings}
         plans = _mention_operators(plans, settings, routing_data, directory, config, "hourly", affected, names)
         for delivery in plans:
@@ -438,7 +428,7 @@ def run_hourly(db, settings, *, now, runner=None):
                                                           set(by_store), exclude=leads):
                 own = [item for key in delivery["profiles"] for item in by_store[key]]
                 scoped = cards.hourly_card(own, day=result["day"], time=result["time"], names=names,
-                                           operators=operators, config=config, footer=footer, scoped=True)
+                                           operators=operators, scoped=True)
                 if scoped is not None and (row_id := _enqueue(db, "hourly", slot, delivery, scoped, now,
                                                               {**extra, "jx_profiles": delivery["profiles"]})):
                     ids.append(row_id)
@@ -483,13 +473,13 @@ def preview(settings, lane, *, now, db, runner=None, config=None):
     if lane == "hourly":
         _, operators = _labels(result, directory)
         value = cards.hourly_card(result["findings"], day=result["day"], time=result["time"], names=names,
-                                  operators=operators, config=config, footer=_footer(result))
+                                  operators=operators)
         affected = {item["pid"] for item in result["findings"]}
         return ([value] if value else []), {**info, "day": result["day"], "findings": len(result["findings"]),
                                             "dropped": result.get("dropped", 0), "note": result.get("note"),
                                             "audience": _audience(settings, directory, affected, names)}
     color = "blue" if lane == "daily" else ("orange" if result["stores"] else "green")
-    values = cards.report_cards(_title(lane, result), result["content"], _footer(result), color=color)
+    values = cards.report_cards(_title(lane, result), result["content"], color=color)
     return values, {**info, "report_date": result["report_date"], "window": result["window"],
                     "stores": len(result["stores"]),
                     "audience": _audience(settings, directory, set(result["stores"]), names)}
@@ -524,9 +514,7 @@ def queue_test(db, settings, lane, values, *, now, preview_id, stores, to_group,
         mentions = recipients.operator_mentions(settings, routing_data, directory, set(stores))
         if mentions:
             group = recipients.with_operator_mentions(group, mentions, stores)
-    local = now.astimezone(BEIJING)
-    marked = cards.mark_as_test(values, f"**测试消息**：由管理台手动发送（北京 {local:%m-%d %H:%M}），内容与预览相同；"
-                                        "不计入定时发送，也不影响当天的提醒去重。")  # template text: only the time varies
+    marked = cards.mark_as_test(values)
     extra = {"jx_test": True, "jx_test_mentions": bool(mentions), "jx_profiles": sorted(stores, key=int)}
     ids = []
     for delivery in (group, lead):

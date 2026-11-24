@@ -104,7 +104,7 @@ def test_a_console_test_send_is_delivered_right_away_and_only_once(settings, ses
     later = SEND + timedelta(hours=6)  # 14:30 Beijing: the daily report's own window has closed
     monkeypatch.setattr(worker, "_clock", lambda: later + timedelta(seconds=20))
     enable(settings, daily={"enabled": False})
-    values = cards.report_cards("SparkX 广告日报 · 2026-11-22", "正文", "")
+    values = cards.report_cards("广告日报 · 2026-11-22", "正文")
     with session_factory() as db:
         lanes.queue_test(db, settings, "daily", values, now=later, preview_id="job-9", stores={}, to_group=True,
                          to_lead=False, mention=False)

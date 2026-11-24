@@ -22,6 +22,9 @@ from jx_alert.storage.models import SyncJob
 _LOG = logging.getLogger("jx_alert.bot")
 JOB = "feishu_question"
 TITLE = "JX 广告助手"
+# Owner (Nov 2026): an 「OK」 reaction on the question shows that the assistant is answering it.
+ACK_EMOJI = "OK"
+ACK_TIMEOUT = 5
 # Follow-up questions see the recent turns of the same conversation (p2p chat, or one person in the group).
 HISTORY_TURNS = 6
 HISTORY_WINDOW = timedelta(minutes=60)
@@ -188,11 +191,11 @@ def enqueue_group_question(db, settings, event_dict):
 
 # ---------------------------------------------------------------- answer rendering
 
-def answer_cards(title, answer, footer):
-    """DeepSeek's Markdown answer as at most three reply cards (tables stay tables)."""
+def answer_cards(title, answer):
+    """DeepSeek's Markdown answer as at most three reply cards (tables stay tables), with no source footer."""
     from jx_alert.reports.cards import report_cards
 
-    return report_cards(title, answer, footer, reserve=0)[:3]
+    return report_cards(title, answer, reserve=0)[:3]
 
 
 def _conversation(meta):
@@ -218,6 +221,34 @@ def history(db, meta, job_id, now):
 
 
 # ---------------------------------------------------------------- worker
+
+def _reaction_client(settings):
+    from jx_alert.notifications.feishu_app import FeishuAppClient
+
+    client = FeishuAppClient.from_settings(settings)
+    client.timeout = min(client.timeout, ACK_TIMEOUT)
+    return client
+
+
+def acknowledge(settings, meta):
+    """The 「OK」 reaction on a question whose answer is being prepared; at most once per question.
+
+    Best effort: a refused or failed reaction is recorded and never delays or blocks the answer.
+    """
+    if meta.get("acknowledged"):
+        return meta["acknowledged"]
+    from jx_alert.notifications.feishu_app import FeishuRejected
+
+    try:
+        _reaction_client(settings).add_reaction(meta["message_id"], ACK_EMOJI)
+        return "OK"
+    except FeishuRejected as exc:
+        _LOG.warning("Question reaction refused (code=%s)", exc.code)
+        return f"REJECTED:{exc.code}"
+    except Exception as exc:  # noqa: BLE001 - never log provider text; the answer goes ahead regardless.
+        _LOG.warning("Question reaction failed (%s)", type(exc).__name__)
+        return "FAILED"
+
 
 def _complete(db, settings, job_id, meta, cards, provider):
     job = db.get(SyncJob, job_id)
@@ -273,20 +304,23 @@ def process_one_question(settings, session_factory, engine, *, answer=None):
                 job.error_message = "会话或读取权限已变更，本次未回复。"
                 db.commit()
                 return {"status": "SKIPPED", "job_id": job_id}
+            # Only a question that will be answered gets the reaction, and only once (also across retries).
+            # A new dict: mutating the one attached to the job would hide the change from the session.
+            meta = {**meta, "acknowledged": acknowledge(settings, meta)}
+            job.metadata_json = meta
+            db.commit()
             turns = history(db, meta, job_id, now)
             roster, _ = latest_roster(db)
         question = meta["question"]
         try:
             result = (answer or answer_question)(settings, question, history=turns, roster=roster)
         except DeepSeekError as exc:
-            cards, provider = [simple_card(TITLE, f"DeepSeek 暂时无法回答：{exc}")], "deepseek_unavailable"
+            cards, provider = [simple_card(TITLE, f"暂时无法回答：{exc}")], "deepseek_unavailable"
         except SparkXError as exc:
-            cards, provider = [simple_card(TITLE, f"暂时无法查询 SparkX：{exc.message}")], "sparkx_error"
+            cards, provider = [simple_card(TITLE, f"暂时查不到广告数据：{exc.message}")], "sparkx_error"
         else:
             provider = result["provider"]
-            footer = (f"数据来源：SparkX MCP 只读查询 {result['calls']} 次 · DeepSeek 分析" if result.get("calls")
-                      else None)
-            cards = answer_cards(TITLE, result["answer"], footer)
+            cards = answer_cards(TITLE, result["answer"])
             meta["sparkx_calls"] = result.get("calls", 0)
             meta["answer_text"] = result["answer"][:MAX_ANSWER_MEMORY]
         with session_factory() as db:

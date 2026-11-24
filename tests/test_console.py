@@ -162,7 +162,7 @@ def test_live_preview_runs_in_the_background_and_is_read_only(console, session_f
     state = wait_for(console, started.json()["job"])
     assert state["status"] == "done"
     result = state["result"]
-    assert result["cards"][0]["header"]["title"]["content"] == "SparkX 广告日报 · 2026-11-22"
+    assert result["cards"][0]["header"]["title"]["content"] == "广告日报 · 2026-11-22"
     assert "全公司核心指标" in result["text"] and result["info"]["profiles"] == 7 and result["info"]["sparkx_calls"] == 4
     assert result["info"]["mentions"] == [] and "audience" not in result["info"]
     with session_factory() as db:
@@ -224,7 +224,7 @@ def test_a_finished_preview_can_be_sent_as_a_test(console, session_factory, sett
         queued = db.query(NotificationOutbox).order_by(NotificationOutbox.id).all()
         assert [row.payload["delivery"]["role"] for row in queued] == ["jx_review_group", "jx_review_lead"]
         assert all(row.idempotency_key.startswith(f"jx:test:review:{job}:") for row in queued)
-        assert queued[0].payload["card"]["header"]["title"]["content"].startswith("【测试】SparkX 广告异常复盘")
+        assert queued[0].payload["card"]["header"]["title"]["content"].startswith("【测试】广告异常复盘")
     assert console.post("/console/api/reports/test-send", json=body, headers=headers).json()["status"] == "ALREADY_QUEUED"
     assert wait_for(console, job)["sent"] == ["group", "lead"]
     deliveries = console.get("/console/api/deliveries").json()["rows"]
