@@ -1,8 +1,10 @@
 """Who receives each lane, resolved from the owner's routing file and store directory.
 
-总负责人 (company lead) receives the 08:30 daily report; 广告负责人 (ad lead)
-receives the review and the hourly monitor; each store's operators receive
-only their own stores. A recipient is re-verified right before each send.
+Every lane goes to the report group; for the review and the hourly monitor the
+group message @-mentions the operators of the affected stores once they are
+mapped. 总负责人 (company lead) also receives the daily report and 广告负责人
+(ad lead) the review and the hourly monitor privately; private operator copies
+(only their own stores) are optional. A recipient is re-verified before each send.
 """
 import hashlib
 import re
@@ -29,6 +31,51 @@ def group_delivery(settings, routing_data, lane):
         return report_group_delivery(settings, routing_data, role=role(lane, "group"))
     except ApplicationRoutingError:
         return None
+
+
+def operator_mentions(settings, routing_data, directory, pids):
+    """{open_id: [profile ids]} of the mapped operators of these stores who are in the report group.
+
+    Stores without an operator contribute nothing: their rows say 未映射运营 and the
+    group message is still sent, just without an @ for them.
+    """
+    roster = verified_members(routing_data, settings)
+    found = {}
+    for key in sorted(pids, key=int):
+        if not directory_module.monitored(directory, key):
+            continue
+        for person in directory_module.operators(directory, key):
+            uid = person["open_id"]
+            if roster is None or uid in roster:
+                found.setdefault(uid, []).append(key)
+    return found
+
+
+def with_operator_mentions(delivery, mentions):
+    """A group delivery that @-mentions exactly these operators (checked again before sending)."""
+    return {**delivery, "open_ids": list(mentions), "mentions": {uid: list(keys) for uid, keys in mentions.items()}}
+
+
+def current_mentions(settings, delivery):
+    """The frozen @-mentions that are still valid now; a changed operator is simply not mentioned."""
+    wanted, frozen = delivery.get("open_ids") or [], delivery.get("mentions") or {}
+    if not wanted or not isinstance(frozen, dict):
+        return []
+    try:
+        routing_data = routing(settings)
+        directory = directory_module.load(settings)
+    except (OSError, RuntimeError, ValueError, directory_module.StoreDirectoryError):
+        return []
+    roster = verified_members(routing_data, settings)
+    keep = []
+    for uid in dict.fromkeys(wanted):
+        keys = frozen.get(uid) if isinstance(frozen.get(uid), list) else []
+        if (isinstance(uid, str) and OPEN_ID.fullmatch(uid) and (roster is None or uid in roster)
+                and any(directory_module.monitored(directory, key)
+                        and uid in {row["open_id"] for row in directory_module.operators(directory, key)}
+                        for key in keys)):
+            keep.append(uid)
+    return keep
 
 
 def _app_identity(settings):

@@ -54,9 +54,10 @@ def simple_card(title, text, color="blue"):
     return shell(title, [markdown(md_safe(text, 2000))], color)
 
 
-def card_fits(value):
+def card_fits(value, reserve=0):
     """Bound both the five-table platform limit and JSON-in-JSON wire size.
 
+    ``reserve`` keeps room for the @-mention line added at send time.
     https://open.feishu.cn/document/feishu-cards/feishu-card-cardkit/components/table
     """
     pending, tables = [value], 0
@@ -71,7 +72,7 @@ def card_fits(value):
             pending.extend(item)
     payload = {"receive_id": "oc_" + "x" * 64, "msg_type": "interactive",
                "content": json.dumps(value, ensure_ascii=False), "uuid": "x" * 40}
-    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= MAX_WIRE_BYTES
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= MAX_WIRE_BYTES - reserve
 
 
 def with_mentions(value, open_ids):
@@ -85,7 +86,7 @@ def with_mentions(value, open_ids):
     if open_ids:
         result["body"]["elements"].insert(0, {
             "tag": "markdown",
-            "content": "提醒：" + " ".join(f"<at id={uid}></at>" for uid in dict.fromkeys(open_ids)),
+            "content": "对应运营：" + " ".join(f"<at id={uid}></at>" for uid in dict.fromkeys(open_ids)),
         })
     return result
 

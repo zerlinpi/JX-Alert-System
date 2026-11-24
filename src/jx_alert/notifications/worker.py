@@ -163,7 +163,12 @@ def _claim(db, selection, capacity, now, claim_time):
     return jobs, unknown
 
 
-def _send(client, payload, key, fence):
+def _mentions(settings, kind, payload):
+    """Lane group copies mention the still-valid operators; nothing else mentions anyone."""
+    return lanes.send_mentions(settings, payload) if kind == "lane" else []
+
+
+def _send(client, payload, key, fence, mentions):
     destination = payload["delivery"]
     card = payload.get("card")
     if destination.get("reply_to_message_id"):
@@ -174,9 +179,9 @@ def _send(client, payload, key, fence):
     if card is not None:
         return client.send_card(card, receive_id=destination["receive_id"],
                                 receive_id_type=destination["receive_id_type"],
-                                open_ids=destination.get("open_ids", []), idempotency_key=key, before_submit=fence)
+                                open_ids=mentions, idempotency_key=key, before_submit=fence)
     return client.send_text(str(payload.get("text") or ""), receive_id=destination["receive_id"],
-                            receive_id_type=destination["receive_id_type"], open_ids=destination.get("open_ids", []),
+                            receive_id_type=destination["receive_id_type"], open_ids=mentions,
                             idempotency_key=key, before_submit=fence)
 
 
@@ -228,10 +233,11 @@ def process_outbox_batch(batch_size=5, max_attempts=8, outbox_ids=None, *, quest
             reason = _blocked(settings, job["kind"], key, payload, _clock())
             if reason:
                 raise _Blocked(reason)
+            mentions = _mentions(settings, job["kind"], payload)
             if client is None:
                 from jx_alert.notifications.feishu_app import FeishuAppClient
                 client = (client_factory or FeishuAppClient.from_settings)(settings)
-            response = _send(client, payload, key, fence)
+            response = _send(client, payload, key, fence, mentions)
             if intent is None:
                 raise _Unfenced("Feishu transport returned without recording a submission")
             message_id = response["message_id"]

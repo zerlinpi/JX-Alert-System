@@ -29,14 +29,18 @@
 - The owner set every store's report timezone to `America/Los_Angeles`. Daily
   reports use the latest completed day; recent sales and orders are provisional
   (7–14 day attribution). Reviews compare the last 7 days with the 7 days before.
-- Recipients: the 总负责人 receives the 08:30 daily report; the 广告负责人
-  receives the review and hourly alerts for all stores, each row labelled with its
-  operator; each operator receives only their own stores. Unmapped stores are
-  labelled, not routed to guessed people.
-- Re-verify the switch, delivery window and exact recipient before every send.
-  Never resend a message that may have been submitted, and never replay old or
-  retired messages. Lanes stay off until the owner enables them in the console.
-  Test Feishu only in the explicitly selected group and with the owner's recipients.
+- Recipients: every lane goes to the report group; the 总负责人 also receives
+  the 08:30 daily report and the 广告负责人 the review and hourly alerts
+  privately, each row labelled with its operator. The owner set all lanes on by
+  default: stores without an operator are still notified (labelled 未映射运营,
+  nobody @-mentioned); once operators are mapped, the group message @-mentions
+  only the operators of the affected stores. Private operator copies are optional.
+  Never route to or mention guessed people.
+- Re-verify the switch, delivery window and exact recipient (including each
+  @-mention) before every send. Never resend a message that may have been
+  submitted, and never replay old or retired messages. Lanes do not run until a
+  SparkX token is saved. Test Feishu only in the explicitly selected group and
+  with the owner's recipients.
 - Database changes are additive with backups and explicit persistence checks.
   Retired Lingxing tables stay untouched. Code rollback retains new historical
   evidence and never removes Docker volumes.

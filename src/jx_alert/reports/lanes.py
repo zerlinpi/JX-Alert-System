@@ -1,9 +1,12 @@
 """Queue the SparkX lanes into the durable outbox and gate every later send.
 
-daily   08:30 Beijing: company KPIs, site and store tables, 须知 → 总负责人 (+ group)
-review  08:30 Beijing: 7-day campaign anomaly review → 广告负责人, operators (+ group)
+daily   08:30 Beijing: company KPIs, site and store tables, 须知 → report group + 总负责人
+review  08:30 Beijing: 7-day campaign anomaly review → report group (@ the affected stores'
+        operators once mapped) + 广告负责人; optional private copies per operator
 hourly  every hour inside the owner's window: wasteful/opportunity campaigns today
-        → 广告负责人, operators (+ group); each campaign/category once per day
+        → report group (@ operators) + 广告负责人; each campaign/category once per day
+
+All lanes are on by default and still notify the group when no operator is mapped.
 
 One SparkX conversation per run; cards are frozen at queue time. Before each
 POST the worker re-checks the switch, the window and the exact recipient.
@@ -90,6 +93,27 @@ def delivery_blocked(settings, key, payload, now):
     return recipients.delivery_current(settings, lane, delivery)
 
 
+def send_mentions(settings, payload):
+    """@-mentions for this send: frozen operators that are still mapped, still in the group,
+    and only while the owner keeps 「在群内 @ 对应运营」 on. Private messages mention no one."""
+    delivery = payload.get("delivery") or {}
+    lane = payload.get("jx_lane")
+    if delivery.get("role") != recipients.role(lane, "group") or not delivery.get("open_ids"):
+        return []
+    try:
+        if not lane_settings.load(settings)["lanes"][lane].get("mention_operators"):
+            return []
+    except (lane_settings.SettingsError, KeyError):
+        return []
+    return recipients.current_mentions(settings, delivery)
+
+
+def _sparkx_ready(settings):
+    from jx_alert.sparkx.credentials import effective_token
+
+    return bool(effective_token(settings))
+
+
 # ---------------------------------------------------------------- run receipts
 
 def _jobs(db, lane, field, value):
@@ -158,6 +182,16 @@ def _morning_plan(settings, routing_data, lane, config):
     return plans
 
 
+def _mention_operators(plans, settings, routing_data, directory, config, lane, pids):
+    """The group copy @-mentions the mapped operators of these stores; nobody else changes."""
+    if not config.get("mention_operators"):
+        return plans
+    mentions = recipients.operator_mentions(settings, routing_data, directory, pids)
+    group = recipients.role(lane, "group")
+    return [recipients.with_operator_mentions(plan, mentions) if plan["role"] == group and mentions else plan
+            for plan in plans]
+
+
 def queue_morning_lane(db, settings, lane, *, now, collector=None, narrator=None):
     """Collect once, freeze cards and enqueue one message per recipient for today's Beijing date."""
     from jx_alert.ai import narrative
@@ -176,6 +210,8 @@ def queue_morning_lane(db, settings, lane, *, now, collector=None, narrator=None
         return {"status": "WAITING"}
     if lane == "review" and config["weekly"] and local.weekday() != 0:
         return {"status": "NOT_SCHEDULED_TODAY"}
+    if not _sparkx_ready(settings):
+        return {"status": "SPARKX_NOT_CONFIGURED"}  # No receipt: nothing to retry until a token is saved.
     day = local.date().isoformat()
     jobs = _jobs(db, lane, "day", day)
     if any(job.status in _TERMINAL_OK for job in jobs):
@@ -221,6 +257,8 @@ def queue_morning_lane(db, settings, lane, *, now, collector=None, narrator=None
             text, source = {"headline": None, "actions": report["actions"]}, "rules"
         value = cards.review_card(report, text, source)
         extra.update(jx_window=report["window"], jx_profiles=sorted(collected["profiles"], key=int))
+        affected = {row["pid"] for row in report["findings"] + report["zero_stores"]}
+        plans = _mention_operators(plans, settings, routing_data, directory, config, lane, affected)
         for delivery in plans:
             if value is None:
                 skipped += 1
@@ -228,7 +266,6 @@ def queue_morning_lane(db, settings, lane, *, now, collector=None, narrator=None
             row_id = _enqueue(db, lane, day, delivery, value, now, extra)
             ids += [row_id] if row_id else []
         if config["to_operators"]:
-            affected = {row["pid"] for row in report["findings"] + report["zero_stores"]}
             leads = {plan["receive_id"] for plan in plans if plan["receive_id_type"] == "open_id"}
             for delivery in recipients.operator_deliveries(settings, routing_data, directory, lane, affected,
                                                           exclude=leads):
@@ -276,6 +313,8 @@ def run_hourly(db, settings, *, now, collector=None):
         return {"status": "DELIVERY_DISABLED"}
     if not in_hours(config, now):
         return {"status": "OUTSIDE_HOURS"}
+    if not _sparkx_ready(settings):
+        return {"status": "SPARKX_NOT_CONFIGURED"}
     slot = now.astimezone(BEIJING).strftime("%Y-%m-%dT%H")
     jobs = _jobs(db, "hourly", "slot", slot)
     if any(job.status in _TERMINAL_OK for job in jobs):
@@ -304,6 +343,8 @@ def run_hourly(db, settings, *, now, collector=None):
     ids, alerted = [], set()
     if report["new"]:
         value = cards.hourly_card(report)
+        plans = _mention_operators(plans, settings, routing_data, directory, config, "hourly",
+                                   {item["pid"] for item in report["new"]})
         for delivery in plans:
             if value is not None and (row_id := _enqueue(db, "hourly", slot, delivery, value, now, {
                     **extra, "jx_profiles": sorted({item["pid"] for item in report["new"]}, key=int)})):

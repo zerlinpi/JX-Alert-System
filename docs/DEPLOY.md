@@ -62,7 +62,7 @@ tail -f /tmp/jx-upgrade.log                            # SSH 断开不影响脚�
 
 ### 3. 升级后
 
-所有通知默认关闭，升级本身不会发送任何消息。按 [管理台首次配置顺序](CONSOLE.md#首次配置顺序) 保存 SparkX Token、指定店铺运营、预览，再开启通知。问答机器人在 SparkX Token 保存前会回复「尚未配置 SparkX MCP Token」。
+三条通知默认开启，但 SparkX Token 保存之前不会运行，所以升级本身不会发送消息。保存 Token 后：实时监控最迟约 10 分钟内开始发到通知群（北京时间 09:00–24:00），日报和复盘在 08:30–10:00 之间发送；没有指定运营的店铺照常通知，不 @ 人。想先核对内容：先在「通知设置」关闭通知，再保存 Token，预览确认后重新打开（预览需要 Token）。按 [管理台首次配置顺序](CONSOLE.md#首次配置顺序) 操作。问答机器人在 SparkX Token 保存前会回复「尚未配置 SparkX MCP Token」。
 
 ## 回滚（`deploy/rollback.sh`）
 

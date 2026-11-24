@@ -46,7 +46,7 @@
 
     <section data-panel="stores" aria-labelledby="stores-title" hidden>
       <div class="page-heading"><div><h1 id="stores-title">店铺与运营</h1>
-        <p class="muted">店铺来自 SparkX Token 授权的 Profile。每家店可指定运营（通知群成员），异常会私聊对应运营；关闭监控的店铺不进入任何通知。</p></div>
+        <p class="muted">店铺来自 SparkX Token 授权的 Profile。每家店可指定运营（通知群成员）：未指定时通知照常发到群里，标注「未映射运营」；指定后，这家店出现异常时群消息会 @ 对应运营。关闭监控的店铺不进入任何通知。</p></div>
         <div class="control-actions"><button type="button" class="button secondary" id="refresh-roster">从 SparkX 刷新店铺</button>
           <button type="button" class="button secondary" id="apply-suggestions" disabled>采用全部建议运营</button></div></div>
       <div id="stores-status" class="notice" role="status" hidden></div>
@@ -70,7 +70,7 @@
 
     <section data-panel="notifications" aria-labelledby="notifications-title" hidden>
       <div class="page-heading"><div><h1 id="notifications-title">通知设置</h1>
-        <p class="muted">三类通知均由 SparkX 直出数据生成，默认关闭，开启后按下方接收人发送。</p></div></div>
+        <p class="muted">三类通知均由 SparkX 直出数据生成，默认全部开启：始终发到通知群，店铺还没有运营时也照常发送；为店铺指定运营后，群消息会 @ 出问题店铺的对应运营。</p></div></div>
       <div id="notifications-status" class="notice" role="status" hidden></div>
       <div class="grid-2">
         <section class="panel" aria-labelledby="group-title"><div class="section-heading"><div><h2 id="group-title">通知群</h2>
@@ -101,8 +101,8 @@
           <button type="button" class="button secondary" data-preview="daily">预览</button></div>
           <div class="panel-body switches">
             <label class="check"><input type="checkbox" name="enabled">开启</label>
-            <label class="check"><input type="checkbox" name="to_lead">私聊总负责人</label>
             <label class="check"><input type="checkbox" name="to_group">发到通知群</label>
+            <label class="check"><input type="checkbox" name="to_lead">私聊总负责人</label>
             <label class="check"><input type="checkbox" name="ai">DeepSeek 撰写须知（数字逐项核对）</label></div></section>
         <section class="panel lane" data-lane="review"><div class="section-heading"><div><h2>08:30 广告异常复盘</h2>
           <p class="muted">近 7 日对比前 7 日，campaign 级：全店零曝光、高花费零出单、ACOS 恶化、加预算后销售下滑、异常停摆，附建议出价。</p></div>
@@ -110,18 +110,20 @@
           <div class="panel-body switches">
             <label class="check"><input type="checkbox" name="enabled">开启</label>
             <label class="check"><input type="checkbox" name="weekly">仅每周一发送</label>
-            <label class="check"><input type="checkbox" name="to_lead">私聊广告负责人</label>
-            <label class="check"><input type="checkbox" name="to_operators">私聊对应运营（只含其店铺）</label>
             <label class="check"><input type="checkbox" name="to_group">发到通知群</label>
+            <label class="check"><input type="checkbox" name="mention_operators">群内 @ 出问题店铺的对应运营</label>
+            <label class="check"><input type="checkbox" name="to_lead">私聊广告负责人</label>
+            <label class="check"><input type="checkbox" name="to_operators">另外私聊对应运营（只含其店铺）</label>
             <label class="check"><input type="checkbox" name="ai">DeepSeek 撰写判断与建议</label></div></section>
         <section class="panel lane" data-lane="hourly"><div class="section-heading"><div><h2>每小时实时监控</h2>
           <p class="muted">美西当日截至目前的 campaign 数据：高花费无转化、高花费低转化、低花费无转化、低花费高转化。同一活动同类提醒每天一次。</p></div>
           <button type="button" class="button secondary" data-preview="hourly">预览</button></div>
           <div class="panel-body switches">
             <label class="check"><input type="checkbox" name="enabled">开启</label>
+            <label class="check"><input type="checkbox" name="to_group">发到通知群</label>
+            <label class="check"><input type="checkbox" name="mention_operators">群内 @ 出问题店铺的对应运营</label>
             <label class="check"><input type="checkbox" name="to_lead">私聊广告负责人</label>
-            <label class="check"><input type="checkbox" name="to_operators">私聊对应运营</label>
-            <label class="check"><input type="checkbox" name="to_group">发到通知群</label></div>
+            <label class="check"><input type="checkbox" name="to_operators">另外私聊对应运营（只含其店铺）</label></div>
           <div class="panel-body thresholds">
             <label>发送时段（北京）<span class="pair"><input type="number" name="start_hour" min="0" max="23" step="1"> 点至
               <input type="number" name="end_hour" min="1" max="24" step="1"> 点</span></label>

@@ -15,6 +15,8 @@ SOURCES = {"deepseek": "说明由 DeepSeek 依据上表数据撰写，数字已�
            "rules": "说明由系统规则生成。",
            "unavailable": "DeepSeek 暂不可用，说明由系统规则生成。",
            "rejected": "DeepSeek 文字未通过数字核对，已改用系统规则说明。"}
+# Room for the send-time line "对应运营：<at id=…></at> …" (about 40 operators).
+MENTION_RESERVE = 2048
 ATTRIBUTION = "销售额、订单为 SparkX 截至生成时的归因数据，近 7–14 天仍会回补；花费与点击基本已定。"
 
 
@@ -134,7 +136,7 @@ def _daily_elements(report, notes, source, cap):
 def daily_card(report, notes, source):
     for cap in (25, 15, 10, 6):
         value = shell(f"SparkX 广告日报 · {report['report_date']}", _daily_elements(report, notes, source, cap))
-        if card_fits(value):
+        if card_fits(value, MENTION_RESERVE):
             return value
     return None
 
@@ -274,7 +276,7 @@ def review_card(report, text, source):
     for cap, store_cap in ((10, 15), (6, 10), (4, 6), (2, 4)):
         value = shell("SparkX 广告异常复盘 · 近 7 日对比前 7 日",
                       _review_elements(report, text, source, cap, store_cap), color)
-        if card_fits(value):
+        if card_fits(value, MENTION_RESERVE):
             return value
     return None
 
@@ -317,6 +319,6 @@ def hourly_card(report, *, cap=8):
     color = "red" if report["grouped"]["high_no_conv"] or report["grouped"]["high_low_conv"] else "orange"
     value = shell(f"广告实时监控 · 美西 {report['day']} {(report.get('marketplace_time') or '')[-5:]}".strip(),
                   elements, color)
-    if card_fits(value):
+    if card_fits(value, MENTION_RESERVE):
         return value
     return hourly_card(report, cap=cap // 2) if cap > 2 else None

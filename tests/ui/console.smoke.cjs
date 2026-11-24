@@ -25,8 +25,8 @@ const card = { schema: "2.0", header: { template: "orange", title: { content: "S
     { tag: "table", columns: [{ name: "c0", display_name: "指标" }, { name: "c1", display_name: "当日" }],
       rows: [{ c0: "广告花费", c1: "$4,034" }] }, { tag: "hr" }] } };
 const lanes = { daily: { enabled: false, to_group: false, to_lead: true, ai: true },
-  review: { enabled: true, to_group: false, to_lead: true, to_operators: true, ai: true, weekly: false },
-  hourly: { enabled: false, to_group: false, to_lead: true, to_operators: true, start_hour: 9, end_hour: 24,
+  review: { enabled: true, to_group: true, mention_operators: true, to_lead: true, to_operators: false, ai: true, weekly: false },
+  hourly: { enabled: true, to_group: true, mention_operators: true, to_lead: true, to_operators: false, start_hour: 9, end_hour: 24,
             high_spend: 30, low_spend: 10, min_clicks: 15, acos_high: 60, cvr_low: 5, acos_good: 20, min_orders_good: 2 } };
 const responses = {
   "GET /console/api/overview": { sparkx: { configured: true, token_source: "console" }, deepseek: { configured: false },
@@ -103,7 +103,8 @@ const click = (node) => node.dispatchEvent(new window.MouseEvent("click", { bubb
   await tick();
   const saved = requests.find((request) => request.key === "POST /console/api/reports");
   checks.push(["lanes saved", saved && JSON.parse(saved.body).lanes.daily.enabled === true
-    && JSON.parse(saved.body).lanes.hourly.min_clicks === 15]);
+    && JSON.parse(saved.body).lanes.hourly.min_clicks === 15 && JSON.parse(saved.body).lanes.review.mention_operators === true]);
+  checks.push(["mention switch shown", window.document.querySelectorAll('#lanes-form input[name="mention_operators"]').length === 2]);
   click(window.document.querySelector('[data-preview="daily"]'));
   await tick();
   checks.push(["preview rendered", !$("preview-panel").hidden && $("preview-card").querySelector("table") !== null

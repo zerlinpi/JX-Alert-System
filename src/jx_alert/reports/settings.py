@@ -1,8 +1,10 @@
 """Owner switches, recipients and thresholds of the three notification lanes (0600 file).
 
-Every lane is off until the owner enables it in the console. Recipients are
-chosen per lane: the report group, the lead (总负责人 for the daily report,
-广告负责人 for the review and the hourly monitor) and the stores' operators.
+Every lane is on by default (owner decision, Nov 2026): it always reaches the
+report group, also while no store has an operator yet; once operators are
+mapped, the group message @-mentions the operators of the affected stores.
+The lead (总负责人 for the daily report, 广告负责人 for the review and the
+hourly monitor) also gets a private copy; private operator copies are optional.
 """
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,11 +18,11 @@ LANES = ("daily", "review", "hourly")
 _EMPTY_REVISION = "0" * 64
 _REVISION = re.compile(r"[0-9a-f]{64}")
 DEFAULTS = {
-    "daily": {"enabled": False, "to_group": False, "to_lead": True, "ai": True},
-    "review": {"enabled": False, "to_group": False, "to_lead": True, "to_operators": True, "ai": True,
-               "weekly": False},
-    "hourly": {"enabled": False, "to_group": False, "to_lead": True, "to_operators": True,
-               "start_hour": 9, "end_hour": 24, **HOURLY_DEFAULTS},
+    "daily": {"enabled": True, "to_group": True, "to_lead": True, "ai": True},
+    "review": {"enabled": True, "to_group": True, "mention_operators": True, "to_lead": True,
+               "to_operators": False, "ai": True, "weekly": False},
+    "hourly": {"enabled": True, "to_group": True, "mention_operators": True, "to_lead": True,
+               "to_operators": False, "start_hour": 9, "end_hour": 24, **HOURLY_DEFAULTS},
 }
 _NUMBERS = {"high_spend": (1, 100_000), "low_spend": (0, 100_000), "min_clicks": (1, 10_000),
             "acos_high": (1, 1000), "cvr_low": (0, 100), "acos_good": (1, 100), "min_orders_good": (1, 1000)}

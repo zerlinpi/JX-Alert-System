@@ -2,14 +2,14 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from jx_alert.notifications import worker
 from jx_alert.notifications.outbox import DELIVERY_UNKNOWN, NotificationOutbox, enqueue_notification
 from jx_alert.reports import lanes
 from jx_alert.storage.models import NotificationLog
-from test_report_lanes import SEND, collector_for, enable, rules
-from test_sparkx_analysis import DAILY
+from test_report_lanes import HOUR, SEND, collector_for, enable, map_operators, rules
+from test_sparkx_analysis import DAILY, HOURLY
 
 
 class FakeClient:
@@ -26,7 +26,8 @@ class FakeClient:
         return {"message_id": f"om_{len(self.sent)}"}
 
     def send_card(self, card, *, receive_id, receive_id_type, open_ids, idempotency_key, before_submit):
-        return self._post("create", before_submit, receive_id=receive_id, receive_id_type=receive_id_type, card=card)
+        return self._post("create", before_submit, receive_id=receive_id, receive_id_type=receive_id_type, card=card,
+                          open_ids=list(open_ids))
 
     def send_text(self, text, *, receive_id, receive_id_type, open_ids, idempotency_key, before_submit):
         return self._post("create", before_submit, receive_id=receive_id, text=text)
@@ -40,11 +41,20 @@ def at_send(monkeypatch):
     monkeypatch.setattr(worker, "_clock", lambda: SEND + timedelta(minutes=1))
 
 
+def pin_times(session_factory, when):
+    """Rows were inserted at the real wall-clock time; pin them to the simulated one."""
+    naive = when.astimezone(timezone.utc).replace(tzinfo=None)
+    with session_factory() as db:
+        db.execute(update(NotificationOutbox).values(created_at=naive, next_attempt_at=naive))
+        db.commit()
+
+
 def queue_daily(settings, session_factory):
-    enable(settings, daily={"enabled": True})
+    """Default settings: the group copy first, then the company lead."""
     with session_factory() as db:
         result = lanes.queue_morning_lane(db, settings, "daily", now=SEND, collector=collector_for(DAILY), narrator=rules)
         db.commit()
+    pin_times(session_factory, SEND)
     return result["outbox_ids"][0]
 
 
@@ -62,13 +72,29 @@ def test_queued_daily_report_is_delivered_after_the_intent_is_committed(settings
     row_id = queue_daily(settings, session_factory)
     client = FakeClient()
     result = run(settings, session_factory, client)
-    assert result["sent"] == 1 and client.sent[0][1]["receive_id"] == "ou_lead"
+    assert result["sent"] == 2
+    assert [(details["receive_id"], details["open_ids"]) for _, details in client.sent] == [
+        ("oc_reports", []), ("ou_lead", [])]
     delivered = row(session_factory, row_id)
-    assert delivered.status == "DELIVERED" and delivered.payload["delivery_intent"]["destination"] == "ou_lead"
+    assert delivered.status == "DELIVERED" and delivered.payload["delivery_intent"]["destination"] == "oc_reports"
     assert delivered.payload["delivery_intent"]["body_sha256"] == "f" * 64
     with session_factory() as db:
         assert db.scalar(select(NotificationLog.status).where(NotificationLog.message_id == "om_1")) == "DELIVERED"
     assert run(settings, session_factory, FakeClient())["claimed"] == 0
+
+
+def test_group_alerts_mention_only_the_operators_still_mapped_when_sending(settings, session_factory, monkeypatch):
+    monkeypatch.setattr(worker, "_clock", lambda: HOUR + timedelta(minutes=2))
+    map_operators(settings, {"101": ("ou_op1", "皮泽霖"), "102": ("ou_op2", "高爽")})
+    with session_factory() as db:
+        lanes.run_hourly(db, settings, now=HOUR, collector=collector_for(HOURLY))
+        db.commit()
+    pin_times(session_factory, HOUR)
+    map_operators(settings, {"101": ("ou_new", "新运营")})  # 101 changed hands after queueing
+    client = FakeClient()
+    run(settings, session_factory, client)
+    assert [(details["receive_id"], details["open_ids"]) for _, details in client.sent] == [
+        ("oc_reports", ["ou_op2"]), ("ou_adlead", [])]
 
 
 def test_messages_from_the_retired_release_are_kept_but_never_sent(settings, session_factory, at_send):
@@ -77,6 +103,7 @@ def test_messages_from_the_retired_release_are_kept_but_never_sent(settings, ses
                                    delivery={"role": "group", "receive_id_type": "chat_id", "receive_id": "oc_reports",
                                              "open_ids": []})
         db.commit()
+    pin_times(session_factory, SEND)
     client = FakeClient()
     run(settings, session_factory, client)
     kept = row(session_factory, old.id)
@@ -144,6 +171,7 @@ def test_question_replies_use_the_original_message(settings, session_factory, mo
             "role": "group_question", "receive_id_type": "chat_id", "receive_id": "oc_reports", "open_ids": [],
             "reply_to_message_id": "om_q"})
         db.commit()
+    pin_times(session_factory, datetime(2026, 11, 24, 3, 0, tzinfo=timezone.utc))
     client = FakeClient()
     run(settings, session_factory, client, question_replies_only=True)
     assert client.sent == [("reply", {"message_id": "om_q", "thread": True})]

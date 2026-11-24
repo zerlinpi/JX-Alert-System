@@ -24,8 +24,8 @@
   const NARRATIVE = { deepseek: "DeepSeek 撰写", rules: "系统规则", unavailable: "DeepSeek 不可用，规则兜底",
                       rejected: "DeepSeek 未通过核对，规则兜底" };
   const TOGGLES = { daily: ["enabled", "to_group", "to_lead", "ai"],
-                    review: ["enabled", "to_group", "to_lead", "to_operators", "ai", "weekly"],
-                    hourly: ["enabled", "to_group", "to_lead", "to_operators"] };
+                    review: ["enabled", "to_group", "mention_operators", "to_lead", "to_operators", "ai", "weekly"],
+                    hourly: ["enabled", "to_group", "mention_operators", "to_lead", "to_operators"] };
   const NUMBERS = ["start_hour", "end_hour", "high_spend", "low_spend", "min_clicks", "acos_high", "cvr_low",
                    "acos_good", "min_orders_good"];
 
@@ -311,7 +311,7 @@
           else input.value = lanes[lane][input.name];
         }
       }
-      $("lanes-updated").textContent = state.reports.updated_at ? "上次保存：" + formatTime(state.reports.updated_at) : "尚未保存（默认全部关闭）";
+      $("lanes-updated").textContent = state.reports.updated_at ? "上次保存：" + formatTime(state.reports.updated_at) : "尚未修改，使用默认设置（全部开启）";
     }
 
     async function loadNotifications() {

@@ -42,14 +42,16 @@ test("store search matches names, sites, profile IDs and operators", () => {
 test("lane form values are validated before saving", () => {
   const values = {
     daily: { enabled: true, to_group: false, to_lead: true, ai: true },
-    review: { enabled: true, to_group: false, to_lead: true, to_operators: true, ai: false, weekly: true },
-    hourly: { enabled: true, to_group: false, to_lead: true, to_operators: true, start_hour: "9", end_hour: "24",
+    review: { enabled: true, to_group: true, mention_operators: true, to_lead: true, to_operators: false, ai: false, weekly: true },
+    hourly: { enabled: true, to_group: true, mention_operators: false, to_lead: true, to_operators: false, start_hour: "9", end_hour: "24",
               high_spend: "30", low_spend: "10", min_clicks: "15", acos_high: "60", cvr_low: "5", acos_good: "20",
               min_orders_good: "2" },
   };
   const lanes = consoleUi.lanePayload(values);
   assert.equal(lanes.hourly.start_hour, 9);
   assert.equal(lanes.review.weekly, true);
+  assert.equal(lanes.review.mention_operators, true);
+  assert.equal(lanes.hourly.mention_operators, false);
   assert.throws(() => consoleUi.lanePayload({ ...values, hourly: { ...values.hourly, low_spend: "40" } }), /低花费/);
   assert.throws(() => consoleUi.lanePayload({ ...values, hourly: { ...values.hourly, start_hour: "23", end_hour: "9" } }), /时段/);
   assert.throws(() => consoleUi.lanePayload({ ...values, hourly: { ...values.hourly, min_clicks: "" } }), /阈值/);

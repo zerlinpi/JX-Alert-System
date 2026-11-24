@@ -166,7 +166,9 @@ main() {
   say "public https://$host/console/login -> $public (expected 200)"
   say "deployed $target (tree $tree); previous $previous; backup $backup"
   say "rollback: $rollback"
-  say "next: open https://$host/console/, save the SparkX token, map operators, preview, then enable lanes"
+  say "next: open https://$host/console/. Lanes are ON by default and start once the SparkX token is saved"
+  say "      (hourly alerts within ~10 min, daily report and review at 08:30): to check content first, switch"
+  say "      lanes off in 通知设置, save the token, preview, then switch them back on. Map operators to get @-mentions."
 }
 
 main "$@"

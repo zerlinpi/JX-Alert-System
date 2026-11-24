@@ -57,15 +57,20 @@ def test_login_is_required_and_rejects_wrong_passwords(console):
 def test_overview_and_csrf_protected_writes(console, settings):
     headers = login(console)
     overview = console.get("/console/api/overview").json()
-    assert overview["sparkx"]["configured"] and overview["lanes"]["daily"]["enabled"] is False
+    assert overview["sparkx"]["configured"] and all(lane["enabled"] for lane in overview["lanes"].values())
     assert overview["feishu"]["group"] == "日报群" and re.fullmatch(r"[0-9a-f]{64}", overview["csrf"])
     reports = console.get("/console/api/reports").json()
     lanes = reports["lanes"]
-    lanes["daily"]["enabled"] = True
+    assert lanes["review"]["mention_operators"] is True and lanes["review"]["to_operators"] is False
+    lanes["hourly"]["mention_operators"] = False
     assert console.post("/console/api/reports", json={"revision": reports["revision"], "lanes": lanes},
                         headers={"origin": ORIGIN}).status_code == 403
     saved = console.post("/console/api/reports", json={"revision": reports["revision"], "lanes": lanes}, headers=headers)
-    assert saved.status_code == 200 and saved.json()["lanes"]["daily"]["enabled"] is True
+    assert saved.status_code == 200 and saved.json()["lanes"]["hourly"]["mention_operators"] is False
+    lanes["daily"]["unknown_switch"] = True
+    rejected = console.post("/console/api/reports", json={"revision": saved.json()["revision"], "lanes": lanes},
+                            headers=headers)
+    assert rejected.status_code == 400
 
 
 def test_secrets_are_write_only(console):
