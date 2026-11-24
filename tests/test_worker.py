@@ -25,9 +25,10 @@ class FakeClient:
         self.sent.append((kind, details))
         return {"message_id": f"om_{len(self.sent)}"}
 
-    def send_card(self, card, *, receive_id, receive_id_type, open_ids, idempotency_key, before_submit):
+    def send_card(self, card, *, receive_id, receive_id_type, open_ids, idempotency_key, before_submit,
+                  mention_labels=None):
         return self._post("create", before_submit, receive_id=receive_id, receive_id_type=receive_id_type, card=card,
-                          open_ids=list(open_ids))
+                          open_ids=list(open_ids), labels=dict(mention_labels or {}))
 
     def send_text(self, text, *, receive_id, receive_id_type, open_ids, idempotency_key, before_submit):
         return self._post("create", before_submit, receive_id=receive_id, text=text)
@@ -93,8 +94,27 @@ def test_group_alerts_mention_only_the_operators_still_mapped_when_sending(setti
     map_operators(settings, {"101": ("ou_new", "新运营")})  # 101 changed hands after queueing
     client = FakeClient()
     run(settings, session_factory, client)
-    assert [(details["receive_id"], details["open_ids"]) for _, details in client.sent] == [
-        ("oc_reports", ["ou_op2"]), ("ou_adlead", [])]
+    assert [(details["receive_id"], details["open_ids"], details["labels"]) for _, details in client.sent] == [
+        ("oc_reports", ["ou_op2"], {"ou_op2": "Campx"}), ("ou_adlead", [], {})]
+
+
+def test_a_console_test_send_is_delivered_right_away_and_only_once(settings, session_factory, monkeypatch):
+    from jx_alert.reports import cards
+
+    later = SEND + timedelta(hours=6)  # 14:30 Beijing: the daily report's own window has closed
+    monkeypatch.setattr(worker, "_clock", lambda: later + timedelta(seconds=20))
+    enable(settings, daily={"enabled": False})
+    values = cards.report_cards("SparkX 广告日报 · 2026-11-22", "正文", "")
+    with session_factory() as db:
+        lanes.queue_test(db, settings, "daily", values, now=later, preview_id="job-9", stores={}, to_group=True,
+                         to_lead=False, mention=False)
+        db.commit()
+    pin_times(session_factory, later)
+    client = FakeClient()
+    assert run(settings, session_factory, client)["sent"] == 1
+    _, details = client.sent[0]
+    assert details["receive_id"] == "oc_reports" and details["card"]["header"]["title"]["content"].startswith("【测试】")
+    assert run(settings, session_factory, FakeClient())["claimed"] == 0
 
 
 def test_messages_from_the_retired_release_are_kept_but_never_sent(settings, session_factory, at_send):

@@ -21,7 +21,7 @@
     EXPIRED: ["已过发送时段", ""], DEAD: ["发送失败", "bad"], REJECTED: ["飞书拒绝", "bad"],
   };
   const RUNS = { SUCCEEDED: ["成功", "ok"], FAILED: ["失败", "bad"], SKIPPED: ["跳过", "warn"] };
-  const TOGGLES = { daily: ["enabled", "to_group", "to_lead"],
+  const TOGGLES = { daily: ["enabled", "to_group", "mention_operators", "to_lead"],
                     review: ["enabled", "to_group", "mention_operators", "to_lead", "to_operators", "weekly"],
                     hourly: ["enabled", "to_group", "mention_operators", "to_lead", "to_operators"] };
   const NUMBERS = ["start_hour", "end_hour", "high_spend", "low_spend", "min_clicks", "acos_high", "cvr_low",
@@ -66,21 +66,59 @@
     return lines.join("\n");
   }
 
-  function storeCounts(rows) {
-    const list = rows || [];
+  function siteOf(row) {
+    return row.country_label || "—";
+  }
+
+  function storeCounts(rows, site) {
+    const list = (rows || []).filter((row) => !site || siteOf(row) === site);
     return { all: list.length, unmapped: list.filter((row) => row.monitored && !(row.operators || []).length).length,
              paused: list.filter((row) => !row.monitored).length };
   }
 
-  function filterStores(rows, query, kind) {
+  function siteOptions(rows) {
+    const counts = new Map();
+    for (const row of rows || []) counts.set(siteOf(row), (counts.get(siteOf(row)) || 0) + 1);
+    return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"))
+      .map(([label, count]) => ({ label, count }));
+  }
+
+  function filterStores(rows, query, kind, site) {
     const needle = String(query || "").trim().toLowerCase();
     return (rows || []).filter((row) => {
+      if (site && siteOf(row) !== site) return false;
       if (kind === "unmapped" && !(row.monitored && !(row.operators || []).length)) return false;
       if (kind === "paused" && row.monitored) return false;
       if (!needle) return true;
       return [row.name, row.short_name, row.country_label, row.profile_id, ...(row.operators || []).map((person) => person.name)]
         .some((value) => String(value || "").toLowerCase().includes(needle));
     });
+  }
+
+  function formatTokens(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return "";
+    return number >= 10000 ? `${(number / 10000).toFixed(1)} 万` : String(Math.round(number));
+  }
+
+  function durationText(seconds) {
+    return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  }
+
+  // What a lane's preview button area says about its latest preview job.
+  function previewStateText(entry, now) {
+    if (!entry || !entry.status) return { text: "", tone: "" };
+    if (entry.status === "running") {
+      const started = new Date(entry.started_at).getTime();
+      const seconds = Number.isFinite(started) ? Math.max(0, Math.round(((now === undefined ? Date.now() : now) - started) / 1000)) : null;
+      return { text: "预览生成中" + (seconds === null ? "…" : `（已用 ${durationText(seconds)}）`) + "，点「预览」查看进度", tone: "running" };
+    }
+    if (entry.status === "failed") return { text: "上次预览失败，可重新预览", tone: "failed" };
+    return { text: `已生成预览 · ${formatTime(entry.finished_at)}（30 分钟内重复打开不会重新生成）`, tone: "" };
+  }
+
+  function mentionText(mentions) {
+    return (mentions || []).map((person) => `${person.name}（${(person.stores || []).join("、")}）`).join("、");
   }
 
   function promptValue(text, fallback) {
@@ -129,9 +167,12 @@
     doc.documentElement.dataset.jxStarted = "1";
     const $ = (id) => doc.getElementById(id);
     const csrf = doc.querySelector('meta[name="jx-console-csrf"]').content;
-    const state = { view: "overview", overview: null, stores: null, filter: "all", selected: new Set(), members: null,
+    const state = { view: "overview", overview: null, stores: null, filter: "all", site: "", selected: new Set(), members: null,
                     dialog: null, reports: null, saved: null, recipients: null, groups: null, sparkx: null,
-                    deepseek: null, preview: null };
+                    deepseek: null };
+    // Latest preview job per lane (kept while the drawer is closed) and the lane shown in the drawer.
+    const previews = {};
+    const drawer = { lane: null, rendered: null, attention: false };
 
     // ---------------------------------------------------------------- helpers
     function el(tag, text, className) {
@@ -197,7 +238,11 @@
       let data = null;
       try { data = await response.json(); } catch (error) { data = null; }
       if (response.status === 401) { win.location.assign("/console/login"); throw new Error("登录已过期，请重新登录。"); }
-      if (!response.ok) throw new Error((data && data.error) || "请求失败，请稍后重试。");
+      if (!response.ok) {
+        const error = new Error((data && data.error) || "请求失败，请稍后重试。");
+        error.status = response.status;
+        throw error;
+      }
       return data;
     }
 
@@ -209,16 +254,29 @@
     }
 
     // ---------------------------------------------------------------- dialogs
+    function syncScrollLock() {
+      // While a dialog or the drawer is open the page behind it must not scroll.
+      const open = [...doc.querySelectorAll(".overlay")].some((overlay) => !overlay.hidden);
+      doc.documentElement.classList.toggle("scroll-locked", open);
+    }
+
     function openOverlay(id, focus) {
       const overlay = $(id);
       overlay.hidden = false;
+      syncScrollLock();
       const target = focus || overlay.querySelector("input, select, textarea, button");
       if (target && target.focus) target.focus();
     }
 
     function closeOverlay(id) {
       $(id).hidden = true;
-      if (id === "preview-drawer" && state.preview) state.preview.closed = true;
+      if (id === "preview-drawer") drawer.lane = null;  // the job keeps running; the lane shows its state
+      syncScrollLock();
+    }
+
+    function scrollToTop() {
+      const scroller = doc.scrollingElement || doc.documentElement;
+      if (scroller) scroller.scrollTop = 0;
     }
 
     for (const overlay of doc.querySelectorAll(".overlay")) {
@@ -237,7 +295,7 @@
       const head = el("div", null, "stat-head");
       head.append(el("h2", title));
       if (tone) head.append(badge(tone));
-      node.append(head, el("strong", value), el("span", detail, "detail"));
+      node.append(head, el("strong", value), ...[].concat(detail).filter(Boolean).map((line) => el("span", line, "detail")));
       if (view) {
         const link = el("button", "设置", "button ghost small link");
         link.type = "button";
@@ -275,6 +333,7 @@
       if (last.queued) parts.push(`排队 ${last.queued} 条`);
       if (last.findings !== undefined && last.findings !== null) parts.push(`提醒 ${last.findings} 个`);
       if (last.sparkx_calls) parts.push(`查询 SparkX ${last.sparkx_calls} 次`);
+      if (last.tokens) parts.push(`Token ${formatTokens(last.tokens)}` + (last.model ? `（${last.model}）` : ""));
       if (last.message) parts.push(last.message);
       return parts.join("；");
     }
@@ -297,7 +356,9 @@
           "通知群：" + (feishu.group || "未设置") + (feishu.bot_enabled ? " · 机器人已开启" : " · 机器人未开启"),
           feishu.delivery_enabled ? { text: "正常", tone: "ok" } : { text: "不发送", tone: "warn" }, "notifications"),
         stat("店铺", `${stores.monitored || 0} / ${stores.authorized || 0}`,
-          `纳入通知 / Token 授权；${stores.mapped || 0} 家已指定运营；更新于 ${formatTime(stores.roster_at)}`, null, "stores"));
+          [`纳入通知 / Token 授权；${stores.mapped || 0} 家已指定运营；更新于 ${formatTime(stores.roster_at)}`,
+           Object.keys(stores.sites || {}).length ? "纳入通知：" + Object.entries(stores.sites)
+             .sort((a, b) => b[1] - a[1]).map(([site, count]) => `${site} ${count}`).join(" · ") : ""], null, "stores"));
       const lanes = data.lanes || {};
       fill("lane-rows", Object.entries(LANES).map(([key, meta]) => {
         const lane = lanes[key] || {}, last = lane.last || null;
@@ -318,7 +379,20 @@
     }
 
     function visibleStores() {
-      return state.stores ? filterStores(state.stores.rows, $("store-search").value, state.filter) : [];
+      return state.stores ? filterStores(state.stores.rows, $("store-search").value, state.filter, state.site) : [];
+    }
+
+    function renderSites(rows) {
+      const options = siteOptions(rows);
+      if (state.site && !options.some((option) => option.label === state.site)) state.site = "";
+      const all = el("option", `全部站点（${rows.length}）`);
+      all.value = "";
+      $("store-site").replaceChildren(all, ...options.map((option) => {
+        const node = el("option", `${option.label}（${option.count}）`);
+        node.value = option.label;
+        return node;
+      }));
+      $("store-site").value = state.site;
     }
 
     function renderBulk() {
@@ -336,7 +410,8 @@
       const data = state.stores;
       if (!data) return;
       $("roster-time").textContent = "店铺列表更新于 " + formatTime(data.roster_at);
-      const counts = storeCounts(data.rows);
+      renderSites(data.rows);
+      const counts = storeCounts(data.rows, state.site);
       for (const span of doc.querySelectorAll("[data-count]")) span.textContent = String(counts[span.dataset.count]);
       for (const button of doc.querySelectorAll("[data-filter]")) button.setAttribute("aria-pressed", String(button.dataset.filter === state.filter));
       const rows = visibleStores().map((store) => {
@@ -509,6 +584,12 @@
         guarded(() => api("/console/api/recipients")), guarded(() => api("/console/api/reports"))]);
       if (recipients) { state.recipients = recipients; renderRecipients(); }
       if (reports) { state.reports = reports; renderLanes(); }
+      // Previews started earlier (also before a page reload) are still on the server for 30 minutes.
+      for (const lane of Object.keys(LANES)) {
+        if (previews[lane]) { renderPreviewState(lane); continue; }
+        api("/console/api/reports/preview?lane=" + lane).then((data) => { if (data && data.job) trackPreview(lane, data); })
+          .catch(() => {});
+      }
     }
 
     function renderCard(value) {
@@ -541,55 +622,139 @@
     }
 
     function previewInfo(info) {
+      const usage = info.usage || {};
       return [info.report_date ? "数据日 " + info.report_date : "", info.window ? "近 7 日 " + info.window.join(" ~ ") : "",
         info.day ? "美西 " + info.day : "", info.profiles !== undefined ? `店铺 ${info.profiles} 家` : "",
         info.sparkx_calls !== undefined && info.sparkx_calls !== null ? `SparkX 查询 ${info.sparkx_calls} 次` : "",
         info.findings !== undefined ? `提醒 ${info.findings} 个` : "", info.seconds !== undefined ? `用时 ${info.seconds} 秒` : "",
+        usage.total_tokens ? `Token ${formatTokens(usage.total_tokens)}` + (usage.prompt_cache_hit_tokens
+          ? `（缓存命中 ${formatTokens(usage.prompt_cache_hit_tokens)}）` : "") : "",
         info.model || ""].filter(Boolean).join(" · ");
     }
 
-    function showPreview(result) {
-      $("preview-progress").hidden = true;
-      const cards = result.cards || [];
-      $("preview-info").textContent = previewInfo(result.info || {});
-      $("preview-cards").replaceChildren(...(cards.length ? cards.map(renderCard) : [el("p", result.text || "没有内容。", "muted")]));
-      $("preview-text").textContent = result.text || "";
-      $("preview-plain").hidden = !cards.length;
+    // Preview jobs live on the server. Asking again for a lane returns its running job, or the finished one
+    // for the same settings, so closing the drawer by accident never costs a second DeepSeek run.
+    function trackPreview(lane, data) {
+      const entry = previews[lane] || (previews[lane] = { timer: null, failures: 0 });
+      for (const key of ["job", "status", "result", "error", "started_at", "finished_at", "sent", "current", "reused"]) {
+        if (data[key] !== undefined) entry[key] = data[key];
+      }
+      renderPreviewState(lane);
+      if (drawer.lane === lane) renderDrawer();
+      if (entry.status === "running") schedulePreviewPoll(lane);
     }
 
-    async function pollPreview(job, started) {
-      const current = state.preview;
-      while (current && !current.closed && state.preview === current) {
-        await new Promise((resolve) => win.setTimeout(resolve, current.interval));
-        if (current.closed || state.preview !== current) return;
+    function schedulePreviewPoll(lane) {
+      const entry = previews[lane];
+      if (!entry || entry.timer) return;
+      entry.timer = win.setTimeout(async () => {
+        entry.timer = null;
+        const job = entry.job;
         let data;
-        try { data = await api("/console/api/reports/preview?job=" + encodeURIComponent(job)); }
-        catch (error) { $("preview-progress").hidden = true; notice("preview-error", error.message, "error"); return; }
-        if (data.status === "running") {
-          $("preview-progress-text").textContent = `DeepSeek 正在调用 SparkX 查询并撰写…（已用 ${Math.round((Date.now() - started) / 1000)} 秒，通常需要 1–5 分钟）`;
-          continue;
+        try {
+          data = await api("/console/api/reports/preview?job=" + encodeURIComponent(job));
+          entry.failures = 0;
+        } catch (error) {
+          if (entry.job !== job) return;
+          if (error.status === 404 || ++entry.failures >= 5) trackPreview(lane, { status: "failed", error: error.message });
+          else schedulePreviewPoll(lane);  // a passing network error: keep following the job
+          return;
         }
-        if (data.status === "failed") { $("preview-progress").hidden = true; notice("preview-error", data.error || "预览失败。", "error"); return; }
-        showPreview(data.result || {});
-        return;
+        if (entry.job === job) trackPreview(lane, data);
+      }, win.JX_PREVIEW_INTERVAL || 3000);
+    }
+
+    function renderPreviewState(lane) {
+      const node = doc.querySelector(`[data-preview-state="${lane}"]`);
+      if (!node) return;
+      const label = previewStateText(previews[lane]);
+      node.textContent = label.text;
+      node.className = "preview-state" + (label.tone ? " " + label.tone : "");
+    }
+
+    function renderDrawer() {
+      const lane = drawer.lane, entry = previews[lane];
+      if (!lane || !entry) return;
+      const running = entry.status === "running", done = entry.status === "done";
+      const result = done ? (entry.result || {}) : null;
+      $("preview-progress").hidden = !running;
+      if (running) {
+        const label = previewStateText(entry);
+        $("preview-progress-text").textContent = "DeepSeek 正在调用 SparkX 查询并撰写…" +
+          label.text.replace(/^预览生成中/, "").replace(/，点「预览」查看进度$/, "") + "，通常需要 1–10 分钟。可以先关闭，稍后再点「预览」回来查看。";
+      }
+      notice("preview-error", entry.status === "failed" ? (entry.error || "预览失败。") : "", "error");
+      const stale = entry.current === false;
+      notice("preview-notice", stale ? "正在显示的是修改设置之前开始生成的预览；" + (running ? "完成后" : "") + "点「重新生成」可按当前设置重新预览。"
+        : done && entry.reused ? `这是 ${formatTime(entry.finished_at)} 生成的预览，没有重新调用 DeepSeek；需要最新数据请点「重新生成」。` : "",
+        stale ? "warn" : "");
+      const key = `${entry.job}:${entry.status}`;
+      if (drawer.rendered !== key) {
+        drawer.rendered = key;
+        const cards = result ? result.cards || [] : [];
+        $("preview-cards").replaceChildren(...(result ? (cards.length ? cards.map(renderCard) : [el("p", result.text || "没有内容。", "muted")]) : []));
+        $("preview-text").textContent = result ? result.text || "" : "";
+        $("preview-plain").hidden = !cards.length;
+      }
+      $("preview-info").textContent = result ? previewInfo(result.info || {}) : "只读：预览不会排队或发送消息。";
+      $("preview-regenerate").disabled = running;
+      renderTestSend(lane, entry, result);
+    }
+
+    function renderTestSend(lane, entry, result) {
+      const cards = result ? (result.cards || []).length : 0;
+      $("test-send").disabled = !cards;
+      const kind = lane === "daily" ? "company" : "ad";
+      const known = Boolean(state.recipients);
+      const lead = known ? state.recipients[kind] : null;
+      $("test-lead-label").textContent = (lane === "daily" ? "总负责人" : "广告负责人") + (lead ? `（${lead.name}）` : known ? "（未设置）" : "");
+      $("test-to-lead").disabled = known && !lead;
+      if (known && !lead) $("test-to-lead").checked = false;
+      const mentions = result && result.info ? result.info.mentions || [] : [];
+      $("test-mention-label").textContent = mentions.length ? "@ 对应运营：" + mentionText(mentions) : "@ 对应运营（这份预览没有可 @ 的运营）";
+      $("test-mention").disabled = !mentions.length;
+      if (!mentions.length) $("test-mention").checked = false;
+      const sent = (entry.sent || []).map((name) => (name === "group" ? "通知群" : lane === "daily" ? "总负责人" : "广告负责人"));
+      $("test-send-hint").textContent = !result ? "预览生成后可以发送测试。" : !cards ? "这份预览没有内容，无法发送测试。"
+        : sent.length ? `已发送测试到：${sent.join("、")}。同一份预览不会重复发给同一对象；需要新内容请「重新生成」。`
+          : "发送的就是上面这份预览（标题带【测试】），不会再调用 DeepSeek，也不计入定时发送。";
+      if (drawer.attention && cards) {
+        drawer.attention = false;
+        $("test-send").classList.remove("lane-attention");
+        void $("test-send").offsetWidth;  // restart the highlight animation
+        $("test-send").classList.add("lane-attention");
+        $("test-send-button").focus();
       }
     }
 
-    async function preview(lane, button) {
+    async function requestPreview(lane, options) {
+      const { fresh = false, button = null, test = false } = options || {};
       let lanes;
       try { lanes = lanePayload(formValues(), state.reports.default_prompts); } catch (error) { toast(error.message, "error"); return; }
-      const data = await guarded(() => api("/console/api/reports/preview", { method: "POST", body: { lane, draft: lanes[lane] } }), button);
+      const body = { lane, draft: lanes[lane] };
+      if (fresh) body.fresh = true;
+      const data = await guarded(() => api("/console/api/reports/preview", { method: "POST", body }), button);
       if (!data) return;
-      state.preview = { job: data.job, closed: false, interval: win.JX_PREVIEW_INTERVAL || 3000 };
+      drawer.lane = lane;
+      drawer.attention = test;
       $("preview-title").textContent = "预览 · " + LANES[lane].label;
-      $("preview-info").textContent = "只读：不会排队或发送消息。";
-      $("preview-progress-text").textContent = "DeepSeek 正在调用 SparkX 查询并撰写…（通常需要 1–5 分钟）";
-      $("preview-progress").hidden = false;
-      notice("preview-error", "");
-      $("preview-cards").replaceChildren();
-      $("preview-plain").hidden = true;
-      openOverlay("preview-drawer", doc.querySelector("#preview-drawer [data-close]"));
-      pollPreview(data.job, Date.now());
+      if ($("preview-drawer").hidden) openOverlay("preview-drawer", doc.querySelector("#preview-drawer [data-close]"));
+      trackPreview(lane, data);
+      if (fresh && data.reused) toast("预览正在生成，完成后再重新生成。", "warn");
+    }
+
+    async function sendTest(button) {
+      const lane = drawer.lane, entry = previews[lane];
+      if (!entry || entry.status !== "done") return;
+      const body = { job: entry.job, to_group: $("test-to-group").checked, to_lead: $("test-to-lead").checked && !$("test-to-lead").disabled,
+                     mention: $("test-mention").checked && !$("test-mention").disabled };
+      if (!body.to_group && !body.to_lead) { toast("请至少选择一个接收对象。", "warn"); return; }
+      const data = await guarded(() => api("/console/api/reports/test-send", { method: "POST", body }), button);
+      if (!data) return;
+      trackPreview(lane, { sent: data.sent });
+      if (data.status === "QUEUED") toast(`测试消息已排队（${data.queued} 张卡片` + (data.mentions ? `，@ ${data.mentions} 位运营` : "") +
+        "），约 10 秒内发出，可在「发送记录」查看结果。");
+      else toast("这份预览已经发送过测试，没有重复发送。", "warn");
     }
 
     // ---------------------------------------------------------------- sparkx & deepseek
@@ -663,6 +828,7 @@
 
     function show(view) {
       if (!loaders[view]) return;
+      if (state.view !== view) scrollToTop();  // a new page starts at its top, not at the old scroll position
       state.view = view;
       for (const button of doc.querySelectorAll("[data-view]")) {
         if (button.dataset.view === view) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
@@ -689,6 +855,7 @@
 
     // stores
     $("store-search").addEventListener("input", renderStores);
+    $("store-site").addEventListener("change", (event) => { state.site = event.currentTarget.value; renderStores(); });
     for (const button of doc.querySelectorAll("[data-filter]")) {
       button.addEventListener("click", () => { state.filter = button.dataset.filter; renderStores(); });
     }
@@ -791,7 +958,16 @@
         method: "POST", body: { revision: state.reports.revision, lanes } }), $("save-lanes"));
       if (data) { state.reports = data; renderLanes(); toast("通知设置已保存，下次运行生效。"); }
     });
-    for (const button of doc.querySelectorAll("[data-preview]")) button.addEventListener("click", () => preview(button.dataset.preview, button));
+    for (const button of doc.querySelectorAll("[data-preview]")) {
+      button.addEventListener("click", () => requestPreview(button.dataset.preview, { button }));
+    }
+    for (const button of doc.querySelectorAll("[data-test]")) {
+      button.addEventListener("click", () => requestPreview(button.dataset.test, { button, test: true }));
+    }
+    $("preview-regenerate").addEventListener("click", (event) => {
+      if (drawer.lane) requestPreview(drawer.lane, { fresh: true, button: event.currentTarget });
+    });
+    $("test-send-button").addEventListener("click", (event) => sendTest(event.currentTarget));
 
     // sparkx
     $("sparkx-form").addEventListener("submit", async (event) => {
@@ -845,6 +1021,6 @@
     show("overview");
   }
 
-  return { start, statusLabel, runLabel, formatTime, parseBold, cardText, filterStores, storeCounts, promptValue,
-           lanePayload, setupSteps, LANES };
+  return { start, statusLabel, runLabel, formatTime, parseBold, cardText, filterStores, storeCounts, siteOptions, promptValue,
+           lanePayload, setupSteps, formatTokens, previewStateText, mentionText, LANES };
 });

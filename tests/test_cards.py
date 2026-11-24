@@ -1,7 +1,7 @@
 """DeepSeek Markdown → Feishu cards, and the hourly alert table."""
 import json
 
-from jx_alert.notifications.cards import card_fits, plain_text
+from jx_alert.notifications.cards import card_fits, mention_line, plain_text, with_mentions
 from jx_alert.reports import cards
 from jx_alert.reports import settings as lane_settings
 from lane_fakes import HOURLY_FINDINGS
@@ -43,14 +43,48 @@ def test_tables_keep_at_most_sixty_rows():
     assert len(elements[0]["rows"]) == 60 and elements[1]["content"] == "另有 15 行未展开。"
 
 
-def test_hourly_card_groups_findings_and_names_operators():
+def test_hourly_card_groups_findings_and_names_operators_in_the_last_column():
     value = cards.hourly_card(HOURLY_FINDINGS, day="2026-11-23", time="22:05", names={"101": "香港川页", "102": "Campx"},
                               operators={"101": "未映射运营", "102": "高爽"}, config=lane_settings.DEFAULTS["hourly"],
                               footer="由 DeepSeek 调用 SparkX 查询 3 次生成。")
     text = plain_text(value)
     assert value["header"]["title"]["content"] == "广告实时监控 · 美西 2026-11-23 22:05"
     assert value["header"]["template"] == "red"
-    assert "**高花费无转化（1）**" in text and "Campx | 高爽 | Campaign 9001 | $41.20 | 28 | 0 | — | 0.0%" in text
+    assert "店铺 | 广告活动 | 花费 | 点击 | 订单 | ACOS | CVR | 建议 | 运营" in text
+    assert "**高花费无转化（1）**" in text
+    assert "Campx | Campaign 9001 | $41.20 | 28 | 0 | — | 0.0% | 先看今日搜索词 | 高爽" in text
     assert "低花费高转化（1）" in text and "ACOS ≤ 20%" in text
     assert cards.hourly_card([], day="d", time="t", names={}, operators={}, config=lane_settings.DEFAULTS["hourly"],
                              footer="") is None
+
+
+def test_the_operator_column_always_comes_last():
+    elements = cards.markdown_elements("| 店铺 | 运营 | 花费 |\n|---|---|---|\n| Campx | 高爽 | $41 |\n| 川页 | 未映射运营 |")
+    table = elements[0]
+    assert [column["display_name"] for column in table["columns"]] == ["店铺", "花费", "运营"]
+    assert table["rows"] == [{"c0": "Campx", "c1": "$41", "c2": "高爽"}, {"c0": "川页", "c1": "—", "c2": "未映射运营"}]
+    wide = ["运营"] + [f"列{i}" for i in range(20)]
+    order = cards.column_order(wide)
+    assert len(order) == cards.MAX_COLUMNS and order[-1] == 0  # trimming never drops the operator
+    assert cards.column_order(["店铺", "负责运营", "花费"]) == [0, 2, 1]
+    assert cards.column_order(["店铺", "运营情况"]) == [0, 1]  # only an operator column moves
+
+
+def test_test_copies_are_marked_and_keep_the_mention_reserve():
+    values = cards.report_cards("SparkX 广告日报 · 2026-11-22", "**全公司核心指标**\n正文", "由 DeepSeek 生成。")
+    marked = cards.mark_as_test(values, "**测试消息**：由管理台手动发送。")
+    assert marked[0]["header"]["title"]["content"] == "【测试】SparkX 广告日报 · 2026-11-22"
+    assert marked[0]["body"]["elements"][0]["content"] == "**测试消息**：由管理台手动发送。"
+    assert values[0]["header"]["title"]["content"] == "SparkX 广告日报 · 2026-11-22"  # the preview itself is unchanged
+    assert card_fits(marked[0], cards.MENTION_RESERVE)
+
+
+def test_the_mention_line_names_each_operators_stores_safely():
+    card = cards.report_cards("复盘", "正文", "")[0]
+    sent = with_mentions(card, ["ou_a", "ou_b"], {"ou_a": "Campx、香港川页", "ou_b": "[x](https://evil.example) <at id=all>"})
+    line = sent["body"]["elements"][0]["content"]
+    assert line.startswith("对应运营：<at id=ou_a></at>（Campx、香港川页） <at id=ou_b></at>（")
+    assert "https://" not in line and "<at id=all>" not in line and line.count("<at ") == 2
+    crowded = {f"ou_{i}": "很长的店铺名称" * 8 for i in range(40)}
+    assert mention_line(list(crowded), crowded) == "对应运营：" + " ".join(f"<at id={uid}></at>" for uid in crowded)
+    assert with_mentions(card, [])["body"]["elements"] == card["body"]["elements"]

@@ -34,11 +34,11 @@
 
 ### 1. 把提交带到服务器
 
-推送到 GitHub 的分支在服务器上直接拉取（仓库为公开仓库，不需要凭据）：
+仓库只有 `main` 一个分支。推送到 GitHub 后在服务器上直接拉取（仓库为公开仓库，不需要凭据）：
 
 ```sh
 cd /opt/jx-alert-system
-sudo git -c safe.directory=$PWD fetch origin feat/sparkx-deepseek-agent
+sudo git -c safe.directory=$PWD fetch origin main
 sudo git -c safe.directory=$PWD rev-parse FETCH_HEAD "FETCH_HEAD^{tree}"   # 与测试通过的提交、tree 核对
 ```
 

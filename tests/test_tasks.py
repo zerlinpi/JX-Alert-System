@@ -27,6 +27,8 @@ def test_daily_task_fixes_dates_scope_and_contract_around_the_owner_text():
     assert "统计日：2026-11-22（美西已结束的完整日）；对比日：2026-11-21" in text
     assert "profileIds = [101, 102, 201]" in text and "不要包含其他店铺" in text
     assert tasks.DEFAULT_PROMPTS["daily"] in text and "TACOS" in text
+    assert "把「运营」放在最后一列" in text and "JX_STORES" in text and "须知" in text
+    assert "花费日环比 | 运营」" in tasks.DEFAULT_PROMPTS["daily"] and "主要问题 | 运营」" in tasks.DEFAULT_PROMPTS["review"]
     custom = tasks.task_message("daily", {"prompt": "只看 ACOS"}, now=SEND, monitored={"101"})
     assert custom.endswith("只看 ACOS") and tasks.DEFAULT_PROMPTS["daily"] not in custom
     review = tasks.task_message("review", {"prompt": ""}, now=SEND, monitored={"101"})
@@ -84,11 +86,12 @@ def test_daily_run_lets_deepseek_query_sparkx_with_the_servers_own_tools(monkeyp
     query = {"profileIds": [101, 102], "factEntity": "campaign", "dateStart": "2026-11-22", "dateEnd": "2026-11-22",
              "metrics": ["Spend"], "userContext": "JX 日报"}
     client = ScriptedDeepSeek([reply(calls=[("get_ads_perf", query)], reasoning="先查花费"),
-                               reply("**全公司核心指标**\n| 指标 | 当日 |\n|---|---|\n| 广告花费 | $53.70 |")])
+                               reply("**全公司核心指标**\n| 指标 | 当日 |\n|---|---|\n| 广告花费 | $53.70 |\nJX_STORES: 101")])
     rosters = []
     result = tasks.run_lane(settings, "daily", lane_settings.DEFAULTS["daily"], now=SEND,
                             directory=stores.load(settings), on_roster=rosters.append, client_factory=lambda s: client)
     assert result["content"].startswith("**全公司核心指标**") and result["report_date"] == "2026-11-22"
+    assert result["stores"] == ["101"] and "JX_STORES" not in result["content"]
     assert "105" not in result["profiles"] and result["summary"]["sparkx_calls"] == 1 and rosters
     first = client.requests[0]
     assert first["tools"] == ["get_user_authorized_context", "get_ads_perf", "get_entity_metadata", "get_operation_log"]
@@ -102,6 +105,16 @@ def test_daily_run_lets_deepseek_query_sparkx_with_the_servers_own_tools(monkeyp
     tool_reply = second[3]
     assert tool_reply["role"] == "tool" and json.loads(tool_reply["content"])["data"]["rows"] == ROWS  # verbatim
     assert fake.calls[-1] == ("get_ads_perf", query)
+
+
+def test_a_daily_report_without_the_store_line_asks_which_stores_it_flags(monkeypatch, settings):
+    install(monkeypatch, FakeSparkX(rows={"campaign": ROWS}), agent)
+    client = ScriptedDeepSeek([reply("**须知**\n1. Campx 有花费没出单。")],
+                              json_replies=[{"profile_ids": ["102", "999"]}])
+    result = tasks.run_lane(settings, "daily", lane_settings.DEFAULTS["daily"], now=SEND,
+                            directory=stores.load(settings), client_factory=lambda s: client)
+    assert result["stores"] == ["102"]  # only stores in the notifications
+    assert "须知" in client.requests[-1]["system"] and client.requests[-1]["json"] is True
 
 
 def test_hourly_run_drops_rows_that_sparkx_never_returned(monkeypatch, settings):

@@ -20,10 +20,10 @@ window.console.error = (...args) => errors.push(args.join(" "));
 window.JX_PREVIEW_INTERVAL = 10;
 const card = { schema: "2.0", header: { template: "blue", title: { content: "SparkX 广告日报 · 2026-11-22" } },
   body: { elements: [{ tag: "markdown", content: "**全公司核心指标**\n第二行" },
-    { tag: "table", columns: [{ name: "c0", display_name: "指标" }, { name: "c1", display_name: "当日" }],
-      rows: [{ c0: "广告花费", c1: "$4,034" }] }, { tag: "hr" }] } };
+    { tag: "table", columns: [{ name: "c0", display_name: "店铺" }, { name: "c1", display_name: "花费" }, { name: "c2", display_name: "运营" }],
+      rows: [{ c0: "Campx", c1: "$4,034", c2: "高爽" }] }, { tag: "hr" }] } };
 const defaults = { daily: "日报默认说明", review: "复盘默认说明", hourly: "" };
-const lanes = { daily: { enabled: true, to_group: true, to_lead: true, prompt: "" },
+const lanes = { daily: { enabled: true, to_group: true, mention_operators: true, to_lead: true, prompt: "" },
   review: { enabled: true, to_group: true, mention_operators: true, to_lead: true, to_operators: false, weekly: false, prompt: "" },
   hourly: { enabled: true, to_group: true, mention_operators: true, to_lead: true, to_operators: false, start_hour: 9, end_hour: 24,
             high_spend: 30, low_spend: 10, min_clicks: 15, acos_high: 60, cvr_low: 5, acos_good: 20, min_orders_good: 2, prompt: "" } };
@@ -33,14 +33,23 @@ const storeRows = () => [
   { profile_id: "102", name: "Campx-主账号", short_name: "Campx", country_label: "美国", store_type: "seller", authorized: true,
     monitored: true, operators: [] },
   { profile_id: "105", name: "昌泉", short_name: "昌泉", country_label: "美国", store_type: "seller", authorized: true,
-    monitored: false, operators: [] }];
-let polls = 0;
+    monitored: false, operators: [] },
+  { profile_id: "201", name: "川页-CA", short_name: "川页-CA", country_label: "加拿大", store_type: "seller", authorized: true,
+    monitored: true, operators: [{ id: "ou_op1", name: "皮泽霖" }] }];
+// Preview jobs as the server keeps them: a lane's job is reused until 「重新生成」 (fresh) asks for a new one.
+const jobs = {};
+let nextJob = 0;
+const startedAt = new Date(Date.now() - 65000).toISOString();
+const doneResult = { cards: [card], text: "SparkX 广告日报",
+  info: { profiles: 2, report_date: "2026-11-22", sparkx_calls: 5, seconds: 70, usage: { total_tokens: 183000, prompt_cache_hit_tokens: 102000 },
+          mentions: [{ name: "高爽", stores: ["Campx"] }] } };
+const view = (id) => ({ job: id, ...jobs[id].state });
 const responses = {
-  "GET /console/api/overview": () => ({ sparkx: { configured: true, token_source: "console" }, deepseek: { configured: true, model: "deepseek-v4-pro" },
+  "GET /console/api/overview": () => ({ sparkx: { configured: true, token_source: "console" }, deepseek: { configured: true, model: "deepseek-flash" },
     skills: { installed: false, release: null, count: 0 },
     feishu: { delivery_enabled: true, scheduler_enabled: true, group: "日报群", company_lead: false, ad_lead: true, bot_enabled: true },
-    stores: { authorized: 3, monitored: 2, mapped: 1, roster_at: "2026-11-24T00:30:00Z" },
-    lanes: { daily: { enabled: true, last: { status: "SUCCEEDED", at: "2026-11-24T00:31:00Z", queued: 2, sparkx_calls: 6 } },
+    stores: { authorized: 4, monitored: 3, mapped: 2, roster_at: "2026-11-24T00:30:00Z", sites: { "美国": 2, "加拿大": 1 } },
+    lanes: { daily: { enabled: true, last: { status: "SUCCEEDED", at: "2026-11-24T00:31:00Z", queued: 2, sparkx_calls: 6, tokens: 183000, model: "deepseek-flash" } },
              review: { enabled: true, last: null }, hourly: { enabled: false, last: null, start_hour: 9, end_hour: 24 } },
     recent: [{ created_at: "2026-11-24T00:31:00Z", lane: "08:30 日报", recipient: "负责人：老板", status: "DELIVERED" }], csrf: "a".repeat(64) }),
   "GET /console/api/stores": () => ({ revision: "0".repeat(64), roster_at: "2026-11-24T00:30:00Z", rows: storeRows() }),
@@ -57,9 +66,19 @@ const responses = {
     group_detail: { name: "日报群" } }),
   "GET /console/api/reports": () => ({ revision: "2".repeat(64), updated_at: null, lanes, default_prompts: defaults, max_prompt: 4000 }),
   "POST /console/api/reports": (body) => ({ revision: "3".repeat(64), updated_at: "2026-11-24T01:00:00Z", lanes: body.lanes, default_prompts: defaults }),
-  "POST /console/api/reports/preview": (body) => ({ job: "job-1", lane: body.lane }),
-  "GET /console/api/reports/preview?job=job-1": () => (++polls < 2 ? { status: "running" }
-    : { status: "done", result: { cards: [card], text: "SparkX 广告日报", info: { profiles: 2, report_date: "2026-11-22", sparkx_calls: 5, seconds: 70 } } }),
+  "POST /console/api/reports/preview": (body) => {
+    const own = Object.keys(jobs).filter((id) => jobs[id].lane === body.lane);
+    const current = own.length ? own[own.length - 1] : null;
+    if (current && (jobs[current].state.status === "running" || !body.fresh)) return { ...view(current), reused: true, current: true };
+    const id = "job-" + (++nextJob);
+    jobs[id] = { lane: body.lane, polls: 0, state: { lane: body.lane, status: "running", started_at: startedAt, finished_at: null, result: null, error: null, sent: [] } };
+    return { ...view(id), reused: false, current: true };
+  },
+  "POST /console/api/reports/test-send": (body) => {
+    const sent = [...(body.to_group ? ["group"] : []), ...(body.to_lead ? ["lead"] : [])];
+    jobs[body.job].state.sent = sent;
+    return { status: "QUEUED", queued: 1, mentions: body.mention ? 1 : 0, targets: sent, sent };
+  },
   "GET /console/api/groups": () => ({ chat_id: "oc_reports", name: "日报群", revision: "1".repeat(64), chats: [{ id: "oc_reports", name: "日报群" }] }),
   "GET /console/api/sparkx": () => ({ revision: "0".repeat(64), configured: true, token_source: "console", endpoint: "https://mcp.sparkx.cn/mcp" }),
   "GET /console/api/skills": () => ({ installed: { release: "v1.3.7", commit: "b72b914b8", installed_at: "2026-11-24T02:00:00Z" },
@@ -67,20 +86,34 @@ const responses = {
     read_tools: ["get_ads_perf", "get_entity_metadata"], source: "SparkXAI/SparkXAI-MCP", latest: null, error: null }),
   "POST /console/api/sparkx/test": () => ({ status: "OK", profile_count: 1, profiles: [{ profile_id: "101", name: "香港川页", country: "US", store_type: "seller" }] }),
   "GET /console/api/deepseek": () => ({ revision: "0".repeat(64), configured: true, models: ["deepseek-flash", "deepseek-v4-pro"],
-    model: "deepseek-v4-pro", timeout: 120, thinking: true, key_source: "console" }),
+    model: "deepseek-flash", timeout: 120, thinking: true, key_source: "console" }),
   "POST /console/api/deepseek": (body) => ({ revision: "4".repeat(64), configured: true, models: ["deepseek-flash", "deepseek-v4-pro"],
     model: body.model, timeout: body.timeout, thinking: body.thinking }),
   "POST /console/api/deepseek/test": () => ({ status: "NOT_CONFIGURED" }),
-  "GET /console/api/deliveries": () => ({ rows: [{ created_at: "2026-11-24T00:31:00Z", lane: "08:30 日报", recipient: "负责人：老板",
-    title: "SparkX 广告日报", status: "DELIVERY_UNKNOWN", error: "可能已提交飞书", delivered_at: null }] }),
+  "GET /console/api/deliveries": () => ({ rows: [{ created_at: "2026-11-24T00:31:00Z", lane: "08:30 日报（测试）", recipient: "通知群",
+    title: "【测试】SparkX 广告日报", status: "DELIVERY_UNKNOWN", error: "可能已提交飞书", delivered_at: null }] }),
+};
+let hold = true;  // DeepSeek keeps "working" until the test releases it
+const prefixes = {
+  "GET /console/api/reports/preview?job=": (body, key) => {
+    const id = decodeURIComponent(key.split("job=")[1]);
+    const job = jobs[id];
+    job.polls += 1;
+    if (!hold && job.state.status === "running") {
+      Object.assign(job.state, { status: "done", finished_at: new Date().toISOString(), result: JSON.parse(JSON.stringify(doneResult)) });
+    }
+    return view(id);
+  },
+  "GET /console/api/reports/preview?lane=": () => ({ job: null, status: null }),
 };
 window.fetch = async (url, init = {}) => {
   const key = `${init.method || "GET"} ${url}`;
   const body = init.body ? JSON.parse(init.body) : undefined;
   requests.push({ key, headers: init.headers || {}, body });
-  const handler = responses[key];
+  const prefix = Object.keys(prefixes).find((value) => key.startsWith(value));
+  const handler = responses[key] || (prefix && prefixes[prefix]);
   if (!handler) return { status: 404, ok: false, json: async () => ({ error: "未模拟 " + key }) };
-  return { status: 200, ok: true, json: async () => handler(body) };
+  return { status: 200, ok: true, json: async () => handler(body, key) };
 };
 window.eval(script);
 const tick = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -90,6 +123,8 @@ const click = (node) => node.dispatchEvent(new window.MouseEvent("click", { bubb
 const change = (node) => node.dispatchEvent(new window.Event("change", { bubbles: true }));
 const input = (node) => node.dispatchEvent(new window.Event("input", { bubbles: true }));
 const last = (key) => [...requests].reverse().find((request) => request.key === key);
+const count = (key) => requests.filter((request) => request.key === key).length;
+const locked = () => doc.documentElement.classList.contains("scroll-locked");
 (async () => {
   window.JXConsole.start(doc, window);
   await tick();
@@ -98,16 +133,24 @@ const last = (key) => [...requests].reverse().find((request) => request.key === 
     && !doc.querySelector('#page-actions [data-for="overview"]').hidden && doc.querySelector('#page-actions [data-for="stores"]').hidden]);
   checks.push(["setup checklist shows the missing steps", !$("setup-panel").hidden && $("setup-steps").children.length === 6
     && $("setup-progress").textContent === "已完成 3/5"]);
-  checks.push(["overview stats", $("status-cards").children.length === 4 && $("status-cards").textContent.includes("deepseek-v4-pro")]);
-  checks.push(["lane rows", $("lane-rows").children.length === 3 && $("lane-rows").textContent.includes("查询 SparkX 6 次")]);
+  checks.push(["overview stats", $("status-cards").children.length === 4 && $("status-cards").textContent.includes("deepseek-flash")
+    && $("status-cards").textContent.includes("纳入通知：美国 2 · 加拿大 1")]);
+  checks.push(["lane rows", $("lane-rows").children.length === 3 && $("lane-rows").textContent.includes("查询 SparkX 6 次")
+    && $("lane-rows").textContent.includes("Token 18.3 万（deepseek-flash）")]);
   checks.push(["recent rows", $("recent-rows").textContent.includes("已送达")]);
 
   click(doc.querySelector('[data-view="stores"]'));
   await tick();
   checks.push(["stores page", !doc.querySelector('[data-panel="stores"]').hidden && $("page-title").textContent === "店铺与运营"
-    && $("store-rows").children.length === 3 && $("store-rows").textContent.includes("未映射运营")]);
+    && $("store-rows").children.length === 4 && $("store-rows").textContent.includes("未映射运营")]);
   checks.push(["store filter counts", doc.querySelector('[data-count="unmapped"]').textContent === "1"
     && doc.querySelector('[data-count="paused"]').textContent === "1"]);
+  checks.push(["site options", [...$("store-site").options].map((option) => option.textContent).join("|") === "全部站点（4）|美国（3）|加拿大（1）"]);
+  $("store-site").value = "加拿大"; change($("store-site"));
+  await tick();
+  checks.push(["site filter", $("store-rows").children.length === 1 && $("store-rows").textContent.includes("川页-CA")
+    && doc.querySelector('[data-count="all"]').textContent === "1"]);
+  $("store-site").value = ""; change($("store-site"));
   click(doc.querySelector('[data-filter="unmapped"]'));
   await tick();
   checks.push(["unmapped filter", $("store-rows").children.length === 1 && $("store-rows").textContent.includes("Campx")]);
@@ -120,7 +163,7 @@ const last = (key) => [...requests].reverse().find((request) => request.key === 
   click($("bulk-assign"));
   await tick();
   checks.push(["member dialog for two stores", !$("member-dialog").hidden && $("member-dialog-subtitle").textContent === "批量设置 2 家店铺"
-    && $("member-list").querySelectorAll('input[type="checkbox"]').length === 2]);
+    && $("member-list").querySelectorAll('input[type="checkbox"]').length === 2 && locked()]);
   const op2 = $("member-list").querySelectorAll("input")[1];
   op2.checked = true; change(op2);
   click($("member-save"));
@@ -129,7 +172,8 @@ const last = (key) => [...requests].reverse().find((request) => request.key === 
   checks.push(["bulk save sends csrf and both stores", bulk && bulk.headers["X-CSRF-Token"] === "a".repeat(64)
     && JSON.stringify(Object.keys(bulk.body.changes).sort()) === JSON.stringify(["101", "102"])
     && bulk.body.changes["102"].operator_ids[0] === "ou_op2" && bulk.body.changes["101"].monitored === true]);
-  checks.push(["dialog closed and selection cleared", $("member-dialog").hidden && $("bulk-bar").hidden && $("store-rows").textContent.includes("高爽")]);
+  checks.push(["dialog closed, page unlocked and selection cleared", $("member-dialog").hidden && !locked() && $("bulk-bar").hidden
+    && $("store-rows").textContent.includes("高爽")]);
   const monitor = $("store-rows").querySelectorAll('input[role="switch"]')[1];
   monitor.checked = false; change(monitor);
   await tick();
@@ -140,6 +184,8 @@ const last = (key) => [...requests].reverse().find((request) => request.key === 
   click(doc.querySelector('[data-view="notifications"]'));
   await tick();
   checks.push(["recipients", $("lead-company").textContent === "老板" && $("lead-ad").textContent === "未设置"]);
+  checks.push(["earlier previews are looked up per lane", count("GET /console/api/reports/preview?lane=daily") === 1
+    && count("GET /console/api/reports/preview?lane=hourly") === 1]);
   const dailyPrompt = doc.querySelector('#lanes-form [data-lane="daily"] textarea[name="prompt"]');
   checks.push(["default task text shown", dailyPrompt.value === "日报默认说明"
     && doc.querySelector('[data-prompt-state="daily"]').textContent === "使用默认说明"]);
@@ -156,18 +202,58 @@ const last = (key) => [...requests].reverse().find((request) => request.key === 
   await tick();
   const saved = last("POST /console/api/reports");
   checks.push(["lanes saved with prompts", saved && saved.body.lanes.daily.prompt === "" && saved.body.lanes.review.prompt === "多看 ACOS 恶化"
-    && saved.body.lanes.hourly.min_clicks === 15 && saved.body.lanes.review.mention_operators === true && !("ai" in saved.body.lanes.daily)]);
+    && saved.body.lanes.hourly.min_clicks === 15 && saved.body.lanes.review.mention_operators === true
+    && saved.body.lanes.daily.mention_operators === true && !("ai" in saved.body.lanes.daily)]);
   checks.push(["saved form is clean", $("lanes-savebar").hidden]);
-  checks.push(["mention switches", doc.querySelectorAll('#lanes-form input[name="mention_operators"]').length === 2]);
+  checks.push(["mention switches on every lane", doc.querySelectorAll('#lanes-form input[name="mention_operators"]').length === 3]);
+
+  // Preview: runs in the background, survives closing the drawer, and is not generated twice.
   click(doc.querySelector('[data-preview="daily"]'));
-  await tick(120);
+  await tick();
   const started = last("POST /console/api/reports/preview");
-  checks.push(["preview runs in the background with the draft", started && started.body.lane === "daily" && started.body.draft.prompt === ""]);
-  checks.push(["preview drawer rendered", !$("preview-drawer").hidden && $("preview-progress").hidden
-    && $("preview-cards").querySelector("table") !== null && $("preview-cards").querySelector("strong").textContent === "全公司核心指标"
-    && $("preview-info").textContent.includes("SparkX 查询 5 次")]);
+  checks.push(["preview runs in the background with the draft", started && started.body.lane === "daily" && started.body.draft.prompt === ""
+    && !started.body.fresh && !$("preview-drawer").hidden && locked()]);
+  checks.push(["progress counts from the server start time", !$("preview-progress").hidden
+    && /已用 1 分 \d+ 秒/.test($("preview-progress-text").textContent) && $("test-send").disabled]);
   doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape" }));
-  checks.push(["escape closes the drawer", $("preview-drawer").hidden]);
+  checks.push(["closing while running keeps the job", $("preview-drawer").hidden && !locked()
+    && doc.querySelector('[data-preview-state="daily"]').textContent.startsWith("预览生成中")]);
+  hold = false;
+  await tick(120);
+  checks.push(["the lane shows the finished preview", doc.querySelector('[data-preview-state="daily"]').textContent.startsWith("已生成预览")
+    && jobs["job-1"].polls >= 2]);
+  click(doc.querySelector('[data-preview="daily"]'));
+  await tick();
+  checks.push(["reopening shows it without a new run", Object.keys(jobs).length === 1 && !$("preview-drawer").hidden
+    && $("preview-progress").hidden && $("preview-cards").querySelector("table") !== null
+    && $("preview-cards").querySelector("strong").textContent === "全公司核心指标"
+    && $("preview-notice").textContent.includes("没有重新调用 DeepSeek")
+    && $("preview-info").textContent.includes("SparkX 查询 5 次") && $("preview-info").textContent.includes("Token 18.3 万（缓存命中 10.2 万）")]);
+  checks.push(["test send is offered for the finished preview", !$("test-send").disabled && $("test-lead-label").textContent === "总负责人（老板）"
+    && !$("test-to-lead").disabled && $("test-mention-label").textContent === "@ 对应运营：高爽（Campx）" && !$("test-mention").disabled]);
+  click($("test-send-button"));
+  await tick();
+  const test = last("POST /console/api/reports/test-send");
+  checks.push(["test send posts only the job and the chosen recipients", test && test.body.job === "job-1" && test.body.to_group === true
+    && test.body.to_lead === false && test.body.mention === false && Object.keys(test.body).length === 4
+    && $("test-send-hint").textContent.startsWith("已发送测试到：通知群")]);
+  hold = true;
+  click($("preview-regenerate"));
+  await tick();
+  const fresh = last("POST /console/api/reports/preview");
+  checks.push(["regenerate asks for a fresh run", fresh.body.fresh === true && Object.keys(jobs).length === 2 && $("test-send").disabled
+    && !$("preview-progress").hidden && $("preview-regenerate").disabled]);
+  hold = false;
+  await tick(120);
+  checks.push(["the new preview replaces the old one", $("preview-progress").hidden && !$("test-send").disabled
+    && $("test-send-hint").textContent.startsWith("发送的就是上面这份预览")]);
+  doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape" }));
+  click(doc.querySelector('[data-test="review"]'));
+  await tick(120);
+  checks.push(["「测试发送」 opens the preview and focuses sending", !$("preview-drawer").hidden && $("preview-title").textContent === "预览 · 广告异常复盘"
+    && doc.activeElement === $("test-send-button") && $("test-lead-label").textContent === "广告负责人（未设置）" && $("test-to-lead").disabled]);
+  doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape" }));
+  checks.push(["escape closes the drawer", $("preview-drawer").hidden && !locked()]);
   click(doc.querySelector('[data-lead="ad"]'));
   await tick();
   checks.push(["lead dialog", !$("member-dialog").hidden && $("member-list").querySelectorAll('input[type="radio"]').length === 2
@@ -188,7 +274,8 @@ const last = (key) => [...requests].reverse().find((request) => request.key === 
 
   click(doc.querySelector('[data-view="deepseek"]'));
   await tick();
-  checks.push(["deepseek form", $("deepseek-model").options.length === 2 && $("deepseek-thinking").checked && $("deepseek-timeout").value === "120"]);
+  checks.push(["deepseek form", $("deepseek-model").options.length === 2 && $("deepseek-model").value === "deepseek-flash"
+    && $("deepseek-thinking").checked && $("deepseek-timeout").value === "120"]);
   checks.push(["bot badge", $("bot-badge").textContent === "已开启"]);
   $("deepseek-thinking").checked = false;
   $("deepseek-form").dispatchEvent(new window.Event("submit", { cancelable: true }));
@@ -200,7 +287,7 @@ const last = (key) => [...requests].reverse().find((request) => request.key === 
 
   click(doc.querySelector('[data-view="deliveries"]'));
   await tick();
-  checks.push(["deliveries", $("delivery-rows").textContent.includes("可能已提交（不自动重发）")
+  checks.push(["deliveries", $("delivery-rows").textContent.includes("可能已提交（不自动重发）") && $("delivery-rows").textContent.includes("（测试）")
     && !doc.querySelector('#page-actions [data-for="deliveries"]').hidden]);
   const failed = checks.filter(([, ok]) => !ok).map(([name]) => name);
   console.log(JSON.stringify({ passed: checks.length - failed.length, failed, errors }, null, 1));

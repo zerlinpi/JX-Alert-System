@@ -3,9 +3,11 @@
 A single owner password (PBKDF2 file) opens a 30-minute browser session. Every
 POST needs the same-origin header and the session-bound CSRF token. Secrets
 are write-only: tokens and keys are never returned to the browser. Previews run
-DeepSeek against live SparkX data in a background job and never queue a message.
+DeepSeek against live SparkX data in a background job and never queue a message;
+only an explicit 「发送测试」 queues the previewed cards (server-side copy), marked 【测试】.
 """
 import asyncio
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -113,30 +115,65 @@ async def _body(request, media, limit=16384):
         raise ConsoleError("请求格式无效。", 400) from None
 
 
+def preview_signature(lane, config):
+    """Identity of what a preview shows: the task text and, for the hourly monitor, its thresholds.
+
+    Switches and recipients do not change the content, so toggling them reuses the preview.
+    """
+    fields = {"prompt", *(lane_settings.HOURLY_DEFAULTS if lane == "hourly" else ())}
+    content = {key: config.get(key) for key in sorted(fields)}
+    return hashlib.sha256(json.dumps([lane, content], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 class PreviewJobs:
     """Background previews: a DeepSeek run takes minutes, longer than a proxy request may stay open.
 
-    One preview runs at a time; finished results are kept for 30 minutes.
+    One preview runs at a time (it shares the SparkX token with the scheduled lanes).
+    Asking again for a lane returns its running preview, or the finished one for the
+    same settings, instead of starting (and paying for) another DeepSeek run; only
+    「重新生成」 (fresh) replaces a finished result. Finished previews are kept for
+    30 minutes after they finish.
     """
 
     TTL = 30 * 60
+    _VIEW = ("status", "lane", "result", "error", "started_at", "finished_at", "sent")
 
     def __init__(self):
         self._jobs, self._lock = {}, threading.Lock()
 
-    def start(self, lane, work):
+    def _purge(self, now):
+        self._jobs = {key: job for key, job in self._jobs.items()
+                      if job["status"] == "running" or now - job["done"] < self.TTL}
+
+    def start(self, lane, signature, work, *, fresh=False, admit=None):
+        """(job id, reused, same settings). ``admit`` runs (and may raise) only before a new run."""
         with self._lock:
             now = time.monotonic()
-            self._jobs = {key: job for key, job in self._jobs.items() if now - job["at"] < self.TTL}
-            if any(job["status"] == "running" for job in self._jobs.values()):
-                raise ConsoleError("已有一个预览正在生成，请等它完成。", 409)
+            self._purge(now)
+            own = [(key, job) for key, job in self._jobs.items() if job["lane"] == lane]
+            running = [(key, job) for key, job in own if job["status"] == "running"]
+            if running:
+                key, job = running[0]
+                return key, True, job["signature"] == signature
+            done = [(key, job) for key, job in own if job["status"] == "done" and job["signature"] == signature]
+            if done and not fresh:
+                key, _ = max(done, key=lambda item: item[1]["done"])
+                return key, True, True
+            busy = [job for job in self._jobs.values() if job["status"] == "running"]
+            if busy:
+                raise ConsoleError(f"「{_LANE_LABELS.get(busy[0]['lane'], '另一条通知')}」的预览正在生成，"
+                                   "完成后再预览这一条（同一时间只生成一份预览）。", 409)
+            if admit is not None:
+                admit()
             key = secrets.token_urlsafe(12)
-            self._jobs[key] = {"at": now, "status": "running", "lane": lane, "result": None, "error": None,
+            self._jobs[key] = {"at": now, "done": now, "status": "running", "lane": lane, "signature": signature,
+                               "result": None, "private": None, "error": None, "sent": [],
                                "started_at": datetime.now(timezone.utc).isoformat()}
 
         def target():
+            private = None
             try:
-                result, status, error = work(), "done", None
+                (result, private), status, error = work(), "done", None
             except ConsoleError as exc:
                 result, status, error = None, "failed", exc.detail
             except Exception as exc:  # noqa: BLE001 - never echo internal errors to the browser.
@@ -144,18 +181,45 @@ class PreviewJobs:
                 result, status, error = None, "failed", "预览生成失败，请稍后重试。"
             with self._lock:
                 if key in self._jobs:
-                    self._jobs[key].update(status=status, result=result, error=error,
-                                           finished_at=datetime.now(timezone.utc).isoformat())
+                    self._jobs[key].update(status=status, result=result, private=private, error=error,
+                                           done=time.monotonic(), finished_at=datetime.now(timezone.utc).isoformat())
 
         threading.Thread(target=target, name="console-preview", daemon=True).start()
-        return key
+        return key, False, True
+
+    def _job(self, key):
+        job = self._jobs.get(key) if isinstance(key, str) else None
+        if job is None or (job["status"] != "running" and time.monotonic() - job["done"] >= self.TTL):
+            raise ConsoleError("预览已过期，请重新生成。", 404)
+        return job
 
     def get(self, key):
         with self._lock:
-            job = self._jobs.get(key) if isinstance(key, str) else None
-            if job is None:
-                raise ConsoleError("预览已过期，请重新生成。", 404)
-            return {name: job.get(name) for name in ("status", "lane", "result", "error", "started_at", "finished_at")}
+            job = self._job(key)
+            return {name: list(job[name]) if name == "sent" else job.get(name) for name in self._VIEW}
+
+    def latest(self, lane):
+        """The lane's running preview, else its most recently finished one (None when there is none)."""
+        with self._lock:
+            self._purge(time.monotonic())
+            own = [(key, job) for key, job in self._jobs.items() if job["lane"] == lane]
+            if not own:
+                return None
+            return max(own, key=lambda item: (item[1]["status"] == "running", item[1]["done"]))[0]
+
+    def claim_send(self, key):
+        """The finished preview's lane and its server-side cards and stores, for a test send."""
+        with self._lock:
+            job = self._job(key)
+            if job["status"] != "done" or not job["private"] or not job["private"]["cards"]:
+                raise ConsoleError("预览还没有可发送的内容。", 409)
+            return job["lane"], job["private"]
+
+    def mark_sent(self, key, targets):
+        with self._lock:
+            job = self._jobs.get(key)
+            if job is not None:
+                job["sent"] = sorted(set(job["sent"]) | set(targets))
 
 
 class OwnerConsole:
@@ -267,10 +331,12 @@ class OwnerConsole:
                 meta = job.metadata_json or {}
                 message = meta.get("message") if isinstance(meta.get("message"), str) else (
                     SparkXError(meta["error"]).message if isinstance(meta.get("error"), str) else None)
+                usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}
                 result[lane] = {"status": job.status, "at": _iso(job.started_at), "error": meta.get("error"),
                                 "queued": len(meta.get("outbox_ids") or []), "findings": meta.get("findings"),
                                 "sparkx_calls": meta.get("sparkx_calls"), "message": message,
-                                "reason": meta.get("reason")}
+                                "reason": meta.get("reason"), "tokens": usage.get("total_tokens"),
+                                "model": meta.get("model")}
         return result
 
     def _deliveries(self, db, limit=30):
@@ -284,7 +350,8 @@ class OwnerConsole:
             delivery = payload.get("delivery") or {}
             kind = (delivery.get("role") or "").removeprefix("jx_")
             lane, _, who = kind.partition("_") if kind.split("_", 1)[0] in lanes.LANES else ("question", "", kind)
-            result.append({"id": row.id, "lane": _LANE_LABELS.get(lane, "问答回复"),
+            label = _LANE_LABELS.get(lane, "问答回复") + ("（测试）" if lanes.is_test(row.idempotency_key, payload) else "")
+            result.append({"id": row.id, "lane": label, "test": lanes.is_test(row.idempotency_key, payload),
                            "recipient": _ROLE_LABELS.get(who or kind, "—") + (
                                f"：{delivery['name']}" if isinstance(delivery.get("name"), str) else ""),
                            "title": (payload.get("text") or "")[:80], "status": row.status,
@@ -336,6 +403,9 @@ class OwnerConsole:
                           for lane in lanes.LANES},
                 "stores": {"authorized": len(roster), "monitored": len(monitored),
                            "mapped": sum(bool(directory_module.operators(directory, key)) for key in monitored),
+                           "sites": dict(Counter(directory_module.COUNTRY_LABELS.get(roster[key].get("country"),
+                                                                                     roster[key].get("country") or "—")
+                                                 for key in monitored)),
                            "roster_at": _iso(roster_at)},
                 "recent": recent}
 
@@ -406,22 +476,26 @@ class OwnerConsole:
                 "max_prompt": lane_settings.MAX_PROMPT}
 
     def _preview_config(self, payload):
-        """The saved lane settings, or the unsaved form values when the owner previews a draft."""
-        if set(payload) - {"lane", "draft"} or payload.get("lane") not in lanes.LANES:
+        """(lane, the saved lane settings or the unsaved form values of a draft, fresh)."""
+        if set(payload) - {"lane", "draft", "fresh"} or payload.get("lane") not in lanes.LANES:
             raise ConsoleError("预览类型无效。", 400)
+        fresh = payload.get("fresh", False)
+        if type(fresh) is not bool:
+            raise ConsoleError("预览参数无效。", 400)
         lane, saved = payload["lane"], lane_settings.load(self.settings)["lanes"]
         draft = payload.get("draft")
         if draft is None:
-            return lane, saved[lane]
+            return lane, saved[lane], fresh
         if not isinstance(draft, dict) or set(draft) - set(lane_settings.DEFAULTS[lane]):
             raise ConsoleError("预览参数无效。", 400)
         try:
             checked = lane_settings.validate({**saved, lane: {**saved[lane], **draft}})
         except (ValueError, TypeError, KeyError):
             raise ConsoleError("请先核对阈值和任务说明再预览。", 400) from None
-        return lane, checked[lane]
+        return lane, checked[lane], fresh
 
     def _run_preview(self, lane, config):
+        """(what the browser shows, what a test send of it needs: the cards and their stores)."""
         if not lanes.sparkx_ready(self.settings):
             raise ConsoleError("请先在「SparkX MCP」保存 Token。", 409)
         if not lanes.deepseek_ready(self.settings) and self.runner is None:
@@ -439,10 +513,53 @@ class OwnerConsole:
                 raise ConsoleError("DeepSeek 的输出不符合约定格式，请重试或调整任务说明。", 502) from None
             db.commit()
         info["seconds"] = round(time.monotonic() - started)
+        audience = info.pop("audience", None) or {"stores": {}, "operators": []}
+        info["mentions"] = audience["operators"]  # names only: who a group test send would @
+        private = {"cards": values, "stores": audience["stores"]}
         if not values:
             text = "当前没有需要提醒的广告活动。" if lane == "hourly" else "没有生成内容。"
-            return {"cards": [], "text": text, "info": info}
-        return {"cards": values, "text": "\n\n".join(plain_text(value) for value in values), "info": info}
+            return {"cards": [], "text": text, "info": info}, private
+        return {"cards": values, "text": "\n\n".join(plain_text(value) for value in values), "info": info}, private
+
+    def _start_preview(self, request, payload):
+        lane, config, fresh = self._preview_config(payload)
+        key, reused, current = self.previews.start(
+            lane, preview_signature(lane, config), lambda: self._run_preview(lane, config), fresh=fresh,
+            admit=lambda: self._limit(request, "preview", 3, 6, "预览太频繁，请一分钟后重试。"))
+        return {**self.previews.get(key), "job": key, "lane": lane, "reused": reused, "current": current}
+
+    def _test_send(self, request, payload):
+        """Queue a finished preview's cards (server-side copy) as a 【测试】 message; no new DeepSeek run."""
+        flags = ("to_group", "to_lead", "mention")
+        if (set(payload) != {"job", *flags} or not isinstance(payload["job"], str)
+                or any(type(payload[name]) is not bool for name in flags)):
+            raise ConsoleError("测试发送参数无效。", 400)
+        if not (payload["to_group"] or payload["to_lead"]):
+            raise ConsoleError("请至少选择一个接收对象。", 400)
+        self._limit(request, "test-send", 4, 8, "测试发送太频繁，请稍后重试。")
+        if not self.settings.delivery_enabled():
+            raise ConsoleError("服务器未开启飞书发送（演练模式或飞书应用未启用），测试消息不会发出。", 409)
+        lane, private = self.previews.claim_send(payload["job"])
+        with self.session_factory() as db:
+            try:
+                result = lanes.queue_test(db, self.settings, lane, private["cards"], now=datetime.now(timezone.utc),
+                                          preview_id=payload["job"], stores=private["stores"],
+                                          to_group=payload["to_group"], to_lead=payload["to_lead"],
+                                          mention=payload["mention"])
+            except ValueError:
+                raise ConsoleError("这份预览无法作为测试消息发送，请重新生成后再试。", 409) from None
+            if result["status"] == "ROUTING_UNAVAILABLE":
+                raise ConsoleError("飞书接收人配置无法核验，未发送。", 409)
+            if result["status"] == "NO_RECIPIENT":
+                lead = "总负责人" if lane == "daily" else "广告负责人"
+                reasons = {"group": "通知群未设置或无法核验", "lead": f"{lead}未设置或已不在通知群"}
+                raise ConsoleError("；".join(reasons[name] for name in result["missing"]) + "，未发送。", 409)
+            db.commit()
+        targets = [name for name in ("group", "lead") if payload[f"to_{name}"]]
+        if result["status"] == "QUEUED":
+            self.previews.mark_sent(payload["job"], targets)
+        return {"status": result["status"], "queued": len(result["outbox_ids"]), "mentions": result["mentions"],
+                "targets": targets, "sent": self.previews.get(payload["job"])["sent"]}
 
     def _skills(self, check=False):
         view = skill_store.status(self.settings, check=check)
@@ -508,7 +625,13 @@ class OwnerConsole:
         if path == "/console/api/skills":
             return await run(self._skills)
         if path == "/console/api/reports/preview":
-            return self.previews.get(request.query_params.get("job"))
+            lane = request.query_params.get("lane")
+            if lane is None:
+                return self.previews.get(request.query_params.get("job"))
+            if lane not in lanes.LANES:
+                raise ConsoleError("预览类型无效。", 400)
+            key = self.previews.latest(lane)
+            return {"job": None, "status": None} if key is None else {**self.previews.get(key), "job": key}
         if path == "/console/api/deliveries":
             def deliveries():
                 with self.session_factory() as db:
@@ -572,9 +695,9 @@ class OwnerConsole:
             await run(lane_settings.save, self.settings, payload)
             return await run(self._reports)
         if path == "/console/api/reports/preview":
-            lane, config = await run(self._preview_config, payload)
-            self._limit(request, "preview", 3, 6, "预览太频繁，请一分钟后重试。")
-            return {"job": self.previews.start(lane, lambda: self._run_preview(lane, config)), "lane": lane}
+            return await run(self._start_preview, request, payload)
+        if path == "/console/api/reports/test-send":
+            return await run(self._test_send, request, payload)
         if path == "/console/api/deepseek":
             self._limit(request, "deepseek-write", 6, 12)
             return await run(deepseek_config.save_configuration, self.settings, payload)
@@ -599,8 +722,8 @@ class OwnerConsole:
         api_get = ["overview", "sparkx", "stores", "members", "recipients", "groups", "reports", "reports/preview",
                    "deepseek", "skills", "deliveries"]
         api_post = ["sparkx", "sparkx/test", "stores/refresh", "stores/save", "recipients/company", "recipients/ad",
-                    "groups", "members/refresh", "reports", "reports/preview", "deepseek", "deepseek/test",
-                    "skills/install", "skills/check"]
+                    "groups", "members/refresh", "reports", "reports/preview", "reports/test-send", "deepseek",
+                    "deepseek/test", "skills/install", "skills/check"]
         routes = [Route("/", self.root), Route("/console", self.home), Route("/console/", self.home),
                   Route("/console/login", self.login, methods=["GET", "POST"]),
                   Route("/console/assets/{asset}", self.asset),

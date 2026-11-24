@@ -75,7 +75,22 @@ def card_fits(value, reserve=0):
     return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= MAX_WIRE_BYTES - reserve
 
 
-def with_mentions(value, open_ids):
+# The mention line must stay inside the room reserved for it (reports.cards.MENTION_RESERVE).
+MAX_MENTION_LINE_BYTES = 1800
+
+
+def mention_line(open_ids, labels=None):
+    """「对应运营：@A（店铺1） @B（店铺2）」; store names are dropped when the line would be too long."""
+    ids = list(dict.fromkeys(open_ids))
+    labels = labels if isinstance(labels, dict) else {}
+    plain_line = "对应运营：" + " ".join(f"<at id={uid}></at>" for uid in ids)
+    named = "对应运营：" + " ".join(
+        f"<at id={uid}></at>（{md_safe(labels[uid], 120)}）" if isinstance(labels.get(uid), str) and labels[uid]
+        else f"<at id={uid}></at>" for uid in ids)
+    return named if len(json.dumps(named, ensure_ascii=False).encode()) <= MAX_MENTION_LINE_BYTES else plain_line
+
+
+def with_mentions(value, open_ids, labels=None):
     if not isinstance(open_ids, list) or any(
         not isinstance(uid, str) or not re.fullmatch(r"ou_[A-Za-z0-9_-]+", uid) for uid in open_ids
     ):
@@ -84,10 +99,7 @@ def with_mentions(value, open_ids):
     if result.get("schema") != "2.0" or not isinstance(result.get("body", {}).get("elements"), list):
         raise ValueError("Expected a Feishu 2.0 card")
     if open_ids:
-        result["body"]["elements"].insert(0, {
-            "tag": "markdown",
-            "content": "对应运营：" + " ".join(f"<at id={uid}></at>" for uid in dict.fromkeys(open_ids)),
-        })
+        result["body"]["elements"].insert(0, {"tag": "markdown", "content": mention_line(open_ids, labels)})
     return result
 
 

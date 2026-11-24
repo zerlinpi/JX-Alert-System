@@ -1,14 +1,15 @@
 # JX-Alert-System development agreement
 
-- Check the local branch and uncommitted work, the GitHub state, and the server
-  revision before continuing. Preserve user changes when combining updates.
-- Commit every code update on a feature branch; keep main intact unless the owner
-  explicitly asks to merge. Push to `zerlinpi/JX-Alert-System` and open a PR,
-  unless the owner asks to keep the work local: then keep it on a local branch
-  and say in the report that it is not pushed.
-- Deploy only an identified, tested commit: from GitHub, or from a git bundle of
-  that commit when the work is local. Verify the commit's tree on the server, and
-  use `deploy/upgrade.sh` / `deploy/rollback.sh` (backup, checks, rollback path).
+- Check the local work, the GitHub state, and the server revision before
+  continuing. Preserve user changes when combining updates.
+- Owner decision (Nov 2026): the repository keeps a single branch, `main`. Commit
+  each tested update on top of `main` and push it to `zerlinpi/JX-Alert-System`
+  as a fast-forward; do not leave other branches on GitHub, locally or on the
+  server. Never force-push or rewrite `main`. When the owner asks to keep work
+  local, say in the report that it is not pushed.
+- Deploy only an identified, tested commit of `main` (or a git bundle of it when
+  the work is local). Verify the commit's tree on the server, and use
+  `deploy/upgrade.sh` / `deploy/rollback.sh` (backup, checks, rollback path).
 - Report the exact revision/tree tested, actual test results, deployed revision,
   unresolved issues, and rollback path. Never claim unexecuted tests or deployment.
 - Preserve `.env`, credentials, historical data, and Docker data volumes. Never
@@ -37,11 +38,17 @@
   (7–14 day attribution). Reviews compare the last 7 days with the 7 days before.
 - Recipients: every lane goes to the report group; the 总负责人 also receives
   the 08:30 daily report and the 广告负责人 the review and hourly alerts
-  privately, each row labelled with its operator. The owner set all lanes on by
-  default: stores without an operator are still notified (labelled 未映射运营,
-  nobody @-mentioned); once operators are mapped, the group message @-mentions
-  only the operators of the affected stores. Private operator copies are optional.
-  Never route to or mention guessed people.
+  privately, each row labelled with its operator (the 运营 column is always the
+  last column). The owner set all lanes on by default: stores without an operator
+  are still notified (labelled 未映射运营, nobody @-mentioned); once operators are
+  mapped, the group message @-mentions only the operators of the affected stores
+  (daily: stores the report flags; review: anomalies; hourly: new alerts), naming
+  their stores. Private operator copies are optional. Never route to or mention
+  guessed people.
+- Console previews never queue anything. A test send (owner's explicit click)
+  queues the server-side copy of a finished preview, marked 【测试】, under
+  `jx:test:` keys and `jx_test` receipts: it never counts as a lane run or an
+  hourly alert, and its recipients are re-checked like any other send.
 - Re-verify the switch, delivery window and exact recipient (including each
   @-mention) before every send. Never resend a message that may have been
   submitted, and never replay old or retired messages. Lanes do not run until a

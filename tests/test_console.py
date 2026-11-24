@@ -1,5 +1,6 @@
 """Owner console: login, CSRF, write-only secrets, store directory, Skills and live previews."""
 import re
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -24,7 +25,16 @@ def drafts():
 
 
 @pytest.fixture
-def console(settings, session_factory, tmp_path, drafts):
+def gate():
+    """Previews finish at once unless a test clears this gate to keep one running."""
+    event = threading.Event()
+    event.set()
+    yield event
+    event.set()
+
+
+@pytest.fixture
+def console(settings, session_factory, tmp_path, drafts, gate):
     secrets = tmp_path / "secrets"
     create_owner_credentials(secrets / "owner.json", PASSWORD)
     configured = settings.model_copy(update={"console_public_url": ORIGIN})
@@ -32,11 +42,13 @@ def console(settings, session_factory, tmp_path, drafts):
 
     def runner(settings_, lane, config, **kwargs):
         drafts.append(dict(config))
+        gate.wait(10)
         return fake(settings_, lane, config, **kwargs)
 
     app = OwnerConsole(configured, OwnerPassword(secrets / "owner.json"), SessionStore(secrets / "sessions.sqlite3"),
                        session_factory=session_factory, runner=runner)
     client = TestClient(Starlette(routes=app.routes()), base_url=ORIGIN)
+    client.owner_console = app
     return client
 
 
@@ -146,15 +158,26 @@ def wait_for(console, job):
 def test_live_preview_runs_in_the_background_and_is_read_only(console, session_factory, drafts):
     headers = login(console)
     started = console.post("/console/api/reports/preview", json={"lane": "daily"}, headers=headers)
-    assert started.status_code == 200 and started.json()["lane"] == "daily"
+    assert started.status_code == 200 and started.json()["lane"] == "daily" and started.json()["reused"] is False
     state = wait_for(console, started.json()["job"])
     assert state["status"] == "done"
     result = state["result"]
     assert result["cards"][0]["header"]["title"]["content"] == "SparkX 广告日报 · 2026-11-22"
     assert "全公司核心指标" in result["text"] and result["info"]["profiles"] == 7 and result["info"]["sparkx_calls"] == 4
+    assert result["info"]["mentions"] == [] and "audience" not in result["info"]
     with session_factory() as db:
         from jx_alert.notifications.outbox import NotificationOutbox
         assert db.query(NotificationOutbox).count() == 0
+    # Opening the same preview again shows the finished result; only 「重新生成」 runs DeepSeek again.
+    again = console.post("/console/api/reports/preview", json={"lane": "daily"}, headers=headers).json()
+    assert again["job"] == started.json()["job"] and again["reused"] is True and again["status"] == "done"
+    assert len(drafts) == 1
+    fresh = console.post("/console/api/reports/preview", json={"lane": "daily", "fresh": True}, headers=headers).json()
+    assert fresh["job"] != started.json()["job"] and fresh["reused"] is False
+    assert wait_for(console, fresh["job"])["status"] == "done" and len(drafts) == 2
+    latest = console.get("/console/api/reports/preview", params={"lane": "daily"}).json()
+    assert latest["job"] == fresh["job"] and latest["status"] == "done"
+    assert console.get("/console/api/reports/preview", params={"lane": "review"}).json() == {"job": None, "status": None}
     draft = console.post("/console/api/reports/preview", json={"lane": "hourly", "draft": {"high_spend": 55, "prompt": "简短"}},
                          headers=headers)
     assert wait_for(console, draft.json()["job"])["status"] == "done"
@@ -163,6 +186,57 @@ def test_live_preview_runs_in_the_background_and_is_read_only(console, session_f
     assert console.post("/console/api/reports/preview", json={"lane": "hourly", "draft": {"low_spend": 99}},
                         headers=headers).status_code == 400  # low spend must stay below high spend
     assert console.get("/console/api/reports/preview", params={"job": "missing"}).status_code == 404
+
+
+def test_reopening_a_running_preview_follows_it_instead_of_starting_another(console, drafts, gate):
+    headers = login(console)
+    gate.clear()  # DeepSeek is still working
+    first = console.post("/console/api/reports/preview", json={"lane": "review"}, headers=headers).json()
+    assert first["status"] == "running" and first["started_at"]
+    reopened = console.post("/console/api/reports/preview", json={"lane": "review"}, headers=headers).json()
+    assert reopened["job"] == first["job"] and reopened["reused"] is True and reopened["current"] is True
+    edited = console.post("/console/api/reports/preview", json={"lane": "review", "draft": {"prompt": "只看 ACOS"}},
+                          headers=headers).json()
+    assert edited["job"] == first["job"] and edited["current"] is False  # the drawer says it shows older settings
+    regenerate = console.post("/console/api/reports/preview", json={"lane": "review", "fresh": True}, headers=headers).json()
+    assert regenerate["job"] == first["job"]  # never two DeepSeek runs of one lane at a time
+    other = console.post("/console/api/reports/preview", json={"lane": "daily"}, headers=headers)
+    # One preview at a time: they share the SparkX token with the scheduled lanes.
+    assert other.status_code == 409 and "异常复盘" in other.json()["error"]
+    gate.set()
+    assert wait_for(console, first["job"])["status"] == "done"
+    daily = console.post("/console/api/reports/preview", json={"lane": "daily"}, headers=headers).json()
+    assert wait_for(console, daily["job"])["status"] == "done" and len(drafts) == 2
+    assert console.post("/console/api/reports/preview", json={"lane": "review", "fresh": "yes"},
+                        headers=headers).status_code == 400
+
+
+def test_a_finished_preview_can_be_sent_as_a_test(console, session_factory, settings):
+    from jx_alert.notifications.outbox import NotificationOutbox
+
+    headers = login(console)
+    job = console.post("/console/api/reports/preview", json={"lane": "review"}, headers=headers).json()["job"]
+    assert wait_for(console, job)["status"] == "done"
+    body = {"job": job, "to_group": True, "to_lead": True, "mention": False}
+    sent = console.post("/console/api/reports/test-send", json=body, headers=headers)
+    assert sent.status_code == 200 and sent.json()["status"] == "QUEUED" and sent.json()["sent"] == ["group", "lead"]
+    with session_factory() as db:
+        queued = db.query(NotificationOutbox).order_by(NotificationOutbox.id).all()
+        assert [row.payload["delivery"]["role"] for row in queued] == ["jx_review_group", "jx_review_lead"]
+        assert all(row.idempotency_key.startswith(f"jx:test:review:{job}:") for row in queued)
+        assert queued[0].payload["card"]["header"]["title"]["content"].startswith("【测试】SparkX 广告异常复盘")
+    assert console.post("/console/api/reports/test-send", json=body, headers=headers).json()["status"] == "ALREADY_QUEUED"
+    assert wait_for(console, job)["sent"] == ["group", "lead"]
+    deliveries = console.get("/console/api/deliveries").json()["rows"]
+    assert deliveries[0]["lane"] == "异常复盘（测试）" and deliveries[0]["test"] is True
+    assert console.post("/console/api/reports/test-send", json={**body, "to_group": False, "to_lead": False},
+                        headers=headers).status_code == 400
+    assert console.post("/console/api/reports/test-send", json={**body, "card": {}}, headers=headers).status_code == 400
+    assert console.post("/console/api/reports/test-send", json={**body, "job": "missing"}, headers=headers).status_code == 404
+    assert console.post("/console/api/reports/test-send", json=body, headers={"origin": ORIGIN}).status_code == 403
+    console.owner_console.settings = console.owner_console.settings.model_copy(update={"app_dry_run": True})
+    dry = console.post("/console/api/reports/test-send", json=body, headers=headers)
+    assert dry.status_code == 409 and "演练模式" in dry.json()["error"]
 
 
 def test_skills_status_and_install(console, monkeypatch):

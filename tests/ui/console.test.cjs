@@ -45,6 +45,30 @@ test("store search and filters match names, sites, profile IDs, operators and st
   assert.deepEqual(consoleUi.storeCounts(STORES), { all: 3, unmapped: 1, paused: 1 });
 });
 
+test("stores can be narrowed to one site, for example to pause the sites without data", () => {
+  const rows = [...STORES, { name: "川页-CA", short_name: "川页-CA", country_label: "加拿大", profile_id: "201", monitored: true, operators: [] },
+    { name: "昌泉-CA", short_name: "昌泉-CA", country_label: "加拿大", profile_id: "202", monitored: true, operators: [] }];
+  assert.deepEqual(consoleUi.siteOptions(rows), [{ label: "美国", count: 3 }, { label: "加拿大", count: 2 }]);
+  assert.deepEqual(consoleUi.filterStores(rows, "", "all", "加拿大").map((row) => row.profile_id), ["201", "202"]);
+  assert.deepEqual(consoleUi.filterStores(rows, "昌泉", "all", "加拿大").map((row) => row.profile_id), ["202"]);
+  assert.deepEqual(consoleUi.storeCounts(rows, "加拿大"), { all: 2, unmapped: 2, paused: 0 });
+});
+
+test("token counts, preview states and mention lists read naturally", () => {
+  assert.equal(consoleUi.formatTokens(180573), "18.1 万");
+  assert.equal(consoleUi.formatTokens(9000), "9000");
+  assert.equal(consoleUi.formatTokens(undefined), "");
+  const started = "2026-11-24T06:00:00Z";
+  const running = consoleUi.previewStateText({ status: "running", started_at: started }, Date.parse(started) + 125000);
+  assert.equal(running.tone, "running");
+  assert.match(running.text, /预览生成中（已用 2 分 5 秒）/);
+  assert.match(consoleUi.previewStateText({ status: "done", finished_at: "2026-11-24T06:03:00Z" }).text, /已生成预览 · 11\/24 14:03/);
+  assert.equal(consoleUi.previewStateText({ status: "failed" }).tone, "failed");
+  assert.equal(consoleUi.previewStateText(undefined).text, "");
+  assert.equal(consoleUi.mentionText([{ name: "高爽", stores: ["Campx", "XPE"] }, { name: "皮泽霖", stores: ["香港川页"] }]),
+    "高爽（Campx、XPE）、皮泽霖（香港川页）");
+});
+
 test("an unchanged default task text is saved as empty so improved defaults still apply", () => {
   assert.equal(consoleUi.promptValue("  默认说明\n", "默认说明"), "");
   assert.equal(consoleUi.promptValue("只看 ACOS", "默认说明"), "只看 ACOS");
@@ -53,7 +77,7 @@ test("an unchanged default task text is saved as empty so improved defaults stil
 
 test("lane form values are validated before saving", () => {
   const values = {
-    daily: { enabled: true, to_group: false, to_lead: true, prompt: "日报默认" },
+    daily: { enabled: true, to_group: false, mention_operators: true, to_lead: true, prompt: "日报默认" },
     review: { enabled: true, to_group: true, mention_operators: true, to_lead: true, to_operators: false, weekly: true, prompt: "多看 ACOS" },
     hourly: { enabled: true, to_group: true, mention_operators: false, to_lead: true, to_operators: false, start_hour: "9", end_hour: "24",
               high_spend: "30", low_spend: "10", min_clicks: "15", acos_high: "60", cvr_low: "5", acos_good: "20",
@@ -65,6 +89,7 @@ test("lane form values are validated before saving", () => {
   assert.equal(lanes.daily.prompt, "");
   assert.equal(lanes.review.prompt, "多看 ACOS");
   assert.equal(lanes.hourly.mention_operators, false);
+  assert.equal(lanes.daily.mention_operators, true);
   assert.equal("ai" in lanes.daily, false);
   assert.throws(() => consoleUi.lanePayload({ ...values, hourly: { ...values.hourly, low_spend: "40" } }), /低花费/);
   assert.throws(() => consoleUi.lanePayload({ ...values, hourly: { ...values.hourly, start_hour: "23", end_hour: "9" } }), /时段/);

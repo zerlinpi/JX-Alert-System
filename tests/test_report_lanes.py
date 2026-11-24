@@ -9,7 +9,7 @@ from sqlalchemy import select
 from conftest import AD_LEAD, GROUP_CHAT, LEAD, write_private
 from jx_alert.ai.deepseek import DeepSeekError
 from jx_alert.notifications.outbox import NotificationOutbox
-from jx_alert.reports import lanes
+from jx_alert.reports import cards, lanes
 from jx_alert.reports import settings as lane_settings
 from jx_alert.sparkx import stores
 from jx_alert.sparkx.client import SparkXError
@@ -43,8 +43,7 @@ def routes(db):
 def test_every_lane_is_on_by_default_and_reaches_the_group():
     defaults = lane_settings.DEFAULTS
     assert all(defaults[lane]["enabled"] and defaults[lane]["to_group"] and defaults[lane]["to_lead"]
-               for lane in lane_settings.LANES)
-    assert defaults["review"]["mention_operators"] and defaults["hourly"]["mention_operators"]
+               and defaults[lane]["mention_operators"] for lane in lane_settings.LANES)
     assert not defaults["review"]["to_operators"] and not defaults["hourly"]["to_operators"]
     assert all(defaults[lane]["prompt"] == "" for lane in lane_settings.LANES)  # empty = built-in default text
 
@@ -114,7 +113,26 @@ def test_review_group_message_mentions_the_operators_of_affected_stores(settings
         assert group.payload["delivery"]["open_ids"] == ["ou_op1", "ou_op2"]
         # 104 is not named by the review, so it is not a reason to mention anyone.
         assert group.payload["delivery"]["mentions"] == {"ou_op1": ["101"], "ou_op2": ["102"]}
+        assert group.payload["delivery"]["mention_names"] == {"101": "香港川页", "102": "Campx"}
         assert lead.payload["delivery"]["open_ids"] == [] and len(rows(db)) == 2  # private operator copies are off
+        overview = next(element for element in group.payload["card"]["body"]["elements"] if element["tag"] == "table")
+        # The model wrote 运营 as the second column; the card shows it last.
+        assert [column["display_name"] for column in overview["columns"]][-1] == "运营"
+        assert overview["rows"][0]["c0"] == "香港川页" and overview["rows"][0]["c6"] == "未映射运营"
+    assert lanes.mention_plan(settings, group.payload) == (["ou_op1", "ou_op2"], {"ou_op1": "香港川页", "ou_op2": "Campx"})
+
+
+def test_daily_report_mentions_the_operators_of_the_stores_it_flags(settings, session_factory):
+    map_operators(settings, {"102": ("ou_op2", "高爽"), "104": ("ou_op1", "皮泽霖")})
+    results = {"daily": lane_result("daily", stores=["102"])}
+    with session_factory() as db:
+        lanes.queue_morning_lane(db, settings, "daily", now=SEND, runner=runner_for(results))
+        db.commit()
+        assert routes(db) == [("jx_daily_group", GROUP_CHAT, ["ou_op2"]), ("jx_daily_lead", LEAD, [])]
+        group = rows(db)[0]
+    assert lanes.mention_plan(settings, group.payload) == (["ou_op2"], {"ou_op2": "Campx"})
+    enable(settings, daily={"mention_operators": False})
+    assert lanes.mention_plan(settings, group.payload) == ([], {})
 
 
 def test_operators_outside_the_group_are_not_mentioned(settings, session_factory):
@@ -235,6 +253,7 @@ def test_mentions_are_rechecked_before_sending(settings, session_factory):
         db.commit()
         group, lead = rows(db)
     assert lanes.send_mentions(settings, group.payload) == ["ou_op2"]
+    assert lanes.mention_plan(settings, group.payload) == (["ou_op2"], {"ou_op2": "Campx"})
     assert lanes.send_mentions(settings, lead.payload) == []
     map_operators(settings, {"102": ("ou_op1", "皮泽霖")})  # reassigned after queueing
     assert lanes.send_mentions(settings, group.payload) == []
@@ -299,6 +318,56 @@ def test_settings_validation(settings):
     custom["daily"]["prompt"] = "  重点看 ACOS 超过 40% 的店铺  "
     saved = lane_settings.save(settings, {"revision": current["revision"], "lanes": custom})
     assert saved["lanes"]["daily"]["prompt"] == "重点看 ACOS 超过 40% 的店铺"
+
+
+def test_a_test_send_queues_marked_copies_outside_the_lane_schedule(settings, session_factory):
+    map_operators(settings, {"102": ("ou_op2", "高爽")})
+    enable(settings, daily={"enabled": False, "to_group": False})  # a test is the owner's explicit choice
+    values = cards.report_cards("SparkX 广告日报 · 2026-11-22", "**全公司核心指标**\n正文", "由 DeepSeek 生成。")
+    later = SEND + timedelta(hours=6)  # 14:30 Beijing, after the 08:30–12:00 window of the daily report
+    with session_factory() as db:
+        result = lanes.queue_test(db, settings, "daily", values, now=later, preview_id="job-1",
+                                  stores={"102": "Campx"}, to_group=True, to_lead=True, mention=True)
+        db.commit()
+        assert result["status"] == "QUEUED" and result["mentions"] == 1
+        assert routes(db) == [("jx_daily_group", GROUP_CHAT, ["ou_op2"]), ("jx_daily_lead", LEAD, [])]
+        group, lead = rows(db)
+        assert group.idempotency_key.startswith("jx:test:daily:job-1:") and group.payload["jx_test"] is True
+        assert group.payload["card"]["header"]["title"]["content"] == "【测试】SparkX 广告日报 · 2026-11-22"
+        assert "测试消息" in json.dumps(group.payload["card"], ensure_ascii=False)
+        again = lanes.queue_test(db, settings, "daily", values, now=later, preview_id="job-1",
+                                 stores={"102": "Campx"}, to_group=True, to_lead=False, mention=False)
+        assert again["status"] == "ALREADY_QUEUED" and len(rows(db)) == 2
+        receipt = db.scalar(select(SyncJob).where(SyncJob.job_type == "jx_test"))
+        assert receipt.metadata_json["lane"] == "daily" and receipt.metadata_json["targets"] == ["group", "lead"]
+        assert db.scalar(select(SyncJob.id).where(SyncJob.job_type == "jx_daily")) is None  # not the day's run
+    for row in (group, lead):
+        assert lanes.delivery_window(row.idempotency_key, row.payload, later + timedelta(minutes=29))[0] == "READY"
+        assert lanes.delivery_window(row.idempotency_key, row.payload, later + timedelta(minutes=31))[0] == "EXPIRED"
+        assert lanes.delivery_blocked(settings, row.idempotency_key, row.payload, later) is None
+    assert lanes.mention_plan(settings, group.payload) == (["ou_op2"], {"ou_op2": "Campx"})
+    assert lanes.mention_plan(settings, lead.payload) == ([], {})
+    forged = {**group.payload, "jx_test": False}
+    assert lanes.delivery_window(group.idempotency_key, forged, later)[0] == "EXPIRED"  # not a daily key
+
+
+def test_a_hourly_test_send_never_counts_as_an_alert(settings, session_factory, routing):
+    value = cards.hourly_card(HOURLY_FINDINGS, day="2026-11-23", time="22:05", names={}, operators={},
+                              config=lane_settings.DEFAULTS["hourly"], footer="")
+    with session_factory() as db:
+        queued = lanes.queue_test(db, settings, "hourly", [value], now=HOUR, preview_id="job-2", stores={},
+                                  to_group=True, to_lead=False, mention=True)
+        db.commit()
+        assert queued["status"] == "QUEUED" and queued["mentions"] == 0
+        assert lanes.alerted_today(db, "2026-11-23") == set()
+        assert lanes.run_hourly(db, settings, now=HOUR, runner=runner_for())["status"] == "QUEUED"
+        changed = copy.deepcopy(routing)
+        changed.pop("ad_alert_subscribers")
+        write_private(settings_path(settings), changed)
+        missing = lanes.queue_test(db, settings, "hourly", [value], now=HOUR, preview_id="job-3", stores={},
+                                   to_group=True, to_lead=True, mention=False)
+        assert missing == {"status": "NO_RECIPIENT", "missing": ["lead"]}  # nothing is queued half-way
+        assert not [row for row in rows(db) if "job-3" in row.idempotency_key]
 
 
 def test_a_file_from_the_previous_release_loads_with_new_defaults(settings):

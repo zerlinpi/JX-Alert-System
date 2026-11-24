@@ -206,8 +206,9 @@ class FeishuAppClient:
         return self._send_message_payload(payload, receive_id_type, before_submit=before_submit)
 
     def send_card(self, card: dict, *, receive_id: str, receive_id_type: str = "chat_id",
-                  open_ids: list[str] | None = None, idempotency_key: str, before_submit=None) -> dict:
-        """Deliver a native table card with only explicitly mapped mentions."""
+                  open_ids: list[str] | None = None, mention_labels: dict | None = None,
+                  idempotency_key: str, before_submit=None) -> dict:
+        """Deliver a native table card with only explicitly mapped mentions (labelled with their stores)."""
         from jx_alert.notifications.cards import with_mentions
         if receive_id_type not in {"chat_id", "open_id"}:
             raise ValueError("Feishu message receive_id_type is invalid")
@@ -218,7 +219,7 @@ class FeishuAppClient:
             raise ValueError("Feishu message idempotency_key is required")
         payload = {
             "receive_id": receive_id, "msg_type": "interactive",
-            "content": json.dumps(with_mentions(card, open_ids or []), ensure_ascii=False),
+            "content": json.dumps(with_mentions(card, open_ids or [], mention_labels), ensure_ascii=False),
             "uuid": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:40],
         }
         return self._send_message_payload(payload, receive_id_type, before_submit=before_submit)

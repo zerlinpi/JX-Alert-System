@@ -9,8 +9,12 @@
   --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Noto Sans CJK SC", sans-serif;
 }
 * { box-sizing: border-box; }
-html, body { height: 100%; }
-body { margin: 0; color: var(--ink); background: var(--bg); font: 14px/1.55 var(--sans); -webkit-font-smoothing: antialiased; }
+/* The document is the only page scroller: the body grows with its content (a fixed-height body made
+   sticky elements stop after one screen), the scrollbar gutter never jumps, and an open dialog locks it. */
+html { scrollbar-gutter: stable; }
+html.scroll-locked { overflow: hidden; }
+body { margin: 0; min-height: 100vh; min-height: 100dvh; color: var(--ink); background: var(--bg); font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased; }
 h1, h2, h3, p, dl, dd, fieldset, ol, ul { margin: 0; }
 h1 { font-size: 22px; font-weight: 700; letter-spacing: -.01em; }
 h2 { font-size: 16px; font-weight: 650; }
@@ -25,9 +29,9 @@ button { cursor: pointer; }
 .hint { font-size: 12px; color: var(--muted); }
 
 /* ---------------------------------------------------------------- layout */
-body.app { display: grid; grid-template-columns: 236px minmax(0, 1fr); }
-.sidebar { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 18px; padding: 18px 14px;
-  background: var(--side); color: var(--side-text); overflow-y: auto; }
+body.app { display: grid; grid-template-columns: 236px minmax(0, 1fr); align-items: start; }
+.sidebar { position: sticky; top: 0; height: 100vh; height: 100dvh; display: flex; flex-direction: column; gap: 18px; padding: 18px 14px;
+  background: var(--side); color: var(--side-text); overflow-y: auto; overscroll-behavior: contain; }
 .brand { display: flex; align-items: center; gap: 10px; color: #fff; text-decoration: none; padding: 4px 6px; }
 .brand-mark { display: grid; place-items: center; flex: none; width: 34px; height: 34px; border-radius: 9px; background: #a8e6c4;
   color: #10332a; font-weight: 800; letter-spacing: .02em; }
@@ -44,8 +48,7 @@ body.app { display: grid; grid-template-columns: 236px minmax(0, 1fr); }
 
 .main { min-width: 0; display: flex; flex-direction: column; }
 .topbar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 12px 20px;
-  flex-wrap: wrap; padding: 18px clamp(16px, 3vw, 36px); background: rgba(244, 246, 245, .92); backdrop-filter: blur(6px);
-  border-bottom: 1px solid var(--line); }
+  flex-wrap: wrap; padding: 16px clamp(16px, 3vw, 36px); background: var(--bg); border-bottom: 1px solid var(--line); }
 .topbar-title { min-width: 0; max-width: 860px; }
 .topbar-title p { margin-top: 2px; font-size: 13px; }
 .topbar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -189,6 +192,11 @@ pre { white-space: pre-wrap; font-size: 12px; background: var(--soft); padding: 
 .pair { display: flex; align-items: center; gap: 8px; }
 .pair input { width: 84px; }
 .lane.off .panel-body, .lane.off .panel-foot { opacity: .6; }
+.lane .panel-foot { align-items: center; flex-wrap: wrap; }
+.preview-state { margin-inline-end: auto; font-size: 12px; color: var(--muted); }
+.preview-state.running { color: var(--info); }
+.preview-state.failed { color: var(--danger); }
+.site-filter select { width: auto; min-width: 128px; }
 .savebar { position: sticky; bottom: 16px; z-index: 5; display: flex; align-items: center; justify-content: space-between; gap: 12px;
   flex-wrap: wrap; padding: 12px 16px; border-radius: var(--radius); background: var(--side); color: #fff; box-shadow: var(--shadow-lg); }
 .savebar .muted { color: var(--side-text); margin-inline-start: 10px; }
@@ -196,21 +204,32 @@ pre { white-space: pre-wrap; font-size: 12px; background: var(--soft); padding: 
 .savebar .ghost:hover:not(:disabled) { background: var(--side-2); }
 
 /* ---------------------------------------------------------------- dialogs, drawer, toasts */
-.overlay { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 20px; background: rgba(16, 32, 28, .42); }
-.dialog { width: min(560px, 100%); max-height: min(720px, calc(100vh - 40px)); display: flex; flex-direction: column; background: #fff;
-  border-radius: 14px; box-shadow: var(--shadow-lg); }
-.dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 18px 20px 10px; }
+.overlay { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 20px; background: rgba(16, 32, 28, .42);
+  overscroll-behavior: contain; }
+.dialog { width: min(560px, 100%); max-height: min(720px, calc(100vh - 40px)); max-height: min(720px, calc(100dvh - 40px)); display: flex;
+  flex-direction: column; background: #fff; border-radius: 14px; box-shadow: var(--shadow-lg); }
+.dialog-head { flex: none; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 18px 20px 10px; }
 .dialog-head p { margin-top: 3px; font-size: 13px; }
-.dialog-body { padding: 4px 20px 16px; overflow-y: auto; display: grid; gap: 12px; align-content: start; }
-.dialog-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 12px 20px;
+/* A flex child only scrolls when it may shrink below its content (min-height: 0). */
+.dialog-body { flex: 1 1 auto; min-height: 0; padding: 4px 20px 16px; overflow-y: auto; overscroll-behavior: contain; display: grid;
+  gap: 12px; align-content: start; }
+.dialog-foot { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 12px 20px;
   border-top: 1px solid var(--line); background: var(--soft); border-radius: 0 0 14px 14px; }
 .members { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 14px; padding: 4px 2px; }
 .members .check { padding: 6px 8px; border-radius: 8px; }
 .members .check:hover { background: var(--soft); }
 .drawer-overlay { place-items: stretch end; padding: 0; }
-.drawer { width: min(860px, 100vw); height: 100vh; display: flex; flex-direction: column; background: var(--bg); box-shadow: var(--shadow-lg); }
+.drawer { width: min(880px, 100vw); height: 100vh; height: 100dvh; display: flex; flex-direction: column; background: var(--bg);
+  box-shadow: var(--shadow-lg); }
 .drawer .dialog-head { background: #fff; border-bottom: 1px solid var(--line); padding-bottom: 14px; }
 .drawer .dialog-body { padding: 18px 20px 30px; }
+.drawer-foot { align-items: center; background: #fff; border-radius: 0; box-shadow: 0 -6px 16px rgba(16, 32, 28, .06); }
+.test-send { display: flex; align-items: center; justify-content: flex-end; gap: 8px 16px; flex-wrap: wrap; margin-inline-start: auto; }
+.test-send-title { font-size: 13px; font-weight: 650; color: var(--ink-2); }
+.test-send .hint { flex-basis: 100%; text-align: end; }
+.test-send:disabled .check { opacity: .55; }
+.lane-attention { animation: attention 1.4s ease-out 1; }
+@keyframes attention { 0% { box-shadow: 0 0 0 0 rgba(11, 110, 90, .45); } 100% { box-shadow: 0 0 0 14px rgba(11, 110, 90, 0); } }
 .progress { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-radius: var(--radius-sm); background: #fff; border: 1px solid var(--line); }
 .spinner { width: 18px; height: 18px; border: 3px solid var(--accent-light); border-top-color: var(--accent); border-radius: 50%;
   animation: spin .9s linear infinite; flex: none; }
@@ -244,9 +263,12 @@ pre { white-space: pre-wrap; font-size: 12px; background: var(--soft); padding: 
 
 /* ---------------------------------------------------------------- small screens */
 @media (max-width: 920px) {
-  body.app { grid-template-columns: 1fr; }
-  .sidebar { position: sticky; top: 0; z-index: 20; height: auto; flex-direction: row; align-items: center; gap: 10px; padding: 10px 12px; overflow-x: auto; }
-  .brand small, .nav-group { display: none; }
+  /* A block body lets the navigation stay pinned while the page scrolls (a grid row would end it). */
+  body.app { display: block; }
+  .sidebar { position: sticky; top: 0; z-index: 20; height: auto; flex-direction: row; align-items: center; gap: 10px; padding: 10px 12px;
+    overflow-x: auto; overflow-y: hidden; }
+  .brand small, .nav-group, .brand > span:not(.brand-mark) { display: none; }
+  .brand { flex: none; }
   .nav { display: flex; gap: 4px; }
   .nav button { width: auto; white-space: nowrap; }
   .nav button[aria-current="page"] { box-shadow: inset 0 -3px 0 #8fdcb4; }

@@ -2,7 +2,8 @@
 
 Every lane is on by default (owner decision, Nov 2026): it always reaches the
 report group, also while no store has an operator yet; once operators are
-mapped, the group message @-mentions the operators of the affected stores.
+mapped, the group message @-mentions the operators of the affected stores
+(the stores the daily report flags, the review's anomalies, the hourly alerts).
 The lead (总负责人 for the daily report, 广告负责人 for the review and the
 hourly monitor) also gets a private copy; private operator copies are optional.
 ``prompt`` is the owner's task text for DeepSeek; empty means the built-in
@@ -21,7 +22,7 @@ HOURLY_DEFAULTS = {"high_spend": 30, "low_spend": 10, "min_clicks": 15, "acos_hi
 _EMPTY_REVISION = "0" * 64
 _REVISION = re.compile(r"[0-9a-f]{64}")
 DEFAULTS = {
-    "daily": {"enabled": True, "to_group": True, "to_lead": True, "prompt": ""},
+    "daily": {"enabled": True, "to_group": True, "mention_operators": True, "to_lead": True, "prompt": ""},
     "review": {"enabled": True, "to_group": True, "mention_operators": True, "to_lead": True,
                "to_operators": False, "weekly": False, "prompt": ""},
     "hourly": {"enabled": True, "to_group": True, "mention_operators": True, "to_lead": True,

@@ -1,11 +1,14 @@
 """Queue the lanes into the durable outbox and gate every later send.
 
-daily   08:30 Beijing: DeepSeek queries SparkX and writes the daily report → report group + 总负责人
+daily   08:30 Beijing: DeepSeek queries SparkX and writes the daily report → report group (@ the
+        operators of the stores it flags) + 总负责人
 review  08:30 Beijing: DeepSeek's 7-day campaign anomaly review → report group (@ the affected stores'
         operators once mapped) + 广告负责人; optional private copies per operator
 hourly  every hour inside the owner's window: wasteful/opportunity campaigns today, found by
         DeepSeek and checked against the SparkX rows → report group (@ operators) + 广告负责人;
         each campaign/category once per marketplace day
+test    the owner's test send of a console preview (jx:test:… keys, receipt jx_test): the same
+        cards marked 【测试】; never counts as a lane run or as an hourly alert
 
 All lanes are on by default and still notify the group when no operator is mapped.
 Cards are frozen at queue time; before each POST the worker re-checks the switch,
@@ -28,9 +31,11 @@ from jx_alert.sparkx.client import SparkXError
 BEIJING = ZoneInfo("Asia/Shanghai")
 OPENS, GENERATE_UNTIL, SEND_UNTIL = time(8, 30), time(10, 0), time(12, 0)
 HOURLY_TTL = timedelta(minutes=50)
+TEST_TTL = timedelta(minutes=30)
 PREFIX = "jx:"
 LANES = ("daily", "review", "hourly")
 JOBS = {lane: f"jx_{lane}" for lane in LANES}
+TEST_JOB = "jx_test"
 _TERMINAL_OK = {"SUCCEEDED"}
 
 
@@ -47,10 +52,24 @@ def _key(lane, slot, delivery, part=0):
     return f"{PREFIX}{lane}:{slot}:{digest}" + (f":{part}" if part else "")
 
 
+def is_test(key, payload):
+    return payload.get("jx_test") is True and isinstance(key, str) and key.startswith(
+        f"{PREFIX}test:{payload.get('jx_lane')}:")
+
+
 def delivery_window(key, payload, now):
     """READY / WAITING (with due UTC) / EXPIRED, from the frozen payload only."""
     instant = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
     lane = payload.get("jx_lane")
+    if payload.get("jx_test") is True:
+        # A console test send goes out right away, or not at all after 30 minutes.
+        try:
+            created = datetime.fromisoformat(payload["jx_created_at"])
+            if created.tzinfo is None or lane not in LANES or not is_test(key, payload):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            return "EXPIRED", None
+        return ("READY", None) if timedelta() <= instant - created <= TEST_TTL else ("EXPIRED", None)
     if lane == "hourly":
         try:
             created = datetime.fromisoformat(payload["jx_created_at"])
@@ -77,6 +96,11 @@ def delivery_window(key, payload, now):
 def delivery_blocked(settings, key, payload, now):
     """A reason to keep the record unsent, or None when this exact send is still wanted."""
     lane = payload.get("jx_lane")
+    if payload.get("jx_test") is True:
+        # The owner chose this recipient for this test; the lane's switches do not apply.
+        if delivery_window(key, payload, now)[0] != "READY":
+            return "测试消息已过发送时段，保留记录不补发"
+        return recipients.delivery_current(settings, lane, payload.get("delivery") or {})
     try:
         config = lane_settings.load(settings)["lanes"][lane]
     except (lane_settings.SettingsError, KeyError):
@@ -93,19 +117,33 @@ def delivery_blocked(settings, key, payload, now):
     return recipients.delivery_current(settings, lane, delivery)
 
 
-def send_mentions(settings, payload):
-    """@-mentions for this send: frozen operators that are still mapped, still in the group,
-    and only while the owner keeps 「在群内 @ 对应运营」 on. Private messages mention no one."""
+def mention_plan(settings, payload):
+    """(open_ids, {open_id: their stores}) to @ in this send.
+
+    Only group copies mention anyone: the frozen operators that are still mapped and
+    still in the group, while the owner keeps 「群内 @ 对应运营」 on (a test send
+    mentions only when the owner asked for it). Private messages mention no one.
+    """
     delivery = payload.get("delivery") or {}
     lane = payload.get("jx_lane")
     if delivery.get("role") != recipients.role(lane, "group") or not delivery.get("open_ids"):
-        return []
-    try:
-        if not lane_settings.load(settings)["lanes"][lane].get("mention_operators"):
-            return []
-    except (lane_settings.SettingsError, KeyError):
-        return []
-    return recipients.current_mentions(settings, delivery)
+        return [], {}
+    if payload.get("jx_test") is True:
+        wanted = payload.get("jx_test_mentions") is True
+    else:
+        try:
+            wanted = bool(lane_settings.load(settings)["lanes"][lane].get("mention_operators"))
+        except (lane_settings.SettingsError, KeyError):
+            wanted = False
+    if not wanted:
+        return [], {}
+    entries = recipients.current_mention_stores(settings, delivery)
+    return [uid for uid, _ in entries], recipients.mention_labels(delivery, entries)
+
+
+def send_mentions(settings, payload):
+    """The open_ids of mention_plan."""
+    return mention_plan(settings, payload)[0]
 
 
 def sparkx_ready(settings):
@@ -150,10 +188,10 @@ def _retry_later(jobs, now, *, limit, pause=timedelta(minutes=10)):
                                           and _utc(now) - failures[0].started_at < pause)
 
 
-def _enqueue(db, lane, slot, delivery, card, now, extra, part=0):
+def _enqueue(db, lane, slot, delivery, card, now, extra, part=0, *, scope=None):
     from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
 
-    key = _key(lane, slot, delivery, part)
+    key = _key(scope or lane, slot, delivery, part)
     if db.scalar(select(NotificationOutbox.id).where(NotificationOutbox.idempotency_key == key)) is not None:
         return None  # Never rewrite a frozen card for the same slot and recipient.
     row = enqueue_notification(db, idempotency_key=key, text=card["header"]["title"]["content"],
@@ -163,12 +201,12 @@ def _enqueue(db, lane, slot, delivery, card, now, extra, part=0):
     return row.id
 
 
-def _enqueue_cards(db, lane, slot, delivery, values, now, extra):
+def _enqueue_cards(db, lane, slot, delivery, values, now, extra, *, scope=None):
     ids = []
     for part, value in enumerate(values):
         # Only the first card of a group message carries the @-mentions.
-        target = delivery if part == 0 else {**delivery, "open_ids": [], "mentions": {}}
-        row_id = _enqueue(db, lane, slot, target, value, now, extra, part)
+        target = delivery if part == 0 else {**delivery, "open_ids": [], "mentions": {}, "mention_names": {}}
+        row_id = _enqueue(db, lane, slot, target, value, now, extra, part, scope=scope)
         ids += [row_id] if row_id else []
     return ids
 
@@ -229,14 +267,19 @@ def _morning_plan(settings, routing_data, lane, config):
     return plans
 
 
-def _mention_operators(plans, settings, routing_data, directory, config, lane, pids):
+def _mention_operators(plans, settings, routing_data, directory, config, lane, pids, names):
     """The group copy @-mentions the mapped operators of these stores; nobody else changes."""
     if not config.get("mention_operators"):
         return plans
     mentions = recipients.operator_mentions(settings, routing_data, directory, pids)
     group = recipients.role(lane, "group")
-    return [recipients.with_operator_mentions(plan, mentions) if plan["role"] == group and mentions else plan
+    return [recipients.with_operator_mentions(plan, mentions, names) if plan["role"] == group and mentions else plan
             for plan in plans]
+
+
+def _names(result):
+    roster = result.get("roster") or {}
+    return directory_module.display_names(roster) if roster else {}
 
 
 def _gate(settings, config, now):
@@ -290,15 +333,14 @@ def queue_morning_lane(db, settings, lane, *, now, runner=None, scoper=None):
     color = "blue" if lane == "daily" else ("orange" if result["stores"] else "green")
     values = cards.report_cards(_title(lane, result), result["content"], footer, color=color)
     extra = {"jx_day": day, "jx_profiles": result["profiles"]}
-    if lane == "review":
-        plans = _mention_operators(plans, settings, routing_data, directory, config, lane, set(result["stores"]))
+    names = _names(result)
+    plans = _mention_operators(plans, settings, routing_data, directory, config, lane, set(result["stores"]), names)
     ids = []
     for delivery in plans:
         ids += _enqueue_cards(db, lane, day, delivery, values, now, extra)
     scoped = 0
     if lane == "review" and config["to_operators"] and result["stores"]:
         leads = {plan["receive_id"] for plan in plans if plan["receive_id_type"] == "open_id"}
-        names = directory_module.display_names(result["roster"]) if result["roster"] else {}
         for delivery in recipients.operator_deliveries(settings, routing_data, directory, lane,
                                                       set(result["stores"]), exclude=leads):
             stores = [names.get(key, key) for key in delivery["profiles"]]
@@ -335,10 +377,8 @@ def in_hours(config, now):
 
 
 def _labels(result, directory):
-    roster = result.get("roster") or {}
-    names = directory_module.display_names(roster) if roster else {}
     operators = {key: directory_module.operator_label(directory, key) for key in result["profiles"]}
-    return names, operators
+    return _names(result), operators
 
 
 def run_hourly(db, settings, *, now, runner=None):
@@ -383,7 +423,7 @@ def run_hourly(db, settings, *, now, runner=None):
         value = cards.hourly_card(findings, day=result["day"], time=result["time"], names=names,
                                   operators=operators, config=config, footer=footer)
         affected = {item["pid"] for item in findings}
-        plans = _mention_operators(plans, settings, routing_data, directory, config, "hourly", affected)
+        plans = _mention_operators(plans, settings, routing_data, directory, config, "hourly", affected, names)
         for delivery in plans:
             if value is not None and (row_id := _enqueue(db, "hourly", slot, delivery, value, now, {
                     **extra, "jx_profiles": sorted(affected, key=int)})):
@@ -412,8 +452,24 @@ def run_hourly(db, settings, *, now, runner=None):
 
 # ---------------------------------------------------------------- console preview
 
+def _audience(settings, directory, pids, names):
+    """The stores a preview is about and the operators its group copy would @ right now."""
+    stores = {key: names.get(key, key) for key in sorted(pids, key=int)}
+    try:
+        mentions = recipients.operator_mentions(settings, recipients.routing(settings), directory, pids)
+    except (OSError, RuntimeError, ValueError):
+        mentions = {}
+    people = {row["open_id"]: row["name"] for key in pids for row in directory_module.operators(directory, key)}
+    return {"stores": stores, "operators": [{"name": people.get(uid, "运营"), "stores": [stores[key] for key in keys]}
+                                            for uid, keys in mentions.items()]}
+
+
 def preview(settings, lane, *, now, db, runner=None, config=None):
-    """Live and read-only: what the lane would freeze now for the group (nothing is queued)."""
+    """Live and read-only: what the lane would freeze now for the group (nothing is queued).
+
+    ``info["audience"]`` names the stores the cards are about and the operators a group
+    copy would @, which is what a console test send of these cards uses.
+    """
     if lane not in LANES:
         raise ValueError("Unknown lane")
     config = config or lane_settings.load(settings)["lanes"][lane]
@@ -423,13 +479,67 @@ def preview(settings, lane, *, now, db, runner=None, config=None):
         alerted = frozenset(alerted_today(db, tasks.marketplace_now(now).date().isoformat()))
     result = _run(settings, lane, config, now=now, directory=directory, db=db, runner=runner, alerted=alerted)
     info = {"profiles": len(result["profiles"]), **_summary(result)}
+    names = _names(result)
     if lane == "hourly":
-        names, operators = _labels(result, directory)
+        _, operators = _labels(result, directory)
         value = cards.hourly_card(result["findings"], day=result["day"], time=result["time"], names=names,
                                   operators=operators, config=config, footer=_footer(result))
+        affected = {item["pid"] for item in result["findings"]}
         return ([value] if value else []), {**info, "day": result["day"], "findings": len(result["findings"]),
-                                            "dropped": result.get("dropped", 0), "note": result.get("note")}
+                                            "dropped": result.get("dropped", 0), "note": result.get("note"),
+                                            "audience": _audience(settings, directory, affected, names)}
     color = "blue" if lane == "daily" else ("orange" if result["stores"] else "green")
     values = cards.report_cards(_title(lane, result), result["content"], _footer(result), color=color)
     return values, {**info, "report_date": result["report_date"], "window": result["window"],
-                    "stores": len(result["stores"])}
+                    "stores": len(result["stores"]),
+                    "audience": _audience(settings, directory, set(result["stores"]), names)}
+
+
+# ---------------------------------------------------------------- console test sends
+
+def queue_test(db, settings, lane, values, *, now, preview_id, stores, to_group, to_lead, mention):
+    """Queue the owner's test send of a finished preview: the same cards, marked 【测试】.
+
+    ``stores`` ({profile id: name}) are the stores the preview is about; with ``mention``
+    the group copy @-mentions their current operators. Test sends use their own keys and
+    receipt type: they never count as the lane's run, never mark hourly alerts as sent
+    and are not tied to the lane's schedule or switches. Each recipient is re-checked
+    before sending, and nothing goes out 30 minutes after queueing.
+    """
+    if lane not in LANES or not values or not (to_group or to_lead):
+        raise ValueError("Nothing to send")
+    try:
+        routing_data = recipients.routing(settings)
+    except (OSError, RuntimeError, ValueError):
+        return {"status": "ROUTING_UNAVAILABLE"}
+    group = recipients.group_delivery(settings, routing_data, lane) if to_group else None
+    lead = recipients.lead_delivery(settings, routing_data, lane) if to_lead else None
+    missing = [name for name, wanted, found in (("group", to_group, group), ("lead", to_lead, lead))
+               if wanted and found is None]
+    if missing:
+        return {"status": "NO_RECIPIENT", "missing": missing}
+    directory = directory_module.load(settings)
+    mentions = {}
+    if group is not None and mention and stores:
+        mentions = recipients.operator_mentions(settings, routing_data, directory, set(stores))
+        if mentions:
+            group = recipients.with_operator_mentions(group, mentions, stores)
+    local = now.astimezone(BEIJING)
+    marked = cards.mark_as_test(values, f"**测试消息**：由管理台手动发送（北京 {local:%m-%d %H:%M}），内容与预览相同；"
+                                        "不计入定时发送，也不影响当天的提醒去重。")  # template text: only the time varies
+    extra = {"jx_test": True, "jx_test_mentions": bool(mentions), "jx_profiles": sorted(stores, key=int)}
+    ids = []
+    for delivery in (group, lead):
+        if delivery is not None:
+            ids += _enqueue_cards(db, lane, preview_id, delivery, marked, now, extra, scope=f"test:{lane}")
+    if not ids:
+        return {"status": "ALREADY_QUEUED", "outbox_ids": [], "mentions": 0}
+    from jx_alert.storage.models import SyncJob
+
+    instant = _utc(now)
+    db.add(SyncJob(job_type=TEST_JOB, status="SUCCEEDED", started_at=instant, finished_at=instant, store_count=0,
+                   metadata_json={"lane": lane, "preview": preview_id, "outbox_ids": ids, "cards": len(marked),
+                                  "targets": [name for name, found in (("group", group), ("lead", lead)) if found],
+                                  "mentions": len(mentions)}))
+    db.flush()
+    return {"status": "QUEUED", "outbox_ids": ids, "mentions": len(mentions)}

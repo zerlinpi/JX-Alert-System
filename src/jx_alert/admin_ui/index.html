@@ -79,6 +79,7 @@
               <button type="button" data-filter="unmapped" aria-pressed="false">未指定运营 <span data-count="unmapped"></span></button>
               <button type="button" data-filter="paused" aria-pressed="false">未纳入通知 <span data-count="paused"></span></button>
             </div>
+            <label class="site-filter"><span class="sr-only">按站点筛选</span><select id="store-site"></select></label>
             <span id="roster-time" class="muted toolbar-end"></span>
           </div>
           <div class="bulkbar" id="bulk-bar" hidden>
@@ -138,14 +139,17 @@
             <div class="panel-body lane-grid">
               <fieldset class="field-group"><legend>发送给</legend>
                 <label class="check"><input type="checkbox" name="to_group">通知群</label>
+                <label class="check"><input type="checkbox" name="mention_operators">群内 @ 日报点名店铺的运营</label>
                 <label class="check"><input type="checkbox" name="to_lead">总负责人（私聊）</label></fieldset>
               <div class="prompt-field"><div class="prompt-head"><label for="prompt-daily">DeepSeek 任务说明</label>
                 <span class="muted prompt-state" data-prompt-state="daily"></span>
                 <button type="button" class="button ghost small" data-reset-prompt="daily">恢复默认</button></div>
                 <textarea id="prompt-daily" name="prompt" rows="8" maxlength="4000" spellcheck="false"></textarea>
-                <p class="hint">统计日期、店铺范围和输出格式由系统自动附加；这里写希望 DeepSeek 关注和呈现的内容。</p></div>
+                <p class="hint">统计日期、店铺范围、输出格式（「运营」列放最后）和 @ 运营所需的信息由系统自动附加；这里写希望 DeepSeek 关注和呈现的内容。</p></div>
             </div>
-            <div class="panel-foot"><button type="button" class="button secondary" data-preview="daily">预览</button></div>
+            <div class="panel-foot"><span class="preview-state" data-preview-state="daily"></span>
+              <button type="button" class="button secondary" data-preview="daily">预览</button>
+              <button type="button" class="button secondary" data-test="daily">测试发送</button></div>
           </section>
 
           <section class="panel lane" data-lane="review" aria-labelledby="lane-review-title">
@@ -164,9 +168,11 @@
                 <span class="muted prompt-state" data-prompt-state="review"></span>
                 <button type="button" class="button ghost small" data-reset-prompt="review">恢复默认</button></div>
                 <textarea id="prompt-review" name="prompt" rows="10" maxlength="4000" spellcheck="false"></textarea>
-                <p class="hint">时间窗口、店铺范围和 @ 运营所需的信息由系统自动附加。</p></div>
+                <p class="hint">时间窗口、店铺范围、输出格式（「运营」列放最后）和 @ 运营所需的信息由系统自动附加。</p></div>
             </div>
-            <div class="panel-foot"><button type="button" class="button secondary" data-preview="review">预览</button></div>
+            <div class="panel-foot"><span class="preview-state" data-preview-state="review"></span>
+              <button type="button" class="button secondary" data-preview="review">预览</button>
+              <button type="button" class="button secondary" data-test="review">测试发送</button></div>
           </section>
 
           <section class="panel lane" data-lane="hourly" aria-labelledby="lane-hourly-title">
@@ -197,7 +203,9 @@
                           placeholder="例如：建议写得更具体，优先提醒花费最高的活动。"></textarea>
                 <p class="hint">提醒规则由上面的阈值决定；DeepSeek 只返回符合规则、能在 SparkX 结果中找到的活动。</p></div>
             </div>
-            <div class="panel-foot"><button type="button" class="button secondary" data-preview="hourly">预览</button></div>
+            <div class="panel-foot"><span class="preview-state" data-preview-state="hourly"></span>
+              <button type="button" class="button secondary" data-preview="hourly">预览</button>
+              <button type="button" class="button secondary" data-test="hourly">测试发送</button></div>
           </section>
 
           <div class="savebar" id="lanes-savebar" hidden>
@@ -276,7 +284,8 @@
                     <input id="deepseek-timeout" type="number" min="1" max="300" step="1"></label></div>
                 <label class="switch"><input type="checkbox" id="deepseek-thinking" role="switch"><span class="switch-track" aria-hidden="true"></span>
                   <span class="switch-text">深度思考（更准确，稍慢）</span></label>
-                <p class="hint">定时通知在后台运行，每次请求至少等待 180 秒；问答至少等待 90 秒。</p>
+                <p class="hint">deepseek-flash 速度快、费用低（推荐）；deepseek-v4-pro 推理更强，单价约为 flash 的 3–7 倍。
+                  定时通知在后台运行，每次请求至少等待 180 秒；问答至少等待 90 秒。</p>
                 <div class="actions-end"><button type="button" class="button secondary" id="deepseek-test">测试连接</button>
                   <button type="submit" class="button primary">保存</button></div>
               </form>
@@ -330,10 +339,23 @@
       <div class="dialog-body">
         <div class="progress" id="preview-progress" hidden><span class="spinner" aria-hidden="true"></span>
           <span id="preview-progress-text">DeepSeek 正在调用 SparkX 查询并撰写…</span></div>
+        <div id="preview-notice" class="notice" role="status" hidden></div>
         <div id="preview-error" class="notice error" role="alert" hidden></div>
         <div id="preview-cards" class="preview-cards"></div>
         <details id="preview-plain" hidden><summary>纯文本</summary><pre id="preview-text"></pre></details>
       </div>
+      <footer class="dialog-foot drawer-foot" id="preview-foot">
+        <button type="button" class="button ghost" id="preview-regenerate" disabled>重新生成</button>
+        <fieldset class="test-send" id="test-send" disabled>
+          <legend class="sr-only">发送测试</legend>
+          <span class="test-send-title" aria-hidden="true">发送测试到</span>
+          <label class="check"><input type="checkbox" id="test-to-group" checked><span>通知群</span></label>
+          <label class="check"><input type="checkbox" id="test-to-lead"><span id="test-lead-label">负责人</span></label>
+          <label class="check"><input type="checkbox" id="test-mention"><span id="test-mention-label">@ 对应运营</span></label>
+          <button type="button" class="button primary" id="test-send-button">发送测试</button>
+          <p class="hint" id="test-send-hint">发送的就是上面这份预览（标题带【测试】），不会再调用 DeepSeek，也不计入定时发送。</p>
+        </fieldset>
+      </footer>
     </aside>
   </div>
 

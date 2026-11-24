@@ -51,13 +51,24 @@ def operator_mentions(settings, routing_data, directory, pids):
     return found
 
 
-def with_operator_mentions(delivery, mentions):
-    """A group delivery that @-mentions exactly these operators (checked again before sending)."""
-    return {**delivery, "open_ids": list(mentions), "mentions": {uid: list(keys) for uid, keys in mentions.items()}}
+def with_operator_mentions(delivery, mentions, names=None):
+    """A group delivery that @-mentions exactly these operators (checked again before sending).
+
+    ``names`` ({profile id: store name}) is frozen too, so the mention line can say
+    which of their stores each operator is mentioned for.
+    """
+    names = names or {}
+    keys = {key for values in mentions.values() for key in values}
+    return {**delivery, "open_ids": list(mentions), "mentions": {uid: list(values) for uid, values in mentions.items()},
+            "mention_names": {key: str(names[key])[:40] for key in sorted(keys, key=int) if names.get(key)}}
 
 
-def current_mentions(settings, delivery):
-    """The frozen @-mentions that are still valid now; a changed operator is simply not mentioned."""
+def current_mention_stores(settings, delivery):
+    """[(open_id, [profile ids])] of the frozen @-mentions that are still valid now.
+
+    An operator is kept for the stores that are still monitored and still theirs; a
+    changed operator is simply not mentioned.
+    """
     wanted, frozen = delivery.get("open_ids") or [], delivery.get("mentions") or {}
     if not wanted or not isinstance(frozen, dict):
         return []
@@ -69,13 +80,30 @@ def current_mentions(settings, delivery):
     roster = verified_members(routing_data, settings)
     keep = []
     for uid in dict.fromkeys(wanted):
+        if not isinstance(uid, str) or not OPEN_ID.fullmatch(uid) or (roster is not None and uid not in roster):
+            continue
         keys = frozen.get(uid) if isinstance(frozen.get(uid), list) else []
-        if (isinstance(uid, str) and OPEN_ID.fullmatch(uid) and (roster is None or uid in roster)
-                and any(directory_module.monitored(directory, key)
-                        and uid in {row["open_id"] for row in directory_module.operators(directory, key)}
-                        for key in keys)):
-            keep.append(uid)
+        valid = [key for key in keys if isinstance(key, str) and directory_module.monitored(directory, key)
+                 and uid in {row["open_id"] for row in directory_module.operators(directory, key)}]
+        if valid:
+            keep.append((uid, valid))
     return keep
+
+
+def current_mentions(settings, delivery):
+    """The frozen @-mentions that are still valid now."""
+    return [uid for uid, _ in current_mention_stores(settings, delivery)]
+
+
+def mention_labels(delivery, entries, *, limit=4):
+    """{open_id: "店铺A、店铺B"} for the mention line, from the store names frozen with the message."""
+    names = delivery.get("mention_names") if isinstance(delivery.get("mention_names"), dict) else {}
+    labels = {}
+    for uid, keys in entries:
+        shown = [names[key] for key in keys if isinstance(names.get(key), str) and names[key]]
+        if shown:
+            labels[uid] = "、".join(shown[:limit]) + (f" 等 {len(shown)} 家" if len(shown) > limit else "")
+    return labels
 
 
 def _app_identity(settings):

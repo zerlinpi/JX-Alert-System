@@ -33,7 +33,7 @@ DEFAULT_PROMPTS = {
 1. 第一段一句话概述：统计日、对比日、监控店铺数、有数据的店铺数、当日有花费的店铺数、金额单位。
 2. **全公司核心指标**：表格「指标 | 当日 | 前一日 | 环比」，依次为店铺总销售额、总订单量、广告花费、广告销售额、广告订单、ACOS、TACOS、CVR、PPC（CPC）、ROAS。店铺总销售额、总订单量和 TACOS 用 factEntity=asin 的 TotalSalesAmount、OrderCount；比率类的环比写百分点。
 3. **站点汇总**：表格「站点 | 币种 | 店铺数 | 有数据 | 花费 | 销售额 | 销量 | 订单 | ACOS | ROAS | 花费环比 | 销售额环比」。
-4. **有花费店铺明细**：表格「店铺 | 运营 | 花费 | 销售额 | 销量 | 订单 | ACOS | TACOS | 花费日环比」，按花费从高到低；当日无花费、SparkX 没有记录的店铺在表格下方各用一行列出名单。
+4. **有花费店铺明细**：表格「店铺 | 花费 | 销售额 | 销量 | 订单 | ACOS | TACOS | 花费日环比 | 运营」，按花费从高到低；当日无花费、SparkX 没有记录的店铺在表格下方各用一行列出名单。
 5. **须知**：2–4 条编号短评，像资深投手在群里提醒老板——先下结论，再给证据：花费是否集中、ACOS 明显偏高的店铺、有花费没出单的店铺、某个站点没有返回数据（可能是 Token 授权范围）。
 金额保留到整数或两位小数，百分比保留一位小数；最后用一句话说明近 7–14 天的销售和订单仍会回补。""",
     "review": """判定口径（金额 USD，campaign 级）：
@@ -46,8 +46,8 @@ DEFAULT_PROMPTS = {
 结构：
 开头一句加粗：「N 个店铺中，M 个有投放数据，K 个检出 X 个异常 campaign。」，再一句统计范围和整体花费、销售、ACOS 的变化。
 **一、最严重**：最需要马上处理的问题，说明为什么严重。
-**二、异常店铺总览**：表格「店铺 | 运营 | 近7日花费 | ACOS 近7日 | 前7日 | 异常数 | 主要问题」。
-**三、按问题类型看具体 campaign**：每类一张表，列出店铺、运营、Campaign、关键数据和建议 CPC（例如 2.45 → 1.80）；⑤ 机会单独列出。
+**二、异常店铺总览**：表格「店铺 | 近7日花费 | ACOS 近7日 | 前7日 | 异常数 | 主要问题 | 运营」。
+**三、按问题类型看具体 campaign**：每类一张表，列出店铺、Campaign、关键数据和建议 CPC（例如 2.45 → 1.80），最后一列是运营；⑤ 机会单独列出。
 **四、建议动作**：3–5 条，每条针对一个店铺，先说动作再说理由，带具体的出价或预算建议。
 口吻直接，像资深投手在群里复盘。""",
     "hourly": "",
@@ -77,8 +77,16 @@ def _scope(monitored):
 
 
 _OUTPUT = ("输出要求：直接输出发到飞书群的正文（Markdown），不要开场白和结束语，不要代码块、链接或 @ 任何人；"
-           "表格用标准 Markdown 表格；店铺写目录里的简称，运营写目录里的运营（未指定写「未映射运营」）；"
-           "缺失的数据写「—」，不要当成 0。")
+           "表格用标准 Markdown 表格；店铺写目录里的简称；有「运营」列的表格把「运营」放在最后一列，"
+           "写目录里的运营（未指定写「未映射运营」）；缺失的数据写「—」，不要当成 0。")
+# Which stores the hidden last line names, so the system can @ their operators.
+_FLAGGED = {"daily": "「须知」里点名需要运营处理的店铺（例如 ACOS 明显偏高、有花费没出单）",
+            "review": "检出异常（含全店零曝光）的店铺"}
+
+
+def _stores_line(lane):
+    return (f"最后单独一行写「JX_STORES: 」，后面跟{_FLAGGED[lane]}的 profileId，用英文逗号分隔；"
+            "没有写「JX_STORES: 无」。这一行只给系统用来 @ 对应运营，不会展示。")
 
 
 def task_message(lane, config, *, now, monitored, alerted=()):
@@ -87,15 +95,14 @@ def task_message(lane, config, *, now, monitored, alerted=()):
     if lane == "daily":
         return ("【定时任务 · 08:30 广告日报】\n"
                 f"统计日：{dates['report_date']}（美西已结束的完整日）；对比日：{dates['previous_date']}。\n"
-                + _scope(monitored) + "\n" + _OUTPUT + "\n\n任务要求：\n" + prompt_text(lane, config))
+                + _scope(monitored) + "\n" + _OUTPUT + "\n" + _stores_line(lane) + "\n\n任务要求：\n"
+                + prompt_text(lane, config))
     if lane == "review":
         w0, w1 = dates["window"]
         p0, p1 = dates["previous_window"]
         return ("【定时任务 · 08:30 广告异常复盘】\n"
                 f"近 7 日：{w0} ~ {w1}；前 7 日：{p0} ~ {p1}（美西日期）。\n"
-                + _scope(monitored) + "\n" + _OUTPUT + "\n"
-                "最后单独一行写「JX_STORES: 」，后面跟检出异常（含全店零曝光）的店铺 profileId，用英文逗号分隔；"
-                "没有异常写「JX_STORES: 无」。这一行只给系统用来 @ 对应运营，不会展示。\n\n任务要求：\n"
+                + _scope(monitored) + "\n" + _OUTPUT + "\n" + _stores_line(lane) + "\n\n任务要求：\n"
                 + prompt_text(lane, config))
     local = marketplace_now(now)
     rules = (f"- high_spend_no_conversion 高花费无转化：花费 ≥ ${config['high_spend']:g} 且订单 = 0\n"
@@ -273,8 +280,8 @@ def run_lane(settings, lane, config, *, now, directory, alerted=frozenset(), on_
     text, stores = split_stores(summary["content"], monitored)
     if not text:
         raise ValueError("empty report")
-    if lane == "review" and stores is None:
-        stores = affected_stores(client, text, context["roster"], monitored)
+    if stores is None:
+        stores = affected_stores(client, text, context["roster"], monitored, lane=lane)
     dates = report_dates(now)
     result.update(content=text, stores=stores or [], report_date=dates["report_date"].isoformat(),
                   window=[value.isoformat() for value in dates["window"]])
@@ -290,15 +297,20 @@ def _repair_json(client, content):
     return value
 
 
-def affected_stores(client, text, roster, monitored):
-    """Profile IDs the review names as having problems, when the agent omitted the JX_STORES line."""
+_AFFECTED = {
+    "daily": "根据广告日报正文，找出「须知」里点名需要运营处理的店铺（例如 ACOS 明显偏高、有花费没出单）",
+    "review": "根据广告异常复盘正文，找出被判定为有异常（含全店零曝光）的店铺；机会类（低花费高转化）不算异常",
+}
+
+
+def affected_stores(client, text, roster, monitored, *, lane="review"):
+    """Profile IDs the report names as needing an operator, when the agent omitted the JX_STORES line."""
     names = directory_module.display_names(roster)
     stores = [{"profile_id": key, "name": roster[key]["name"], "short_name": names[key]}
               for key in sorted(monitored, key=int)]
     try:
         value = client.complete_json(
-            "根据广告异常复盘正文，找出被判定为有异常（含全店零曝光）的店铺，输出 json：{\"profile_ids\":[\"…\"]}。"
-            "只能使用给出的店铺列表中的 profile_id；机会类（低花费高转化）不算异常。",
+            _AFFECTED[lane] + "，输出 json：{\"profile_ids\":[\"…\"]}。只能使用给出的店铺列表中的 profile_id。",
             json.dumps({"stores": stores, "report": text[:60_000]}, ensure_ascii=False), max_tokens=2000)
     except DeepSeekError:
         return []
