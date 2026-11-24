@@ -13,7 +13,7 @@ import re
 from sqlalchemy import or_, select, update
 
 from jx_alert.config import get_settings
-from jx_alert.notifications.feishu_app import FeishuTokenRefused
+from jx_alert.notifications.feishu_app import FeishuRejected, FeishuTokenRefused
 from jx_alert.notifications.outbox import (
     CLAIMABLE, DELIVERY_UNKNOWN, PRE_SEND_RETRY, QUESTION_REPLY_PREFIX, NotificationOutbox,
 )
@@ -27,6 +27,13 @@ LEGACY_REASON = "旧版本的通知类型已停用，保留记录不发送"
 UNKNOWN_REASON = "可能已提交飞书，未确认送达；禁止自动重发，请人工核对原会话"
 LEGACY_ATTEMPT_REASON = "旧版尝试没有可核验的提交阶段；禁止自动重发，请人工核对原会话"
 REPLY_ROLES = frozenset({"group_question", "private_question"})
+# Feishu's documented refusals of a message (im/v1/messages, 错误码): the reason shown to the owner.
+REJECTIONS = {
+    230002: "机器人不在该群", 230013: "接收人不在飞书应用的可用范围内（或已离职），请在开发者后台把此人加入应用可用范围",
+    230018: "群设置不允许机器人发言", 230020: "触发飞书频率限制", 230025: "消息内容超出飞书长度限制",
+    230029: "接收人已离职", 230035: "没有发送权限（群禁言或机器人被屏蔽）", 230053: "接收人已设置不接收机器人消息",
+    232009: "群已解散",
+}
 
 
 class _LostClaim(RuntimeError):
@@ -251,7 +258,8 @@ def process_outbox_batch(batch_size=5, max_attempts=8, outbox_ids=None, *, quest
             if isinstance(exc, _Unfenced):
                 status = DELIVERY_UNKNOWN
             elif intent is not None:
-                status = "REJECTED" if isinstance(exc, FeishuTokenRefused) else DELIVERY_UNKNOWN
+                # Feishu's own error answer proves nothing was created; anything else may have been.
+                status = "REJECTED" if isinstance(exc, (FeishuTokenRefused, FeishuRejected)) else DELIVERY_UNKNOWN
             else:
                 status = "DEAD" if job["attempts"] >= max_attempts else PRE_SEND_RETRY
             error = f"Feishu delivery failed: {type(exc).__name__}"
@@ -260,6 +268,9 @@ def process_outbox_batch(batch_size=5, max_attempts=8, outbox_ids=None, *, quest
                 error += f" code={code[1]}"
             if status == DELIVERY_UNKNOWN:
                 error = f"{UNKNOWN_REASON} ({error})"
+            elif status == "REJECTED" and isinstance(exc, FeishuRejected):
+                error = (f"飞书拒绝，未送达（code={exc.code}"
+                         + (f"：{REJECTIONS[exc.code]}）" if exc.code in REJECTIONS else "）"))
             delivered_at = None
             logger.warning("Feishu outbox id=%s status=%s (%s)", job["id"], status, type(exc).__name__)
         with session_factory() as db:

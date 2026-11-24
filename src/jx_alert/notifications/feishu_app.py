@@ -28,6 +28,17 @@ class FeishuTokenRefused(FeishuAppError):
     """A valid authentication rejection for this POST, not a receipt."""
 
 
+class FeishuRejected(FeishuAppError):
+    """Feishu answered this request with an error code (HTTP 2xx or 4xx): nothing was created.
+
+    https://open.feishu.cn/document/server-docs/im-v1/message/create (错误码)
+    """
+
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
 class FeishuAppClient:
     """Send as one app identity; cache its tenant token only in server memory."""
 
@@ -130,9 +141,11 @@ class FeishuAppClient:
             message_path = path == self._MESSAGE_PATH or re.fullmatch(
                 re.escape(self._MESSAGE_PATH) + r"/om_[A-Za-z0-9_-]+/reply", path)
             if not (message_path and response.status_code in (400, 401) and code == self._EXPIRED_TOKEN_CODE):
-                raise FeishuAppError(
-                    f"Feishu app HTTP request rejected: HTTP {response.status_code}, code={code}"
-                )
+                message = f"Feishu app HTTP request rejected: HTTP {response.status_code}, code={code}"
+                # A 4xx answer with an error code is a definite refusal; a 5xx answer may not be.
+                if 400 <= response.status_code < 500 and code != 0:
+                    raise FeishuRejected(message, code)
+                raise FeishuAppError(message)
         return data
 
     def _get_token(self, *, rejected_token: str | None = None) -> str:
@@ -271,7 +284,7 @@ class FeishuAppClient:
                 token = self._get_token(rejected_token=token)
                 continue
             if data["code"] != 0:
-                raise FeishuAppError(f"Feishu app message rejected: code={data['code']}")
+                raise FeishuRejected(f"Feishu app message rejected: code={data['code']}", data["code"])
             result = data.get("data")
             message_id = result.get("message_id") if isinstance(result, dict) else None
             if not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]{1,197}", message_id):

@@ -147,6 +147,19 @@ def test_failure_after_the_fence_is_never_resent(settings, session_factory, at_s
     assert run(settings, session_factory, client)["claimed"] == 0 and client.sent == []
 
 
+def test_a_definite_feishu_refusal_is_recorded_with_its_reason_and_never_resent(settings, session_factory, at_send):
+    from jx_alert.notifications.feishu_app import FeishuRejected
+
+    row_id = queue_daily(settings, session_factory)
+    refusal = FeishuRejected("Feishu app HTTP request rejected: HTTP 400, code=230013", 230013)
+    result = run(settings, session_factory, FakeClient(fail_after_fence=refusal))
+    refused = row(session_factory, row_id)
+    assert refused.status == "REJECTED" and result["failed"] == 2 and result["unknown"] == 0
+    assert "飞书拒绝，未送达（code=230013" in refused.last_error and "可用范围" in refused.last_error
+    client = FakeClient()
+    assert run(settings, session_factory, client)["claimed"] == 0 and client.sent == []
+
+
 def test_failure_before_any_post_is_retried_with_backoff(settings, session_factory, at_send):
     row_id = queue_daily(settings, session_factory)
 

@@ -4,7 +4,7 @@ import httpx
 import pytest
 from types import SimpleNamespace
 
-from jx_alert.notifications.feishu_app import FeishuAppClient, FeishuAppError
+from jx_alert.notifications.feishu_app import FeishuAppClient, FeishuAppError, FeishuRejected
 
 
 def mock_http(monkeypatch, handler):
@@ -178,6 +178,21 @@ def test_rejected_and_malformed_message_responses_are_sanitized(monkeypatch, res
         send(FeishuAppClient("cli_test", "secret"))
     assert "secret" not in str(error.value)
     assert "t-test-token" not in str(error.value)
+
+
+@pytest.mark.parametrize("response,code", [
+    (httpx.Response(200, json={"code": 230013, "msg": "Bot has NO availability to this user."}), 230013),
+    (httpx.Response(400, json={"code": 230013, "msg": "Bot has NO availability to this user."}), 230013),
+    (httpx.Response(403, json={"code": 230027, "msg": "Lack of necessary permissions."}), 230027),
+    (httpx.Response(500, json={"code": 1500, "msg": "internal error"}), None),  # may have been processed
+    (httpx.Response(502, text="bad gateway"), None),
+])
+def test_only_feishus_own_error_answers_count_as_a_definite_refusal(monkeypatch, response, code):
+    mock_http(monkeypatch, lambda request: token_response() if request.url.path.endswith("/internal") else response)
+    with pytest.raises(FeishuAppError) as error:
+        send(FeishuAppClient("cli_test", "secret"))
+    assert isinstance(error.value, FeishuRejected) is (code is not None)
+    assert getattr(error.value, "code", None) == code
 
 
 @pytest.mark.parametrize("response", [
