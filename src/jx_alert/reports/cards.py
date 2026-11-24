@@ -145,6 +145,7 @@ HOURLY_ORDER = ("high_spend_no_conversion", "high_spend_low_conversion", "low_sp
                 "low_spend_high_conversion")
 HOURLY_LABELS = {"high_spend_no_conversion": "高花费无转化", "high_spend_low_conversion": "高花费低转化",
                  "low_spend_no_conversion": "低花费无转化", "low_spend_high_conversion": "低花费高转化"}
+INTRADAY_NOTE = "今日数据仍在累计，广告订单会延迟回补；金额 USD。"
 
 
 def _money(value):
@@ -162,13 +163,14 @@ def _percent(value):
 def hourly_card(findings, *, day, time, names, operators, scoped=False, cap=10):
     """The alert table of new findings, grouped by category; None when there is nothing to send.
 
-    The title carries the marketplace day and time; the body is only the alerts.
+    The title carries the marketplace day and time; the body is the alerts plus the one data note
+    the SparkX Skill requires (intraday figures are not final; multi-store money is USD).
     """
     if not findings:
         return None
     stores = len({item["pid"] for item in findings})
     lead = ("你负责的店铺中，" if scoped else "") + f"{stores} 个店铺 {len(findings)} 个广告活动触发提醒。"
-    elements = [markdown(lead)]
+    elements = [markdown(lead + INTRADAY_NOTE)]
     headers = ["店铺", "广告活动", "花费", "点击", "广告订单", "ACOS", "CVR", "建议", "运营"]
     for code in HOURLY_ORDER:
         items = [item for item in findings if item["category"] == code]

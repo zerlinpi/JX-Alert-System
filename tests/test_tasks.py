@@ -63,16 +63,29 @@ def test_the_daily_report_tells_ad_and_store_totals_apart():
     assert "总订单为 0 但总销量大于 0" in daily and "写「—」，不当成 0" in daily
     # A store without store totals must not inflate TACOS: its ad spend stays out of the numerator too.
     assert "全公司 TACOS = 有总销售额数据的店铺的广告花费合计 ÷ 这些店铺的总销售额合计" in daily
-    # Owner (Nov 2026): only conclusions, data and suggestions; no closing caveats, short notes.
-    assert "回补" not in daily and "金额单位" not in daily and "不超过 60 字" in daily
+    # Owner (Nov 2026): lean texts, but what the SparkX Skills require readers to be told stays, in one phrase.
+    assert "注明金额为 USD、广告订单和广告销售额等转化数据是暂定值" in daily and "不超过 60 字" in daily
+    assert "暂定值" in tasks.DEFAULT_PROMPTS["review"]
 
 
-def test_every_report_lane_leaves_out_sources_and_methods():
+def test_sparkx_data_and_skills_rank_above_the_jx_task_text():
+    """Owner (Nov 2026): SparkX's data and its official Skills first, JX's own instructions second."""
+    for lane in ("daily", "review", "hourly"):
+        config = {**lane_settings.DEFAULTS[lane], "prompt": "自定义说明"}
+        message = tasks.task_message(lane, config, now=SEND, monitored={"101"})
+        assert tasks.TASK_LABEL + "\n自定义说明" in message  # the owner's text is labelled second priority
     for lane in ("daily", "review"):
-        message = tasks.task_message(lane, {"prompt": "自定义说明"}, now=SEND, monitored={"101"})
-        assert "不写数据来源、查询过程、分析方法、口径或算法说明和数据回补的提醒" in message
+        message = tasks.task_message(lane, {"prompt": ""}, now=SEND, monitored={"101"})
+        assert "不写数据来源、生成方式、查询次数和查询或分析过程" in message
+        assert "SparkX 结果和官方 Skill 要求说明的事项" in message and "只用一句短话" in message
         assert "不重复标题里已有的报告名称和日期" in message
     assert "不重复判定条件" in tasks.DEFAULT_PROMPTS["review"]  # section titles name the problem type only
+    for mode in ("report", "chat"):
+        system = agent.system_prompt(now=SEND, tool_names=["get_ads_perf"], skills_index=None, roster={},
+                                     directory={"profiles": {}}, mode=mode)
+        assert agent.PRIORITY in system
+        first, second = system.index("第一优先级"), system.index("第二优先级")
+        assert first < second and "冲突时以第 1 条为准" in system
 
 
 def test_hourly_task_carries_the_thresholds_and_what_was_already_alerted():

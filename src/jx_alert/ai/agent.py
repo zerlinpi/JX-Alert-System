@@ -102,6 +102,18 @@ def directory_table(roster, directory, *, only_monitored=False):
     return "\n".join(lines)
 
 
+# Owner decision (Nov 2026): SparkX's data and its official Skills come first, JX's own task texts second.
+PRIORITY = (
+    "要求的优先级（有冲突时按顺序取舍）：\n"
+    "1. 第一优先级：SparkX 返回的数据，以及 SparkX 官方 Skill 和结果 meta.hint 的要求——查询方法、指标口径、"
+    "数据解读，以及它们要求向读者说明的事项（例如最近几天的广告订单、广告销售额和 ACOS 是暂定值，多店金额是 USD，"
+    "分页没取完或数据缺失、不足以下结论，相关不等于因果）。Skill 里的示例报告格式只是示意，不算这里的要求。\n"
+    "2. 第二优先级：JX 的任务说明和输出要求——写哪些内容、结构、表格和列、篇幅和措辞；"
+    "在不违背第 1 条的前提下照做，冲突时以第 1 条为准。\n"
+    "3. 从简：第 1 条要求说明的事项用一句短话或在表格里标注，不展开；不写数据来源、生成方式、查询次数和查询过程。"
+)
+
+
 def system_prompt(*, now, tool_names, skills_index, roster, directory, instructions="", mode="report",
                   only_monitored=False, sparkx_note=None):
     tools = "、".join(tool_names) if tool_names else (
@@ -122,6 +134,7 @@ def system_prompt(*, now, tool_names, skills_index, roster, directory, instructi
         "- 按 Skill 和工具说明构造查询，遵守每次结果 meta.hint 里的提示；分页没取完不要当作全部；"
         "缺失的字段和查不到的数据不是 0；比率由基础指标重新计算，不对比率求平均。\n"
         "- 回答里的数字必须来自工具结果或由其直接计算，不要编造。",
+        PRIORITY,
     ]
     if skills_index:
         parts.append("已安装的 SparkX 官方 Skills（只读）：\n" + skill_store.prompt_index(skills_index))
@@ -134,7 +147,8 @@ def system_prompt(*, now, tool_names, skills_index, roster, directory, instructi
     if mode == "chat":
         parts.append(
             "对话方式：你在飞书里与同事自由交流，可以回答任何问题，不限于广告；只有需要数据时才调用 SparkX 工具。"
-            "用自然、简洁的中文回答，先说结论；不介绍数据来源、查询过程和分析方法，除非对方问起；"
+            "用自然、简洁的中文回答，先说结论；SparkX 和 Skill 要求说明的事项一句话带过，"
+            "不介绍数据来源、查询过程和分析方法，除非对方问起；"
             "展示数据时用 Markdown 表格（每张不超过 20 行）。"
             "不要输出代码块或 JSON，不要 @ 任何人，不要附链接。")
     return "\n\n".join(parts)

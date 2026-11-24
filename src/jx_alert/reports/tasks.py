@@ -35,12 +35,12 @@ DEFAULT_PROMPTS = {
 - 总销售额、总订单、总销量（店铺全部销售，含自然单）：factEntity=asin 的 TotalSalesAmount、OrderCount、UnitCount。asin 表只取这三项，广告指标一律用 campaign 的合计。
 - ACOS = 广告花费 ÷ 广告销售额；TACOS = 广告花费 ÷ 总销售额；CVR = 广告订单 ÷ 点击；PPC = 广告花费 ÷ 点击；ROAS = 广告销售额 ÷ 广告花费；比率类的环比写百分点。
 - 店铺总数据（总销售额、总订单、总销量）比广告数据更新得晚，也可能缺失：某店总订单为 0 但总销量大于 0，是总订单还没更新；总销售额为 0 但广告销售额大于 0，是 SparkX 没有返回这家店的店铺总数据。这两种情况写「—」，不当成 0。全公司的总销售额、总订单、总销量只加有数据的店铺；全公司 TACOS = 有总销售额数据的店铺的广告花费合计 ÷ 这些店铺的总销售额合计（不能用全公司广告花费去除）。
-结构（只写下面这些，不加别的段落）：
-1. 开头一句话：对比日、监控店铺数、当日有广告花费的店铺数。
+结构（按下面的顺序写，不加别的段落）：
+1. 开头一句话：对比日、监控店铺数、当日有广告花费的店铺数，并按 Skill 要求注明金额为 USD、广告订单和广告销售额等转化数据是暂定值。
 2. **全公司核心指标**：表格「指标 | 当日 | 前一日 | 环比」，依次为总销售额、广告销售额、总订单、广告订单、总销量、广告销量、广告花费、ACOS、TACOS、CVR、PPC（CPC）、ROAS。
 3. **站点汇总**（监控店铺分布在两个及以上站点时才写，只有一个站点时省略）：表格「站点 | 店铺数 | 有数据 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费环比」。
 4. **有花费店铺明细**：表格「店铺 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费日环比 | 运营」，按广告花费从高到低；当日无广告花费或没有数据的店铺，在表格下方用一行列出名单。
-5. **须知**：2–4 条编号短评，每条一两句话、不超过 60 字，先下结论再给关键数字：花费是否集中、ACOS 明显偏高的店铺、有广告花费但没有广告订单的店铺；有店铺缺数据时用一条点名，不解释原因。
+5. **须知**：2–4 条编号短评，每条一两句话、不超过 60 字，先下结论再给关键数字：花费是否集中、ACOS 明显偏高的店铺、有广告花费但没有广告订单的店铺；有店铺缺数据时用一条点名（写「暂无数据」，不推断原因，也不当成没有销售）。
 订单和销量写整数，百分比保留一位小数。""",
     "review": """判定口径（金额 USD，campaign 级）：
 - 全店零曝光：两周内没有任何曝光，但仍有开启的 campaign（用 get_entity_metadata 统计开启数量），放在「最严重」。
@@ -50,7 +50,7 @@ DEFAULT_PROMPTS = {
 - ④ 异常停摆：开启状态，前 7 日花费 ≥ $50，近 7 日没有曝光。
 - ⑤ 低花费高转化（机会，不计入异常）：近 7 日花费 < $100、广告订单 ≥ 3、ACOS ≤ 20%。
 结构：
-开头一句加粗：「N 个店铺中，M 个有投放数据，K 个检出 X 个异常 campaign。」，再一句整体广告花费、广告销售额、ACOS 的变化。
+开头一句加粗：「N 个店铺中，M 个有投放数据，K 个检出 X 个异常 campaign。」，再一句整体广告花费、广告销售额、ACOS 的变化，并按 Skill 要求用半句话注明近 7 日的转化数据是暂定值。
 **一、最严重**：最需要马上处理的问题，一两句话说明为什么严重。
 **二、异常店铺总览**：表格「店铺 | 近7日花费 | ACOS 近7日 | 前7日 | 异常数 | 主要问题 | 运营」。
 **三、按问题类型看具体 campaign**：每类一张表，表前只写类型名称（例如「① 高花费零出单」），不重复判定条件；列出店铺、Campaign、关键数据和建议 CPC（例如 2.45 → 1.80），最后一列是运营；⑤ 机会单独列出。
@@ -83,8 +83,9 @@ def _scope(monitored):
 
 
 _OUTPUT = ("输出要求：直接输出发到飞书群的正文（Markdown），不要开场白和结束语，不要代码块、链接或 @ 任何人；"
-           "只写结论、数据和建议：不写数据来源、查询过程、分析方法、口径或算法说明和数据回补的提醒，"
-           "不重复标题里已有的报告名称和日期；"
+           "篇幅从简，只写结论、数据和建议：不写数据来源、生成方式、查询次数和查询或分析过程，不复述口径和公式，"
+           "不重复标题里已有的报告名称和日期；SparkX 结果和官方 Skill 要求说明的事项（例如近期的广告订单、"
+           "广告销售额是暂定值，多店金额是 USD，数据不全）照写，但只用一句短话；"
            "表格用标准 Markdown 表格；金额带 $ 符号，保留整数或两位小数；店铺写目录里的简称；有「运营」列的表格把「运营」放在最后一列，"
            "写目录里的运营（未指定写「未映射运营」）；订单、销量、销售额写明是广告的还是店铺总的"
            "（广告订单/总订单、广告销量/总销量、广告销售额/总销售额），不要只写「订单」「销量」「销售额」；"
@@ -100,20 +101,24 @@ def _stores_line(lane):
             "没有写「JX_STORES: 无」。这一行只给系统用来 @ 对应运营，不会展示。")
 
 
+# The owner's task text is JX's own instruction: it ranks below SparkX's data and official Skills.
+TASK_LABEL = "JX 任务要求（第二优先级：在不违背 SparkX 返回数据和官方 Skill 要求的前提下照做）："
+
+
 def task_message(lane, config, *, now, monitored, alerted=()):
     """The user message of one scheduled run: fixed scope and contract + the owner's task text."""
     dates = report_dates(now)
     if lane == "daily":
         return ("【定时任务 · 08:30 广告日报】\n"
                 f"统计日：{dates['report_date']}（美西已结束的完整日）；对比日：{dates['previous_date']}。\n"
-                + _scope(monitored) + "\n" + _OUTPUT + "\n" + _stores_line(lane) + "\n\n任务要求：\n"
+                + _scope(monitored) + "\n" + _OUTPUT + "\n" + _stores_line(lane) + "\n\n" + TASK_LABEL + "\n"
                 + prompt_text(lane, config))
     if lane == "review":
         w0, w1 = dates["window"]
         p0, p1 = dates["previous_window"]
         return ("【定时任务 · 08:30 广告异常复盘】\n"
                 f"近 7 日：{w0} ~ {w1}；前 7 日：{p0} ~ {p1}（美西日期）。\n"
-                + _scope(monitored) + "\n" + _OUTPUT + "\n" + _stores_line(lane) + "\n\n任务要求：\n"
+                + _scope(monitored) + "\n" + _OUTPUT + "\n" + _stores_line(lane) + "\n\n" + TASK_LABEL + "\n"
                 + prompt_text(lane, config))
     local = marketplace_now(now)
     rules = (f"- high_spend_no_conversion 高花费无转化：花费 ≥ ${config['high_spend']:g} 且广告订单 = 0\n"
@@ -136,7 +141,7 @@ def task_message(lane, config, *, now, monitored, alerted=()):
             '"campaign_name":"…","category":"high_spend_no_conversion","spend":31.2,"clicks":20,"orders":0,'
             '"sales":0,"acos":null,"cvr":0,"suggestion":"不超过40字的处理建议"}],"note":"可选，一句话"}。'
             "campaign_id 必须照抄 SparkX 返回的值；没有需要提醒的活动时 findings 为空数组。"
-            + (f"\n\n补充要求：\n{extra}" if extra else ""))
+            + (f"\n\n{TASK_LABEL}\n{extra}" if extra else ""))
 
 
 # ---------------------------------------------------------------- answer checks

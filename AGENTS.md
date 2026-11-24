@@ -45,10 +45,14 @@
   (daily: stores the report flags; review: anomalies; hourly: new alerts), naming
   their stores. Private operator copies are optional. Never route to or mention
   guessed people.
-- Owner decision (Nov 2026): notification and bot texts hold only conclusions, data
-  and suggestions. No footer or line about the data source, how the text was
-  generated, query counts, analysis method, formulas or backfill caveats; titles do
-  not say "SparkX". The bot puts an 「OK」 reaction on each question it is about to
+- Owner decisions (Nov 2026): SparkX's returned data and the requirements of its
+  official Skills and `meta.hint` come first; JX's own task texts and output rules
+  come second and give way on conflict. Texts are lean: conclusions, data and
+  suggestions, with no footer or line about the data source, how the text was
+  generated, query counts or the query/analysis process, and titles do not say
+  "SparkX". What the Skills require readers to be told (provisional recent
+  conversions, USD for multi-store money, incomplete or missing data) stays, in one
+  short phrase. The bot puts an 「OK」 reaction on each question it is about to
   answer (once per question, never on one it will not answer).
 - Console previews never queue anything. A test send (owner's explicit click)
   queues the server-side copy of a finished preview, marked 【测试】, under

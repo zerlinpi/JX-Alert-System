@@ -16,6 +16,7 @@
 - 工具：只把 SparkX 标记为只读（`readOnlyHint`）且在白名单内的工具交给 DeepSeek（`get_user_authorized_context`、`get_ads_perf`、`get_entity_metadata`、`get_operation_log` 等），工具名称、说明和参数结构与 SparkX 原样一致；写工具（`batch_update_ads`、`create_*` 等）永远不提供。
 - 结果：SparkX 的返回原样交给 DeepSeek（含 `meta.hint`）；只有超过 15 万字符的结果会被截断并提示缩小查询。
 - Skills：管理台从 GitHub `SparkXAI/SparkXAI-MCP` 安装官方只读 Skills 到 `data/sparkx-skills/`（不进入本仓库），DeepSeek 通过 `read_skill` 按需阅读 SKILL.md 和参考文件，与 Claude、Codex 使用 Skills 的方式相同。
+- 优先级：SparkX 返回的数据和官方 Skill 的要求第一，JX 的任务说明和输出格式第二，冲突时以 SparkX 为准；正文从简，Skill 要求说明的事项只用一句话。
 - 任务：每条通知的「任务说明」可在管理台修改；统计日期、店铺范围和输出格式由系统附加。实时监控返回结构化结果，系统核对每个活动 ID 确实出现在 SparkX 结果中、并符合阈值，再按「每个活动每类每天一次」去重。
 
 ## 目录
