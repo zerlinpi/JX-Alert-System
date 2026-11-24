@@ -1,30 +1,36 @@
 """Runtime settings compatibility and the owner's private files."""
 import json
+import logging
 import os
 
 import pytest
-from sqlalchemy import text
 
 from conftest import write_private
 from jx_alert import config
 from jx_alert.sparkx import credentials, stores
 
 
-def test_retired_runtime_keys_are_ignored_and_renamed_ones_still_apply(tmp_path, monkeypatch):
+def test_unused_runtime_fields_are_ignored_by_name_and_renamed_ones_still_apply(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(config, "_REPORTED_IGNORED", set())
+    monkeypatch.chdir(tmp_path)  # no .env from the working directory
+    monkeypatch.delenv("APP_DRY_RUN", raising=False)
     path = tmp_path / "runtime-settings.json"
-    path.write_text(json.dumps({"feishu_enabled": True, "feishu_transport": "app", "lingxing_sources_file": "x",
-                                "hourly_ad_monitor_enabled": True, "mcp_auth_mode": "oauth",
-                                "mcp_public_url": "https://jx.example", "excel_archive_enabled": True}))
+    path.write_text(json.dumps({"feishu_enabled": True, "feishu_transport": "app", "hourly_ad_monitor_enabled": True,
+                                "mcp_auth_mode": "oauth", "mcp_public_url": "https://jx.example",
+                                "excel_archive_enabled": True, "app_dryrun": False}))
     monkeypatch.setenv("RUNTIME_SETTINGS_FILE", str(path))
-    settings = config.load_runtime_settings()
-    assert settings.feishu_enabled and settings.console_public_url == "https://jx.example"
-    assert not hasattr(settings, "lingxing_sources_file")
-    path.write_text(json.dumps({"unknown_switch": True}))
-    with pytest.raises(ValueError):
-        config.load_runtime_settings()
-    path.write_text('{"feishu_enabled": true, "feishu_enabled": false}')
-    with pytest.raises(ValueError):
-        config.load_runtime_settings()
+    with caplog.at_level(logging.WARNING, logger="jx_alert.config"):
+        settings = config.load_runtime_settings()
+        assert settings.feishu_enabled and settings.console_public_url == "https://jx.example"
+        assert settings.app_dry_run and not hasattr(settings, "hourly_ad_monitor_enabled")  # a typo changes nothing
+        assert caplog.text.count("ignoring 4 field(s)") == 1
+        assert all(name in caplog.text for name in ("app_dryrun", "excel_archive_enabled", "mcp_auth_mode"))
+        config.load_runtime_settings()  # the scheduler reloads often: each name is logged once per process
+        assert caplog.text.count("ignoring") == 1
+    for broken in ("[]", '{"feishu_enabled": true, "feishu_enabled": false}', '{"sparkx_timeout": "slow"}'):
+        path.write_text(broken)
+        with pytest.raises(ValueError):
+            config.load_runtime_settings()
 
 
 def test_environment_aliases_from_the_previous_release(monkeypatch):
@@ -67,27 +73,6 @@ def test_store_directory_validation_and_compare_and_swap(settings):
     with pytest.raises(stores.StoreDirectoryError):
         stores.save(settings, {"101": {"monitored": True, "operators": [{"open_id": "bad", "name": "x"}]}},
                     again["revision"])
-
-
-def test_legacy_operator_suggestions_read_the_old_tables_without_writing(session_factory, routing):
-    with session_factory() as db:
-        db.execute(text("CREATE TABLE stores (sid VARCHAR(20), name VARCHAR(200), country VARCHAR(20), "
-                        "marketplace_id VARCHAR(40))"))
-        db.execute(text("INSERT INTO stores VALUES ('9060', '川页-US', '美国', 'ATVPDKIKX0DER'), "
-                        "('5171', '耀强-Campx-主账号-US', '美国', 'ATVPDKIKX0DER'), ('9061', '川页-CA', '加拿大', NULL)"))
-        db.commit()
-        old = {**routing, "stores": {"9060": {"open_ids": ["ou_op1"], "owner_display_names": {"ou_op1": "皮泽霖"}},
-                                     "5171": ["ou_op2"]}}
-        roster = {"101": {"name": "香港川页", "country": "US"}, "102": {"name": "Campx-主账号", "country": "US"},
-                  "103": {"name": "OCTORA", "country": "US"}}
-        found = stores.legacy_suggestions(db, old, roster)
-    assert found == {"101": {"store": "川页-US", "operators": [{"open_id": "ou_op1", "name": "皮泽霖"}]},
-                     "102": {"store": "耀强-Campx-主账号-US", "operators": [{"open_id": "ou_op2", "name": "ou_op2"}]}}
-
-
-def test_legacy_suggestions_without_the_old_table_are_empty(session_factory, routing):
-    with session_factory() as db:
-        assert stores.legacy_suggestions(db, routing, {"101": {"name": "x", "country": "US"}}) == {}
 
 
 def test_display_names_follow_the_agent_style():

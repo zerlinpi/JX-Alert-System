@@ -15,8 +15,8 @@
   print or commit secrets. Keep credentials in private 0600 files, separate from code.
 - SparkX MCP is the only business data source, and access is read-only: call only
   `get_user_authorized_context`, `get_ads_perf` and `get_entity_metadata`. Never
-  change campaigns, budgets, bids, listings, or store settings. Lingxing is
-  retired; do not reintroduce its collectors or credentials.
+  change campaigns, budgets, bids, listings, or store settings. Do not add other
+  data sources, collectors or their credentials.
 - Follow the official SparkXAI-MCP skill documentation for query shapes; do not
   guess undocumented fields or parameters.
 - Every figure in a notification or answer comes from SparkX rows and is computed
@@ -42,5 +42,5 @@
   SparkX token is saved. Test Feishu only in the explicitly selected group and
   with the owner's recipients.
 - Database changes are additive with backups and explicit persistence checks.
-  Retired Lingxing tables stay untouched. Code rollback retains new historical
-  evidence and never removes Docker volumes.
+  Tables left by earlier releases stay untouched. Code rollback retains new
+  historical evidence and never removes Docker volumes.

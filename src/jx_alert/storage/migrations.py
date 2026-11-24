@@ -1,7 +1,7 @@
 """Idempotent additive schema upgrades.
 
 New tables are created from ORM metadata. Existing tables are never dropped or
-altered destructively; retired Lingxing tables are left exactly as they are.
+altered destructively; tables of earlier releases are left exactly as they are.
 Add nullable/defaulted columns here when a model gains one.
 """
 from sqlalchemy import inspect, text

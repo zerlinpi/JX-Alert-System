@@ -3,8 +3,8 @@
 PENDING/RETRY/PRE_SEND_RETRY → PREPARING (claimed, nothing sent) → SUBMITTING
 (write-ahead intent committed; the POST may have happened) → DELIVERED,
 DELIVERY_UNKNOWN, REJECTED, DEAD, SKIPPED or EXPIRED. A row that may have
-reached Feishu is never resent automatically. Rows written by the retired
-Lingxing release are skipped and kept as history.
+reached Feishu is never resent automatically. Rows of a kind this release does
+not send (for example queued by an earlier release) are skipped and kept.
 """
 from datetime import datetime, timedelta, timezone
 import logging
@@ -23,7 +23,7 @@ from jx_alert.storage.models import NotificationLog
 
 logger = logging.getLogger(__name__)
 CHANNEL = "feishu_app"
-LEGACY_REASON = "旧版通知（领星时期）已停用，保留记录不发送"
+LEGACY_REASON = "旧版本的通知类型已停用，保留记录不发送"
 UNKNOWN_REASON = "可能已提交飞书，未确认送达；禁止自动重发，请人工核对原会话"
 LEGACY_ATTEMPT_REASON = "旧版尝试没有可核验的提交阶段；禁止自动重发，请人工核对原会话"
 REPLY_ROLES = frozenset({"group_question", "private_question"})

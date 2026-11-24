@@ -1,8 +1,9 @@
 """Process settings: environment (.env) plus the owner's runtime JSON overrides.
 
 SparkX MCP is the only business data source. DeepSeek writes narrative text and
-answers questions; Feishu (enterprise app) delivers. Retired Lingxing/MCP-server
-keys in an existing runtime file are tolerated and ignored, never applied.
+answers questions; Feishu (enterprise app) delivers. Runtime fields this release
+does not use (for example ones left by earlier releases) are ignored and named
+in the log once per process; the file itself is never rewritten.
 """
 from functools import lru_cache
 import json
@@ -100,28 +101,12 @@ RUNTIME_KEYS = frozenset({
     "notification_settings_file", "console_public_url", "console_owner_credentials_file",
     "console_sessions_file", "console_forwarded_allow_ips",
 })
-# Keys written by the retired Lingxing/MCP-server releases. They stay in the file
-# (owner data is never rewritten) but no longer change behaviour.
+# Earlier names of the console settings; still applied when the new name is absent.
 _RENAMED = {"mcp_public_url": "console_public_url",
             "mcp_owner_credentials_file": "console_owner_credentials_file",
             "mcp_forwarded_allow_ips": "console_forwarded_allow_ips"}
-LEGACY_RUNTIME_KEYS = frozenset({
-    "daily_sync_cron", "hourly_ad_monitor_enabled", "hourly_ad_monitor_cron", "hourly_mode_daily_sync_cron",
-    "hourly_ad_store_routing_enabled", "hourly_ad_store_routing_app_id", "feishu_daily_report_cron",
-    "feishu_daily_report_start_date", "feishu_company_executive_digest_enabled",
-    "feishu_company_executive_digest_start_date", "feishu_daily_report_group_digest",
-    "sb_sd_detail_reports_enabled", "business_alert_delivery_mode", "excel_archive_enabled",
-    "excel_archive_dir", "excel_daily_snapshot_enabled", "excel_daily_snapshot_cron",
-    "alert_kpi_change_ratio", "alert_kpi_min_impressions", "alert_materiality_enabled",
-    "allow_unconfigured_timezone_history", "collection_scope_file", "store_controls_file",
-    "advertising_source_controls_file", "sp_collection_enabled", "sp_validation_targets_file",
-    "store_timezones_file", "sp_refresh_days", "mcp_operations_enabled", "mcp_notifications_enabled",
-    "feishu_group_fallback_enabled", "feishu_manager_open_ids", "feishu_daily_report_enabled",
-    "feishu_morning_focus_enabled", "feishu_quiet_delivery_enabled", "lingxing_performance_enabled",
-    "lingxing_performance_source_timezone", "lingxing_performance_observation_only",
-    "lingxing_business_credentials_file", "lingxing_sources_file", "mcp_allowed_hosts",
-    "mcp_allowed_origins", "mcp_auth_mode", "mcp_oauth_database_path", *_RENAMED,
-})
+# Ignored field names already logged by this process (the scheduler reloads often).
+_REPORTED_IGNORED: set[str] = set()
 
 
 def _unique(pairs):
@@ -140,15 +125,18 @@ def load_runtime_settings() -> Settings:
     if not path.is_file():
         return settings
     runtime = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique)
-    if not isinstance(runtime, dict) or set(runtime) - RUNTIME_KEYS - LEGACY_RUNTIME_KEYS:
-        raise ValueError("Runtime settings contain unsupported fields")
+    if not isinstance(runtime, dict):
+        raise ValueError("Runtime settings must be a JSON object")
     applied = {key: value for key, value in runtime.items() if key in RUNTIME_KEYS}
     for old, new in _RENAMED.items():
         if old in runtime and new not in runtime:
             applied[new] = runtime[old]
-    ignored = sorted(set(runtime) & LEGACY_RUNTIME_KEYS - set(_RENAMED))
-    if ignored:
-        _LOG.info("Ignoring %d retired runtime setting(s)", len(ignored))
+    # An unknown field, including a misspelt one, changes nothing: the .env value or default stays.
+    fresh = sorted(set(runtime) - RUNTIME_KEYS - set(_RENAMED) - _REPORTED_IGNORED)
+    if fresh:
+        _REPORTED_IGNORED.update(fresh)
+        _LOG.warning("Runtime settings: ignoring %d field(s) this release does not use: %s",
+                     len(fresh), [key[:64] for key in fresh[:60]])
     return Settings(_env_file=None, **{**settings.model_dump(), **applied})
 
 

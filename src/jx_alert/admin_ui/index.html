@@ -47,15 +47,14 @@
     <section data-panel="stores" aria-labelledby="stores-title" hidden>
       <div class="page-heading"><div><h1 id="stores-title">店铺与运营</h1>
         <p class="muted">店铺来自 SparkX Token 授权的 Profile。每家店可指定运营（通知群成员）：未指定时通知照常发到群里，标注「未映射运营」；指定后，这家店出现异常时群消息会 @ 对应运营。关闭监控的店铺不进入任何通知。</p></div>
-        <div class="control-actions"><button type="button" class="button secondary" id="refresh-roster">从 SparkX 刷新店铺</button>
-          <button type="button" class="button secondary" id="apply-suggestions" disabled>采用全部建议运营</button></div></div>
+        <div class="control-actions"><button type="button" class="button secondary" id="refresh-roster">从 SparkX 刷新店铺</button></div></div>
       <div id="stores-status" class="notice" role="status" hidden></div>
       <section class="panel">
         <div class="toolbar"><label class="sr-only" for="store-search">搜索店铺或运营</label>
           <input id="store-search" type="search" placeholder="搜索店铺、站点或运营" autocomplete="off">
           <span id="roster-time" class="muted"></span></div>
         <div class="table-scroll"><table class="stores-table"><thead><tr><th scope="col">店铺</th><th scope="col">站点</th>
-          <th scope="col">类型</th><th scope="col">监控</th><th scope="col">运营</th><th scope="col">建议（来自旧店铺映射）</th></tr></thead>
+          <th scope="col">类型</th><th scope="col">监控</th><th scope="col">运营</th></tr></thead>
           <tbody id="store-rows"></tbody></table></div>
       </section>
       <section class="panel picker" id="operator-picker" hidden aria-labelledby="picker-title">

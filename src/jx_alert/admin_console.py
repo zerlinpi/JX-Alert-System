@@ -282,11 +282,6 @@ class OwnerConsole:
         directory = directory_module.load(self.settings)
         with self.session_factory() as db:
             roster, roster_at = directory_module.latest_roster(db)
-            try:
-                _, routing, _ = admin_feishu.snapshot(self.settings)
-            except admin_feishu.MappingError:
-                routing = {}
-            suggestions = directory_module.legacy_suggestions(db, routing, roster) if roster else {}
         names = directory_module.display_names(roster) if roster else {}
         rows = []
         for key in sorted(set(roster) | set(directory["profiles"]), key=int):
@@ -298,8 +293,7 @@ class OwnerConsole:
                                                                               profile.get("country") or "—"),
                          "store_type": profile.get("store_type"), "authorized": key in roster,
                          "monitored": directory_module.monitored(directory, key),
-                         "operators": [{"id": row["open_id"], "name": row["name"]} for row in operators],
-                         "suggestion": None if operators else suggestions.get(key)})
+                         "operators": [{"id": row["open_id"], "name": row["name"]} for row in operators]})
         rows.sort(key=lambda row: (not row["authorized"], row["country"] != "US", row["short_name"]))
         return {"revision": directory["revision"], "roster_at": _iso(roster_at), "rows": rows}
 
@@ -335,25 +329,6 @@ class OwnerConsole:
             "operators": [people[uid] for uid in dict.fromkeys(value["operator_ids"])]}
             for key, value in changes.items()}, payload["revision"])
         return self._stores()
-
-    def _apply_suggestions(self, payload):
-        if set(payload) != {"revision"}:
-            raise ConsoleError("提交内容无效。", 400)
-        view = self._stores()
-        if view["revision"] != payload["revision"]:
-            raise ConsoleError("店铺目录已更新，请刷新后重试。", 409)
-        roster = {row["id"] for row in admin_feishu.group_members(self.settings, refresh=True)}
-        changes, skipped = {}, 0
-        for row in view["rows"]:
-            if row["suggestion"] and not row["operators"] and row["authorized"]:
-                people = [person for person in row["suggestion"]["operators"] if person["open_id"] in roster]
-                skipped += len(row["suggestion"]["operators"]) - len(people)
-                if people:
-                    changes[row["profile_id"]] = {"monitored": row["monitored"], "operators": people}
-        if not changes:
-            return {**view, "applied": 0, "skipped_people": skipped}
-        directory_module.save(self.settings, changes, payload["revision"])
-        return {**self._stores(), "applied": len(changes), "skipped_people": skipped}
 
     def _recipients(self):
         result = admin_feishu.leads(self.settings)
@@ -473,9 +448,6 @@ class OwnerConsole:
         if path == "/console/api/stores/save":
             self._limit(request, "stores-save", 12, 24)
             return await run(self._save_stores, payload)
-        if path == "/console/api/stores/suggestions/apply":
-            self._limit(request, "stores-suggest", 3, 6)
-            return await run(self._apply_suggestions, payload)
         if path in {"/console/api/recipients/company", "/console/api/recipients/ad"}:
             if set(payload) != {"open_ids", "revision"}:
                 raise ConsoleError("提交内容无效。", 400)
@@ -513,9 +485,8 @@ class OwnerConsole:
     def routes(self):
         api_get = ["overview", "sparkx", "stores", "members", "recipients", "groups", "reports", "deepseek",
                    "deliveries"]
-        api_post = ["sparkx", "sparkx/test", "stores/refresh", "stores/save", "stores/suggestions/apply",
-                    "recipients/company", "recipients/ad", "groups", "members/refresh", "reports",
-                    "reports/preview", "deepseek", "deepseek/test"]
+        api_post = ["sparkx", "sparkx/test", "stores/refresh", "stores/save", "recipients/company", "recipients/ad",
+                    "groups", "members/refresh", "reports", "reports/preview", "deepseek", "deepseek/test"]
         routes = [Route("/", self.root), Route("/console", self.home), Route("/console/", self.home),
                   Route("/console/login", self.login, methods=["GET", "POST"]),
                   Route("/console/assets/{asset}", self.asset),

@@ -10,16 +10,16 @@
 | `console` | `python -m jx_alert.admin_console` | 管理台，监听 `127.0.0.1:8002`；服务器上同时占用原 MCP 端口（默认 8001） |
 | `bot` | `python -m jx_alert.feishu_bot` | 飞书长连接问答 |
 
-原 `mcp` 服务（领星数据的 ChatGPT 连接器）已移除。需要在 ChatGPT/Claude 中查广告数据时，可按 SparkX 官方说明直接连接 SparkX MCP。
+旧版本的 `mcp` 服务（ChatGPT 连接器）已移除。需要在 ChatGPT/Claude 中查广告数据时，可按 SparkX 官方说明直接连接 SparkX MCP。
 
 ## 服务器不需要改的配置
 
 - **Nginx 不用改。** 现有站点把 `/console`、`/oauth/owner` 转到 8002，其余路径转到原 MCP 端口。新版本的 `docker-compose.runtime.yml` 让管理台同时监听这个端口：`/` 跳转到 `/console/`，`/mcp`、`/authorize`、`/token`、`/.well-known/oauth-*` 等旧路径返回 410 和停用说明，不再出现 502。想精简时可换成 `deploy/jxmcp.pacefitday.com.conf`（只转发 `/console`），属于可选项。
 - **`.env` 不用改。** `MCP_PUBLIC_URL`、`MCP_OWNER_CREDENTIALS_FILE`、`MCP_FORWARDED_ALLOW_IPS` 继续作为管理台设置使用，`MCP_BIND_IP`/`MCP_BIND_PORT` 决定兼容端口。
-- **`runtime-settings.json` 不用改。** 领星、MCP、Excel 等旧字段被忽略，文件不会被改写。
+- **`runtime-settings.json` 不用改。** 本版本不使用的字段（包括旧版本留下的）一律忽略，每个进程启动后在日志里列出一次字段名；`mcp_public_url`、`mcp_owner_credentials_file`、`mcp_forwarded_allow_ips` 仍作为管理台设置生效。文件不会被改写。
 - **不需要重新构建镜像。** `app`、`scheduler`、`console` 用现有 `jx-alert-app` 镜像挂载 `./src`，`bot` 用现有 `jx-alert-bot` 镜像。
-- 原所有者口令 `data/secrets/mcp-owner.json`、管理台会话文件、`feishu-routing.json`（通知群、总负责人、广告负责人）原样沿用。
-- 数据库只新增、不删除：领星时期的表原样保留、不再写入；`notification_outbox`、`notification_logs`、`sync_jobs` 继续使用。发送队列里领星时期的待发消息不会发送，标记为「已跳过」。
+- 原所有者口令 `data/secrets/mcp-owner.json`、管理台会话文件、`feishu-routing.json`（通知群、总负责人、广告负责人）原样沿用。`feishu-routing.json` 里旧版本的店铺映射（`stores` 段）保留但不再读取：升级后在管理台「店铺与运营」为店铺指定运营，指定之前照常通知、不 @ 人。
+- 数据库只新增、不删除：旧版本建立的其他表原样保留，本版本不读取、不写入；`notification_outbox`、`notification_logs`、`sync_jobs` 继续使用。发送队列里旧版本的待发消息不会发送，标记为「已跳过」。
 
 ## 升级（`deploy/upgrade.sh`）
 

@@ -1,8 +1,7 @@
 """Tables used by the SparkX-only release.
 
-Tables of the retired Lingxing warehouse (stores, daily_metrics, campaigns, ...)
-remain in existing databases as historical evidence. They are never dropped or
-written; only the legacy operator-name suggestion reads ``stores`` by raw SQL.
+Other tables in an existing database (left by earlier releases) remain as
+historical evidence. This release does not map, read, write or drop them.
 """
 from datetime import datetime, timezone
 

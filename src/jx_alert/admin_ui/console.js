@@ -225,17 +225,10 @@
         edit.type = "button";
         edit.addEventListener("click", () => openPicker(store));
         people.append(edit);
-        let suggestion = "—";
-        if (store.suggestion) {
-          suggestion = doc.createElement("div");
-          suggestion.append(chips(store.suggestion.operators.map((p) => ({ name: p.name })), ""),
-            el("div", "匹配旧店铺：" + store.suggestion.store, "muted"));
-        }
         return row([name, store.country_label, store.store_type === "vendor" ? "Vendor" : store.store_type === "seller" ? "Seller" : "—",
-          monitor, people, suggestion]);
+          monitor, people]);
       });
-      fill("store-rows", rows, data.rows.length ? "没有匹配的店铺。" : "还没有店铺：请先在「SparkX 连接」保存 Token，再点击「从 SparkX 刷新店铺」。", 6);
-      $("apply-suggestions").disabled = !data.rows.some((store) => store.suggestion && store.authorized);
+      fill("store-rows", rows, data.rows.length ? "没有匹配的店铺。" : "还没有店铺：请先在「SparkX 连接」保存 Token，再点击「从 SparkX 刷新店铺」。", 5);
     }
 
     async function loadStores() {
@@ -440,14 +433,6 @@
       notice("stores-status", "正在读取 SparkX 授权店铺…");
       const data = await guarded("stores-status", () => api("/console/api/stores/refresh", { method: "POST" }), event.currentTarget);
       if (data) { state.stores = data; renderStores(); notice("stores-status", `已更新：${data.rows.length} 家店铺。`); }
-    });
-    $("apply-suggestions").addEventListener("click", async (event) => {
-      const data = await guarded("stores-status", () => api("/console/api/stores/suggestions/apply", {
-        method: "POST", body: { revision: state.stores.revision } }), event.currentTarget);
-      if (data) {
-        state.stores = data; renderStores();
-        notice("stores-status", `已为 ${data.applied} 家店铺采用建议运营` + (data.skipped_people ? `；${data.skipped_people} 人已不在通知群，未采用。` : "。"));
-      }
     });
     $("picker-search").addEventListener("input", () => renderMembers("picker-members", $("picker-search").value, state.picker.selected, "checkbox", "operator"));
     $("picker-close").addEventListener("click", () => { $("operator-picker").hidden = true; });

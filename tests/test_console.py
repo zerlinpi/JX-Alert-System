@@ -93,6 +93,10 @@ def test_store_directory_lists_the_roster_and_saves_verified_operators(console, 
     view = console.get("/console/api/stores").json()
     assert len(view["rows"]) == 7 and [row["short_name"] for row in view["rows"]][:2] == ["Campx", "FITFIZZ"]
     assert all(row["monitored"] and row["operators"] == [] for row in view["rows"])
+    assert set(view["rows"][0]) == {"profile_id", "name", "short_name", "country", "country_label", "store_type",
+                                    "authorized", "monitored", "operators"}  # operators are assigned by hand only
+    assert console.post("/console/api/stores/suggestions/apply", json={"revision": view["revision"]},
+                        headers=headers).status_code == 404
     monkeypatch.setattr(admin_feishu, "verified_people",
                         lambda settings_, ids: [{"open_id": uid, "name": "皮泽霖"} for uid in ids])
     saved = console.post("/console/api/stores/save", json={"revision": view["revision"], "changes": {

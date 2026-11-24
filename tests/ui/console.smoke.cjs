@@ -36,9 +36,9 @@ const responses = {
     recent: [{ created_at: "2026-11-24T00:31:00Z", lane: "08:30 日报", recipient: "负责人：老板", status: "DELIVERED" }], csrf: "a".repeat(64) },
   "GET /console/api/stores": { revision: "0".repeat(64), roster_at: "2026-11-24T00:30:00Z", rows: [
     { profile_id: "101", name: "香港川页", short_name: "香港川页", country_label: "美国", store_type: "seller", authorized: true,
-      monitored: true, operators: [{ id: "ou_op1", name: "皮泽霖" }], suggestion: null },
+      monitored: true, operators: [{ id: "ou_op1", name: "皮泽霖" }] },
     { profile_id: "102", name: "Campx-主账号", short_name: "Campx", country_label: "美国", store_type: "seller", authorized: true,
-      monitored: true, operators: [], suggestion: { store: "耀强-Campx-主账号-US", operators: [{ open_id: "ou_op2", name: "高爽" }] } }] },
+      monitored: true, operators: [] }] },
   "GET /console/api/members": { members: [{ id: "ou_op1", name: "皮泽霖" }, { id: "ou_op2", name: "高爽" }] },
   "POST /console/api/stores/save": null,
   "GET /console/api/recipients": { revision: "1".repeat(64), group: "日报群", company: { id: "ou_lead", name: "老板" }, ad: null,
@@ -82,7 +82,8 @@ const click = (node) => node.dispatchEvent(new window.MouseEvent("click", { bubb
   await tick();
   checks.push(["stores panel visible", !window.document.querySelector('[data-panel="stores"]').hidden]);
   checks.push(["store rows", $("store-rows").children.length === 2 && $("store-rows").textContent.includes("未映射运营")]);
-  checks.push(["suggestion shown", $("store-rows").textContent.includes("匹配旧店铺：耀强-Campx-主账号-US")]);
+  checks.push(["five store columns", window.document.querySelectorAll(".stores-table thead th").length === 5
+    && [...$("store-rows").children].every((tr) => tr.children.length === 5)]);
   click($("store-rows").children[1].querySelector("button"));
   await tick();
   checks.push(["picker open", !$("operator-picker").hidden && $("picker-members").querySelectorAll("input").length === 2]);

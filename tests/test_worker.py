@@ -99,7 +99,7 @@ def test_group_alerts_mention_only_the_operators_still_mapped_when_sending(setti
 
 def test_messages_from_the_retired_release_are_kept_but_never_sent(settings, session_factory, at_send):
     with session_factory() as db:
-        old = enqueue_notification(db, idempotency_key="scheduled-daily:morning:2026-11-24:x", text="领星日报",
+        old = enqueue_notification(db, idempotency_key="scheduled-daily:morning:2026-11-24:x", text="旧版日报",
                                    delivery={"role": "group", "receive_id_type": "chat_id", "receive_id": "oc_reports",
                                              "open_ids": []})
         db.commit()
