@@ -61,6 +61,11 @@ def test_daily_report_goes_to_the_group_and_the_company_lead_once(settings, sess
         assert card["header"]["title"]["content"] == "SparkX 广告日报 · 2026-11-22"
         tags = [element["tag"] for element in card["body"]["elements"]]
         assert tags.count("table") == 2  # the agent's Markdown tables became Feishu tables
+        detail = [element for element in card["body"]["elements"] if element["tag"] == "table"][1]
+        headers = [column["display_name"] for column in detail["columns"]]
+        assert headers[-1] == "运营" and headers[headers.index("广告销量"):headers.index("广告销量") + 2] == [
+            "广告销量", "总销量"]
+        assert detail["rows"][0][f"c{headers.index('总订单')}"] == "—"  # not yet updated: missing, not 0
         assert "SparkX MCP 只读查询 4 次" in json.dumps(card, ensure_ascii=False)
         again = lanes.queue_morning_lane(db, settings, "daily", now=SEND + timedelta(minutes=5),
                                          runner=runner_for(calls=calls))

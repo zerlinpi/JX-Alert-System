@@ -168,7 +168,7 @@ def hourly_card(findings, *, day, time, names, operators, config, footer, scoped
     lead = ("你负责的店铺中，" if scoped else "") + f"{stores} 个店铺 {len(findings)} 个广告活动触发提醒。"
     elements = [markdown(f"美西 {md_safe(day, 12)} 今日截至 {md_safe(time, 8)}（SparkX 当日累计，订单归因会延迟数小时）："
                          + lead)]
-    headers = ["店铺", "广告活动", "花费", "点击", "订单", "ACOS", "CVR", "建议", "运营"]
+    headers = ["店铺", "广告活动", "花费", "点击", "广告订单", "ACOS", "CVR", "建议", "运营"]
     for code in HOURLY_ORDER:
         items = [item for item in findings if item["category"] == code]
         if not items:
@@ -182,7 +182,7 @@ def hourly_card(findings, *, day, time, names, operators, config, footer, scoped
             elements.append(markdown(f"另有 {len(items) - cap} 个{HOURLY_LABELS[code]}活动未展开。"))
     rule = (f"判定：高花费 ≥ ${config['high_spend']:g}；低转化 = ACOS ≥ {config['acos_high']:g}% 或 "
             f"CVR < {config['cvr_low']:g}%；低花费无转化 = 花费 ≥ ${config['low_spend']:g} 且点击 ≥ "
-            f"{config['min_clicks']:g}；高转化 = 订单 ≥ {config['min_orders_good']:g} 且 ACOS ≤ {config['acos_good']:g}%。"
+            f"{config['min_clicks']:g}；高转化 = 广告订单 ≥ {config['min_orders_good']:g} 且 ACOS ≤ {config['acos_good']:g}%。"
             "同一活动同类提醒每天只发一次。")
     elements += [{"tag": "hr"}, markdown(md_safe(rule, 400)), markdown(md_safe(footer, 300))]
     color = "red" if any(item["category"].startswith("high_spend") for item in findings) else "orange"

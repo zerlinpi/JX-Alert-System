@@ -29,22 +29,28 @@ REQUEST_MINIMUM_TIMEOUT = 180
 _STORES_LINE = re.compile(r"^\s*JX_STORES\s*[:：]\s*(.*)$", re.MULTILINE)
 
 DEFAULT_PROMPTS = {
-    "daily": """请按下面的结构写日报：
-1. 第一段一句话概述：统计日、对比日、监控店铺数、有数据的店铺数、当日有花费的店铺数、金额单位。
-2. **全公司核心指标**：表格「指标 | 当日 | 前一日 | 环比」，依次为店铺总销售额、总订单量、广告花费、广告销售额、广告订单、ACOS、TACOS、CVR、PPC（CPC）、ROAS。店铺总销售额、总订单量和 TACOS 用 factEntity=asin 的 TotalSalesAmount、OrderCount；比率类的环比写百分点。
-3. **站点汇总**：表格「站点 | 币种 | 店铺数 | 有数据 | 花费 | 销售额 | 销量 | 订单 | ACOS | ROAS | 花费环比 | 销售额环比」。
-4. **有花费店铺明细**：表格「店铺 | 花费 | 销售额 | 销量 | 订单 | ACOS | TACOS | 花费日环比 | 运营」，按花费从高到低；当日无花费、SparkX 没有记录的店铺在表格下方各用一行列出名单。
-5. **须知**：2–4 条编号短评，像资深投手在群里提醒老板——先下结论，再给证据：花费是否集中、ACOS 明显偏高的店铺、有花费没出单的店铺、某个站点没有返回数据（可能是 Token 授权范围）。
-金额保留到整数或两位小数，百分比保留一位小数；最后用一句话说明近 7–14 天的销售和订单仍会回补。""",
+    "daily": """请按下面的口径和结构写日报。
+口径：订单、销量、销售额都分「广告」和「总」两种，表格和正文都照下面的名称写：
+- 广告花费、广告销售额、广告订单、广告销量、点击：factEntity=campaign 的 Spend、Sales、Conversions、Units、Clicks（含 SP、SB、SD 全部广告）。
+- 总销售额、总订单、总销量（店铺全部销售，含自然单）：factEntity=asin 的 TotalSalesAmount、OrderCount、UnitCount。asin 表只取这三项，广告指标一律用 campaign 的合计。
+- ACOS = 广告花费 ÷ 广告销售额；TACOS = 广告花费 ÷ 总销售额；CVR = 广告订单 ÷ 点击；PPC = 广告花费 ÷ 点击；ROAS = 广告销售额 ÷ 广告花费；比率类的环比写百分点。
+- 店铺总数据（总销售额、总订单、总销量）比广告数据更新得晚，也可能缺失：某店总订单为 0 但总销量大于 0，是总订单还没更新；总销售额为 0 但广告销售额大于 0，是 SparkX 没有返回这家店的店铺总数据。这两种情况写「—」，不当成 0。全公司的总销售额、总订单、总销量只加有数据的店铺；全公司 TACOS = 有总销售额数据的店铺的广告花费合计 ÷ 这些店铺的总销售额合计（不能用全公司广告花费去除），并注明不含哪几家。
+结构：
+1. 第一段一句话概述：统计日、对比日、监控店铺数、有广告数据的店铺数、当日有广告花费的店铺数、金额单位。
+2. **全公司核心指标**：表格「指标 | 当日 | 前一日 | 环比」，依次为总销售额、广告销售额、总订单、广告订单、总销量、广告销量、广告花费、ACOS、TACOS、CVR、PPC（CPC）、ROAS。
+3. **站点汇总**（监控店铺分布在两个及以上站点时才写，只有一个站点时省略）：表格「站点 | 店铺数 | 有数据 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费环比」。
+4. **有花费店铺明细**：表格「店铺 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费日环比 | 运营」，按广告花费从高到低；当日无广告花费、SparkX 没有记录的店铺在表格下方各用一行列出名单。
+5. **须知**：2–4 条编号短评，像资深投手在群里提醒老板——先下结论，再给证据：花费是否集中、ACOS 明显偏高的店铺、有广告花费但没有广告订单的店铺、店铺总数据缺失或未更新的店铺、某个站点没有返回数据（可能是 Token 授权范围）。
+金额保留到整数或两位小数，订单和销量写整数，百分比保留一位小数；最后用一句话说明近 7–14 天的广告销售和广告订单仍会回补，最近一天的店铺总数据可能还没更新完整。""",
     "review": """判定口径（金额 USD，campaign 级）：
 - 全店零曝光：两周内没有任何曝光，但仍有开启的 campaign（用 get_entity_metadata 统计开启数量），放在「最严重」。
-- ① 高花费零出单：近 7 日花费 ≥ $50、点击 ≥ 10、订单 = 0；建议 CPC = 当前 CPC × 70%。
+- ① 高花费零出单：近 7 日花费 ≥ $50、点击 ≥ 10、广告订单 = 0；建议 CPC = 当前 CPC × 70%。
 - ② ACOS 明显恶化（高花费低转化）：近 7 日花费 ≥ $50，ACOS ≥ 前 7 日的 1.5 倍且至少高 15 个百分点；建议 CPC = 当前 CPC × 前 7 日 ACOS ÷ 近 7 日 ACOS。
-- ③ 加预算后销售反而下滑：近 7 日花费 ≥ $50 且比前 7 日增加 ≥ 30%，销售额下降 ≥ 20%（或归零）。
+- ③ 加预算后销售反而下滑：近 7 日花费 ≥ $50 且比前 7 日增加 ≥ 30%，广告销售额下降 ≥ 20%（或归零）。
 - ④ 异常停摆：开启状态，前 7 日花费 ≥ $50，近 7 日没有曝光。
-- ⑤ 低花费高转化（机会，不计入异常）：近 7 日花费 < $100、订单 ≥ 3、ACOS ≤ 20%。
+- ⑤ 低花费高转化（机会，不计入异常）：近 7 日花费 < $100、广告订单 ≥ 3、ACOS ≤ 20%。
 结构：
-开头一句加粗：「N 个店铺中，M 个有投放数据，K 个检出 X 个异常 campaign。」，再一句统计范围和整体花费、销售、ACOS 的变化。
+开头一句加粗：「N 个店铺中，M 个有投放数据，K 个检出 X 个异常 campaign。」，再一句统计范围和整体广告花费、广告销售额、ACOS 的变化。
 **一、最严重**：最需要马上处理的问题，说明为什么严重。
 **二、异常店铺总览**：表格「店铺 | 近7日花费 | ACOS 近7日 | 前7日 | 异常数 | 主要问题 | 运营」。
 **三、按问题类型看具体 campaign**：每类一张表，列出店铺、Campaign、关键数据和建议 CPC（例如 2.45 → 1.80），最后一列是运营；⑤ 机会单独列出。
@@ -78,9 +84,12 @@ def _scope(monitored):
 
 _OUTPUT = ("输出要求：直接输出发到飞书群的正文（Markdown），不要开场白和结束语，不要代码块、链接或 @ 任何人；"
            "表格用标准 Markdown 表格；店铺写目录里的简称；有「运营」列的表格把「运营」放在最后一列，"
-           "写目录里的运营（未指定写「未映射运营」）；缺失的数据写「—」，不要当成 0。")
+           "写目录里的运营（未指定写「未映射运营」）；订单、销量、销售额写明是广告的还是店铺总的"
+           "（广告订单/总订单、广告销量/总销量、广告销售额/总销售额），不要只写「订单」「销量」「销售额」；"
+           "缺失的数据写「—」，不要当成 0。")
 # Which stores the hidden last line names, so the system can @ their operators.
-_FLAGGED = {"daily": "「须知」里点名需要运营处理的店铺（例如 ACOS 明显偏高、有花费没出单）",
+_FLAGGED = {"daily": "「须知」里点名需要运营处理的店铺（例如 ACOS 明显偏高、有广告花费但没有广告订单；"
+                     "只是店铺总数据缺失或未更新的不算）",
             "review": "检出异常（含全店零曝光）的店铺"}
 
 
@@ -105,19 +114,19 @@ def task_message(lane, config, *, now, monitored, alerted=()):
                 + _scope(monitored) + "\n" + _OUTPUT + "\n" + _stores_line(lane) + "\n\n任务要求：\n"
                 + prompt_text(lane, config))
     local = marketplace_now(now)
-    rules = (f"- high_spend_no_conversion 高花费无转化：花费 ≥ ${config['high_spend']:g} 且订单 = 0\n"
-             f"- high_spend_low_conversion 高花费低转化：花费 ≥ ${config['high_spend']:g}，有订单，"
+    rules = (f"- high_spend_no_conversion 高花费无转化：花费 ≥ ${config['high_spend']:g} 且广告订单 = 0\n"
+             f"- high_spend_low_conversion 高花费低转化：花费 ≥ ${config['high_spend']:g}，有广告订单，"
              f"但 ACOS ≥ {config['acos_high']:g}% 或 CVR < {config['cvr_low']:g}%\n"
              f"- low_spend_no_conversion 低花费无转化：${config['low_spend']:g} ≤ 花费 < ${config['high_spend']:g}，"
-             f"点击 ≥ {config['min_clicks']:g}，订单 = 0\n"
+             f"点击 ≥ {config['min_clicks']:g}，广告订单 = 0\n"
              f"- low_spend_high_conversion 低花费高转化（放量机会）：花费 < ${config['high_spend']:g}，"
-             f"订单 ≥ {config['min_orders_good']:g} 且 ACOS ≤ {config['acos_good']:g}%")
+             f"广告订单 ≥ {config['min_orders_good']:g} 且 ACOS ≤ {config['acos_good']:g}%")
     seen = "、".join(sorted(alerted)[:300]) or "无"
     extra = prompt_text(lane, config)
     return ("【定时任务 · 每小时广告监控】\n"
             f"美西今天：{local:%Y-%m-%d}，当前美西时间 {local:%H:%M}（今日数据是截至目前的累计，订单归因会延迟数小时）。\n"
             + _scope(monitored) + "只看开启状态（enabled）的 campaign。\n"
-            "提醒规则（金额 USD，订单 = Conversions）：\n" + rules + "\n"
+            "提醒规则（金额 USD，广告订单 = Conversions）：\n" + rules + "\n"
             f"今天已经提醒过、本次不要再列出的（profileId:campaignId:类型）：{seen}\n"
             "可以用 get_ads_perf 的 filters 按花费、订单直接过滤，减少返回行数。\n"
             "最终回答只输出一个 JSON 对象，不要任何其他文字或代码块，格式："

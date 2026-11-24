@@ -1,9 +1,11 @@
 """Lane tasks: the fixed scope around the owner's text, and checks on DeepSeek's answers."""
 import json
+import re
 
 import pytest
 
 from jx_alert.ai import agent
+from jx_alert.reports import cards
 from jx_alert.reports import settings as lane_settings
 from jx_alert.reports import tasks
 from jx_alert.sparkx import skills as skill_store
@@ -33,12 +35,40 @@ def test_daily_task_fixes_dates_scope_and_contract_around_the_owner_text():
     assert custom.endswith("只看 ACOS") and tasks.DEFAULT_PROMPTS["daily"] not in custom
     review = tasks.task_message("review", {"prompt": ""}, now=SEND, monitored={"101"})
     assert "近 7 日：2026-11-16 ~ 2026-11-22；前 7 日：2026-11-09 ~ 2026-11-15" in review and "JX_STORES" in review
+    for message in (custom, review):  # fixed contract: also when the owner rewrote the task text
+        assert "广告订单/总订单、广告销量/总销量" in message and "不要只写「订单」「销量」「销售额」" in message
+
+
+def _table_spec(text, section):
+    """The columns a section of the task text asks for, e.g. 「店铺 | … | 运营」."""
+    found = re.search(re.escape(section) + r"[^「]*「([^」]+)」", text)
+    return [name.strip() for name in found.group(1).split("|")]
+
+
+def test_the_daily_report_tells_ad_and_store_totals_apart():
+    """Owner (Nov 2026): 总销量 is shown, and 广告订单/总订单, 广告销量/总销量 are never mixed up."""
+    daily = tasks.DEFAULT_PROMPTS["daily"]
+    stores_table = _table_spec(daily, "**有花费店铺明细**")
+    assert stores_table == ["店铺", "广告花费", "广告销售额", "总销售额", "广告订单", "总订单", "广告销量", "总销量",
+                            "ACOS", "TACOS", "花费日环比", "运营"]
+    core = re.search(r"依次为([^。]+)。", daily).group(1).split("、")
+    assert core[:7] == ["总销售额", "广告销售额", "总订单", "广告订单", "总销量", "广告销量", "广告花费"]
+    site = _table_spec(daily, "**站点汇总**")
+    assert {"广告订单", "总订单", "广告销量", "总销量"} <= set(site) and not {"订单", "销量", "销售额"} & set(site)
+    assert max(len(stores_table), len(site)) <= cards.MAX_COLUMNS
+    # Where each figure comes from (SparkX sparkx-query-ads-performance field reference, checked live).
+    assert "factEntity=campaign 的 Spend、Sales、Conversions、Units、Clicks" in daily
+    assert "factEntity=asin 的 TotalSalesAmount、OrderCount、UnitCount" in daily
+    # Live data: the latest day's OrderCount can still be 0 while UnitCount is filled; that is missing, not zero.
+    assert "总订单为 0 但总销量大于 0" in daily and "写「—」，不当成 0" in daily
+    # A store without store totals must not inflate TACOS: its ad spend stays out of the numerator too.
+    assert "全公司 TACOS = 有总销售额数据的店铺的广告花费合计 ÷ 这些店铺的总销售额合计" in daily
 
 
 def test_hourly_task_carries_the_thresholds_and_what_was_already_alerted():
     text = tasks.task_message("hourly", HOURLY, now=HOUR, monitored={"101"}, alerted={"101:9:low_spend_no_conversion"})
     assert "美西今天：2026-11-23，当前美西时间 22:05" in text
-    assert "花费 ≥ $30 且订单 = 0" in text and "点击 ≥ 15" in text and "ACOS ≤ 20%" in text
+    assert "花费 ≥ $30 且广告订单 = 0" in text and "点击 ≥ 15" in text and "ACOS ≤ 20%" in text
     assert "101:9:low_spend_no_conversion" in text and '"findings"' in text
 
 
