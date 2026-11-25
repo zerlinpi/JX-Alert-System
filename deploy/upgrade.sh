@@ -155,7 +155,8 @@ main() {
   wait_for 30 "existing vhost route via port $legacy_port" status_is "$legacy_port" /console/login "$host" 200 \
     || fail "legacy port $legacy_port does not reach the console; rollback: $rollback"
   [[ "$(http_status "$legacy_port" /mcp "$host")" == 410 ]] || fail "retired /mcp path does not answer 410; rollback: $rollback"
-  # The official read-only SparkX Skills live in data/ (not in the repository); agents also retry later.
+  # The official SparkX Skills (read, and write ones used only in write mode) live in data/, not in the
+  # repository; agents also retry later.
   if compose exec -T console python -m jx_alert.sparkx.skills install; then
     say "ok: SparkX Skills installed"
   else

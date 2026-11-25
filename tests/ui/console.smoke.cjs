@@ -54,10 +54,22 @@ const skillsView = (disabled) => ({ installed: { release: "v1.3.7", commit: "b72
       state: disabled.includes("sparkx-weekly-ads-report") ? "off" : "on", tools: [] },
     { name: "sparkx-query-market-data", version: "1.0.1", description: "Market.", mcp_tools: ["get_market_search_perf"], required: false,
       state: "missing_tools", tools: ["get_market_search_perf"] },
-    { name: "sparkx-edit-ads", version: "1.3.0", description: "Edit.", mcp_tools: ["batch_update_ads"], required: true,
-      state: "write", tools: ["batch_update_ads"] }],
+    { name: "sparkx-edit-ads", version: "1.3.0", description: "Edit.", mcp_tools: ["batch_update_ads"], required: true, write: true,
+      state: writeOn ? "on" : "write_off", tools: writeOn ? [] : ["batch_update_ads"] },
+    { name: "sparkx-future-tool", version: "0.1.0", description: "Needs a tool JX never offers.", mcp_tools: ["list_skills"], required: false,
+      write: false, state: "unsupported", tools: ["list_skills"] }],
   choices: { revision: disabled.length ? "7".repeat(64) : "0".repeat(64), disabled },
-  read_tools: ["get_ads_perf", "get_entity_metadata"], source: "SparkXAI/SparkXAI-MCP", latest: null, error: null });
+  read_tools: ["get_ads_perf", "get_entity_metadata"], write_tools: ["batch_update_ads"], source: "SparkXAI/SparkXAI-MCP",
+  latest: null, error: null });
+// The 「广告写入」 switch and its audit log as the server answers them.
+let writeOn = false;
+const writesView = () => ({ revision: (writeOn ? "8" : "0").repeat(64), enabled: writeOn, updated_at: null,
+  enabled_at: writeOn ? "2026-11-26T01:00:00Z" : null, error: null, leads: ["老板", "广告主管"], confirm_word: "确认执行",
+  write_tools: ["batch_update_ads", "create_portfolio"], offered_write_tools: ["batch_update_ads"], max_writes: 30,
+  log: [{ id: 7, at: "2026-11-26T01:05:00Z", status: "EXECUTED", status_label: "已执行", tool: "batch_update_ads", requester: "老板",
+    request: '{"profileId":101,"request":{"confirmToken":"***"}}', result: '{"status":"SUCCESS"}' },
+  { id: 6, at: "2026-11-26T01:04:00Z", status: "BLOCKED", status_label: "已拦截，未执行", tool: "batch_update_ads", requester: "老板",
+    request: '{"profileId":101}', result: "" }] });
 const responses = {
   "GET /console/api/overview": () => ({ sparkx: { configured: true, token_source: "console" }, deepseek: { configured: true, model: "deepseek-flash" },
     skills: { installed: false, release: null, count: 0 },
@@ -101,6 +113,8 @@ const responses = {
   "GET /console/api/groups": () => ({ chat_id: "oc_reports", name: "日报群", revision: "1".repeat(64), chats: [{ id: "oc_reports", name: "日报群" }] }),
   "GET /console/api/sparkx": () => ({ revision: "0".repeat(64), configured: true, token_source: "console", endpoint: "https://mcp.sparkx.cn/mcp" }),
   "GET /console/api/skills": () => skillsView([]),
+  "GET /console/api/sparkx/write": () => writesView(),
+  "POST /console/api/sparkx/write": (body) => { writeOn = body.enabled; return writesView(); },
   "POST /console/api/sparkx/test": () => ({ status: "OK", profile_count: 1, profiles: [{ profile_id: "101", name: "香港川页", country: "US", store_type: "seller" }] }),
   "GET /console/api/deepseek": () => ({ revision: "0".repeat(64), configured: true, models: ["deepseek-flash", "deepseek-v4-pro"],
     model: "deepseek-flash", timeout: 120, thinking: true, key_source: "console" }),
@@ -108,7 +122,7 @@ const responses = {
     model: body.model, timeout: body.timeout, thinking: body.thinking }),
   "POST /console/api/deepseek/test": () => ({ status: "NOT_CONFIGURED" }),
   "GET /console/api/deliveries": () => ({ rows: [{ created_at: "2026-11-24T00:31:00Z", lane: "08:30 日报（测试）", recipient: "通知群",
-    title: "【测试】SparkX 广告日报", status: "DELIVERY_UNKNOWN", error: "可能已提交飞书", delivered_at: null }] }),
+    title: "广告日报 · 2026-11-22", status: "DELIVERY_UNKNOWN", error: "可能已提交飞书", delivered_at: null }] }),
 };
 let hold = true;  // DeepSeek keeps "working" until the test releases it
 const prefixes = {
@@ -295,12 +309,41 @@ const locked = () => doc.documentElement.classList.contains("scroll-locked");
   checks.push(["skills listed", $("skills-rows").textContent.includes("sparkx-query-ads-performance") && $("skills-facts").textContent.includes("v1.3.7")
     && $("tool-chips").children.length === 2]);
   const skillBox = (name) => $("skills-rows").querySelector(`input[data-skill="${name}"]`);
-  checks.push(["every official skill shows its state", $("skills-rows").children.length === 4
+  checks.push(["every official skill shows its state", $("skills-rows").children.length === 5
     && skillBox("sparkx-query-ads-performance").checked && skillBox("sparkx-query-ads-performance").disabled
     && skillBox("sparkx-weekly-ads-report").checked && !skillBox("sparkx-weekly-ads-report").disabled
     && !skillBox("sparkx-edit-ads").checked && skillBox("sparkx-edit-ads").disabled
-    && $("skills-rows").textContent.includes("需要写入工具，不安装") && $("skills-rows").textContent.includes("当前 SparkX Token 没有提供")
-    && $("skills-summary").textContent === "已安装 3 个，使用中 2 个；1 个需要写入工具，未安装"]);
+    && !skillBox("sparkx-future-tool").checked && skillBox("sparkx-future-tool").disabled
+    && $("skills-rows").textContent.includes("写入未开启") && $("skills-rows").textContent.includes("开启「广告写入」后启用")
+    && $("skills-rows").textContent.includes("写入（随「广告写入」开关）")
+    && $("skills-rows").textContent.includes("需要本系统不提供的工具：list_skills")
+    && $("skills-rows").textContent.includes("当前 SparkX Token 没有提供")
+    && $("skills-summary").textContent === "已安装 4 个（写入 1 个），使用中 2 个；1 个需要本系统不提供的工具，未安装"]);
+  checks.push(["the write switch starts off and lists who may write", $("writes-badge").textContent === "已关闭（只读）"
+    && !$("writes-enabled").checked && $("writes-confirm-row").hidden && $("writes-facts").textContent.includes("老板、广告主管")
+    && $("writes-facts").textContent.includes("确认执行") && $("writes-facts").textContent.includes("batch_update_ads")
+    && $("writes-rows").children.length === 2 && $("writes-rows").textContent.includes("已拦截，未执行")
+    && $("writes-rows").textContent.includes('"confirmToken":"***"')]);
+  $("writes-enabled").checked = true; change($("writes-enabled"));
+  checks.push(["switching on asks for a confirmation first", !$("writes-confirm-row").hidden && !$("writes-confirm").checked]);
+  const before = count("POST /console/api/sparkx/write");
+  $("writes-form").dispatchEvent(new window.Event("submit", { cancelable: true }));
+  await tick();
+  checks.push(["without the confirmation nothing is saved", count("POST /console/api/sparkx/write") === before]);
+  $("writes-confirm").checked = true;
+  $("writes-form").dispatchEvent(new window.Event("submit", { cancelable: true }));
+  await tick();
+  const writeSave = last("POST /console/api/sparkx/write");
+  checks.push(["the switch is saved with its revision and the confirmation", writeSave && writeSave.body.enabled === true
+    && writeSave.body.confirmed === true && writeSave.body.revision === "0".repeat(64) && Object.keys(writeSave.body).length === 3
+    && $("writes-badge").textContent === "已开启" && $("writes-confirm-row").hidden
+    && skillBox("sparkx-edit-ads").checked && skillBox("sparkx-edit-ads").disabled]);
+  $("writes-enabled").checked = false; change($("writes-enabled"));
+  $("writes-form").dispatchEvent(new window.Event("submit", { cancelable: true }));
+  await tick();
+  const writeOff = last("POST /console/api/sparkx/write");
+  checks.push(["switching off needs no confirmation", writeOff.body.enabled === false && writeOff.body.confirmed === false
+    && writeOff.body.revision === "8".repeat(64) && $("writes-badge").textContent === "已关闭（只读）"]);
   const weeklySkill = skillBox("sparkx-weekly-ads-report");
   weeklySkill.checked = false; change(weeklySkill);
   await tick();

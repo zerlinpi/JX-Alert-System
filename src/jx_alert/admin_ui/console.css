@@ -154,6 +154,10 @@ td.col-actions { text-align: end; }
 .skills-table input[type="checkbox"] { width: 16px; height: 16px; }
 .skill-name span.muted, .skill-state span.muted { display: block; font-size: 12px; font-family: inherit; }
 .skill-state { min-width: 120px; }
+.write-log td { vertical-align: top; }
+.write-log td:nth-child(1), .write-log td:nth-child(3) { white-space: nowrap; }
+.write-log .payload { display: block; min-width: 220px; max-width: 420px; max-height: 160px; overflow: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
 .section-note { margin: -6px 0 4px; font-size: 12px; }
 .store-name strong { display: block; }
 .store-name span { display: block; font-size: 12px; color: var(--muted); }

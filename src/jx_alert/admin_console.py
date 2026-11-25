@@ -5,8 +5,10 @@ is used (12 hours without a request ends it, 7 days after login at the latest). 
 POST needs the same-origin header and the session-bound CSRF token. Secrets are
 write-only: tokens and keys are never returned to the browser. Previews run DeepSeek
 against live SparkX data in a background job and never queue a message; only an
-explicit 「发送测试」 queues the previewed cards (server-side copy), marked 【测试】,
-with their Excel copy. Saved Excel copies can be downloaded from 「发送记录」.
+explicit 「发送测试」 queues the previewed cards (server-side copy, with no 测试 wording)
+with their Excel copy. Saved Excel copies can be downloaded from 「发送记录」. The
+「广告写入」 switch (off by default) lets the 负责人 change ads through the Feishu bot,
+each change confirmed with 「确认执行」; the console lists every write attempt.
 """
 import asyncio
 from collections import Counter
@@ -39,9 +41,11 @@ from jx_alert.reports import archive, lanes
 from jx_alert.reports import settings as lane_settings
 from jx_alert.reports import tasks as lane_tasks
 from jx_alert.sparkx import credentials as sparkx_credentials
+from jx_alert.ai.agent import MAX_WRITES
 from jx_alert.sparkx import skills as skill_store
 from jx_alert.sparkx import stores as directory_module
-from jx_alert.sparkx.client import READ_TOOLS, SparkXError, fetch_roster, offered_read_tools
+from jx_alert.sparkx import write_mode
+from jx_alert.sparkx.client import READ_TOOLS, WRITE_TOOLS, SparkXError, fetch_roster, offered_tool_names
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import SyncJob
 
@@ -68,6 +72,8 @@ _ROLE_LABELS = {"group": "通知群", "lead": "负责人", "operator": "运营",
                 "private_question": "私聊问答"}
 _LANE_LABELS = {"daily": "08:30 日报", "review": "异常复盘", "hourly": "实时监控"}
 _ARCHIVE_LABELS = {**_LANE_LABELS, "tests": "测试发送"}
+_WRITE_LABELS = {"RUNNING": "已提交，结果未知", "PREVIEW": "预览（待二次确认）", "EXECUTED": "已执行",
+                 "FAILED": "失败", "BLOCKED": "已拦截，未执行"}
 
 
 def _digest(value):
@@ -397,6 +403,7 @@ class OwnerConsole:
         return {"sparkx": sparkx, "deepseek": deepseek,
                 "skills": {"installed": bool(index), "release": (index or {}).get("release"),
                            "count": len((index or {}).get("skills") or [])},
+                "writes": {"enabled": write_mode.enabled(settings)},
                 "feishu": {"enabled": settings.feishu_enabled, "dry_run": settings.app_dry_run,
                            "delivery_enabled": settings.delivery_enabled(), "group": group,
                            "company_lead": bool(leads.get("company")), "ad_lead": bool(leads.get("ad")),
@@ -535,7 +542,7 @@ class OwnerConsole:
         return {**self.previews.get(key), "job": key, "lane": lane, "reused": reused, "current": current}
 
     def _test_send(self, request, payload):
-        """Queue a finished preview's cards (server-side copy) as a 【测试】 message; no new DeepSeek run."""
+        """Queue a finished preview's cards (server-side copy) as a test send; no new DeepSeek run."""
         flags = ("to_group", "to_lead", "mention")
         if (set(payload) != {"job", *flags} or not isinstance(payload["job"], str)
                 or any(type(payload[name]) is not bool for name in flags)):
@@ -571,22 +578,73 @@ class OwnerConsole:
     # ------------------------------------------------------------ skills
 
     def _offered(self, refresh=False):
-        """SparkX read tools this token gets now (cached 10 minutes); None when SparkX cannot be asked."""
+        """SparkX tools this token gets in write mode (read tools and the allow-listed write tools),
+        cached 10 minutes; None when SparkX cannot be asked."""
         cached = self._tools
         if cached and not refresh and time.monotonic() - cached[0] < 600:
             return cached[1]
         if not lanes.sparkx_ready(self.settings):
             return None
         try:
-            names = offered_read_tools(self.settings)
+            names = offered_tool_names(self.settings, write=True)
         except SparkXError:
             return None
         self._tools = (time.monotonic(), names)
         return names
 
     def _skills(self, check=False):
-        view = skill_store.status(self.settings, check=check, offered=self._offered(refresh=check))
-        return {**view, "read_tools": sorted(READ_TOOLS), "source": skill_store.REPOSITORY}
+        view = skill_store.status(self.settings, check=check, offered=self._offered(refresh=check),
+                                  write_on=write_mode.enabled(self.settings))
+        return {**view, "read_tools": sorted(READ_TOOLS), "write_tools": sorted(WRITE_TOOLS),
+                "source": skill_store.REPOSITORY}
+
+    # ------------------------------------------------------------ ad writes (owner decision, Nov 2026)
+
+    def _write_log(self, db, limit=30):
+        rows = db.scalars(select(SyncJob).where(SyncJob.job_type == "sparkx_write")
+                          .order_by(SyncJob.id.desc()).limit(limit)).all()
+        result = []
+        for row in rows:
+            meta = row.metadata_json or {}
+            request = meta.get("request")
+            result.append({"id": row.id, "at": _iso(row.started_at), "status": row.status,
+                           "status_label": _WRITE_LABELS.get(row.status, row.status),
+                           "tool": str(meta.get("tool") or "")[:80], "requester": str(meta.get("requester") or "—")[:100],
+                           "request": json.dumps(request, ensure_ascii=False)[:600] if request is not None else "",
+                           "result": str(meta.get("result") or "")[:600]})
+        return result
+
+    def _writes(self):
+        try:
+            state = write_mode.load(self.settings)
+            error = None
+        except write_mode.WriteModeError as exc:
+            state, error = {"revision": None, "enabled": False, "updated_at": None, "enabled_at": None}, exc.detail
+        try:
+            leads = admin_feishu.leads(self.settings)
+        except admin_feishu.MappingError:
+            leads = {}
+        people = [person.get("name") or "—" for key in ("company", "ad") for person in leads.get(key) or []]
+        offered = self._offered()
+        with self.session_factory() as db:
+            log = self._write_log(db)
+        return {**state, "error": error, "leads": list(dict.fromkeys(people)), "confirm_word": write_mode.CONFIRM_WORD,
+                "write_tools": sorted(WRITE_TOOLS),
+                "offered_write_tools": None if offered is None else sorted(set(offered) & WRITE_TOOLS),
+                "max_writes": MAX_WRITES, "log": log}
+
+    def _save_writes(self, payload):
+        if (set(payload) != {"enabled", "revision", "confirmed"} or type(payload["enabled"]) is not bool
+                or type(payload["confirmed"]) is not bool or not isinstance(payload["revision"], str)):
+            raise ConsoleError("提交内容无效。", 400)
+        if payload["enabled"] and not payload["confirmed"]:
+            raise ConsoleError("开启前请勾选确认：负责人在飞书里确认后，DeepSeek 会直接修改线上广告。", 400)
+        try:
+            write_mode.save(self.settings, payload["enabled"], payload["revision"])
+        except write_mode.WriteModeError as exc:
+            raise ConsoleError(exc.detail, exc.status_code) from None
+        _LOG.warning("Ad writes switched %s from the console", "on" if payload["enabled"] else "off")
+        return self._writes()
 
     def _install_skills(self):
         try:
@@ -672,6 +730,8 @@ class OwnerConsole:
             return await run(deepseek_config.configuration, self.settings)
         if path == "/console/api/skills":
             return await run(self._skills)
+        if path == "/console/api/sparkx/write":
+            return await run(self._writes)
         if path == "/console/api/reports/preview":
             lane = request.query_params.get("lane")
             if lane is None:
@@ -772,14 +832,17 @@ class OwnerConsole:
         if path == "/console/api/skills/choices":
             self._limit(request, "skills-choices", 20, 40)
             return await run(self._choose_skills, payload)
+        if path == "/console/api/sparkx/write":
+            self._limit(request, "ad-write-switch", 6, 12)
+            return await run(self._save_writes, payload)
         raise ConsoleError("接口不存在。", 404)
 
     def routes(self):
         api_get = ["overview", "sparkx", "stores", "members", "recipients", "groups", "reports", "reports/preview",
-                   "deepseek", "skills", "deliveries", "archive", "archive/file"]
+                   "deepseek", "skills", "sparkx/write", "deliveries", "archive", "archive/file"]
         api_post = ["sparkx", "sparkx/test", "stores/refresh", "stores/save", "recipients/company", "recipients/ad",
                     "groups", "members/refresh", "reports", "reports/preview", "reports/test-send", "deepseek",
-                    "deepseek/test", "skills/install", "skills/check", "skills/choices"]
+                    "deepseek/test", "skills/install", "skills/check", "skills/choices", "sparkx/write"]
         routes = [Route("/", self.root), Route("/console", self.home), Route("/console/", self.home),
                   Route("/console/login", self.login, methods=["GET", "POST"]),
                   Route("/console/assets/{asset}", self.asset),

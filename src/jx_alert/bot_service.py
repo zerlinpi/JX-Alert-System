@@ -4,6 +4,15 @@ The event callback only persists the validated envelope (SyncJob
 "feishu_question"); a separate worker thread answers it and replies to the
 original message through the outbox. No model or SparkX request runs inside
 the event callback. Answered turns keep their text so follow-ups have context.
+
+Ad changes (owner decision, Nov 2026): with the 「广告写入」 switch on, a question
+from a 负责人 runs in write mode. The worker, never the model, decides the turn:
+"plan" (writes blocked; the answer lists the change and asks for 「确认执行」) or
+"execute" (the requester's message is exactly 「确认执行」 and their previous turn
+in this conversation was such a plan, at most CONFIRM_WINDOW old). An execute
+turn never runs twice: a retried one only says that changes may have been made.
+Every write attempt is kept as a SyncJob "sparkx_write" row without the
+confirmToken.
 """
 from datetime import datetime, timedelta, timezone
 import json
@@ -16,6 +25,7 @@ from sqlalchemy import func, select
 from jx_alert.notifications.cards import simple_card
 from jx_alert.notifications.outbox import QUESTION_REPLY_PREFIX, enqueue_notification
 from jx_alert.notifications.routing import OPEN_ID, load_routing, report_group_delivery
+from jx_alert.sparkx import write_mode
 from jx_alert.storage.job_lock import JobAlreadyRunning, database_job_lock
 from jx_alert.storage.models import SyncJob
 
@@ -29,6 +39,14 @@ ACK_TIMEOUT = 5
 HISTORY_TURNS = 6
 HISTORY_WINDOW = timedelta(minutes=60)
 MAX_ANSWER_MEMORY = 4000
+WRITE_JOB = "sparkx_write"
+# A 「确认执行」 answers the plan of the requester's previous turn, given at most this long ago.
+CONFIRM_WINDOW = timedelta(minutes=30)
+MAX_WRITE_REQUEST = 20000
+MAX_WRITE_RESULT = 4000
+INTERRUPTED_WRITE = ("上次执行在完成前中断，部分修改可能已经提交。请先让我查一下当前状态，"
+                     "确认后再重新发起修改。")
+UNSURE_WRITE = "这次执行没有完成，部分修改可能已经提交。请先让我查一下当前状态，确认后再重新发起修改。"
 
 
 def _utcnow():
@@ -217,6 +235,76 @@ def history(db, meta, job_id, now):
     return list(reversed(turns))
 
 
+# ---------------------------------------------------------------- write mode
+
+def write_leads(settings):
+    """{open_id: name} of the people who may change ads through the bot: every 总负责人 and
+    广告负责人 chosen in the console (owner decision, Nov 2026)."""
+    from jx_alert.reports.recipients import ad_leads, company_leads
+
+    routing = load_routing(settings.feishu_routing_file)
+    return {person["open_id"]: person["name"] for person in (*company_leads(settings, routing), *ad_leads(routing))}
+
+
+def previous_turn(db, meta, job_id):
+    """The latest earlier question of the same conversation, whatever became of it, or None."""
+    rows = db.scalars(select(SyncJob).where(
+        SyncJob.job_type == JOB, SyncJob.id < job_id,
+        SyncJob.metadata_json["chat_id"].as_string() == meta.get("chat_id"))
+        .order_by(SyncJob.id.desc()).limit(40)).all()
+    return next((row for row in rows if _conversation(row.metadata_json or {}) == _conversation(meta)), None)
+
+
+def write_turn(settings, db, meta, job_id, now):
+    """(mode, requester name). Mode: None (writes off), "denied" (not a 负责人), "plan", or "execute":
+    the message is exactly 「确认执行」 and the requester's previous turn here was a plan."""
+    if not write_mode.enabled(settings):
+        return None, None
+    try:
+        allowed = write_leads(settings)
+    except (OSError, RuntimeError, ValueError):
+        return "denied", None
+    name = allowed.get(meta.get("sender_id"))
+    if name is None:
+        return "denied", None
+    if not write_mode.confirms(meta.get("question")):
+        return "plan", name
+    last = previous_turn(db, meta, job_id)
+    item = (last.metadata_json or {}) if last is not None else {}
+    if (last is not None and last.status == "SUCCEEDED" and item.get("write_plan") is True
+            and item.get("sender_id") == meta.get("sender_id") and last.finished_at is not None
+            and timedelta(0) <= now.replace(tzinfo=None) - last.finished_at <= CONFIRM_WINDOW):
+        return "execute", name
+    return "plan", name
+
+
+def write_recorder(session_factory, meta, job_id):
+    """``record(attempt, tool, request, status, result)`` for agent.WriteGate: one row per attempt,
+    committed at once. RUNNING (submitted, outcome unknown) becomes PREVIEW, EXECUTED or FAILED;
+    a blocked call is BLOCKED. Requests and results arrive without the confirmToken."""
+    rows = {}
+
+    def record(attempt, tool, request, status, result):
+        body = json.dumps(request, ensure_ascii=False, default=str)
+        clock = _utcnow().replace(tzinfo=None)
+        with session_factory() as db:
+            row = db.get(SyncJob, rows[attempt]) if attempt in rows else None
+            if row is None:
+                row = SyncJob(job_type=WRITE_JOB, started_at=clock)
+                db.add(row)
+            row.status, row.finished_at = status, None if status == "RUNNING" else clock
+            row.metadata_json = {
+                "question_job_id": job_id, "message_id": meta.get("message_id"), "sender_id": meta.get("sender_id"),
+                "requester": meta.get("requester"), "chat_type": meta.get("chat_type"), "write_mode":
+                meta.get("write_mode"), "attempt": attempt, "tool": tool,
+                "request": request if len(body) <= MAX_WRITE_REQUEST else {"truncated": body[:MAX_WRITE_REQUEST]},
+                "result": result[:MAX_WRITE_RESULT] if isinstance(result, str) else None}
+            db.commit()
+            rows[attempt] = row.id
+
+    return record
+
+
 # ---------------------------------------------------------------- worker
 
 def _reaction_client(settings):
@@ -308,18 +396,43 @@ def process_one_question(settings, session_factory, engine, *, answer=None):
             db.commit()
             turns = history(db, meta, job_id, now)
             roster, _ = latest_roster(db)
-        question = meta["question"]
+            # An execute turn never runs twice: some of its changes may already have been made.
+            interrupted = meta.get("write_mode") == "execute"
+            if not interrupted:
+                mode, requester = write_turn(settings, db, meta, job_id, now)
+                meta = {**meta, "write_mode": mode, "requester": requester}
+                job.metadata_json = meta
+                db.commit()
+        if interrupted:
+            meta = {**meta, "answer_text": INTERRUPTED_WRITE, "write_plan": False}
+            with session_factory() as db:
+                return _complete(db, settings, job_id, meta, [simple_card(TITLE, INTERRUPTED_WRITE)],
+                                 "write_interrupted")
+        mode = meta["write_mode"]
+        record = write_recorder(session_factory, meta, job_id) if mode in {"plan", "execute"} else None
+        # After a failed execute turn the reader must know that changes may have been made.
+        unsure = "\n\n" + UNSURE_WRITE if mode == "execute" else ""
         try:
-            result = (answer or answer_question)(settings, question, history=turns, roster=roster)
+            result = (answer or answer_question)(settings, meta["question"], history=turns, roster=roster,
+                                                 write=mode, record=record)
         except DeepSeekError as exc:
-            cards, provider = [simple_card(TITLE, f"暂时无法回答：{exc}")], "deepseek_unavailable"
+            text, provider = f"暂时无法回答：{exc}{unsure}", "deepseek_unavailable"
+            cards = [simple_card(TITLE, text)]
         except SparkXError as exc:
-            cards, provider = [simple_card(TITLE, f"暂时查不到广告数据：{exc.message}")], "sparkx_error"
+            text, provider = f"暂时查不到广告数据：{exc.message}{unsure}", "sparkx_error"
+            cards = [simple_card(TITLE, text)]
         else:
-            provider = result["provider"]
+            text, provider = None, result["provider"]
             cards = answer_cards(TITLE, result["answer"])
             meta["sparkx_calls"] = result.get("calls", 0)
             meta["answer_text"] = result["answer"][:MAX_ANSWER_MEMORY]
+            # Only a write-mode answer that asks for 「确认执行」 can be confirmed by the next message.
+            meta["write_plan"] = (result.get("write") in {"plan", "execute"}
+                                  and write_mode.CONFIRM_WORD in result["answer"])
+            if mode == "execute":
+                meta["writes"] = result.get("writes", 0)
+        if text is not None and mode == "execute":
+            meta = {**meta, "answer_text": text, "write_plan": False}
         with session_factory() as db:
             return _complete(db, settings, job_id, meta, cards, provider)
 

@@ -31,7 +31,11 @@
   const MAX_LEADS = 10;
   const SKILL_STATES = {
     on: ["使用中", "ok"], off: ["已停用", ""], missing_tools: ["需开通工具", "warn"],
-    not_installed: ["未安装", "warn"], write: ["需要写入工具，不安装", "bad"],
+    not_installed: ["未安装", "warn"], write_off: ["写入未开启", ""], unsupported: ["不支持，不安装", "bad"],
+  };
+  const WRITES = {
+    RUNNING: ["已提交，结果未知", "warn"], PREVIEW: ["预览（待二次确认）", "info"], EXECUTED: ["已执行", "ok"],
+    FAILED: ["失败", "bad"], BLOCKED: ["已拦截，未执行", ""],
   };
 
   // Leads are lists since multiple leads (older servers answered one object or null).
@@ -46,10 +50,17 @@
   function skillState(entry) {
     const found = SKILL_STATES[entry && entry.state] || [entry && entry.state ? entry.state : "—", ""];
     const tools = (entry && entry.tools) || [];
-    const detail = entry && entry.state === "missing_tools" ? "当前 SparkX Token 没有提供：" + tools.join("、")
-      : entry && entry.state === "write" ? "需要：" + tools.join("、") : entry && entry.state === "not_installed"
-        ? "点「安装 / 更新」后可用" : "";
+    const kind = entry && entry.state;
+    const detail = kind === "missing_tools" ? "当前 SparkX Token 没有提供：" + tools.join("、")
+      : kind === "unsupported" ? "需要本系统不提供的工具：" + tools.join("、")
+        : kind === "write_off" ? "开启「广告写入」后启用"
+          : kind === "not_installed" ? "点「安装 / 更新」后可用" : "";
     return { text: found[0], tone: found[1], detail };
+  }
+
+  function writeLabel(status) {
+    const found = WRITES[status];
+    return found ? { text: found[0], tone: found[1] } : { text: status || "—", tone: "" };
   }
 
   function fileSize(bytes) {
@@ -378,7 +389,8 @@
       $("status-cards").replaceChildren(
         stat("SparkX MCP", sparkx.configured ? "已连接" : "未配置",
           skills.installed ? `官方 Skills ${skills.release || ""}（${skills.count} 个）` : "官方 Skills 未安装",
-          sparkx.configured ? { text: "只读", tone: "ok" } : { text: "待配置", tone: "warn" }, "sparkx"),
+          !sparkx.configured ? { text: "待配置", tone: "warn" }
+            : (data.writes || {}).enabled ? { text: "广告写入已开启", tone: "warn" } : { text: "只读", tone: "ok" }, "sparkx"),
         stat("DeepSeek", deepseek.configured ? (deepseek.model || "已配置") : "未配置",
           deepseek.configured ? (deepseek.thinking === false ? "深度思考已关闭" : "深度思考已开启") : "未配置时三条通知不会运行",
           deepseek.configured ? { text: "可用", tone: "ok" } : { text: "待配置", tone: "warn" }, "deepseek"),
@@ -746,7 +758,7 @@
       const sent = (entry.sent || []).map((name) => (name === "group" ? "通知群" : lane === "daily" ? "总负责人" : "广告负责人"));
       $("test-send-hint").textContent = !result ? "预览生成后可以发送测试。" : !cards ? "这份预览没有内容，无法发送测试。"
         : sent.length ? `已发送测试到：${sent.join("、")}。同一份预览不会重复发给同一对象；需要新内容请「重新生成」。`
-          : "发送的就是上面这份预览（标题带【测试】）" + (result.info && result.info.excel ? "和它的 Excel 文件" : "") +
+          : "发送的就是上面这份预览" + (result.info && result.info.excel ? "和它的 Excel 文件" : "") +
             "，不会再调用 DeepSeek，也不计入定时发送。";
       if (drawer.attention && cards) {
         drawer.attention = false;
@@ -817,22 +829,54 @@
         const box = doc.createElement("input");
         box.type = "checkbox";
         box.dataset.skill = skill.name;
-        box.checked = skill.state === "on" || skill.state === "missing_tools" || (skill.required && skill.state !== "write");
-        box.disabled = Boolean(skill.required) || skill.state === "write" || skill.state === "not_installed";
+        // Write Skills follow the 「广告写入」 switch; only optional read Skills can be ticked here.
+        const fixed = Boolean(skill.required) || Boolean(skill.write);
+        box.checked = skill.state === "on" || skill.state === "missing_tools"
+          || (Boolean(skill.required) && !skill.write && skill.state !== "unsupported" && skill.state !== "not_installed");
+        box.disabled = fixed || skill.state === "unsupported" || skill.state === "not_installed";
         box.setAttribute("aria-label", "启用 " + skill.name);
         const name = el("div", null, "skill-name");
-        name.append(el("strong", skill.name), el("span", skill.required ? "基础（始终启用）" : "选装", "muted"));
+        name.append(el("strong", skill.name), el("span", skill.write ? "写入（随「广告写入」开关）"
+          : skill.required ? "基础（始终启用）" : "选装", "muted"));
         const status = el("div", null, "skill-state");
         status.append(badge(label));
         if (label.detail) status.append(el("span", label.detail, "muted"));
         return row([box, name, skill.version || "—", status, (skill.mcp_tools || []).join("、"), skill.description || "—"]);
-      }), "尚未安装：点「安装 / 更新」从 GitHub 获取官方只读 Skills。", 6);
+      }), "尚未安装：点「安装 / 更新」从 GitHub 获取官方 Skills。", 6);
       const used = catalog.filter((skill) => skill.state === "on").length;
-      const present = catalog.filter((skill) => skill.state !== "write" && skill.state !== "not_installed").length;
-      const blocked = catalog.filter((skill) => skill.state === "write").length;
-      $("skills-summary").textContent = catalog.length ? `已安装 ${present} 个，使用中 ${used} 个` +
-        (blocked ? `；${blocked} 个需要写入工具，未安装` : "") : "";
+      const present = catalog.filter((skill) => skill.state !== "unsupported" && skill.state !== "not_installed");
+      const writes = present.filter((skill) => skill.write).length;
+      const blocked = catalog.filter((skill) => skill.state === "unsupported").length;
+      const waiting = catalog.filter((skill) => skill.state === "not_installed").length;
+      $("skills-summary").textContent = catalog.length ? `已安装 ${present.length} 个（写入 ${writes} 个），使用中 ${used} 个` +
+        (waiting ? `；${waiting} 个待安装` : "") + (blocked ? `；${blocked} 个需要本系统不提供的工具，未安装` : "") : "";
       $("tool-chips").replaceChildren(...(data.read_tools || []).map((name) => el("span", name, "chip mono")));
+    }
+
+    function renderWrites(data) {
+      state.writes = data;
+      setBadge($("writes-badge"), data.enabled ? { text: "已开启", tone: "warn" } : { text: "已关闭（只读）", tone: "" });
+      const offered = data.offered_write_tools;
+      const entries = [
+        ["状态", data.enabled ? "已开启" + (data.enabled_at ? `（${formatTime(data.enabled_at)} 起）` : "") : "已关闭：DeepSeek 只能查询"],
+        ["可以修改的人", data.leads && data.leads.length ? data.leads.join("、") : "未设置负责人（在「通知与报告 → 负责人」选择）"],
+        ["确认方式", `机器人列出修改计划后，同一位负责人在 30 分钟内回复「${data.confirm_word || "确认执行"}」`],
+        ["本 Token 的写入工具", offered === null || offered === undefined ? "暂时无法向 SparkX 查询"
+          : offered.length ? offered.join("、") : "SparkX 没有为这个 Token 提供写入工具"],
+        ["单次上限", `每次确认最多 ${data.max_writes || 30} 次写入调用`]];
+      if (data.error) entries.push(["读取结果", data.error]);
+      facts("writes-facts", entries);
+      $("writes-enabled").checked = Boolean(data.enabled);
+      $("writes-confirm").checked = false;
+      $("writes-confirm-row").hidden = true;
+      fill("writes-rows", (data.log || []).map((item) => row([formatTime(item.at), item.requester || "—", item.tool,
+        badge(writeLabel(item.status)), el("span", item.request || "—", "payload"), el("span", item.result || "—", "payload")])),
+        "还没有写入记录。", 6);
+    }
+
+    async function loadWrites() {
+      const data = await guarded(() => api("/console/api/sparkx/write"));
+      if (data) renderWrites(data);
     }
 
     async function saveSkillChoice(box) {
@@ -847,7 +891,8 @@
     }
 
     async function loadSparkx() {
-      const [data, skills] = await Promise.all([guarded(() => api("/console/api/sparkx")), guarded(() => api("/console/api/skills"))]);
+      const [data, skills] = await Promise.all([guarded(() => api("/console/api/sparkx")), guarded(() => api("/console/api/skills")),
+        loadWrites()]);
       if (data) {
         state.sparkx = data;
         setBadge($("sparkx-badge"), data.configured ? { text: "已配置", tone: "ok" } : { text: "未配置", tone: "warn" });
@@ -1078,6 +1123,30 @@
       const box = event.target.closest("input[data-skill]");
       if (box) saveSkillChoice(box);
     });
+    $("writes-enabled").addEventListener("change", () => {
+      const turningOn = $("writes-enabled").checked && !(state.writes && state.writes.enabled);
+      $("writes-confirm-row").hidden = !turningOn;
+      if (!turningOn) $("writes-confirm").checked = false;
+    });
+    $("writes-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!state.writes) return;
+      const enabled = $("writes-enabled").checked;
+      if (enabled === Boolean(state.writes.enabled)) { toast("没有改动。", "warn"); return; }
+      if (enabled && !$("writes-confirm").checked) { toast("开启前请先勾选确认。", "warn"); return; }
+      const body = { enabled, revision: state.writes.revision, confirmed: enabled && $("writes-confirm").checked };
+      const data = await guarded(() => api("/console/api/sparkx/write", { method: "POST", body }), event.submitter || null);
+      if (!data) {
+        $("writes-enabled").checked = Boolean(state.writes.enabled);
+        $("writes-confirm-row").hidden = true;
+        return;
+      }
+      renderWrites(data);
+      state.overview = null;
+      toast(enabled ? "广告写入已开启：负责人在飞书回复「确认执行」后才会修改。" : "广告写入已关闭，DeepSeek 只能查询。");
+      const skills = await guarded(() => api("/console/api/skills"));
+      if (skills) renderSkills(skills);
+    });
 
     // deepseek
     $("deepseek-form").addEventListener("submit", async (event) => {
@@ -1101,5 +1170,5 @@
 
   return { start, statusLabel, runLabel, formatTime, parseBold, cardText, filterStores, storeCounts, siteOptions, promptValue,
            lanePayload, setupSteps, formatTokens, previewStateText, mentionText, leadList, leadNames, skillState, fileSize,
-           LANES };
+           writeLabel, LANES };
 });

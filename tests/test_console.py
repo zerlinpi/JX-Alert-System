@@ -39,9 +39,9 @@ def console(settings, session_factory, tmp_path, drafts, gate, monkeypatch):
     create_owner_credentials(secrets / "owner.json", PASSWORD)
     configured = settings.model_copy(update={"console_public_url": ORIGIN})
     fake = runner_for()
-    # The read tools this token gets (the console asks SparkX live; no network in tests).
-    monkeypatch.setattr("jx_alert.admin_console.offered_read_tools", lambda settings_: [
-        "get_ads_perf", "get_entity_metadata", "get_operation_log", "get_user_authorized_context"])
+    # The tools this token gets in write mode (the console asks SparkX live; no network in tests).
+    monkeypatch.setattr("jx_alert.admin_console.offered_tool_names", lambda settings_, write=True: [
+        "batch_update_ads", "get_ads_perf", "get_entity_metadata", "get_operation_log", "get_user_authorized_context"])
 
     def runner(settings_, lane, config, **kwargs):
         drafts.append(dict(config))
@@ -231,9 +231,11 @@ def test_a_finished_preview_can_be_sent_as_a_test(console, session_factory, sett
             ("jx_review_group", "app"), ("jx_review_group", "app_file"), ("jx_review_lead", "app"),
             ("jx_review_lead", "app_file")]
         assert all(row.idempotency_key.startswith(f"jx:test:review:{job}:") for row in queued)
-        assert queued[0].payload["card"]["header"]["title"]["content"].startswith("【测试】广告异常复盘")
+        # Owner (Nov 2026): no 测试 wording in the message or the file; the keys and folder tell it apart.
+        title = queued[0].payload["card"]["header"]["title"]["content"]
+        assert title.startswith("广告异常复盘") and "测试" not in title
         excel = queued[1].payload["file"]
-        assert excel["name"] == "【测试】广告异常复盘_2026-11-16至2026-11-22.xlsx" and excel["path"].startswith("tests/")
+        assert excel["name"] == "广告异常复盘_2026-11-16至2026-11-22.xlsx" and excel["path"].startswith("tests/")
     assert console.post("/console/api/reports/test-send", json=body, headers=headers).json()["status"] == "ALREADY_QUEUED"
     assert wait_for(console, job)["sent"] == ["group", "lead"]
     deliveries = console.get("/console/api/deliveries").json()["rows"]
@@ -268,7 +270,8 @@ def test_skills_status_and_install(console, monkeypatch):
 
 
 def test_optional_skills_can_be_switched_off_and_on(console, settings):
-    """Owner (Nov 2026): every official read-only Skill is installed and can be ticked on or off."""
+    """Owner (Nov 2026): every official Skill is installed; optional read Skills can be ticked on or off,
+    the write Skills follow the 「广告写入」 switch."""
     from test_skills import install_fake
 
     install_fake(settings)
@@ -276,10 +279,11 @@ def test_optional_skills_can_be_switched_off_and_on(console, settings):
     view = console.get("/console/api/skills").json()
     states = {entry["name"]: entry["state"] for entry in view["catalog"]}
     assert states == {"sparkx-query-ads-performance": "on", "sparkx-weekly-ads-report": "on",
-                      "sparkx-edit-ads": "write", "sparkx-promo-prep": "write",
-                      "sparkx-query-market-data": "missing_tools"}
-    assert view["offered_tools"] == ["get_ads_perf", "get_entity_metadata", "get_operation_log",
+                      "sparkx-edit-ads": "write_off", "sparkx-promo-prep": "write_off",
+                      "sparkx-query-market-data": "missing_tools", "sparkx-skill-platform": "unsupported"}
+    assert view["offered_tools"] == ["batch_update_ads", "get_ads_perf", "get_entity_metadata", "get_operation_log",
                                      "get_user_authorized_context"]
+    assert "batch_update_ads" in view["write_tools"] and "batch_update_ads" not in view["read_tools"]
     body = {"revision": view["choices"]["revision"], "disabled": ["sparkx-weekly-ads-report"]}
     saved = console.post("/console/api/skills/choices", json=body, headers=headers)
     assert saved.status_code == 200 and saved.json()["choices"]["disabled"] == ["sparkx-weekly-ads-report"]
@@ -287,9 +291,49 @@ def test_optional_skills_can_be_switched_off_and_on(console, settings):
     assert console.post("/console/api/skills/choices", json=body, headers=headers).status_code == 409  # stale revision
     locked = {"revision": saved.json()["choices"]["revision"], "disabled": ["sparkx-query-ads-performance"]}
     assert console.post("/console/api/skills/choices", json=locked, headers=headers).status_code == 400
-    unknown = {"revision": saved.json()["choices"]["revision"], "disabled": ["sparkx-edit-ads"]}
+    writer = {"revision": saved.json()["choices"]["revision"], "disabled": ["sparkx-promo-prep"]}
+    refused = console.post("/console/api/skills/choices", json=writer, headers=headers)
+    assert refused.status_code == 400 and "广告写入" in refused.json()["error"]
+    unknown = {"revision": saved.json()["choices"]["revision"], "disabled": ["sparkx-skill-platform"]}  # never installed
     assert console.post("/console/api/skills/choices", json=unknown, headers=headers).status_code == 400
     assert console.post("/console/api/skills/choices", json=body, headers={"origin": ORIGIN}).status_code == 403
+
+
+def test_the_ad_write_switch_needs_a_confirmation_and_lists_every_attempt(console, settings, session_factory):
+    """Owner (Nov 2026): writing is off by default; switching it on enables every write Skill."""
+    from jx_alert.storage.models import SyncJob
+    from test_skills import install_fake
+
+    install_fake(settings)
+    headers = login(console)
+    view = console.get("/console/api/sparkx/write").json()
+    assert view["enabled"] is False and view["revision"] == "0" * 64 and view["leads"] == ["老板", "广告主管"]
+    assert view["offered_write_tools"] == ["batch_update_ads"] and view["log"] == []
+    assert console.get("/console/api/overview").json()["writes"] == {"enabled": False}
+    unconfirmed = {"enabled": True, "revision": view["revision"], "confirmed": False}
+    refused = console.post("/console/api/sparkx/write", json=unconfirmed, headers=headers)
+    assert refused.status_code == 400 and "勾选确认" in refused.json()["error"]
+    assert console.post("/console/api/sparkx/write", json={**unconfirmed, "confirmed": True},
+                        headers={"origin": ORIGIN}).status_code == 403  # no CSRF token
+    assert console.post("/console/api/sparkx/write", json={**unconfirmed, "extra": 1}, headers=headers).status_code == 400
+    on = console.post("/console/api/sparkx/write", json={**unconfirmed, "confirmed": True}, headers=headers)
+    assert on.status_code == 200 and on.json()["enabled"] is True and on.json()["enabled_at"]
+    stale = console.post("/console/api/sparkx/write", json={"enabled": False, "revision": view["revision"],
+                                                            "confirmed": False}, headers=headers)
+    assert stale.status_code == 409
+    states = {entry["name"]: entry["state"] for entry in console.get("/console/api/skills").json()["catalog"]}
+    assert states["sparkx-edit-ads"] == "on" and states["sparkx-promo-prep"] == "on"
+    with session_factory() as db:
+        db.add(SyncJob(job_type="sparkx_write", status="EXECUTED", metadata_json={
+            "tool": "batch_update_ads", "requester": "老板", "request": {"profileId": 101, "request": {
+                "confirmToken": "***"}}, "result": '{"status":"SUCCESS"}'}))
+        db.commit()
+    log = console.get("/console/api/sparkx/write").json()["log"]
+    assert [(row["tool"], row["status_label"], row["requester"]) for row in log] == [("batch_update_ads", "已执行", "老板")]
+    assert '"confirmToken": "***"' in log[0]["request"]
+    off = console.post("/console/api/sparkx/write", json={"enabled": False, "revision": on.json()["revision"],
+                                                          "confirmed": False}, headers=headers)
+    assert off.status_code == 200 and off.json()["enabled"] is False and off.json()["enabled_at"] is None
 
 
 def test_a_used_session_is_renewed_and_an_idle_one_ends(tmp_path):

@@ -1,4 +1,4 @@
-"""Installing the official read-only SparkX Skills and reading them through read_skill."""
+"""Installing the official SparkX Skills (read and write) and reading them through read_skill."""
 import io
 import json
 import tarfile
@@ -21,7 +21,9 @@ MANIFEST = {"release": "v1.3.7", "updated_at": "2026-11-18", "skills": [
      "mcp_tools": ["get_ads_perf", "batch_update_ads"], "path": "sparkx-promo-prep", "description": "Promo."},
     {"name": "sparkx-query-market-data", "version": "1.0.1", "required": False,
      "mcp_tools": ["get_market_search_perf", "get_peer_benchmark"], "path": "sparkx-query-market-data",
-     "description": "SQP / ABA search terms and peer benchmarks."}]}
+     "description": "SQP / ABA search terms and peer benchmarks."},
+    {"name": "sparkx-skill-platform", "version": "0.1.0", "required": False, "mcp_tools": ["list_skills"],
+     "path": "sparkx-skill-platform", "description": "Needs a SparkX platform tool JX never offers."}]}
 
 
 def archive(extra=None, manifest=MANIFEST):
@@ -33,6 +35,7 @@ def archive(extra=None, manifest=MANIFEST):
         "skills/sparkx-edit-ads/SKILL.md": "# Edit ads (write)",
         "skills/sparkx-promo-prep/SKILL.md": "# Promo (write)",
         "skills/sparkx-query-market-data/SKILL.md": "# Query Market and Peer Data",
+        "skills/sparkx-skill-platform/SKILL.md": "# Platform",
         "skills/sparkx-query-ads-performance/../../../escape.md": "outside",
         "README.md": "repo readme",
         **(extra or {})}
@@ -58,20 +61,24 @@ def transport(body, status=200):
 
 
 def install_fake(settings):
-    """The official repository stand-in installed: three read-only Skills, two that need write tools."""
+    """The official repository stand-in installed: three read Skills, two write Skills, and one Skill
+    that needs a tool JX never offers (listed, not installed)."""
     return skills.install(settings, transport=transport(archive()))
 
 
-def test_only_read_only_skills_are_installed_and_readable(settings):
+def test_read_and_write_skills_are_installed_and_readable(settings):
     mock = transport(archive())
     index = skills.install(settings, transport=mock)
     assert mock.seen == ["https://codeload.github.com/SparkXAI/SparkXAI-MCP/tar.gz/main"]
-    assert [entry["name"] for entry in index["skills"]] == ["sparkx-query-ads-performance", "sparkx-weekly-ads-report",
-                                                            "sparkx-query-market-data"]
+    assert [(entry["name"], entry["write"]) for entry in index["skills"]] == [
+        ("sparkx-query-ads-performance", False), ("sparkx-weekly-ads-report", False), ("sparkx-edit-ads", True),
+        ("sparkx-promo-prep", True), ("sparkx-query-market-data", False)]
     # The whole official list is kept, so the console can say why a Skill is not installed.
     blocked = {entry["name"]: entry["blocked_tools"] for entry in index["catalog"] if not entry["installable"]}
-    assert blocked == {"sparkx-edit-ads": ["batch_update_ads"], "sparkx-promo-prep": ["batch_update_ads"]}
+    assert blocked == {"sparkx-skill-platform": ["list_skills"]}
+    assert {entry["name"]: entry["kind"] for entry in index["catalog"]}["sparkx-promo-prep"] == "write"
     assert index["release"] == "v1.3.7" and index["commit"] == SHA
+    assert "Edit ads (write)" in skills.read(settings, index, "sparkx-edit-ads")
     assert skills.installed(settings)["folder"] == index["folder"]
     first = skills.read(settings, index, "sparkx-query-ads-performance")
     assert first.startswith("[sparkx-query-ads-performance 1.4.11 · SKILL.md · 第 1–40000 字符") and "offset=40000" in first
@@ -79,9 +86,13 @@ def test_only_read_only_skills_are_installed_and_readable(settings):
     assert "未读完" not in rest
     assert "Ratio Metric" in skills.read(settings, index, "sparkx-query-ads-performance", "references/platform-notes.md")
     assert "没有文件" in skills.read(settings, index, "sparkx-query-ads-performance", "../../escape.md")
-    assert "没有这个 Skill" in skills.read(settings, index, "sparkx-edit-ads")
-    text = skills.prompt_index(index)
+    assert "没有这个 Skill" in skills.read(settings, index, "sparkx-skill-platform")
+    # Runs read the write Skills only in write mode (the owner's 「广告写入」 switch, a 负责人 asking).
+    read_only = skills.for_agent(settings)
+    assert "没有这个 Skill" in skills.read(settings, read_only, "sparkx-edit-ads")
+    text = skills.prompt_index(read_only)
     assert "sparkx-weekly-ads-report 1.1.6" in text and "references/platform-notes.md" in text and "edit" not in text
+    assert "sparkx-edit-ads" in skills.prompt_index(skills.for_agent(settings, write=True))
 
 
 def test_reinstall_switches_folders_and_failures_keep_the_old_install(settings):
@@ -107,7 +118,7 @@ def test_status_reports_outdated_skills(settings):
         lambda request: httpx.Response(200, json=newer)))
     assert view["installed"]["release"] == "v1.3.7" and view["latest"]["outdated"] == ["sparkx-query-ads-performance"]
     assert [row["name"] for row in view["skills"]] == ["sparkx-query-ads-performance", "sparkx-weekly-ads-report",
-                                                       "sparkx-query-market-data"]
+                                                       "sparkx-edit-ads", "sparkx-promo-prep", "sparkx-query-market-data"]
 
 
 def test_optional_skills_can_be_switched_off_but_required_ones_stay_on(settings, monkeypatch):
@@ -124,17 +135,26 @@ def test_optional_skills_can_be_switched_off_but_required_ones_stay_on(settings,
         skills.save_choices(settings, ["sparkx-query-ads-performance"], skills.choices(settings)["revision"])
     assert exc.value.status_code == 400 and "基础查询" in exc.value.detail
     with pytest.raises(skills.SkillsError) as exc:
-        skills.save_choices(settings, ["sparkx-edit-ads"], skills.choices(settings)["revision"])  # never installed
+        skills.save_choices(settings, ["sparkx-promo-prep"], skills.choices(settings)["revision"])
+    assert exc.value.status_code == 400 and "广告写入" in exc.value.detail  # write Skills follow the switch
+    with pytest.raises(skills.SkillsError) as exc:
+        skills.save_choices(settings, ["sparkx-skill-platform"], skills.choices(settings)["revision"])  # not installed
     assert exc.value.status_code == 400
     with pytest.raises(skills.SkillsError) as exc:
         skills.save_choices(settings, [], "1" * 64)
     assert exc.value.status_code == 409
     skills.save_choices(settings, [], skills.choices(settings)["revision"])
     assert len(skills.for_agent(settings)["skills"]) == 3
-    states = {row["name"]: (row["state"], row["tools"]) for row in skills.status(
-        settings, offered=["get_ads_perf", "get_entity_metadata", "get_operation_log"])["catalog"]}
+    assert len(skills.for_agent(settings, write=True)["skills"]) == 5  # the switch enables every write Skill
+    reads = ["get_ads_perf", "get_entity_metadata", "get_operation_log"]
+    states = {row["name"]: (row["state"], row["tools"]) for row in skills.status(settings, offered=reads)["catalog"]}
     assert states["sparkx-query-market-data"] == ("missing_tools", ["get_market_search_perf", "get_peer_benchmark"])
-    assert states["sparkx-promo-prep"] == ("write", ["batch_update_ads"]) and states["sparkx-weekly-ads-report"][0] == "on"
+    assert states["sparkx-promo-prep"] == ("write_off", ["batch_update_ads"]) and states["sparkx-weekly-ads-report"][0] == "on"
+    assert states["sparkx-skill-platform"] == ("unsupported", ["list_skills"])
+    writing = {row["name"]: (row["state"], row["tools"]) for row in skills.status(
+        settings, offered=reads, write_on=True)["catalog"]}
+    assert writing["sparkx-promo-prep"] == ("missing_tools", ["batch_update_ads"])
+    assert skills.status(settings, offered=[*reads, "batch_update_ads"], write_on=True)["catalog"][2]["state"] == "on"
 
 
 def test_a_run_offers_only_skills_whose_tools_this_token_gets(settings, monkeypatch):

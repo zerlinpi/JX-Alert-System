@@ -221,7 +221,7 @@
 
       <!-- ============================================================ SparkX MCP -->
       <section data-panel="sparkx" hidden data-title="SparkX MCP"
-               data-subtitle="DeepSeek 通过 SparkX AI MCP 读取广告数据，并按 SparkX 官方 Skills 的方法查询和分析。只提供只读工具。">
+               data-subtitle="DeepSeek 通过 SparkX AI MCP 读取广告数据，并按 SparkX 官方 Skills 的方法查询和分析。默认只读；开启「广告写入」后，负责人可以在飞书里确认修改广告。">
         <div id="sparkx-status" class="notice" role="status" hidden></div>
         <div class="grid-2">
           <section class="panel" aria-labelledby="sparkx-conn-title">
@@ -241,7 +241,7 @@
           </section>
           <section class="panel" aria-labelledby="skills-title">
             <div class="panel-head"><div><h2 id="skills-title">官方 Skills</h2>
-              <p class="muted">从 GitHub SparkXAI/SparkXAI-MCP 安装官方清单里所有只读 Skill（查询方法、口径和分析流程）；需要写入工具的 Skill 不会安装。</p></div>
+              <p class="muted">从 GitHub SparkXAI/SparkXAI-MCP 安装官方清单里的只读 Skill（查询方法、口径和分析流程）和写入 Skill（修改广告的流程）；写入 Skill 只在「广告写入」开启时使用。</p></div>
               <span class="badge" id="skills-badge"></span></div>
             <div class="panel-body">
               <dl class="facts" id="skills-facts"></dl>
@@ -252,15 +252,38 @@
         </div>
         <section class="panel" aria-labelledby="skills-list-title">
           <div class="panel-head"><div><h2 id="skills-list-title">选择使用的 Skills</h2>
-            <p class="muted">勾选的 Skill 提供给 DeepSeek（三条通知和飞书问答），改动下次运行生效。基础查询 Skill 始终启用；需要写入工具的 Skill 按只读规则不安装。</p></div>
+            <p class="muted">勾选的只读 Skill 提供给 DeepSeek（三条通知和飞书问答），改动下次运行生效。基础查询 Skill 始终启用；写入 Skill 不能单独勾选，随「广告写入」开关一起启用，只用于负责人在飞书里的修改。</p></div>
             <span class="muted" id="skills-summary"></span></div>
           <div class="table-scroll"><table class="skills-table"><thead><tr><th scope="col">启用</th><th scope="col">Skill</th>
             <th scope="col">版本</th><th scope="col">状态</th><th scope="col">用到的工具</th><th scope="col">用途</th></tr></thead>
             <tbody id="skills-rows"></tbody></table></div>
         </section>
+        <section class="panel" aria-labelledby="writes-title">
+          <div class="panel-head"><div><h2 id="writes-title">广告写入</h2>
+            <p class="muted">开启后，负责人（总负责人、广告负责人）可以在飞书里让 DeepSeek 按 SparkX 官方写入 Skill 修改广告（出价、预算、状态、否定词、托管组、新建活动等）。
+              每次修改先列出计划，负责人回复「确认执行」后才执行；定时通知、预览和测试发送始终只读。</p></div>
+            <span class="badge" id="writes-badge"></span></div>
+          <div class="panel-body">
+            <dl class="facts" id="writes-facts"></dl>
+            <form id="writes-form" class="stack">
+              <label class="switch"><input type="checkbox" id="writes-enabled" role="switch"><span class="switch-track" aria-hidden="true"></span>
+                <span class="switch-text">允许负责人通过飞书机器人修改广告</span></label>
+              <label class="check" id="writes-confirm-row" hidden><input type="checkbox" id="writes-confirm">
+                <span>我已了解：负责人回复「确认执行」后，修改直接作用于线上广告，部分操作（例如删除托管组）无法撤销。</span></label>
+              <div class="actions-end"><button type="submit" class="button primary" id="writes-save">保存</button></div>
+            </form>
+          </div>
+        </section>
+        <section class="panel" aria-labelledby="writes-log-title">
+          <div class="panel-head"><div><h2 id="writes-log-title">写入记录</h2>
+            <p class="muted">最近 30 次写入调用，包括被拦截的。「已提交，结果未知」表示调用已经发出但没有收到结果，请到 SparkX 或亚马逊广告后台核对。</p></div></div>
+          <div class="table-scroll"><table class="write-log"><thead><tr><th scope="col">时间</th><th scope="col">负责人</th><th scope="col">工具</th>
+            <th scope="col">结果</th><th scope="col">请求</th><th scope="col">SparkX 返回</th></tr></thead>
+            <tbody id="writes-rows"></tbody></table></div>
+        </section>
         <section class="panel" aria-labelledby="tools-title">
           <div class="panel-head"><div><h2 id="tools-title">提供给 DeepSeek 的工具</h2>
-            <p class="muted">只有 SparkX 标记为只读、且在白名单内的工具会提供给 DeepSeek；工具说明和返回结果与 SparkX 原样一致。</p></div></div>
+            <p class="muted">只有 SparkX 标记为只读、且在白名单内的工具会提供给 DeepSeek；写入工具只在「广告写入」开启后提供给负责人的飞书对话。工具说明和返回结果与 SparkX 原样一致。</p></div></div>
           <div class="panel-body"><div class="chips" id="tool-chips"></div></div>
         </section>
         <section class="panel" id="sparkx-profiles-panel" hidden aria-labelledby="profiles-title">
@@ -306,7 +329,7 @@
                 <li>机器人开始回答时，会先在你的消息上点一个「OK」。</li>
                 <li>同一段对话会记住最近 6 轮（60 分钟内），可以直接追问「那上周呢」。</li>
                 <li>群内只回复通知群；私聊限负责人、运营和通知群成员。</li>
-                <li>只能查询，不能修改广告、预算或出价。</li>
+                <li>默认只能查询。在「SparkX MCP → 广告写入」开启后，负责人可以让机器人修改广告：机器人先列出修改计划，回复「确认执行」后才执行。</li>
               </ul>
             </div>
           </section>
@@ -367,7 +390,7 @@
           <label class="check"><input type="checkbox" id="test-to-lead"><span id="test-lead-label">负责人</span></label>
           <label class="check"><input type="checkbox" id="test-mention"><span id="test-mention-label">@ 对应运营</span></label>
           <button type="button" class="button primary" id="test-send-button">发送测试</button>
-          <p class="hint" id="test-send-hint">发送的就是上面这份预览（标题带【测试】），不会再调用 DeepSeek，也不计入定时发送。</p>
+          <p class="hint" id="test-send-hint">发送的就是上面这份预览，不会再调用 DeepSeek，也不计入定时发送。</p>
         </fieldset>
       </footer>
     </aside>

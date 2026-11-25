@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     notification_settings_file: str = "/app/data/jx-notifications.json"
     # Excel copies of every lane message (daily/review/hourly/tests, one folder per month, 0600 files).
     report_archive_dir: str = "/app/data/reports"
+    # The owner's 「广告写入」 switch (off when missing or unreadable); see sparkx.write_mode.
+    sparkx_write_file: str = "/app/data/sparkx-write.json"
 
     # DeepSeek ("dp"): queries SparkX for the three lanes and chats in the Feishu bot.
     deepseek_api_key: SecretStr = SecretStr("")

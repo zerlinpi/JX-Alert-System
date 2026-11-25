@@ -11,7 +11,7 @@ whatever order the model wrote.
 import copy
 import re
 
-from jx_alert.notifications.cards import card_fits, markdown, md_safe, plain, shell, table
+from jx_alert.notifications.cards import card_fits, markdown, md_safe, shell, table
 
 # Room for the send-time line "对应运营：<at id=…></at>（店铺） …" (see notifications.cards).
 MENTION_RESERVE = 2048
@@ -204,16 +204,14 @@ def hourly_card(findings, *, day, time, names, operators, scoped=False, cap=10):
 
 # ---------------------------------------------------------------- console test sends
 
-TEST_MARK = "【测试】"
+def test_copies(values):
+    """The previewed cards for a test send, unchanged (owner, Nov 2026: no 测试 wording in the message).
 
-
-def mark_as_test(values):
-    """The previewed cards as a test message: only 【测试】 in front of each title, the body is unchanged."""
+    Each copy must still fit Feishu's card limit, the first one with room for the @-mention line.
+    """
     copies = []
     for index, value in enumerate(values):
         card = copy.deepcopy(value)
-        title = card["header"]["title"]
-        title["content"] = plain(TEST_MARK + title["content"], 120)
         if not card_fits(card, MENTION_RESERVE if index == 0 else 0):
             raise ValueError("test card does not fit")
         copies.append(card)

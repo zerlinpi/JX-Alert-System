@@ -72,13 +72,13 @@ def test_the_operator_column_always_comes_last():
     assert cards.column_order(["店铺", "运营情况"]) == [0, 1]  # only an operator column moves
 
 
-def test_test_copies_are_marked_and_keep_the_mention_reserve():
+def test_test_copies_carry_no_test_wording_and_keep_the_mention_reserve():
+    """Owner (Nov 2026): a test send reads exactly like the real message."""
     values = cards.report_cards("广告日报 · 2026-11-22", "**全公司核心指标**\n正文")
-    marked = cards.mark_as_test(values)
-    assert marked[0]["header"]["title"]["content"] == "【测试】广告日报 · 2026-11-22"
-    assert marked[0]["body"] == values[0]["body"]  # the same content, only the title is marked
-    assert values[0]["header"]["title"]["content"] == "广告日报 · 2026-11-22"  # the preview itself is unchanged
-    assert card_fits(marked[0], cards.MENTION_RESERVE)
+    copies = cards.test_copies(values)
+    assert copies == values and copies[0] is not values[0]  # equal content, separate copies
+    assert "测试" not in copies[0]["header"]["title"]["content"]
+    assert card_fits(copies[0], cards.MENTION_RESERVE)
 
 
 def test_the_mention_line_names_each_operators_stores_safely():

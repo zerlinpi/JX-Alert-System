@@ -128,7 +128,7 @@ def test_a_console_test_send_is_delivered_right_away_and_only_once(settings, ses
     client = FakeClient()
     assert run(settings, session_factory, client)["sent"] == 1
     _, details = client.sent[0]
-    assert details["receive_id"] == "oc_reports" and details["card"]["header"]["title"]["content"].startswith("【测试】")
+    assert details["receive_id"] == "oc_reports" and details["card"]["header"]["title"]["content"] == "广告日报 · 2026-11-22"
     assert run(settings, session_factory, FakeClient())["claimed"] == 0
 
 

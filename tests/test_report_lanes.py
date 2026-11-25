@@ -343,7 +343,7 @@ def test_settings_validation(settings):
     assert saved["lanes"]["daily"]["prompt"] == "重点看 ACOS 超过 40% 的店铺"
 
 
-def test_a_test_send_queues_marked_copies_outside_the_lane_schedule(settings, session_factory):
+def test_a_test_send_queues_unmarked_copies_outside_the_lane_schedule(settings, session_factory):
     map_operators(settings, {"102": ("ou_op2", "高爽")})
     enable(settings, daily={"enabled": False, "to_group": False})  # a test is the owner's explicit choice
     values = cards.report_cards("广告日报 · 2026-11-22", "**全公司核心指标**\n正文")
@@ -356,8 +356,9 @@ def test_a_test_send_queues_marked_copies_outside_the_lane_schedule(settings, se
         assert routes(db) == [("jx_daily_group", GROUP_CHAT, ["ou_op2"]), ("jx_daily_lead", LEAD, [])]
         group, lead = rows(db)
         assert group.idempotency_key.startswith("jx:test:daily:job-1:") and group.payload["jx_test"] is True
-        assert group.payload["card"]["header"]["title"]["content"] == "【测试】广告日报 · 2026-11-22"
-        assert group.payload["card"]["body"] == values[0]["body"]  # only the title says it is a test
+        # Owner (Nov 2026): the test send reads like the real message; only its key and receipt differ.
+        assert group.payload["card"]["header"]["title"]["content"] == "广告日报 · 2026-11-22"
+        assert group.payload["card"]["body"] == values[0]["body"]
         again = lanes.queue_test(db, settings, "daily", values, now=later, preview_id="job-1",
                                  stores={"102": "Campx"}, to_group=True, to_lead=False, mention=False)
         assert again["status"] == "ALREADY_QUEUED" and len(rows(db)) == 2
@@ -493,8 +494,8 @@ def test_a_test_send_reaches_every_lead_with_its_excel(settings, session_factory
         db.commit()
         assert result["status"] == "QUEUED" and result["cards"] == 2 and result["files"] == 2
         assert routes(db) == [("jx_daily_lead", LEAD, []), ("jx_daily_lead", "ou_op1", [])]
-        assert files(db) == [("jx_daily_lead", LEAD, "【测试】广告日报_2026-11-22.xlsx"),
-                             ("jx_daily_lead", "ou_op1", "【测试】广告日报_2026-11-22.xlsx")]
+        assert files(db) == [("jx_daily_lead", LEAD, "广告日报_2026-11-22.xlsx"),
+                             ("jx_daily_lead", "ou_op1", "广告日报_2026-11-22.xlsx")]
         copy_row = rows(db, excel=True)[0]
         assert copy_row.payload["file"]["path"].startswith("tests/") and copy_row.payload["jx_test"] is True
         assert copy_row.idempotency_key.startswith("jx:test:daily:job-9:") and copy_row.idempotency_key.endswith(":file")

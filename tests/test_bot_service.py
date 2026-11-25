@@ -90,8 +90,8 @@ def test_data_answers_are_replied_with_tables_and_no_source_line(bot_settings, s
     with session_factory() as db:
         queue(db, bot_settings, "@机器人 昨天各店花费")
 
-    def answer(settings, question, *, history, roster):
-        assert question == "昨天各店花费" and history == []
+    def answer(settings, question, *, history, roster, write=None, record=None):
+        assert question == "昨天各店花费" and history == [] and write is None and record is None  # writes are off
         assert reactions.calls == [("om_1", "OK")]  # the question shows 「OK」 before the answer is written
         return {"answer": "**结论**：昨天花费最高的是香港川页。\n\n| 店铺 | 花费 |\n|---|---|\n| 香港川页 | $3,217.70 |",
                 "provider": "deepseek", "calls": 2}
@@ -158,7 +158,7 @@ def test_questions_that_will_not_be_answered_get_no_reaction(bot_settings, sessi
 def test_free_conversation_remembers_the_same_persons_recent_turns(bot_settings, session_factory):
     seen = []
 
-    def answer(settings, question, *, history, roster):
+    def answer(settings, question, *, history, roster, **kwargs):
         seen.append([turn["question"] for turn in history])
         return {"answer": f"回答：{question}", "provider": "deepseek", "calls": 0}
 

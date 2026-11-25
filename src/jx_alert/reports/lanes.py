@@ -8,7 +8,7 @@ hourly  every hour inside the owner's window: wasteful/opportunity campaigns tod
         DeepSeek and checked against the SparkX rows → report group (@ operators) + 广告负责人;
         each campaign/category once per marketplace day
 test    the owner's test send of a console preview (jx:test:… keys, receipt jx_test): the same
-        cards marked 【测试】; never counts as a lane run or as an hourly alert
+        cards and Excel, with no 测试 wording; never counts as a lane run or as an hourly alert
 
 All lanes are on by default and still notify the group when no operator is mapped.
 Cards are frozen at queue time; before each POST the worker re-checks the switch,
@@ -261,7 +261,7 @@ def alerts_book(result, findings, names, operators, now, *, scoped=False):
         names=names, operators=operators, period=f"{result['day']} {result['time']}", created=now)
 
 
-def save_book(settings, folder, book, now, *, who=None, test=False):
+def save_book(settings, folder, book, now, *, who=None):
     """The archive record of a workbook (see reports.archive), or None when it cannot be built or saved.
 
     A missing Excel copy never stops the message itself.
@@ -270,7 +270,7 @@ def save_book(settings, folder, book, now, *, who=None, test=False):
         return None
     try:
         base, data = book() if callable(book) else book
-        return archive.save(settings, folder, workbook.file_name(base, who=who, test=test), data, now=now)
+        return archive.save(settings, folder, workbook.file_name(base, who=who), data, now=now)
     except (archive.ArchiveError, ValueError, KeyError, TypeError) as exc:
         _LOG.warning("Excel copy not saved for %s (%s)", folder, type(exc).__name__)
         return None
@@ -573,7 +573,8 @@ def preview(settings, lane, *, now, db, runner=None, config=None):
 # ---------------------------------------------------------------- console test sends
 
 def queue_test(db, settings, lane, values, *, now, preview_id, stores, to_group, to_lead, mention, book=None):
-    """Queue the owner's test send of a finished preview: the same cards, marked 【测试】, and its Excel copy.
+    """Queue the owner's test send of a finished preview: the same cards and its Excel copy, with no
+    测试 wording (owner, Nov 2026) — only the keys, receipts and archive folder tell it apart.
 
     ``stores`` ({profile id: name}) are the stores the preview is about; with ``mention``
     the group copy @-mentions their current operators. ``to_lead`` reaches every lead of
@@ -600,8 +601,8 @@ def queue_test(db, settings, lane, values, *, now, preview_id, stores, to_group,
         mentions = recipients.operator_mentions(settings, routing_data, directory, set(stores))
         if mentions:
             group = recipients.with_operator_mentions(group, mentions, stores)
-    marked = cards.mark_as_test(values)
-    attachment = save_book(settings, "tests", book, now, test=True)
+    marked = cards.test_copies(values)
+    attachment = save_book(settings, "tests", book, now)
     extra = {"jx_test": True, "jx_test_mentions": bool(mentions), "jx_profiles": sorted(stores, key=int)}
     ids, cards_queued, files = [], 0, 0
     for delivery in ([group] if group else []) + leads:

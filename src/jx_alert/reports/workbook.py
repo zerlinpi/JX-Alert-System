@@ -153,11 +153,15 @@ def alerts_book(title, lead, findings, *, names, operators, period, note="", cre
     return xlsx.workbook([summary, sheet], title=title, created=created)
 
 
-def file_name(base, *, who=None, test=False):
-    """A safe file name: 「广告日报_2026-11-24.xlsx」, 「…_高爽.xlsx」 for one operator, 【测试】 for test sends."""
+def file_name(base, *, who=None):
+    """A safe file name: 「广告日报_2026-11-24.xlsx」, 「…_高爽.xlsx」 for one operator.
+
+    Test sends use the same names (owner, Nov 2026: no 测试 wording); they are kept apart in
+    the archive's tests folder.
+    """
     name = base + (f"_{who}" if who else "")
     name = _UNSAFE_NAME.sub("", name).strip(" .")[:120] or "JX报表"
-    return ("【测试】" if test else "") + name + ".xlsx"
+    return name + ".xlsx"
 
 
 def daily_name(report_date):

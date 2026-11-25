@@ -1,11 +1,13 @@
 """Read-only SparkX AI MCP client (Streamable HTTP, Bearer MCP token).
 
 Contract: https://github.com/SparkXAI/SparkXAI-MCP. DeepSeek uses SparkX the way
-an MCP agent does: it receives the read tools exactly as the server lists them
-(name, description, input schema) and their results unmodified. A tool is
-offered only when it is in READ_TOOLS *and* SparkX marks it readOnlyHint=true,
-so write tools (batch_update_ads, create_*, save_*, delete_*) are unreachable.
-Failures carry a bounded code; the token never leaves this module.
+an MCP agent does: it receives the tools exactly as the server lists them (name,
+description, input schema) and their results unmodified. A read tool is offered
+only when it is in READ_TOOLS *and* SparkX marks it readOnlyHint=true. The write
+tools in WRITE_TOOLS are offered only in write mode (the owner's 「广告写入」 switch,
+a 负责人 in the Feishu bot), and every write call passes the confirmation gate of
+ai.agent; any other tool is never offered. Failures carry a bounded code; the
+token never leaves this module.
 """
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -25,6 +27,17 @@ SPARKX_MCP_URL = "https://mcp.sparkx.cn/mcp"
 READ_TOOLS = frozenset({"get_user_authorized_context", "get_ads_perf", "get_entity_metadata", "get_operation_log",
                         "get_amc_audience_perf", "get_ai_group_template", "get_market_search_perf",
                         "get_peer_benchmark"})
+# Owner decision (Nov 2026): the ad-changing tools of the official write Skills (edit ads, create
+# campaigns, managed groups, keyword lists). Offered only in write mode — the owner's 「广告写入」
+# switch is on and a 负责人 asks the Feishu bot — and every call goes through the confirmation gate
+# of ai.agent. Scheduled lanes never get them. SparkX's skill-platform tools are never offered.
+WRITE_TOOLS = frozenset({"batch_update_ads", "create_portfolio", "create_sp_sb_campaign", "create_sd_campaign",
+                         "create_sp_ad_group", "create_sb_ad_group", "create_sd_ad_group", "create_sd_ai_managed_group",
+                         "save_sp_sb_ai_managed_group", "save_sp_sb_ai_group_schedule", "edit_sd_ai_managed_group",
+                         "delete_ai_managed_group", "create_keyword_list", "update_keyword_list",
+                         "delete_keyword_list"})
+# Read tools that only the write Skills use; offered together with the write tools.
+WRITE_READS = frozenset({"get_keyword_list", "get_sp_sb_ai_personality_recommendation"})
 _PID = re.compile(r"[1-9][0-9]{0,19}")
 
 MESSAGES = {
@@ -228,12 +241,23 @@ def read_only(tool) -> bool:
     return tool.name in READ_TOOLS and getattr(annotations, "readOnlyHint", None) is True
 
 
-async def agent_tools(session):
-    """The read tools exactly as SparkX lists them; anything else is never offered."""
+def offered(tool, *, write=False):
+    """Read tools always; in write mode also the allow-listed write tools, and the helper reads of
+    the write Skills when SparkX marks them read-only (they run without the confirmation gate)."""
+    if read_only(tool):
+        return True
+    if not write:
+        return False
+    hint = getattr(getattr(tool, "annotations", None), "readOnlyHint", None)
+    return tool.name in WRITE_TOOLS or (tool.name in WRITE_READS and hint is True)
+
+
+async def agent_tools(session, *, write=False):
+    """The tools exactly as SparkX lists them: read tools, plus the write tools in write mode."""
     found, cursor, seen = [], None, set()
     for _ in range(20):
         listed = await (session.list_tools(cursor=cursor) if cursor else session.list_tools())
-        found += [tool for tool in listed.tools if read_only(tool)]
+        found += [tool for tool in listed.tools if offered(tool, write=write)]
         cursor = getattr(listed, "nextCursor", None)
         if not cursor or cursor in seen:
             break
@@ -243,15 +267,17 @@ async def agent_tools(session):
     return found
 
 
-async def call_raw(session, tool, arguments):
+async def call_raw(session, tool, arguments, *, write=False):
     """(text, is_error): the tool result as SparkX returned it, for the model to read.
 
     A JSON-RPC error from SparkX is returned as text too, as MCP clients show it to
-    the agent; transport failures propagate and end the run.
+    the agent; transport failures propagate and end the run. Only read tools may be
+    called, unless ``write`` (write mode, after the confirmation gate of ai.agent)
+    also allows the write tools and their helper reads.
     """
     from mcp.shared.exceptions import McpError
 
-    if tool not in READ_TOOLS:
+    if tool not in READ_TOOLS and not (write and tool in WRITE_TOOLS | WRITE_READS):
         raise SparkXError("SPARKX_TOOL_NOT_ALLOWED", 400)
     try:
         result = await session.call_tool(tool, arguments)
@@ -319,8 +345,8 @@ def fetch_roster(settings, *, token=None, timeout=20.0):
     return run(conversation, total_timeout=timeout + 10)
 
 
-def offered_read_tools(settings, *, token=None, timeout=15.0):
-    """Names of the read tools SparkX offers this token (what the agent would get), for the console."""
+def offered_tool_names(settings, *, token=None, timeout=15.0, write=True):
+    """Names of the tools SparkX offers this token (read tools, and the write tools in write mode)."""
     from jx_alert.sparkx.credentials import effective_token
 
     token = effective_token(settings) if token is None else token
@@ -329,6 +355,6 @@ def offered_read_tools(settings, *, token=None, timeout=15.0):
 
     async def conversation():
         async with open_session(token, timeout) as session:
-            return sorted(tool.name for tool in await agent_tools(session))
+            return sorted(tool.name for tool in await agent_tools(session, write=write))
 
     return run(conversation, total_timeout=timeout + 10)

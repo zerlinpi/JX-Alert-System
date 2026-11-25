@@ -119,9 +119,19 @@ test("skill states say why a skill is or is not used", () => {
   assert.deepEqual(consoleUi.skillState({ state: "on", tools: [] }), { text: "使用中", tone: "ok", detail: "" });
   assert.equal(consoleUi.skillState({ state: "missing_tools", tools: ["get_market_search_perf"] }).detail,
     "当前 SparkX Token 没有提供：get_market_search_perf");
-  assert.deepEqual(consoleUi.skillState({ state: "write", tools: ["batch_update_ads"] }),
-    { text: "需要写入工具，不安装", tone: "bad", detail: "需要：batch_update_ads" });
+  assert.deepEqual(consoleUi.skillState({ state: "write_off", tools: ["batch_update_ads"] }),
+    { text: "写入未开启", tone: "", detail: "开启「广告写入」后启用" });
+  assert.deepEqual(consoleUi.skillState({ state: "unsupported", tools: ["list_skills"] }),
+    { text: "不支持，不安装", tone: "bad", detail: "需要本系统不提供的工具：list_skills" });
   assert.equal(consoleUi.skillState({ state: "off" }).text, "已停用");
+});
+
+test("write attempts never read as done unless SparkX confirmed them", () => {
+  assert.deepEqual(consoleUi.writeLabel("EXECUTED"), { text: "已执行", tone: "ok" });
+  assert.deepEqual(consoleUi.writeLabel("RUNNING"), { text: "已提交，结果未知", tone: "warn" });
+  assert.equal(consoleUi.writeLabel("BLOCKED").text, "已拦截，未执行");
+  assert.equal(consoleUi.writeLabel("PREVIEW").text, "预览（待二次确认）");
+  assert.equal(consoleUi.writeLabel("SOMETHING_NEW").text, "SOMETHING_NEW");
 });
 
 test("file sizes read naturally", () => {

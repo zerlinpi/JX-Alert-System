@@ -19,7 +19,7 @@ def test_small_talk_is_answered_without_sparkx_queries(monkeypatch, settings):
     client = ScriptedDeepSeek([reply("你好！有什么可以帮你？")])
     result = ask(settings, client, "你好")
     assert result == {"answer": "你好！有什么可以帮你？", "provider": "deepseek", "calls": 0, "skill_reads": 0,
-                      "usage": client.last_usage}
+                      "usage": client.last_usage, "writes": 0, "write": None}
     assert fake.calls == []  # only the tool list was read
     system = client.requests[0]["messages"][0]["content"]
     assert "自由交流" in system and "get_ads_perf" in system

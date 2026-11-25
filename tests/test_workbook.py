@@ -81,7 +81,6 @@ def test_sheet_and_file_names_are_safe():
     assert xlsx.sheet_names(["a/b:c*?[d]", "A/B:C*?[D]", "", "x" * 40]) == ["abcd", "ABCD(2)", "表3", "x" * 31]
     assert workbook.file_name("广告日报_2026-11-24") == "广告日报_2026-11-24.xlsx"
     assert workbook.file_name("广告实时监控_2026-11-24_1705_美西", who="高/爽:") == "广告实时监控_2026-11-24_1705_美西_高爽.xlsx"
-    assert workbook.file_name("广告日报_2026-11-24", test=True) == "【测试】广告日报_2026-11-24.xlsx"
     assert xlsx.column_letter(0) == "A" and xlsx.column_letter(25) == "Z" and xlsx.column_letter(26) == "AA"
 
 
