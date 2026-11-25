@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     sparkx_skills_dir: str = "/app/data/sparkx-skills"
     # Owner switches, recipients and thresholds of the notification lanes (0600).
     notification_settings_file: str = "/app/data/jx-notifications.json"
+    # Excel copies of every lane message (daily/review/hourly/tests, one folder per month, 0600 files).
+    report_archive_dir: str = "/app/data/reports"
 
     # DeepSeek ("dp"): queries SparkX for the three lanes and chats in the Feishu bot.
     deepseek_api_key: SecretStr = SecretStr("")

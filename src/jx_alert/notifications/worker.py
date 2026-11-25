@@ -5,6 +5,11 @@ PENDING/RETRY/PRE_SEND_RETRY → PREPARING (claimed, nothing sent) → SUBMITTIN
 DELIVERY_UNKNOWN, REJECTED, DEAD, SKIPPED or EXPIRED. A row that may have
 reached Feishu is never resent automatically. Rows of a kind this release does
 not send (for example queued by an earlier release) are skipped and kept.
+
+The Excel copy of a lane message (transport ``app_file``) follows the same rules:
+its saved file is checked against the queued SHA-256, uploaded to Feishu (an upload
+sends nothing to anyone), then sent as one file message behind the same fence.
+Releases before Excel copies do not know this transport and skip such rows.
 """
 from datetime import datetime, timedelta, timezone
 import logging
@@ -13,11 +18,11 @@ import re
 from sqlalchemy import or_, select, update
 
 from jx_alert.config import get_settings
-from jx_alert.notifications.feishu_app import FeishuRejected, FeishuTokenRefused
+from jx_alert.notifications.feishu_app import FeishuRejected, FeishuTokenRefused, FeishuUploadRejected
 from jx_alert.notifications.outbox import (
     CLAIMABLE, DELIVERY_UNKNOWN, PRE_SEND_RETRY, QUESTION_REPLY_PREFIX, NotificationOutbox,
 )
-from jx_alert.reports import lanes
+from jx_alert.reports import archive, lanes
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import NotificationLog
 
@@ -34,6 +39,15 @@ REJECTIONS = {
     230029: "接收人已离职", 230035: "没有发送权限（群禁言或机器人被屏蔽）", 230053: "接收人已设置不接收机器人消息",
     232009: "群已解散",
 }
+# Feishu's refusals of a file upload (im/v1/files, 错误码 and 通用错误码): nothing was sent.
+UPLOAD_REJECTIONS = {
+    99991672: "飞书应用缺少上传文件的权限（im:resource），请在开发者后台开通并发布新版本",
+    234006: "文件超过飞书大小上限", 234007: "飞书应用没有启用机器人能力", 234010: "文件为空",
+}
+# Rate limits are temporary: those uploads are retried like any other failure before sending.
+RATE_LIMITED = frozenset({99991400, 230020})
+FILE_KINDS = frozenset({"lane_file"})
+LANE_KINDS = frozenset({"lane", "lane_file"})
 
 
 class _LostClaim(RuntimeError):
@@ -59,7 +73,12 @@ def _utcnow():
 
 def _kind(key, payload):
     delivery = payload.get("delivery") if isinstance(payload, dict) else None
-    if not isinstance(delivery, dict) or payload.get("transport") != "app":
+    if not isinstance(delivery, dict):
+        return None
+    if payload.get("transport") == lanes.FILE_TRANSPORT:
+        # The Excel copy of a lane message; releases before it skip these rows (other transport).
+        return "lane_file" if lanes.is_lane(key, payload) and isinstance(payload.get("file"), dict) else None
+    if payload.get("transport") != "app":
         return None
     if lanes.is_lane(key, payload):
         return "lane"
@@ -69,11 +88,11 @@ def _kind(key, payload):
 
 
 def _window(kind, key, payload, now):
-    return lanes.delivery_window(key, payload, now) if kind == "lane" else ("READY", None)
+    return lanes.delivery_window(key, payload, now) if kind in LANE_KINDS else ("READY", None)
 
 
 def _blocked(settings, kind, key, payload, now):
-    if kind == "lane":
+    if kind in LANE_KINDS:
         return lanes.delivery_blocked(settings, key, payload, now)
     from jx_alert.bot_service import validate_question_delivery
     if not validate_question_delivery(settings, payload["delivery"]):
@@ -175,8 +194,23 @@ def _mentions(settings, kind, payload):
     return lanes.mention_plan(settings, payload) if kind == "lane" else ([], {})
 
 
-def _send(client, payload, key, fence, mentions, labels):
+def _attachment(settings, kind, payload):
+    """(bytes, file name) of an Excel copy, read before anything is sent; None for other messages."""
+    if kind not in FILE_KINDS:
+        return None
+    try:
+        return archive.read(settings, payload["file"]), payload["file"]["name"]
+    except (archive.ArchiveError, KeyError, TypeError):
+        raise _Blocked("Excel 文件缺失或内容已变化，未发送") from None
+
+
+def _send(client, payload, key, fence, mentions, labels, attachment=None):
     destination = payload["delivery"]
+    if attachment is not None:
+        data, name = attachment
+        return client.send_file(data, name, receive_id=destination["receive_id"],
+                                receive_id_type=destination["receive_id_type"], idempotency_key=key,
+                                before_submit=fence)
     card = payload.get("card")
     if destination.get("reply_to_message_id"):
         if destination.get("role") not in REPLY_ROLES or card is None:
@@ -232,7 +266,7 @@ def process_outbox_batch(batch_size=5, max_attempts=8, outbox_ids=None, *, quest
             nonlocal claimed_at, intent
             claimed_at, intent = _record_submission(session_factory, settings, job, claimed_at, lease_seconds, evidence)
             # The intent COMMIT may cross the window boundary; no more I/O before the POST.
-            if job["kind"] == "lane" and lanes.delivery_window(key, payload, _clock())[0] != "READY":
+            if job["kind"] in LANE_KINDS and lanes.delivery_window(key, payload, _clock())[0] != "READY":
                 intent = {**intent, "aborted_before_post": True}
                 raise _Blocked("已过发送时段，保留记录不补发")
 
@@ -241,10 +275,11 @@ def process_outbox_batch(batch_size=5, max_attempts=8, outbox_ids=None, *, quest
             if reason:
                 raise _Blocked(reason)
             mentions, labels = _mentions(settings, job["kind"], payload)
+            attachment = _attachment(settings, job["kind"], payload)
             if client is None:
                 from jx_alert.notifications.feishu_app import FeishuAppClient
                 client = (client_factory or FeishuAppClient.from_settings)(settings)
-            response = _send(client, payload, key, fence, mentions, labels)
+            response = _send(client, payload, key, fence, mentions, labels, attachment)
             if intent is None:
                 raise _Unfenced("Feishu transport returned without recording a submission")
             message_id = response["message_id"]
@@ -260,6 +295,8 @@ def process_outbox_batch(batch_size=5, max_attempts=8, outbox_ids=None, *, quest
             elif intent is not None:
                 # Feishu's own error answer proves nothing was created; anything else may have been.
                 status = "REJECTED" if isinstance(exc, (FeishuTokenRefused, FeishuRejected)) else DELIVERY_UNKNOWN
+            elif isinstance(exc, FeishuUploadRejected) and exc.code not in RATE_LIMITED:
+                status = "REJECTED"  # the file was refused before any message: retrying would not help
             else:
                 status = "DEAD" if job["attempts"] >= max_attempts else PRE_SEND_RETRY
             error = f"Feishu delivery failed: {type(exc).__name__}"
@@ -268,6 +305,9 @@ def process_outbox_batch(batch_size=5, max_attempts=8, outbox_ids=None, *, quest
                 error += f" code={code[1]}"
             if status == DELIVERY_UNKNOWN:
                 error = f"{UNKNOWN_REASON} ({error})"
+            elif status == "REJECTED" and isinstance(exc, FeishuUploadRejected):
+                error = (f"飞书拒绝接收 Excel 文件，未发送（code={exc.code}"
+                         + (f"：{UPLOAD_REJECTIONS[exc.code]}）" if exc.code in UPLOAD_REJECTIONS else "）"))
             elif status == "REJECTED" and isinstance(exc, FeishuRejected):
                 error = (f"飞书拒绝，未送达（code={exc.code}"
                          + (f"：{REJECTIONS[exc.code]}）" if exc.code in REJECTIONS else "）"))

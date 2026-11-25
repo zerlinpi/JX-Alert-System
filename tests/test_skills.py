@@ -18,7 +18,10 @@ MANIFEST = {"release": "v1.3.7", "updated_at": "2026-11-18", "skills": [
     {"name": "sparkx-edit-ads", "version": "1.2.0", "required": True, "mcp_tools": ["batch_update_ads"],
      "path": "sparkx-edit-ads", "description": "Edit live ad entities."},
     {"name": "sparkx-promo-prep", "version": "1.0.0", "required": False,
-     "mcp_tools": ["get_ads_perf", "batch_update_ads"], "path": "sparkx-promo-prep", "description": "Promo."}]}
+     "mcp_tools": ["get_ads_perf", "batch_update_ads"], "path": "sparkx-promo-prep", "description": "Promo."},
+    {"name": "sparkx-query-market-data", "version": "1.0.1", "required": False,
+     "mcp_tools": ["get_market_search_perf", "get_peer_benchmark"], "path": "sparkx-query-market-data",
+     "description": "SQP / ABA search terms and peer benchmarks."}]}
 
 
 def archive(extra=None, manifest=MANIFEST):
@@ -29,6 +32,7 @@ def archive(extra=None, manifest=MANIFEST):
         "skills/sparkx-weekly-ads-report/SKILL.md": "# Weekly report",
         "skills/sparkx-edit-ads/SKILL.md": "# Edit ads (write)",
         "skills/sparkx-promo-prep/SKILL.md": "# Promo (write)",
+        "skills/sparkx-query-market-data/SKILL.md": "# Query Market and Peer Data",
         "skills/sparkx-query-ads-performance/../../../escape.md": "outside",
         "README.md": "repo readme",
         **(extra or {})}
@@ -53,11 +57,20 @@ def transport(body, status=200):
     return mock
 
 
+def install_fake(settings):
+    """The official repository stand-in installed: three read-only Skills, two that need write tools."""
+    return skills.install(settings, transport=transport(archive()))
+
+
 def test_only_read_only_skills_are_installed_and_readable(settings):
     mock = transport(archive())
     index = skills.install(settings, transport=mock)
     assert mock.seen == ["https://codeload.github.com/SparkXAI/SparkXAI-MCP/tar.gz/main"]
-    assert [entry["name"] for entry in index["skills"]] == ["sparkx-query-ads-performance", "sparkx-weekly-ads-report"]
+    assert [entry["name"] for entry in index["skills"]] == ["sparkx-query-ads-performance", "sparkx-weekly-ads-report",
+                                                            "sparkx-query-market-data"]
+    # The whole official list is kept, so the console can say why a Skill is not installed.
+    blocked = {entry["name"]: entry["blocked_tools"] for entry in index["catalog"] if not entry["installable"]}
+    assert blocked == {"sparkx-edit-ads": ["batch_update_ads"], "sparkx-promo-prep": ["batch_update_ads"]}
     assert index["release"] == "v1.3.7" and index["commit"] == SHA
     assert skills.installed(settings)["folder"] == index["folder"]
     first = skills.read(settings, index, "sparkx-query-ads-performance")
@@ -93,7 +106,63 @@ def test_status_reports_outdated_skills(settings):
     view = skills.status(settings, check=True, transport=httpx.MockTransport(
         lambda request: httpx.Response(200, json=newer)))
     assert view["installed"]["release"] == "v1.3.7" and view["latest"]["outdated"] == ["sparkx-query-ads-performance"]
-    assert [row["name"] for row in view["skills"]] == ["sparkx-query-ads-performance", "sparkx-weekly-ads-report"]
+    assert [row["name"] for row in view["skills"]] == ["sparkx-query-ads-performance", "sparkx-weekly-ads-report",
+                                                       "sparkx-query-market-data"]
+
+
+def test_optional_skills_can_be_switched_off_but_required_ones_stay_on(settings, monkeypatch):
+    monkeypatch.setattr(skills, "_auto_attempt", {"at": 0.0})
+    install_fake(settings)
+    current = skills.choices(settings)
+    assert current["disabled"] == [] and current["revision"] == "0" * 64
+    skills.save_choices(settings, ["sparkx-weekly-ads-report"], current["revision"])
+    agent_index = skills.for_agent(settings)
+    assert [entry["name"] for entry in agent_index["skills"]] == ["sparkx-query-ads-performance",
+                                                                  "sparkx-query-market-data"]
+    assert "没有这个 Skill" in skills.read(settings, agent_index, "sparkx-weekly-ads-report")
+    with pytest.raises(skills.SkillsError) as exc:
+        skills.save_choices(settings, ["sparkx-query-ads-performance"], skills.choices(settings)["revision"])
+    assert exc.value.status_code == 400 and "基础查询" in exc.value.detail
+    with pytest.raises(skills.SkillsError) as exc:
+        skills.save_choices(settings, ["sparkx-edit-ads"], skills.choices(settings)["revision"])  # never installed
+    assert exc.value.status_code == 400
+    with pytest.raises(skills.SkillsError) as exc:
+        skills.save_choices(settings, [], "1" * 64)
+    assert exc.value.status_code == 409
+    skills.save_choices(settings, [], skills.choices(settings)["revision"])
+    assert len(skills.for_agent(settings)["skills"]) == 3
+    states = {row["name"]: (row["state"], row["tools"]) for row in skills.status(
+        settings, offered=["get_ads_perf", "get_entity_metadata", "get_operation_log"])["catalog"]}
+    assert states["sparkx-query-market-data"] == ("missing_tools", ["get_market_search_perf", "get_peer_benchmark"])
+    assert states["sparkx-promo-prep"] == ("write", ["batch_update_ads"]) and states["sparkx-weekly-ads-report"][0] == "on"
+
+
+def test_a_run_offers_only_skills_whose_tools_this_token_gets(settings, monkeypatch):
+    """Market-data Skills need extra SparkX scopes: without those tools DeepSeek is not pointed at them."""
+    import anyio
+
+    from jx_alert.ai import agent
+    from jx_alert.sparkx import stores
+    from sparkx_fake import FakeSparkX, ScriptedDeepSeek, install, reply
+
+    index = install_fake(settings)
+    assert [entry["name"] for entry in skills.usable(index, [])["skills"]] == [entry["name"] for entry in index["skills"]]
+    install(monkeypatch, FakeSparkX(), agent)
+    client = ScriptedDeepSeek([reply("好的。")])
+    seen = {}
+
+    def messages_for(context):
+        seen["skills"] = [entry["name"] for entry in context["skills"]["skills"]]
+        return [{"role": "system", "content": skills.prompt_index(context["skills"])}, {"role": "user", "content": "x"}]
+
+    async def conversation():
+        return await agent.run_task(settings, client, token="synthetic-sparkx-token", messages_for=messages_for,
+                                    now=None, directory=stores.load(settings), need_roster=False, max_tool_calls=2,
+                                    max_rounds=2, skills_index=index)
+
+    anyio.run(conversation)
+    assert seen["skills"] == ["sparkx-query-ads-performance", "sparkx-weekly-ads-report"]
+    assert "sparkx-query-market-data" not in client.requests[0]["messages"][0]["content"]
 
 
 def test_auto_install_is_attempted_once_per_interval(settings, monkeypatch):

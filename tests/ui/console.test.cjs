@@ -107,3 +107,26 @@ test("the setup checklist follows the overview", () => {
   assert.deepEqual(ready.filter((step) => !step.done).map((step) => step.key), ["operators"]);
   assert.equal(ready.find((step) => step.key === "operators").optional, true);
 });
+
+test("leads are lists of names, also for an older server's single lead", () => {
+  assert.equal(consoleUi.leadNames([{ id: "ou_a", name: "老板" }, { id: "ou_b", name: "高爽" }]), "老板、高爽");
+  assert.equal(consoleUi.leadNames({ id: "ou_a", name: "老板" }), "老板");
+  assert.equal(consoleUi.leadNames(null), "");
+  assert.deepEqual(consoleUi.leadList([]), []);
+});
+
+test("skill states say why a skill is or is not used", () => {
+  assert.deepEqual(consoleUi.skillState({ state: "on", tools: [] }), { text: "使用中", tone: "ok", detail: "" });
+  assert.equal(consoleUi.skillState({ state: "missing_tools", tools: ["get_market_search_perf"] }).detail,
+    "当前 SparkX Token 没有提供：get_market_search_perf");
+  assert.deepEqual(consoleUi.skillState({ state: "write", tools: ["batch_update_ads"] }),
+    { text: "需要写入工具，不安装", tone: "bad", detail: "需要：batch_update_ads" });
+  assert.equal(consoleUi.skillState({ state: "off" }).text, "已停用");
+});
+
+test("file sizes read naturally", () => {
+  assert.equal(consoleUi.fileSize(512), "512 B");
+  assert.equal(consoleUi.fileSize(12595), "12.3 KB");
+  assert.equal(consoleUi.fileSize(3 * 1024 * 1024), "3.0 MB");
+  assert.equal(consoleUi.fileSize(undefined), "—");
+});

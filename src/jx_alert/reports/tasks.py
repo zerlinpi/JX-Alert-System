@@ -43,19 +43,26 @@ DEFAULT_PROMPTS = {
 4. **有花费店铺明细**：表格「店铺 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费日环比 | 运营」，按广告花费从高到低；表格下方一行写「暂无广告数据：…」（SparkX 没有返回当日广告数据的店铺）和「当日无广告花费：…」（有数据但当日没有花费的店铺）。
 5. **须知**：2–4 条编号短评，每条一两句话、不超过 60 字，先下结论再给关键数字：花费是否集中、ACOS 明显偏高的店铺、有广告花费但没有广告订单的店铺。缺数据或数据未更新的店铺不写进开头和须知：系统会按 SparkX 返回的数据，在明细表下方统一列出。
 订单和销量写整数，百分比保留一位小数。""",
-    "review": """判定口径（金额 USD，campaign 级）：
+    "review": """判定方法（金额 USD）：先按 campaign 找出候选，再结合主推产品以往的数据和产品的价值、类型，判断是否真的异常、有多严重。
+- 主推产品：只对候选 campaign 查（不扫全店）。用 factEntity=productAd、select campaign.campaignId_ 和 productAd.asin_，取每个候选 campaign 花费最多的 ASIN；再查这些 ASIN 在基准期（前 7 日之前的 30 天）的广告花费、广告销售额、广告订单、点击，以及售价 asin.asinPrice_、类目 asin.asinCategoryInfo_、SP 上线日 asin.asinOpenDate_。
+- 产品价值：客单价 = 基准期广告销售额 ÷ 广告订单（基准期没有广告订单时用售价）。单笔允许花费 T = 客单价 × 目标 ACOS；没有给定目标 ACOS 时用该店近 30 天的 ACOS（Skill 规则），在开头注明一次。
+- 产品历史：基准期 CVR = 广告订单 ÷ 点击，ACOS = 广告花费 ÷ 广告销售额，CPA = 广告花费 ÷ 广告订单。基准期广告订单少于 3 单为样本不足：只按 T 判断，标注「样本不足」。
+- 产品类型：SP 上线不足 90 天的新品、客单价 ≥ $150 的高客单产品转化慢、单量少，照常按 T 判断，但标注「新品期」「高客单」并把严重程度降一级；季节性明显的类目注明。
+判定口径：
 - 全店零曝光：两周内没有任何曝光，但仍有开启的 campaign（用 get_entity_metadata 统计开启数量），放在「最严重」。
-- ① 高花费零出单：近 7 日花费 ≥ $50、点击 ≥ 10、广告订单 = 0；建议 CPC = 当前 CPC × 70%。
-- ② ACOS 明显恶化（高花费低转化）：近 7 日花费 ≥ $50，ACOS ≥ 前 7 日的 1.5 倍且至少高 15 个百分点；建议 CPC = 当前 CPC × 前 7 日 ACOS ÷ 近 7 日 ACOS。
-- ③ 加预算后销售反而下滑：近 7 日花费 ≥ $50 且比前 7 日增加 ≥ 30%，广告销售额下降 ≥ 20%（或归零）。
-- ④ 异常停摆：开启状态，前 7 日花费 ≥ $50，近 7 日没有曝光。
-- ⑤ 低花费高转化（机会，不计入异常）：近 7 日花费 < $100、广告订单 ≥ 3、ACOS ≤ 20%。
+- ① 高花费零出单：近 7 日广告订单 = 0，花费 ≥ T（已花掉一单允许的成本），且点击 ≥ 2 ÷ 基准期 CVR（按产品历史转化本应出 2 单以上；样本不足时不看这一条）；建议 CPC = 当前 CPC × 70%。
+- ② ACOS 明显恶化（高花费低转化）：近 7 日花费 ≥ T，ACOS ≥ 产品基准期 ACOS 的 1.5 倍且至少高 15 个百分点（样本不足时与前 7 日比）；建议 CPC = 当前 CPC × 基准期 ACOS ÷ 近 7 日 ACOS，一次最多下调 50%（避免流量断崖）。
+- ③ 加预算后销售反而下滑：近 7 日花费 ≥ T 且比前 7 日增加 ≥ 30%，广告销售额下降 ≥ 20%（或归零）。
+- ④ 异常停摆：开启状态，前 7 日花费 ≥ T，近 7 日没有曝光。
+- ⑤ 低花费高转化（机会，不计入异常）：近 7 日花费 < 3T、广告订单 ≥ 3，ACOS ≤ 产品基准期 ACOS 的 70% 且不高于店铺 ACOS。
+- 托管组里的 campaign（campaign.aiGroupId_ 不为 0）由 AI 调价：只给托管组层面的建议（目标 ACOS、组预算），不给出价数字。
+- 同类问题按浪费的金额排序：浪费 = 花费 − 广告订单 × 产品历史 CPA（没有历史时用 T）。
 结构：
-开头一句加粗：「N 个店铺中，M 个有投放数据，K 个检出 X 个异常 campaign。」，再一句整体广告花费、广告销售额、ACOS 的变化，并按 Skill 要求用半句话注明近 7 日的转化数据是暂定值。
-**一、最严重**：最需要马上处理的问题，一两句话说明为什么严重。
+开头一句加粗：「N 个店铺中，M 个有投放数据，K 个检出 X 个异常 campaign。」，再一句整体广告花费、广告销售额、ACOS 的变化，并按 Skill 要求用半句话注明近 7 日的转化数据是暂定值、T 用的是哪个 ACOS。
+**一、最严重**：最需要马上处理的问题，一两句话说明为什么严重（带浪费金额和产品客单价）。
 **二、异常店铺总览**：表格「店铺 | 近7日花费 | ACOS 近7日 | 前7日 | 异常数 | 主要问题 | 运营」。
-**三、按问题类型看具体 campaign**：每类一张表，表前只写类型名称（例如「① 高花费零出单」），不重复判定条件；列出店铺、Campaign、关键数据和建议 CPC（例如 2.45 → 1.80），最后一列是运营；⑤ 机会单独列出。
-**四、建议动作**：3–5 条，每条针对一个店铺、不超过 60 字，先说动作再说理由，带具体的出价或预算建议。
+**三、按问题类型看具体 campaign**：每类一张表，表前只写类型名称（例如「① 高花费零出单」），不重复判定条件；表格「店铺 | Campaign | 主推产品 | 客单价 | 近7日花费 | 点击 | 广告订单 | ACOS | 产品历史 | 建议 | 运营」：主推产品写 ASIN（可带简短品名），产品历史写基准期 CVR 和 ACOS（例如「CVR 6.2% / ACOS 28%」，样本不足写「样本不足」），建议写建议 CPC（例如 2.45 → 1.80；托管组写组层面建议）；⑤ 机会单独列出。
+**四、建议动作**：3–5 条，每条针对上面已列出的一个异常店铺、不超过 60 字，先说动作再说理由，带具体的出价或预算建议（托管组除外）；没有列出的店铺不写。
 口吻直接，像资深投手在群里复盘。""",
     "hourly": "",
 }
@@ -266,7 +273,7 @@ def run_lane(settings, lane, config, *, now, directory, alerted=frozenset(), on_
     if not token:
         raise SparkXError("SPARKX_NOT_CONFIGURED", 409)
     client = _client(settings, client_factory)
-    index = skill_store.ensure(settings)
+    index = skill_store.for_agent(settings)  # installed Skills the owner left switched on
     limits = LIMITS[lane]
     state = {}
 
@@ -276,7 +283,7 @@ def run_lane(settings, lane, config, *, now, directory, alerted=frozenset(), on_
         if not monitored:
             raise SparkXError("SPARKX_NO_PROFILES", 409)
         state["monitored"] = monitored
-        system = agent.system_prompt(now=now, tool_names=context["tool_names"], skills_index=index,
+        system = agent.system_prompt(now=now, tool_names=context["tool_names"], skills_index=context["skills"],
                                      roster=roster, directory=directory, instructions=context["instructions"],
                                      only_monitored=True)
         return [{"role": "system", "content": system},

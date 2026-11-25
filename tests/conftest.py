@@ -66,4 +66,5 @@ def settings(tmp_path, routing):
                     deepseek_credentials_file=str(secrets / "deepseek.json"),
                     runtime_settings_file=str(tmp_path / "runtime-settings.json"),
                     sparkx_skills_dir=str(tmp_path / "sparkx-skills"),
+                    report_archive_dir=str(tmp_path / "reports"),
                     sparkx_ai_token="synthetic-sparkx-token", deepseek_api_key="sk-synthetic-deepseek")

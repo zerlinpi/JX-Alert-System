@@ -42,8 +42,22 @@ let nextJob = 0;
 const startedAt = new Date(Date.now() - 65000).toISOString();
 const doneResult = { cards: [card], text: "SparkX 广告日报",
   info: { profiles: 2, report_date: "2026-11-22", sparkx_calls: 5, seconds: 70, usage: { total_tokens: 183000, prompt_cache_hit_tokens: 102000 },
-          mentions: [{ name: "高爽", stores: ["Campx"] }] } };
+          mentions: [{ name: "高爽", stores: ["Campx"] }], excel: true } };
 const view = (id) => ({ job: id, ...jobs[id].state });
+// The Skills page as the server answers it: the official catalog with each Skill's state.
+const skillsView = (disabled) => ({ installed: { release: "v1.3.7", commit: "b72b914b8", installed_at: "2026-11-24T02:00:00Z" },
+  skills: [{ name: "sparkx-query-ads-performance", version: "1.4.11", description: "Query metrics.", mcp_tools: ["get_ads_perf"], required: true }],
+  catalog: [
+    { name: "sparkx-query-ads-performance", version: "1.4.11", description: "Query metrics.", mcp_tools: ["get_ads_perf"], required: true,
+      state: "on", tools: [] },
+    { name: "sparkx-weekly-ads-report", version: "1.1.6", description: "Weekly.", mcp_tools: ["get_ads_perf"], required: false,
+      state: disabled.includes("sparkx-weekly-ads-report") ? "off" : "on", tools: [] },
+    { name: "sparkx-query-market-data", version: "1.0.1", description: "Market.", mcp_tools: ["get_market_search_perf"], required: false,
+      state: "missing_tools", tools: ["get_market_search_perf"] },
+    { name: "sparkx-edit-ads", version: "1.3.0", description: "Edit.", mcp_tools: ["batch_update_ads"], required: true,
+      state: "write", tools: ["batch_update_ads"] }],
+  choices: { revision: disabled.length ? "7".repeat(64) : "0".repeat(64), disabled },
+  read_tools: ["get_ads_perf", "get_entity_metadata"], source: "SparkXAI/SparkXAI-MCP", latest: null, error: null });
 const responses = {
   "GET /console/api/overview": () => ({ sparkx: { configured: true, token_source: "console" }, deepseek: { configured: true, model: "deepseek-flash" },
     skills: { installed: false, release: null, count: 0 },
@@ -62,8 +76,13 @@ const responses = {
     }
     return { revision: "9".repeat(64), roster_at: "2026-11-24T00:30:00Z", rows };
   },
-  "GET /console/api/recipients": () => ({ revision: "1".repeat(64), group: "日报群", company: { id: "ou_lead", name: "老板" }, ad: null,
-    group_detail: { name: "日报群" } }),
+  "GET /console/api/recipients": () => ({ revision: "1".repeat(64), group: "日报群",
+    company: [{ id: "ou_lead", name: "老板" }, { id: "ou_op2", name: "高爽" }], ad: [], max: 10, group_detail: { name: "日报群" } }),
+  "POST /console/api/recipients/company": (body) => ({ revision: "5".repeat(64), group: "日报群", max: 10, ad: [],
+    company: body.open_ids.map((id) => ({ id, name: id })) }),
+  "GET /console/api/archive": () => ({ rows: [{ path: "daily/2026-11/广告日报_2026-11-24.xlsx", name: "广告日报_2026-11-24.xlsx",
+    lane: "daily", lane_label: "08:30 日报", month: "2026-11", size: 12595, saved_at: "2026-11-25T00:31:00Z" }] }),
+  "POST /console/api/skills/choices": (body) => skillsView(body.disabled),
   "GET /console/api/reports": () => ({ revision: "2".repeat(64), updated_at: null, lanes, default_prompts: defaults, max_prompt: 4000 }),
   "POST /console/api/reports": (body) => ({ revision: "3".repeat(64), updated_at: "2026-11-24T01:00:00Z", lanes: body.lanes, default_prompts: defaults }),
   "POST /console/api/reports/preview": (body) => {
@@ -77,13 +96,11 @@ const responses = {
   "POST /console/api/reports/test-send": (body) => {
     const sent = [...(body.to_group ? ["group"] : []), ...(body.to_lead ? ["lead"] : [])];
     jobs[body.job].state.sent = sent;
-    return { status: "QUEUED", queued: 1, mentions: body.mention ? 1 : 0, targets: sent, sent };
+    return { status: "QUEUED", queued: 2, cards: 1, files: 1, mentions: body.mention ? 1 : 0, targets: sent, sent };
   },
   "GET /console/api/groups": () => ({ chat_id: "oc_reports", name: "日报群", revision: "1".repeat(64), chats: [{ id: "oc_reports", name: "日报群" }] }),
   "GET /console/api/sparkx": () => ({ revision: "0".repeat(64), configured: true, token_source: "console", endpoint: "https://mcp.sparkx.cn/mcp" }),
-  "GET /console/api/skills": () => ({ installed: { release: "v1.3.7", commit: "b72b914b8", installed_at: "2026-11-24T02:00:00Z" },
-    skills: [{ name: "sparkx-query-ads-performance", version: "1.4.11", description: "Query metrics.", mcp_tools: ["get_ads_perf"] }],
-    read_tools: ["get_ads_perf", "get_entity_metadata"], source: "SparkXAI/SparkXAI-MCP", latest: null, error: null }),
+  "GET /console/api/skills": () => skillsView([]),
   "POST /console/api/sparkx/test": () => ({ status: "OK", profile_count: 1, profiles: [{ profile_id: "101", name: "香港川页", country: "US", store_type: "seller" }] }),
   "GET /console/api/deepseek": () => ({ revision: "0".repeat(64), configured: true, models: ["deepseek-flash", "deepseek-v4-pro"],
     model: "deepseek-flash", timeout: 120, thinking: true, key_source: "console" }),
@@ -183,7 +200,7 @@ const locked = () => doc.documentElement.classList.contains("scroll-locked");
 
   click(doc.querySelector('[data-view="notifications"]'));
   await tick();
-  checks.push(["recipients", $("lead-company").textContent === "老板" && $("lead-ad").textContent === "未设置"]);
+  checks.push(["recipients list several leads", $("lead-company").textContent === "老板、高爽" && $("lead-ad").textContent === "未设置"]);
   checks.push(["earlier previews are looked up per lane", count("GET /console/api/reports/preview?lane=daily") === 1
     && count("GET /console/api/reports/preview?lane=hourly") === 1]);
   const dailyPrompt = doc.querySelector('#lanes-form [data-lane="daily"] textarea[name="prompt"]');
@@ -229,14 +246,16 @@ const locked = () => doc.documentElement.classList.contains("scroll-locked");
     && $("preview-cards").querySelector("strong").textContent === "全公司核心指标"
     && $("preview-notice").textContent.includes("没有重新调用 DeepSeek")
     && $("preview-info").textContent.includes("SparkX 查询 5 次") && $("preview-info").textContent.includes("Token 18.3 万（缓存命中 10.2 万）")]);
-  checks.push(["test send is offered for the finished preview", !$("test-send").disabled && $("test-lead-label").textContent === "总负责人（老板）"
-    && !$("test-to-lead").disabled && $("test-mention-label").textContent === "@ 对应运营：高爽（Campx）" && !$("test-mention").disabled]);
+  checks.push(["test send is offered for the finished preview", !$("test-send").disabled && $("test-lead-label").textContent === "总负责人（老板、高爽）"
+    && !$("test-to-lead").disabled && $("test-mention-label").textContent === "@ 对应运营：高爽（Campx）" && !$("test-mention").disabled
+    && $("test-send-hint").textContent.includes("和它的 Excel 文件")]);
   click($("test-send-button"));
   await tick();
   const test = last("POST /console/api/reports/test-send");
   checks.push(["test send posts only the job and the chosen recipients", test && test.body.job === "job-1" && test.body.to_group === true
     && test.body.to_lead === false && test.body.mention === false && Object.keys(test.body).length === 4
-    && $("test-send-hint").textContent.startsWith("已发送测试到：通知群")]);
+    && $("test-send-hint").textContent.startsWith("已发送测试到：通知群")
+    && [...$("toasts").children].some((node) => node.textContent.includes("1 张卡片 + 1 个 Excel"))]);
   hold = true;
   click($("preview-regenerate"));
   await tick();
@@ -254,11 +273,18 @@ const locked = () => doc.documentElement.classList.contains("scroll-locked");
     && doc.activeElement === $("test-send-button") && $("test-lead-label").textContent === "广告负责人（未设置）" && $("test-to-lead").disabled]);
   doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape" }));
   checks.push(["escape closes the drawer", $("preview-drawer").hidden && !locked()]);
-  click(doc.querySelector('[data-lead="ad"]'));
+  click(doc.querySelector('[data-lead="company"]'));
   await tick();
-  checks.push(["lead dialog", !$("member-dialog").hidden && $("member-list").querySelectorAll('input[type="radio"]').length === 2
-    && !$("member-clear").hidden]);
-  click(doc.querySelector('#member-dialog [data-close]'));
+  const leadBoxes = $("member-list").querySelectorAll('input[type="checkbox"]');
+  checks.push(["lead dialog allows several people", !$("member-dialog").hidden && leadBoxes.length === 2 && !leadBoxes[0].checked
+    && leadBoxes[1].checked && $("member-hint").textContent.includes("最多 10 位") && !$("member-clear").hidden
+    && $("member-list").querySelectorAll('input[type="radio"]').length === 0]);
+  leadBoxes[0].checked = true; change(leadBoxes[0]);
+  click($("member-save"));
+  await tick();
+  const leadSave = last("POST /console/api/recipients/company");
+  checks.push(["several leads are saved together", leadSave && $("member-dialog").hidden
+    && JSON.stringify([...leadSave.body.open_ids].sort()) === JSON.stringify(["ou_lead", "ou_op1", "ou_op2"])]);
   click($("load-groups"));
   await tick();
   checks.push(["group change", !$("group-change").hidden && $("group-select").options.length === 1]);
@@ -268,6 +294,20 @@ const locked = () => doc.documentElement.classList.contains("scroll-locked");
   checks.push(["sparkx facts", $("sparkx-facts").textContent.includes("已保存（管理台）") && $("sparkx-badge").textContent === "已配置"]);
   checks.push(["skills listed", $("skills-rows").textContent.includes("sparkx-query-ads-performance") && $("skills-facts").textContent.includes("v1.3.7")
     && $("tool-chips").children.length === 2]);
+  const skillBox = (name) => $("skills-rows").querySelector(`input[data-skill="${name}"]`);
+  checks.push(["every official skill shows its state", $("skills-rows").children.length === 4
+    && skillBox("sparkx-query-ads-performance").checked && skillBox("sparkx-query-ads-performance").disabled
+    && skillBox("sparkx-weekly-ads-report").checked && !skillBox("sparkx-weekly-ads-report").disabled
+    && !skillBox("sparkx-edit-ads").checked && skillBox("sparkx-edit-ads").disabled
+    && $("skills-rows").textContent.includes("需要写入工具，不安装") && $("skills-rows").textContent.includes("当前 SparkX Token 没有提供")
+    && $("skills-summary").textContent === "已安装 3 个，使用中 2 个；1 个需要写入工具，未安装"]);
+  const weeklySkill = skillBox("sparkx-weekly-ads-report");
+  weeklySkill.checked = false; change(weeklySkill);
+  await tick();
+  const choice = last("POST /console/api/skills/choices");
+  checks.push(["switching a skill off saves the choice", choice && JSON.stringify(choice.body.disabled) === JSON.stringify(["sparkx-weekly-ads-report"])
+    && choice.body.revision === "0".repeat(64) && !skillBox("sparkx-weekly-ads-report").checked
+    && $("skills-rows").textContent.includes("已停用")]);
   click($("sparkx-test"));
   await tick();
   checks.push(["sparkx test", !$("sparkx-profiles-panel").hidden && $("sparkx-status").textContent.includes("授权 1 家")]);
@@ -289,6 +329,11 @@ const locked = () => doc.documentElement.classList.contains("scroll-locked");
   await tick();
   checks.push(["deliveries", $("delivery-rows").textContent.includes("可能已提交（不自动重发）") && $("delivery-rows").textContent.includes("（测试）")
     && !doc.querySelector('#page-actions [data-for="deliveries"]').hidden]);
+  const download = $("archive-rows").querySelector("a");
+  checks.push(["excel archive lists downloadable files", $("archive-rows").textContent.includes("广告日报_2026-11-24.xlsx")
+    && $("archive-rows").textContent.includes("12.3 KB") && $("archive-rows").textContent.includes("08:30 日报") && download
+    && download.getAttribute("href") === "/console/api/archive/file?path=" + encodeURIComponent("daily/2026-11/广告日报_2026-11-24.xlsx")
+    && download.getAttribute("download") === "广告日报_2026-11-24.xlsx"]);
   const failed = checks.filter(([, ok]) => !ok).map(([name]) => name);
   console.log(JSON.stringify({ passed: checks.length - failed.length, failed, errors }, null, 1));
   process.exit(failed.length || errors.length ? 1 : 0);

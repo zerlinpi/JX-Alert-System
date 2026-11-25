@@ -1,12 +1,17 @@
 """Official SparkX Skills, installed from SparkXAI/SparkXAI-MCP the way an agent installs them.
 
 "MCP 的 Tool 决定 AI 能拿到什么数据，Skill 决定 AI 把数据用得好不好" (SparkX README).
-Only Skills whose MCP tools are all read tools are installed: the three query
-Skills and the read-only analyses (weekly/monthly report, structure, product and
-search-term diagnosis). Write Skills are never installed. Files are kept under
-``settings.sparkx_skills_dir`` in a versioned folder that an index file points
-to; DeepSeek reads them through the ``read_skill`` tool, as Claude/Codex load
-SKILL.md and its references on demand. Nothing is copied into this repository.
+Every Skill whose MCP tools are all read tools is installed: the three query Skills
+and the read-only analyses (weekly/monthly report, structure, product, ASIN and
+search-term diagnosis, market data, category scorecard). Skills that need a write
+tool are listed in the console with the reason but never installed. Files are kept
+under ``settings.sparkx_skills_dir`` in a versioned folder that an index file points
+to; DeepSeek reads them through the ``read_skill`` tool, as Claude/Codex load SKILL.md
+and its references on demand. Nothing is copied into this repository.
+
+The owner switches optional Skills on and off in the console (``choices.json``); the
+official required Skills (the query Skills) always stay on. A run offers DeepSeek only
+the switched-on Skills whose tools SparkX offers this token.
 """
 from datetime import datetime, timezone
 import io
@@ -70,23 +75,105 @@ def installed(settings):
     return data
 
 
-def selected(manifest):
-    """Manifest entries whose tools are all read tools (no write Skill is ever installed)."""
+def catalog(manifest):
+    """Every well-formed manifest entry, with ``installable`` (all tools are read tools) and the others."""
     skills = manifest.get("skills") if isinstance(manifest, dict) else None
     if not isinstance(skills, list):
         raise SkillsError("SparkX Skills 清单格式无法识别。")
-    chosen = []
+    found = []
     for entry in skills:
         if not isinstance(entry, dict):
             continue
         name, path, tools = entry.get("name"), entry.get("path"), entry.get("mcp_tools")
         if (isinstance(name, str) and _NAME.fullmatch(name) and isinstance(path, str) and _NAME.fullmatch(path)
-                and isinstance(tools, list) and tools and all(isinstance(tool, str) for tool in tools)
-                and set(tools) <= READ_TOOLS):
-            chosen.append({"name": name, "path": path, "version": str(entry.get("version") or "")[:20],
-                           "description": str(entry.get("description") or "")[:600], "mcp_tools": tools,
-                           "required": entry.get("required") is True})
-    return chosen
+                and isinstance(tools, list) and tools and all(isinstance(tool, str) for tool in tools)):
+            tools = [tool[:80] for tool in tools[:40]]
+            found.append({"name": name, "path": path, "version": str(entry.get("version") or "")[:20],
+                          "description": str(entry.get("description") or "")[:600], "mcp_tools": tools,
+                          "required": entry.get("required") is True, "installable": set(tools) <= READ_TOOLS,
+                          "blocked_tools": [tool for tool in tools if tool not in READ_TOOLS]})
+    return found
+
+
+def selected(manifest):
+    """Manifest entries whose tools are all read tools (no write Skill is ever installed)."""
+    return [{key: value for key, value in entry.items() if key not in {"installable", "blocked_tools"}}
+            for entry in catalog(manifest) if entry["installable"]]
+
+
+# ---------------------------------------------------------------- the owner's choices
+
+def _choices_path(settings):
+    return _root(settings) / "choices.json"
+
+
+_EMPTY = "0" * 64
+
+
+def choices(settings):
+    """{"revision", "disabled": [names], "updated_at"}: optional Skills the owner switched off."""
+    try:
+        data = private_file.read_json(_choices_path(settings), max_bytes=64 * 1024)
+    except ValueError:
+        raise SkillsError("Skills 启用设置无法读取，请检查 data 目录权限。", 503) from None
+    if data is None:
+        return {"revision": _EMPTY, "disabled": [], "updated_at": None}
+    disabled = data.get("disabled") if isinstance(data, dict) else None
+    if (not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("revision"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", data["revision"]) or not isinstance(disabled, list)
+            or not all(isinstance(name, str) and _NAME.fullmatch(name) for name in disabled)):
+        raise SkillsError("Skills 启用设置无法读取，请检查 data 目录权限。", 503)
+    return {"revision": data["revision"], "disabled": sorted(set(disabled)), "updated_at": data.get("updated_at")}
+
+
+def save_choices(settings, disabled, revision):
+    """Switch optional installed Skills off (the others on). Required Skills cannot be switched off."""
+    index = installed(settings)
+    if not index:
+        raise SkillsError("请先安装官方 Skills。", 409)
+    names = {entry["name"]: entry for entry in index["skills"]}
+    if (not isinstance(disabled, list) or len(disabled) > 100
+            or not all(isinstance(name, str) and name in names for name in disabled)):
+        raise SkillsError("选择的 Skill 无效，请刷新后重试。", 400)
+    if any(names[name].get("required") for name in disabled):
+        raise SkillsError("基础查询 Skill 不能停用：DeepSeek 查询 SparkX 前必须读取它们。", 400)
+    path = _choices_path(settings)
+    try:
+        with private_file.locked(path):
+            if choices(settings)["revision"] != revision:
+                raise SkillsError("Skills 设置已更新，请刷新后重新选择。", 409)
+            candidate = {"version": 1, "revision": secrets.token_hex(32), "disabled": sorted(set(disabled)),
+                         "updated_at": datetime.now(timezone.utc).isoformat()}
+            private_file.replace_json(path, candidate)
+    except private_file.Busy:
+        raise SkillsError("Skills 设置正在保存，请稍后刷新。", 409) from None
+    except (OSError, ValueError):
+        raise SkillsError("Skills 启用设置无法保存，请检查 data 目录权限。", 503) from None
+    return candidate
+
+
+def _keep(index, names):
+    return {**index, "skills": [entry for entry in index["skills"] if entry["name"] in names]}
+
+
+def for_agent(settings):
+    """The installed index without the Skills the owner switched off (required Skills always stay)."""
+    index = ensure(settings)
+    if not index:
+        return index
+    try:
+        off = set(choices(settings)["disabled"])
+    except SkillsError:
+        off = set()  # unreadable choices: offer every installed Skill rather than none
+    return _keep(index, {entry["name"] for entry in index["skills"] if entry.get("required") or entry["name"] not in off})
+
+
+def usable(index, tool_names):
+    """Only the Skills whose MCP tools are all offered in this session (e.g. market data needs extra scopes)."""
+    if not index or not tool_names:
+        return index
+    offered = set(tool_names)
+    return _keep(index, {entry["name"] for entry in index["skills"] if set(entry.get("mcp_tools") or ()) <= offered})
 
 
 def _download(ref, transport):
@@ -158,6 +245,7 @@ def install(settings, *, ref="main", transport=None):
     chosen = [entry for entry in selected(manifest) if "SKILL.md" in files.get(entry["path"], {})]
     if not chosen:
         raise SkillsError("官方清单中没有可安装的只读 Skill。")
+    listed = [{key: value for key, value in entry.items() if key != "path"} for entry in catalog(manifest)]
     release = str(manifest.get("release") or "")[:20]
     root = _root(settings)
     folder = re.sub(r"[^A-Za-z0-9._-]", "-", f"{release or ref}-{(commit or secrets.token_hex(4))[:7]}")[:60]
@@ -177,7 +265,8 @@ def install(settings, *, ref="main", transport=None):
             staging.rename(root / folder)
             index = {"version": 1, "source": REPOSITORY, "ref": ref, "commit": commit, "release": release,
                      "manifest_updated_at": str(manifest.get("updated_at") or "")[:20],
-                     "installed_at": datetime.now(timezone.utc).isoformat(), "folder": folder, "skills": chosen}
+                     "installed_at": datetime.now(timezone.utc).isoformat(), "folder": folder, "skills": chosen,
+                     "catalog": listed}
             private_file.replace_json(_index_path(settings), index)
             if previous and previous["folder"] != folder:
                 shutil.rmtree(root / previous["folder"], ignore_errors=True)
@@ -221,15 +310,43 @@ def latest_manifest(*, ref="main", transport=None):
         raise SkillsError("官方清单无法解析。") from None
 
 
-def status(settings, *, check=False, transport=None):
-    """Console view: what is installed and, on request, whether the official manifest is newer."""
+def _state(entry, installed_names, off, offered):
+    """(state, missing tools) of one catalog entry for the console."""
+    if not entry["installable"]:
+        return "write", entry.get("blocked_tools") or []
+    if entry["name"] not in installed_names:
+        return "not_installed", []
+    if not entry.get("required") and entry["name"] in off:
+        return "off", []
+    missing = [tool for tool in entry["mcp_tools"] if offered is not None and tool not in offered]
+    return ("missing_tools" if missing else "on"), missing
+
+
+def status(settings, *, check=False, transport=None, offered=None):
+    """Console view: installed Skills, the whole official catalog with each Skill's state, update check.
+
+    ``offered`` (tool names SparkX offers this token, or None when unknown) shows which switched-on
+    Skills cannot be used yet. States: on, off, missing_tools, not_installed, write (never installed).
+    """
     index = installed(settings)
-    view = {"installed": None, "skills": [], "latest": None, "error": None}
+    view = {"installed": None, "skills": [], "catalog": [], "choices": None, "latest": None, "error": None,
+            "offered_tools": sorted(offered) if offered is not None else None}
+    try:
+        current = choices(settings)
+    except SkillsError as exc:
+        current, view["error"] = {"revision": _EMPTY, "disabled": []}, exc.detail
+    view["choices"] = {"revision": current["revision"], "disabled": current["disabled"]}
     if index:
         view["installed"] = {key: index.get(key) for key in ("release", "commit", "ref", "installed_at",
                                                              "manifest_updated_at")}
         view["skills"] = [{key: entry.get(key) for key in ("name", "version", "description", "mcp_tools", "required")}
                           for entry in index["skills"]]
+        listed = index.get("catalog") or [{**entry, "installable": True, "blocked_tools": []} for entry in index["skills"]]
+        names, off = {entry["name"] for entry in index["skills"]}, set(current["disabled"])
+        for entry in listed:
+            state, tools = _state(entry, names, off, offered)
+            view["catalog"].append({key: entry.get(key) for key in ("name", "version", "description", "mcp_tools",
+                                                                    "required")} | {"state": state, "tools": tools})
     if check:
         try:
             manifest = latest_manifest(transport=transport)

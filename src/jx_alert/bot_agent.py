@@ -29,10 +29,10 @@ def answer_question(settings, question, *, history=(), roster=None, now=None, cl
     client = (client_factory or (lambda value: DeepSeekClient.from_settings(
         value, minimum_timeout=REQUEST_MINIMUM_TIMEOUT)))(settings)
     directory = directory_module.load(settings) if directory is None else directory
-    index = skill_store.ensure(settings) if token else None
+    index = skill_store.for_agent(settings) if token else None
 
     def messages_for(context):
-        system = agent.system_prompt(now=now, tool_names=context["tool_names"], skills_index=index,
+        system = agent.system_prompt(now=now, tool_names=context["tool_names"], skills_index=context["skills"],
                                      roster=context["roster"], directory=directory,
                                      instructions=context["instructions"], mode="chat",
                                      sparkx_note=context.get("sparkx_unavailable"))

@@ -41,13 +41,10 @@ def _route(settings):
 
 def _explicit_readers(settings, routing):
     """Leads, group administrators and mapped operators may ask privately."""
-    from jx_alert.reports.recipients import ad_lead, company_lead
+    from jx_alert.reports.recipients import ad_leads, company_leads
     from jx_alert.sparkx import stores as directory_module
 
-    readers = set()
-    for person in (company_lead(settings, routing), ad_lead(routing)):
-        if person:
-            readers.add(person["open_id"])
+    readers = {person["open_id"] for person in (*company_leads(settings, routing), *ad_leads(routing))}
     group = (routing.get("groups") or {}).get(getattr(settings, "feishu_daily_report_chat_id", ""), {})
     readers.update(uid for uid in group.get("admin_open_ids", []) if isinstance(uid, str))
     try:

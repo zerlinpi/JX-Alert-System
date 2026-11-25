@@ -34,11 +34,14 @@ def gate():
 
 
 @pytest.fixture
-def console(settings, session_factory, tmp_path, drafts, gate):
+def console(settings, session_factory, tmp_path, drafts, gate, monkeypatch):
     secrets = tmp_path / "secrets"
     create_owner_credentials(secrets / "owner.json", PASSWORD)
     configured = settings.model_copy(update={"console_public_url": ORIGIN})
     fake = runner_for()
+    # The read tools this token gets (the console asks SparkX live; no network in tests).
+    monkeypatch.setattr("jx_alert.admin_console.offered_read_tools", lambda settings_: [
+        "get_ads_perf", "get_entity_metadata", "get_operation_log", "get_user_authorized_context"])
 
     def runner(settings_, lane, config, **kwargs):
         drafts.append(dict(config))
@@ -220,15 +223,31 @@ def test_a_finished_preview_can_be_sent_as_a_test(console, session_factory, sett
     body = {"job": job, "to_group": True, "to_lead": True, "mention": False}
     sent = console.post("/console/api/reports/test-send", json=body, headers=headers)
     assert sent.status_code == 200 and sent.json()["status"] == "QUEUED" and sent.json()["sent"] == ["group", "lead"]
+    assert sent.json()["cards"] == 2 and sent.json()["files"] == 2
     with session_factory() as db:
         queued = db.query(NotificationOutbox).order_by(NotificationOutbox.id).all()
-        assert [row.payload["delivery"]["role"] for row in queued] == ["jx_review_group", "jx_review_lead"]
+        # Each card is followed by its Excel copy, to the same recipient.
+        assert [(row.payload["delivery"]["role"], row.payload["transport"]) for row in queued] == [
+            ("jx_review_group", "app"), ("jx_review_group", "app_file"), ("jx_review_lead", "app"),
+            ("jx_review_lead", "app_file")]
         assert all(row.idempotency_key.startswith(f"jx:test:review:{job}:") for row in queued)
         assert queued[0].payload["card"]["header"]["title"]["content"].startswith("【测试】广告异常复盘")
+        excel = queued[1].payload["file"]
+        assert excel["name"] == "【测试】广告异常复盘_2026-11-16至2026-11-22.xlsx" and excel["path"].startswith("tests/")
     assert console.post("/console/api/reports/test-send", json=body, headers=headers).json()["status"] == "ALREADY_QUEUED"
     assert wait_for(console, job)["sent"] == ["group", "lead"]
     deliveries = console.get("/console/api/deliveries").json()["rows"]
     assert deliveries[0]["lane"] == "异常复盘（测试）" and deliveries[0]["test"] is True
+    assert deliveries[0]["title"] == "Excel：" + excel["name"]
+    # The saved Excel copies are listed and can be downloaded; nothing outside the archive can be.
+    archive_rows = console.get("/console/api/archive").json()["rows"]
+    assert [(row["name"], row["lane_label"]) for row in archive_rows] == [(excel["name"], "测试发送")]
+    download = console.get("/console/api/archive/file", params={"path": excel["path"]})
+    assert download.status_code == 200 and download.content[:2] == b"PK"
+    assert download.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.spreadsheetml")
+    assert "filename*=UTF-8''" in download.headers["content-disposition"]
+    for bad in ("../secrets/sparkx.json", "tests/2026-11/../../x.xlsx", "/etc/passwd", "daily/2026-11/missing.xlsx"):
+        assert console.get("/console/api/archive/file", params={"path": bad}).status_code == 404
     assert console.post("/console/api/reports/test-send", json={**body, "to_group": False, "to_lead": False},
                         headers=headers).status_code == 400
     assert console.post("/console/api/reports/test-send", json={**body, "card": {}}, headers=headers).status_code == 400
@@ -246,3 +265,67 @@ def test_skills_status_and_install(console, monkeypatch):
     monkeypatch.setattr(skill_store, "install", lambda settings: (_ for _ in ()).throw(skill_store.SkillsError("离线")))
     failed = console.post("/console/api/skills/install", json={}, headers=headers)
     assert failed.status_code == 502 and failed.json()["error"] == "离线"
+
+
+def test_optional_skills_can_be_switched_off_and_on(console, settings):
+    """Owner (Nov 2026): every official read-only Skill is installed and can be ticked on or off."""
+    from test_skills import install_fake
+
+    install_fake(settings)
+    headers = login(console)
+    view = console.get("/console/api/skills").json()
+    states = {entry["name"]: entry["state"] for entry in view["catalog"]}
+    assert states == {"sparkx-query-ads-performance": "on", "sparkx-weekly-ads-report": "on",
+                      "sparkx-edit-ads": "write", "sparkx-promo-prep": "write",
+                      "sparkx-query-market-data": "missing_tools"}
+    assert view["offered_tools"] == ["get_ads_perf", "get_entity_metadata", "get_operation_log",
+                                     "get_user_authorized_context"]
+    body = {"revision": view["choices"]["revision"], "disabled": ["sparkx-weekly-ads-report"]}
+    saved = console.post("/console/api/skills/choices", json=body, headers=headers)
+    assert saved.status_code == 200 and saved.json()["choices"]["disabled"] == ["sparkx-weekly-ads-report"]
+    assert {entry["name"]: entry["state"] for entry in saved.json()["catalog"]}["sparkx-weekly-ads-report"] == "off"
+    assert console.post("/console/api/skills/choices", json=body, headers=headers).status_code == 409  # stale revision
+    locked = {"revision": saved.json()["choices"]["revision"], "disabled": ["sparkx-query-ads-performance"]}
+    assert console.post("/console/api/skills/choices", json=locked, headers=headers).status_code == 400
+    unknown = {"revision": saved.json()["choices"]["revision"], "disabled": ["sparkx-edit-ads"]}
+    assert console.post("/console/api/skills/choices", json=unknown, headers=headers).status_code == 400
+    assert console.post("/console/api/skills/choices", json=body, headers={"origin": ORIGIN}).status_code == 403
+
+
+def test_a_used_session_is_renewed_and_an_idle_one_ends(tmp_path):
+    """Owner (Nov 2026): the console logged out after 30 minutes even while in use."""
+    from jx_alert import console_auth
+
+    now = [1_000_000.0]
+    store = SessionStore(tmp_path / "sessions.sqlite3", clock=lambda: now[0])
+    token = store.new()
+    for _ in range(20):  # 20 working hours, one request each hour: still logged in
+        now[0] += 3600
+        assert store.valid(token)
+    other = store.new()
+    now[0] += console_auth.SESSION_IDLE + 1  # half a day without any request
+    assert not store.valid(other)
+    used = store.new()
+    for _ in range(7 * 24):
+        now[0] += 3600
+        store.valid(used)
+    assert not store.valid(used)  # at most 7 days after the login
+    assert console_auth.SESSION_TTL == console_auth.SESSION_MAX
+
+
+def test_sessions_of_the_previous_release_keep_working(tmp_path):
+    import sqlite3
+    from contextlib import closing
+    from jx_alert import console_auth
+
+    path = tmp_path / "sessions.sqlite3"
+    store = SessionStore(path, clock=lambda: 1_000.0)
+    token = store.new()  # creates the file with both tables
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("DELETE FROM session_starts")  # a session written by the old release: no start time
+        db.execute("UPDATE sessions SET expires = ?", (1_000.0 + console_auth.LEGACY_TTL,))
+        # The old release inserts two values into the unchanged sessions table; that still works.
+        db.execute("INSERT INTO sessions VALUES (?, ?)", ("x" * 64, 2_000.0))
+    later = SessionStore(path, clock=lambda: 1_000.0 + 1200)
+    assert later.valid(token)  # renewed instead of ending after 30 minutes
+    assert SessionStore(path, clock=lambda: 1_000.0 + 6 * 3600).valid(token)

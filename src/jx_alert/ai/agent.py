@@ -271,9 +271,12 @@ async def run_task(settings, client, *, token, messages_for, now, directory, max
                 roster = await authorized_profiles(await link.get())
                 if on_roster:
                     on_roster(roster)
+        tool_names = [spec["function"]["name"] for spec in specs]
+        # A Skill is offered only when SparkX offers all of its tools to this token (e.g. market data
+        # needs extra scopes); without any tools (SparkX unreachable in chat) the list stays as installed.
+        skills_index = skill_store.usable(skills_index, tool_names)
         context = {"roster": roster or {}, "directory": directory, "instructions": instructions,
-                   "tool_names": [spec["function"]["name"] for spec in specs], "skills": skills_index, "now": now,
-                   "sparkx_unavailable": unavailable}
+                   "tool_names": tool_names, "skills": skills_index, "now": now, "sparkx_unavailable": unavailable}
         messages = messages_for(context)
         summary = await converse(client, messages, link=link, specs=specs, settings=settings,
                                  skills_index=skills_index, max_tool_calls=max_tool_calls, max_rounds=max_rounds,

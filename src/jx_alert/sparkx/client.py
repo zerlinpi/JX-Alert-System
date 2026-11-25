@@ -18,9 +18,13 @@ import httpx
 
 _LOG = logging.getLogger(__name__)
 SPARKX_MCP_URL = "https://mcp.sparkx.cn/mcp"
-# Read-only data tools of SparkX AI MCP v1.3.x. Skill-platform tools are not offered.
+# Read-only data tools of SparkX AI MCP. Skill-platform tools are not offered. The two market tools
+# (SQP/ABA search terms, peer benchmarks; official skill sparkx-query-market-data) are read tools that
+# SparkX lists only for tokens with the sqp:read / benchmark:read scopes; like every tool here they are
+# offered only when SparkX also marks them readOnlyHint=true.
 READ_TOOLS = frozenset({"get_user_authorized_context", "get_ads_perf", "get_entity_metadata", "get_operation_log",
-                        "get_amc_audience_perf", "get_ai_group_template"})
+                        "get_amc_audience_perf", "get_ai_group_template", "get_market_search_perf",
+                        "get_peer_benchmark"})
 _PID = re.compile(r"[1-9][0-9]{0,19}")
 
 MESSAGES = {
@@ -311,5 +315,20 @@ def fetch_roster(settings, *, token=None, timeout=20.0):
     async def conversation():
         async with open_session(token, timeout) as session:
             return await authorized_profiles(session)
+
+    return run(conversation, total_timeout=timeout + 10)
+
+
+def offered_read_tools(settings, *, token=None, timeout=15.0):
+    """Names of the read tools SparkX offers this token (what the agent would get), for the console."""
+    from jx_alert.sparkx.credentials import effective_token
+
+    token = effective_token(settings) if token is None else token
+    if not token:
+        raise SparkXError("SPARKX_NOT_CONFIGURED", 409)
+
+    async def conversation():
+        async with open_session(token, timeout) as session:
+            return sorted(tool.name for tool in await agent_tools(session))
 
     return run(conversation, total_timeout=timeout + 10)

@@ -160,6 +160,17 @@ def _percent(value):
     return "—" if value is None else f"{value:.1f}%"
 
 
+def hourly_title(day, time):
+    return f"广告实时监控 · 美西 {day} {time}"
+
+
+def hourly_lead(findings, *, scoped=False):
+    """The first line of an hourly alert: counts plus the one data note the SparkX Skill requires."""
+    stores = len({item["pid"] for item in findings})
+    return (("你负责的店铺中，" if scoped else "") + f"{stores} 个店铺 {len(findings)} 个广告活动触发提醒。"
+            + INTRADAY_NOTE)
+
+
 def hourly_card(findings, *, day, time, names, operators, scoped=False, cap=10):
     """The alert table of new findings, grouped by category; None when there is nothing to send.
 
@@ -168,9 +179,7 @@ def hourly_card(findings, *, day, time, names, operators, scoped=False, cap=10):
     """
     if not findings:
         return None
-    stores = len({item["pid"] for item in findings})
-    lead = ("你负责的店铺中，" if scoped else "") + f"{stores} 个店铺 {len(findings)} 个广告活动触发提醒。"
-    elements = [markdown(lead + INTRADAY_NOTE)]
+    elements = [markdown(hourly_lead(findings, scoped=scoped))]
     headers = ["店铺", "广告活动", "花费", "点击", "广告订单", "ACOS", "CVR", "建议", "运营"]
     for code in HOURLY_ORDER:
         items = [item for item in findings if item["category"] == code]
@@ -184,7 +193,7 @@ def hourly_card(findings, *, day, time, names, operators, scoped=False, cap=10):
         if len(items) > cap:
             elements.append(markdown(f"另有 {len(items) - cap} 个{HOURLY_LABELS[code]}活动未展开。"))
     color = "red" if any(item["category"].startswith("high_spend") for item in findings) else "orange"
-    value = shell(f"广告实时监控 · 美西 {day} {time}", elements, color)
+    value = shell(hourly_title(day, time), elements, color)
     if card_fits(value, MENTION_RESERVE):
         return value
     if cap > 2:

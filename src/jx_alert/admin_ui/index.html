@@ -118,7 +118,7 @@
             </div>
           </section>
           <section class="panel" aria-labelledby="leads-title">
-            <div class="panel-head"><div><h2 id="leads-title">负责人</h2><p class="muted">私聊接收，只能是通知群成员。</p></div></div>
+            <div class="panel-head"><div><h2 id="leads-title">负责人</h2><p class="muted">私聊接收，可多选（每类最多 10 位），只能是通知群成员。</p></div></div>
             <div class="panel-body list">
               <div class="list-row"><div><strong>总负责人</strong><span class="muted">接收 08:30 广告日报</span></div>
                 <span class="chip" id="lead-company">未设置</span>
@@ -131,6 +131,7 @@
         </div>
 
         <h2 class="section-title">通知</h2>
+        <p class="muted section-note">每条日报、复盘和实时监控消息后面都附带同内容的 Excel 文件（文件名带日期），发给这条消息的同一批接收人；文件保存在服务器，可在「发送记录 → Excel 存档」下载。</p>
         <form id="lanes-form" class="lanes" autocomplete="off" novalidate>
           <section class="panel lane" data-lane="daily" aria-labelledby="lane-daily-title">
             <div class="panel-head"><div><h2 id="lane-daily-title">08:30 广告日报</h2>
@@ -240,7 +241,7 @@
           </section>
           <section class="panel" aria-labelledby="skills-title">
             <div class="panel-head"><div><h2 id="skills-title">官方 Skills</h2>
-              <p class="muted">从 GitHub SparkXAI/SparkXAI-MCP 安装只读 Skills（查询方法、口径和分析流程），写操作 Skill 不会安装。</p></div>
+              <p class="muted">从 GitHub SparkXAI/SparkXAI-MCP 安装官方清单里所有只读 Skill（查询方法、口径和分析流程）；需要写入工具的 Skill 不会安装。</p></div>
               <span class="badge" id="skills-badge"></span></div>
             <div class="panel-body">
               <dl class="facts" id="skills-facts"></dl>
@@ -250,9 +251,12 @@
           </section>
         </div>
         <section class="panel" aria-labelledby="skills-list-title">
-          <div class="panel-head"><h2 id="skills-list-title">已安装的 Skills</h2></div>
-          <div class="table-scroll"><table class="skills-table"><thead><tr><th scope="col">Skill</th><th scope="col">版本</th><th scope="col">用到的工具</th>
-            <th scope="col">用途</th></tr></thead><tbody id="skills-rows"></tbody></table></div>
+          <div class="panel-head"><div><h2 id="skills-list-title">选择使用的 Skills</h2>
+            <p class="muted">勾选的 Skill 提供给 DeepSeek（三条通知和飞书问答），改动下次运行生效。基础查询 Skill 始终启用；需要写入工具的 Skill 按只读规则不安装。</p></div>
+            <span class="muted" id="skills-summary"></span></div>
+          <div class="table-scroll"><table class="skills-table"><thead><tr><th scope="col">启用</th><th scope="col">Skill</th>
+            <th scope="col">版本</th><th scope="col">状态</th><th scope="col">用到的工具</th><th scope="col">用途</th></tr></thead>
+            <tbody id="skills-rows"></tbody></table></div>
         </section>
         <section class="panel" aria-labelledby="tools-title">
           <div class="panel-head"><div><h2 id="tools-title">提供给 DeepSeek 的工具</h2>
@@ -314,6 +318,13 @@
         <section class="panel"><div class="table-scroll"><table><thead><tr><th scope="col">时间</th><th scope="col">通知</th>
           <th scope="col">接收人</th><th scope="col">标题</th><th scope="col">状态</th><th scope="col">说明</th></tr></thead>
           <tbody id="delivery-rows"></tbody></table></div></section>
+        <section class="panel" aria-labelledby="archive-title">
+          <div class="panel-head"><div><h2 id="archive-title">Excel 存档</h2>
+            <p class="muted">每条通知消息附带的 Excel 文件（文件名带统计日期），保存在服务器 data/reports，这里列出最近 80 个。</p></div></div>
+          <div class="table-scroll"><table><thead><tr><th scope="col">保存时间</th><th scope="col">通知</th><th scope="col">文件</th>
+            <th scope="col">大小</th><th scope="col"><span class="sr-only">下载</span></th></tr></thead>
+            <tbody id="archive-rows"></tbody></table></div>
+        </section>
       </section>
     </main>
   </div>

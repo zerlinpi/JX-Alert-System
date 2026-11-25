@@ -70,6 +70,22 @@ def test_the_daily_report_tells_ad_and_store_totals_apart():
     assert "「暂无广告数据：…」" in daily and "缺数据或数据未更新的店铺不写进开头和须知" in daily
 
 
+def test_the_review_judges_anomalies_by_the_products_own_history_and_value():
+    """Owner (Nov 2026): ad anomalies are measured against the product's past data, its value and its type."""
+    review = tasks.DEFAULT_PROMPTS["review"]
+    # The product behind each candidate campaign and its own baseline, from SparkX (Skill field names).
+    assert "factEntity=productAd" in review and "productAd.asin_" in review and "基准期（前 7 日之前的 30 天）" in review
+    assert all(field in review for field in ("asin.asinPrice_", "asin.asinCategoryInfo_", "asin.asinOpenDate_"))
+    # Value: the Skill's T (one order's allowed spend) instead of a fixed $50; history and type adjust the verdict.
+    assert "T = 客单价 × 目标 ACOS" in review and "≥ $50" not in review and "样本不足" in review
+    assert "新品期" in review and "高客单" in review and "浪费 = 花费 − 广告订单 × 产品历史 CPA" in review
+    # Campaigns in an AI managed group get group-level advice, never bid numbers (Skill rule).
+    assert "campaign.aiGroupId_" in review and "不给出价数字" in review
+    columns = [name.strip() for name in re.search(r"表格「(店铺 \| Campaign[^」]+)」", review).group(1).split("|")]
+    assert {"主推产品", "客单价", "产品历史"} <= set(columns) and columns[-1] == "运营"
+    assert len(columns) <= cards.MAX_COLUMNS
+
+
 def test_sparkx_data_and_skills_rank_above_the_jx_task_text():
     """Owner (Nov 2026): SparkX's data and its official Skills first, JX's own instructions second."""
     for lane in ("daily", "review", "hourly"):

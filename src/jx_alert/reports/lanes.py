@@ -12,23 +12,28 @@ test    the owner's test send of a console preview (jx:test:… keys, receipt jx
 
 All lanes are on by default and still notify the group when no operator is mapped.
 Cards are frozen at queue time; before each POST the worker re-checks the switch,
-the window and the exact recipient.
+the window and the exact recipient. Each card message is followed by its Excel copy
+(owner, Nov 2026): the same content, dated, saved under data/reports and sent to
+exactly the recipients of that message (transport ``app_file``).
 """
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
+import logging
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
 from jx_alert.ai.deepseek import DeepSeekError
-from jx_alert.reports import cards, recipients, tasks
+from jx_alert.reports import archive, cards, recipients, tasks, workbook
 from jx_alert.reports import settings as lane_settings
 from jx_alert.sparkx import stores as directory_module
 from jx_alert.sparkx.client import SparkXError
 
+_LOG = logging.getLogger(__name__)
 BEIJING = ZoneInfo("Asia/Shanghai")
+FILE_TRANSPORT = "app_file"
 OPENS, GENERATE_UNTIL, SEND_UNTIL = time(8, 30), time(10, 0), time(12, 0)
 HOURLY_TTL = timedelta(minutes=50)
 TEST_TTL = timedelta(minutes=30)
@@ -211,6 +216,66 @@ def _enqueue_cards(db, lane, slot, delivery, values, now, extra, *, scope=None):
     return ids
 
 
+def _enqueue_file(db, lane, slot, delivery, attachment, now, extra, *, scope=None):
+    """The Excel copy for the recipient of a card just queued: no @-mention, never rewritten."""
+    from jx_alert.notifications.outbox import NotificationOutbox, enqueue_notification
+
+    if attachment is None:
+        return []
+    key = _key(scope or lane, slot, delivery, "file")
+    if db.scalar(select(NotificationOutbox.id).where(NotificationOutbox.idempotency_key == key)) is not None:
+        return []
+    target = {**delivery, "open_ids": [], "mentions": {}, "mention_names": {}}
+    row = enqueue_notification(db, idempotency_key=key, text="Excel：" + attachment["name"], delivery=target,
+                               extra={"jx_lane": lane, "jx_created_at": now.astimezone(timezone.utc).isoformat(),
+                                      **extra, "transport": FILE_TRANSPORT, "file": dict(attachment)})
+    return [row.id]
+
+
+def _queue_message(db, lane, slot, delivery, values, attachment, now, extra, *, scope=None):
+    """Cards, then their Excel copy (only when the cards were queued now)."""
+    ids = _enqueue_cards(db, lane, slot, delivery, values, now, extra, scope=scope)
+    return ids + (_enqueue_file(db, lane, slot, delivery, attachment, now, extra, scope=scope) if ids else [])
+
+
+# ---------------------------------------------------------------- Excel copies
+
+def report_book(lane, result, text, now, *, title):
+    """(file base name, .xlsx bytes) of a daily report or review text."""
+    if lane == "daily":
+        day = date.fromisoformat(result["report_date"])
+        return workbook.daily_name(result["report_date"]), workbook.report_book(
+            title, text, period_label="统计日（美西）", period=result["report_date"],
+            details=[("对比日", (day - timedelta(days=1)).isoformat())], created=now)
+    start, end = (date.fromisoformat(value) for value in result["window"])
+    before = f"{(start - timedelta(days=7)).isoformat()} ~ {(end - timedelta(days=7)).isoformat()}"
+    return workbook.review_name(result["window"]), workbook.report_book(
+        title, text, period_label="近 7 日（美西）", period=f"{start.isoformat()} ~ {end.isoformat()}",
+        details=[("对比前 7 日", before)], created=now)
+
+
+def alerts_book(result, findings, names, operators, now, *, scoped=False):
+    """(file base name, .xlsx bytes) of hourly alerts."""
+    return workbook.hourly_name(result["day"], result["time"]), workbook.alerts_book(
+        cards.hourly_title(result["day"], result["time"]), cards.hourly_lead(findings, scoped=scoped), findings,
+        names=names, operators=operators, period=f"{result['day']} {result['time']}", created=now)
+
+
+def save_book(settings, folder, book, now, *, who=None, test=False):
+    """The archive record of a workbook (see reports.archive), or None when it cannot be built or saved.
+
+    A missing Excel copy never stops the message itself.
+    """
+    if book is None:
+        return None
+    try:
+        base, data = book() if callable(book) else book
+        return archive.save(settings, folder, workbook.file_name(base, who=who, test=test), data, now=now)
+    except (archive.ArchiveError, ValueError, KeyError, TypeError) as exc:
+        _LOG.warning("Excel copy not saved for %s (%s)", folder, type(exc).__name__)
+        return None
+
+
 def _remember(db, now):
     def remember(roster):
         try:
@@ -254,8 +319,8 @@ def _morning_plan(settings, routing_data, lane, config):
     plans = []
     if config["to_group"] and (group := recipients.group_delivery(settings, routing_data, lane)):
         plans.append(group)
-    if config["to_lead"] and (lead := recipients.lead_delivery(settings, routing_data, lane)):
-        plans.append(lead)
+    if config["to_lead"]:
+        plans += recipients.lead_deliveries(settings, routing_data, lane)
     return plans
 
 
@@ -322,13 +387,16 @@ def queue_morning_lane(db, settings, lane, *, now, runner=None, scoper=None):
         _receipt(db, lane, "FAILED", now, day=day, **failure)
         return {"status": "FAILED", **failure}
     color = "blue" if lane == "daily" else ("orange" if result["stores"] else "green")
-    values = cards.report_cards(_title(lane, result), result["content"], color=color)
+    title = _title(lane, result)
+    values = cards.report_cards(title, result["content"], color=color)
+    attachment = save_book(settings, lane, lambda: report_book(lane, result, result["content"], now, title=title), now)
+    files = [attachment["name"]] if attachment else []
     extra = {"jx_day": day, "jx_profiles": result["profiles"]}
     names = _names(result)
     plans = _mention_operators(plans, settings, routing_data, directory, config, lane, set(result["stores"]), names)
     ids = []
     for delivery in plans:
-        ids += _enqueue_cards(db, lane, day, delivery, values, now, extra)
+        ids += _queue_message(db, lane, day, delivery, values, attachment, now, extra)
     scoped = 0
     if lane == "review" and config["to_operators"] and result["stores"]:
         leads = {plan["receive_id"] for plan in plans if plan["receive_id_type"] == "open_id"}
@@ -342,12 +410,15 @@ def queue_morning_lane(db, settings, lane, *, now, runner=None, scoper=None):
             if not text:
                 continue
             scoped += 1
-            ids += _enqueue_cards(db, lane, day, delivery, cards.report_cards(
-                _title(lane, result) + " · 你负责的店铺", text, color=color), now,
-                {**extra, "jx_profiles": delivery["profiles"]})
+            own_title = title + " · 你负责的店铺"
+            own = save_book(settings, lane, lambda: report_book(lane, result, text, now, title=own_title), now,
+                            who=delivery["name"])
+            files += [own["name"]] if own else []
+            ids += _queue_message(db, lane, day, delivery, cards.report_cards(own_title, text, color=color), own, now,
+                                  {**extra, "jx_profiles": delivery["profiles"]})
     db.flush()
     _receipt(db, lane, "SUCCEEDED", now, day=day, outbox_ids=ids, cards=len(values), stores=result["stores"],
-             report_date=result["report_date"], window=result["window"], operator_copies=scoped,
+             report_date=result["report_date"], window=result["window"], operator_copies=scoped, files=files,
              store_count=len(result["profiles"]), **_summary(result))
     return {"status": "QUEUED", "outbox_ids": ids}
 
@@ -392,8 +463,8 @@ def run_hourly(db, settings, *, now, runner=None):
     plans = []
     if config["to_group"] and (group := recipients.group_delivery(settings, routing_data, "hourly")):
         plans.append(group)
-    if config["to_lead"] and (lead := recipients.lead_delivery(settings, routing_data, "hourly")):
-        plans.append(lead)
+    if config["to_lead"]:
+        plans += recipients.lead_deliveries(settings, routing_data, "hourly")
     if not plans and not config["to_operators"]:
         return {"status": "NO_RECIPIENT"}
     directory = directory_module.load(settings)
@@ -408,16 +479,22 @@ def run_hourly(db, settings, *, now, runner=None):
     findings = result["findings"]
     names, operators = _labels(result, directory)
     extra = {"jx_slot": slot, "jx_marketplace_day": marketplace_day}
-    ids, alerted = [], set()
+    ids, alerted, files = [], set(), []
     if findings:
         value = cards.hourly_card(findings, day=result["day"], time=result["time"], names=names,
                                   operators=operators)
         affected = {item["pid"] for item in findings}
+        attachment = None
+        if value is not None:
+            attachment = save_book(settings, "hourly", lambda: alerts_book(result, findings, names, operators, now),
+                                   now)
+            files += [attachment["name"]] if attachment else []
         plans = _mention_operators(plans, settings, routing_data, directory, config, "hourly", affected, names)
         for delivery in plans:
-            if value is not None and (row_id := _enqueue(db, "hourly", slot, delivery, value, now, {
-                    **extra, "jx_profiles": sorted(affected, key=int)})):
+            group_extra = {**extra, "jx_profiles": sorted(affected, key=int)}
+            if value is not None and (row_id := _enqueue(db, "hourly", slot, delivery, value, now, group_extra)):
                 ids.append(row_id)
+                ids += _enqueue_file(db, "hourly", slot, delivery, attachment, now, group_extra)
                 alerted.update(tasks.finding_key(item) for item in findings)
         if config["to_operators"]:
             leads = {plan["receive_id"] for plan in plans if plan["receive_id_type"] == "open_id"}
@@ -429,13 +506,17 @@ def run_hourly(db, settings, *, now, runner=None):
                 own = [item for key in delivery["profiles"] for item in by_store[key]]
                 scoped = cards.hourly_card(own, day=result["day"], time=result["time"], names=names,
                                            operators=operators, scoped=True)
-                if scoped is not None and (row_id := _enqueue(db, "hourly", slot, delivery, scoped, now,
-                                                              {**extra, "jx_profiles": delivery["profiles"]})):
+                own_extra = {**extra, "jx_profiles": delivery["profiles"]}
+                if scoped is not None and (row_id := _enqueue(db, "hourly", slot, delivery, scoped, now, own_extra)):
                     ids.append(row_id)
+                    copy = save_book(settings, "hourly", lambda: alerts_book(result, own, names, operators, now,
+                                                                             scoped=True), now, who=delivery["name"])
+                    files += [copy["name"]] if copy else []
+                    ids += _enqueue_file(db, "hourly", slot, delivery, copy, now, own_extra)
                     alerted.update(tasks.finding_key(item) for item in own)
     db.flush()
     _receipt(db, "hourly", "SUCCEEDED", now, slot=slot, marketplace_day=marketplace_day, outbox_ids=ids,
-             alerted=sorted(alerted), findings=len(findings), dropped=result.get("dropped", 0),
+             alerted=sorted(alerted), findings=len(findings), dropped=result.get("dropped", 0), files=files,
              store_count=len(result["profiles"]), **_summary(result))
     return {"status": "QUEUED" if ids else "NO_FINDINGS", "outbox_ids": ids}
 
@@ -475,26 +556,31 @@ def preview(settings, lane, *, now, db, runner=None, config=None):
         value = cards.hourly_card(result["findings"], day=result["day"], time=result["time"], names=names,
                                   operators=operators)
         affected = {item["pid"] for item in result["findings"]}
+        book = alerts_book(result, result["findings"], names, operators, now) if value else None
         return ([value] if value else []), {**info, "day": result["day"], "findings": len(result["findings"]),
                                             "dropped": result.get("dropped", 0), "note": result.get("note"),
-                                            "audience": _audience(settings, directory, affected, names)}
+                                            "audience": _audience(settings, directory, affected, names),
+                                            "workbook": book}
     color = "blue" if lane == "daily" else ("orange" if result["stores"] else "green")
-    values = cards.report_cards(_title(lane, result), result["content"], color=color)
+    title = _title(lane, result)
+    values = cards.report_cards(title, result["content"], color=color)
     return values, {**info, "report_date": result["report_date"], "window": result["window"],
                     "stores": len(result["stores"]),
-                    "audience": _audience(settings, directory, set(result["stores"]), names)}
+                    "audience": _audience(settings, directory, set(result["stores"]), names),
+                    "workbook": report_book(lane, result, result["content"], now, title=title)}
 
 
 # ---------------------------------------------------------------- console test sends
 
-def queue_test(db, settings, lane, values, *, now, preview_id, stores, to_group, to_lead, mention):
-    """Queue the owner's test send of a finished preview: the same cards, marked 【测试】.
+def queue_test(db, settings, lane, values, *, now, preview_id, stores, to_group, to_lead, mention, book=None):
+    """Queue the owner's test send of a finished preview: the same cards, marked 【测试】, and its Excel copy.
 
     ``stores`` ({profile id: name}) are the stores the preview is about; with ``mention``
-    the group copy @-mentions their current operators. Test sends use their own keys and
-    receipt type: they never count as the lane's run, never mark hourly alerts as sent
-    and are not tied to the lane's schedule or switches. Each recipient is re-checked
-    before sending, and nothing goes out 30 minutes after queueing.
+    the group copy @-mentions their current operators. ``to_lead`` reaches every lead of
+    the lane. Test sends use their own keys and receipt type: they never count as the
+    lane's run, never mark hourly alerts as sent and are not tied to the lane's schedule
+    or switches; their Excel files are kept apart (data/reports/tests). Each recipient is
+    re-checked before sending, and nothing goes out 30 minutes after queueing.
     """
     if lane not in LANES or not values or not (to_group or to_lead):
         raise ValueError("Nothing to send")
@@ -503,9 +589,9 @@ def queue_test(db, settings, lane, values, *, now, preview_id, stores, to_group,
     except (OSError, RuntimeError, ValueError):
         return {"status": "ROUTING_UNAVAILABLE"}
     group = recipients.group_delivery(settings, routing_data, lane) if to_group else None
-    lead = recipients.lead_delivery(settings, routing_data, lane) if to_lead else None
-    missing = [name for name, wanted, found in (("group", to_group, group), ("lead", to_lead, lead))
-               if wanted and found is None]
+    leads = recipients.lead_deliveries(settings, routing_data, lane) if to_lead else []
+    missing = [name for name, wanted, found in (("group", to_group, group), ("lead", to_lead, leads))
+               if wanted and not found]
     if missing:
         return {"status": "NO_RECIPIENT", "missing": missing}
     directory = directory_module.load(settings)
@@ -515,19 +601,25 @@ def queue_test(db, settings, lane, values, *, now, preview_id, stores, to_group,
         if mentions:
             group = recipients.with_operator_mentions(group, mentions, stores)
     marked = cards.mark_as_test(values)
+    attachment = save_book(settings, "tests", book, now, test=True)
     extra = {"jx_test": True, "jx_test_mentions": bool(mentions), "jx_profiles": sorted(stores, key=int)}
-    ids = []
-    for delivery in (group, lead):
-        if delivery is not None:
-            ids += _enqueue_cards(db, lane, preview_id, delivery, marked, now, extra, scope=f"test:{lane}")
+    ids, cards_queued, files = [], 0, 0
+    for delivery in ([group] if group else []) + leads:
+        queued = _enqueue_cards(db, lane, preview_id, delivery, marked, now, extra, scope=f"test:{lane}")
+        if queued:
+            cards_queued += len(queued)
+            copy = _enqueue_file(db, lane, preview_id, delivery, attachment, now, extra, scope=f"test:{lane}")
+            files += len(copy)
+            ids += queued + copy
     if not ids:
-        return {"status": "ALREADY_QUEUED", "outbox_ids": [], "mentions": 0}
+        return {"status": "ALREADY_QUEUED", "outbox_ids": [], "mentions": 0, "cards": 0, "files": 0}
     from jx_alert.storage.models import SyncJob
 
     instant = _utc(now)
     db.add(SyncJob(job_type=TEST_JOB, status="SUCCEEDED", started_at=instant, finished_at=instant, store_count=0,
                    metadata_json={"lane": lane, "preview": preview_id, "outbox_ids": ids, "cards": len(marked),
-                                  "targets": [name for name, found in (("group", group), ("lead", lead)) if found],
-                                  "mentions": len(mentions)}))
+                                  "targets": [name for name, found in (("group", group), ("lead", leads)) if found],
+                                  "leads": len(leads), "mentions": len(mentions),
+                                  "file": attachment["name"] if attachment else None}))
     db.flush()
-    return {"status": "QUEUED", "outbox_ids": ids, "mentions": len(mentions)}
+    return {"status": "QUEUED", "outbox_ids": ids, "mentions": len(mentions), "cards": cards_queued, "files": files}

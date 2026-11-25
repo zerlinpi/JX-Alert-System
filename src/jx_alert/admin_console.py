@@ -1,10 +1,12 @@
 """Owner console: SparkX connection and Skills, store directory, recipients, lanes and DeepSeek.
 
-A single owner password (PBKDF2 file) opens a 30-minute browser session. Every
-POST needs the same-origin header and the session-bound CSRF token. Secrets
-are write-only: tokens and keys are never returned to the browser. Previews run
-DeepSeek against live SparkX data in a background job and never queue a message;
-only an explicit 「发送测试」 queues the previewed cards (server-side copy), marked 【测试】.
+A single owner password (PBKDF2 file) opens a browser session that is renewed while it
+is used (12 hours without a request ends it, 7 days after login at the latest). Every
+POST needs the same-origin header and the session-bound CSRF token. Secrets are
+write-only: tokens and keys are never returned to the browser. Previews run DeepSeek
+against live SparkX data in a background job and never queue a message; only an
+explicit 「发送测试」 queues the previewed cards (server-side copy), marked 【测试】,
+with their Excel copy. Saved Excel copies can be downloaded from 「发送记录」.
 """
 import asyncio
 from collections import Counter
@@ -19,7 +21,7 @@ import re
 import secrets
 import threading
 import time
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from sqlalchemy import or_, select
 from starlette.applications import Starlette
@@ -33,13 +35,13 @@ from jx_alert.notifications.cards import plain_text
 from jx_alert.notifications.outbox import QUESTION_REPLY_PREFIX, NotificationOutbox
 from jx_alert.notifications.receipt import unique_json_fields
 from jx_alert.ai.deepseek import DeepSeekError
-from jx_alert.reports import lanes
+from jx_alert.reports import archive, lanes
 from jx_alert.reports import settings as lane_settings
 from jx_alert.reports import tasks as lane_tasks
 from jx_alert.sparkx import credentials as sparkx_credentials
 from jx_alert.sparkx import skills as skill_store
 from jx_alert.sparkx import stores as directory_module
-from jx_alert.sparkx.client import READ_TOOLS, SparkXError, fetch_roster
+from jx_alert.sparkx.client import READ_TOOLS, SparkXError, fetch_roster, offered_read_tools
 from jx_alert.storage.db import SessionLocal
 from jx_alert.storage.models import SyncJob
 
@@ -65,6 +67,7 @@ RETIRED_MESSAGE = ("JX MCP 服务已停用。广告数据请在 ChatGPT/Claude �
 _ROLE_LABELS = {"group": "通知群", "lead": "负责人", "operator": "运营", "group_question": "群内问答",
                 "private_question": "私聊问答"}
 _LANE_LABELS = {"daily": "08:30 日报", "review": "异常复盘", "hourly": "实时监控"}
+_ARCHIVE_LABELS = {**_LANE_LABELS, "tests": "测试发送"}
 
 
 def _digest(value):
@@ -237,6 +240,7 @@ class OwnerConsole:
         self.previews = PreviewJobs()
         self._limits = {}
         self._limit_lock = threading.Lock()
+        self._tools = None
 
     # ------------------------------------------------------------ plumbing
 
@@ -515,7 +519,9 @@ class OwnerConsole:
         info["seconds"] = round(time.monotonic() - started)
         audience = info.pop("audience", None) or {"stores": {}, "operators": []}
         info["mentions"] = audience["operators"]  # names only: who a group test send would @
-        private = {"cards": values, "stores": audience["stores"]}
+        book = info.pop("workbook", None)  # (file name, bytes): stays on the server for a test send
+        info["excel"] = bool(book)
+        private = {"cards": values, "stores": audience["stores"], "workbook": book}
         if not values:
             text = "当前没有需要提醒的广告活动。" if lane == "hourly" else "没有生成内容。"
             return {"cards": [], "text": text, "info": info}, private
@@ -545,7 +551,7 @@ class OwnerConsole:
                 result = lanes.queue_test(db, self.settings, lane, private["cards"], now=datetime.now(timezone.utc),
                                           preview_id=payload["job"], stores=private["stores"],
                                           to_group=payload["to_group"], to_lead=payload["to_lead"],
-                                          mention=payload["mention"])
+                                          mention=payload["mention"], book=private.get("workbook"))
             except ValueError:
                 raise ConsoleError("这份预览无法作为测试消息发送，请重新生成后再试。", 409) from None
             if result["status"] == "ROUTING_UNAVAILABLE":
@@ -558,11 +564,28 @@ class OwnerConsole:
         targets = [name for name in ("group", "lead") if payload[f"to_{name}"]]
         if result["status"] == "QUEUED":
             self.previews.mark_sent(payload["job"], targets)
-        return {"status": result["status"], "queued": len(result["outbox_ids"]), "mentions": result["mentions"],
-                "targets": targets, "sent": self.previews.get(payload["job"])["sent"]}
+        return {"status": result["status"], "queued": len(result["outbox_ids"]), "cards": result.get("cards", 0),
+                "files": result.get("files", 0), "mentions": result["mentions"], "targets": targets,
+                "sent": self.previews.get(payload["job"])["sent"]}
+
+    # ------------------------------------------------------------ skills
+
+    def _offered(self, refresh=False):
+        """SparkX read tools this token gets now (cached 10 minutes); None when SparkX cannot be asked."""
+        cached = self._tools
+        if cached and not refresh and time.monotonic() - cached[0] < 600:
+            return cached[1]
+        if not lanes.sparkx_ready(self.settings):
+            return None
+        try:
+            names = offered_read_tools(self.settings)
+        except SparkXError:
+            return None
+        self._tools = (time.monotonic(), names)
+        return names
 
     def _skills(self, check=False):
-        view = skill_store.status(self.settings, check=check)
+        view = skill_store.status(self.settings, check=check, offered=self._offered(refresh=check))
         return {**view, "read_tools": sorted(READ_TOOLS), "source": skill_store.REPOSITORY}
 
     def _install_skills(self):
@@ -571,6 +594,31 @@ class OwnerConsole:
         except skill_store.SkillsError as exc:
             raise ConsoleError(exc.detail, exc.status_code) from None
         return self._skills()
+
+    def _choose_skills(self, payload):
+        if (set(payload) != {"revision", "disabled"} or not isinstance(payload["revision"], str)
+                or not isinstance(payload["disabled"], list)):
+            raise ConsoleError("提交内容无效。", 400)
+        try:
+            skill_store.save_choices(self.settings, payload["disabled"], payload["revision"])
+        except skill_store.SkillsError as exc:
+            raise ConsoleError(exc.detail, exc.status_code) from None
+        return self._skills()
+
+    # ------------------------------------------------------------ Excel archive
+
+    def _archive(self):
+        rows = archive.listing(self.settings)
+        return {"rows": [{**row, "lane_label": _ARCHIVE_LABELS.get(row["lane"], row["lane"])} for row in rows]}
+
+    def _download(self, request):
+        try:
+            name, data = archive.load(self.settings, request.query_params.get("path"))
+        except archive.ArchiveError:
+            raise ConsoleError("文件不存在或已不可用。", 404) from None
+        disposition = f"attachment; filename=\"jx-report.xlsx\"; filename*=UTF-8''{quote(name, safe='')}"
+        return Response(data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={**_HEADERS, "Content-Disposition": disposition})
 
     # ------------------------------------------------------------ dispatch
 
@@ -584,12 +632,12 @@ class OwnerConsole:
         try:
             if request.method == "POST":
                 data = await self._post(request, token, path)
-                if isinstance(data, Response):
-                    return data
             else:
                 data = await self._get(request, path)
                 if path == "/console/api/overview":
                     data["csrf"] = _csrf(token)
+            if isinstance(data, Response):
+                return data
             return JSONResponse(data, headers=_HEADERS)
         except ConsoleError as exc:
             return _error(exc.detail, exc.status)
@@ -637,6 +685,11 @@ class OwnerConsole:
                 with self.session_factory() as db:
                     return {"rows": self._deliveries(db)}
             return await run(deliveries)
+        if path == "/console/api/archive":
+            return await run(self._archive)
+        if path == "/console/api/archive/file":
+            self._limit(request, "archive-file", 30, 60, "下载太频繁，请稍后重试。")
+            return await run(self._download, request)
         raise ConsoleError("接口不存在。", 404)
 
     async def _post(self, request, token, path):
@@ -716,14 +769,17 @@ class OwnerConsole:
                 raise ConsoleError("检查不接受额外参数。", 400)
             self._limit(request, "skills-check", 4, 8, "检查太频繁，请稍后重试。")
             return await run(self._skills, True)
+        if path == "/console/api/skills/choices":
+            self._limit(request, "skills-choices", 20, 40)
+            return await run(self._choose_skills, payload)
         raise ConsoleError("接口不存在。", 404)
 
     def routes(self):
         api_get = ["overview", "sparkx", "stores", "members", "recipients", "groups", "reports", "reports/preview",
-                   "deepseek", "skills", "deliveries"]
+                   "deepseek", "skills", "deliveries", "archive", "archive/file"]
         api_post = ["sparkx", "sparkx/test", "stores/refresh", "stores/save", "recipients/company", "recipients/ad",
                     "groups", "members/refresh", "reports", "reports/preview", "reports/test-send", "deepseek",
-                    "deepseek/test", "skills/install", "skills/check"]
+                    "deepseek/test", "skills/install", "skills/check", "skills/choices"]
         routes = [Route("/", self.root), Route("/console", self.home), Route("/console/", self.home),
                   Route("/console/login", self.login, methods=["GET", "POST"]),
                   Route("/console/assets/{asset}", self.asset),

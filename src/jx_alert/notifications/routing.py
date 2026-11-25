@@ -4,8 +4,11 @@ Sections used by this release (others written by earlier releases are kept
 verbatim and ignored):
   groups.<alias>              chat_id, display_name, admin_open_ids,
                               verified_member_open_ids, notifications_changed_at
-  company_executive_digest    总负责人: open_id, name, app_id, generation
-  ad_alert_subscribers        广告负责人: recipients[{open_id, name, generation}]
+  company_executive_digest    总负责人: open_id, name, app_id, generation (the first person),
+                              more_recipients[{open_id, name, generation}] (the others)
+  ad_alert_subscribers        广告负责人: recipients[{open_id, name, generation}] (the first person),
+                              more_recipients[...] (the others)
+Releases before multiple leads read only the first person, so a rollback still reaches them.
 """
 from datetime import datetime, timezone
 import json

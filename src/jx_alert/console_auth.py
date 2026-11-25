@@ -17,8 +17,17 @@ import stat
 import time
 
 ROUNDS = 600_000
-SESSION_TTL = 1800
+# Owner (Nov 2026): the 30-minute session logged out too soon. A session now lives while it is
+# used: every request renews it for SESSION_IDLE, up to SESSION_MAX after the login.
+SESSION_IDLE = 12 * 3600
+SESSION_MAX = 7 * 24 * 3600
+SESSION_TTL = SESSION_MAX  # the browser cookie lasts as long as the longest session
+RENEW_AFTER = 300
+LEGACY_TTL = 1800  # sessions created by earlier releases
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
+_SCHEMA = ("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, expires REAL NOT NULL)",
+           # Added table (earlier releases keep using ``sessions`` unchanged, also after a rollback).
+           "CREATE TABLE IF NOT EXISTS session_starts (id TEXT PRIMARY KEY, created REAL NOT NULL)")
 
 
 def private_file(path: Path, *, create=False):
@@ -88,31 +97,54 @@ def _digest(value):
 
 
 class SessionStore:
-    """Opaque browser tokens; only their SHA-256 is stored."""
+    """Opaque browser tokens; only their SHA-256 is stored.
 
-    def __init__(self, path):
-        self.path = Path(path)
+    A valid request renews the session (at most every RENEW_AFTER seconds) to SESSION_IDLE from
+    now, never past SESSION_MAX after the login; the token itself stays the same, so the page's
+    CSRF token stays valid.
+    """
+
+    def __init__(self, path, *, clock=time.time):
+        self.path, self.clock = Path(path), clock
+
+    def _open(self):
+        db = sqlite3.connect(self.path, timeout=5)
+        for statement in _SCHEMA:
+            db.execute(statement)
+        return db
 
     def new(self):
         private_file(self.path, create=True)
-        token, now = secrets.token_urlsafe(32), time.time()
-        with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
-            db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, expires REAL NOT NULL)")
+        token, now = secrets.token_urlsafe(32), self.clock()
+        with closing(self._open()) as db, db:
             db.execute("DELETE FROM sessions WHERE expires <= ?", (now,))
-            db.execute("INSERT INTO sessions VALUES (?, ?)", (_digest(token), now + SESSION_TTL))
+            db.execute("DELETE FROM session_starts WHERE id NOT IN (SELECT id FROM sessions)")
+            db.execute("INSERT INTO sessions VALUES (?, ?)", (_digest(token), now + SESSION_IDLE))
+            db.execute("INSERT OR REPLACE INTO session_starts VALUES (?, ?)", (_digest(token), now))
         return token
 
     def valid(self, token):
         if not isinstance(token, str) or not _TOKEN.fullmatch(token) or not self.path.exists():
             return False
         private_file(self.path)
-        with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
-            db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, expires REAL NOT NULL)")
-            return db.execute("SELECT 1 FROM sessions WHERE id=? AND expires>?",
-                              (_digest(token), time.time())).fetchone() is not None
+        key, now = _digest(token), self.clock()
+        with closing(self._open()) as db, db:
+            found = db.execute("SELECT s.expires, t.created FROM sessions s LEFT JOIN session_starts t ON t.id = s.id "
+                               "WHERE s.id = ?", (key,)).fetchone()
+            if found is None:
+                return False
+            expires, created = found
+            created = created if created is not None else expires - LEGACY_TTL
+            limit = created + SESSION_MAX
+            if expires <= now or limit <= now:
+                return False
+            if expires - now < SESSION_IDLE - RENEW_AFTER:
+                db.execute("UPDATE sessions SET expires = ? WHERE id = ?", (min(now + SESSION_IDLE, limit), key))
+                db.execute("INSERT OR IGNORE INTO session_starts VALUES (?, ?)", (key, created))
+            return True
 
     def remove(self, token):
         if isinstance(token, str) and _TOKEN.fullmatch(token) and self.path.exists():
-            with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
-                db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, expires REAL NOT NULL)")
+            with closing(self._open()) as db, db:
                 db.execute("DELETE FROM sessions WHERE id = ?", (_digest(token),))
+                db.execute("DELETE FROM session_starts WHERE id = ?", (_digest(token),))

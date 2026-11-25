@@ -317,3 +317,57 @@ def test_settings_do_not_mix_conflicting_app_credentials(tmp_path):
     )
     with pytest.raises(FeishuAppError, match="conflicting app IDs"):
         FeishuAppClient.from_settings(settings)
+
+
+def test_a_file_is_uploaded_then_sent_as_one_file_message(monkeypatch):
+    """Excel copies (owner, Nov 2026): upload to im/v1/files, then msg_type=file with the file_key."""
+    requests, fenced = [], []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("/internal"):
+            return token_response()
+        if request.url.path == "/open-apis/im/v1/files":
+            body = request.content
+            assert b'name="file_type"' in body and b"xls" in body and "广告日报_2026-11-24.xlsx".encode() in body
+            assert b"PK-workbook-bytes" in body
+            return httpx.Response(200, json={"code": 0, "data": {"file_key": "file_v3_abc"}})
+        assert not fenced or fenced == ["fence"]
+        return message_response()
+
+    mock_http(monkeypatch, handler)
+    client = FeishuAppClient("cli_test", "secret")
+    result = client.send_file(b"PK-workbook-bytes", "广告日报_2026-11-24.xlsx", receive_id="ou_lead",
+                              receive_id_type="open_id", idempotency_key="jx:daily:x:file",
+                              before_submit=lambda evidence: fenced.append("fence"))
+    assert result == {"message_id": "om_message"} and fenced == ["fence"]
+    paths = [request.url.path for request in requests]
+    assert paths == ["/open-apis/auth/v3/tenant_access_token/internal", "/open-apis/im/v1/files",
+                     "/open-apis/im/v1/messages"]
+    payload = json.loads(requests[2].content)
+    assert payload["msg_type"] == "file" and json.loads(payload["content"]) == {"file_key": "file_v3_abc"}
+    assert requests[2].url.params["receive_id_type"] == "open_id"
+
+
+def test_a_refused_upload_sends_no_message(monkeypatch):
+    from jx_alert.notifications.feishu_app import FeishuUploadRejected
+
+    posted = []
+
+    def handler(request):
+        if request.url.path.endswith("/internal"):
+            return token_response()
+        posted.append(request.url.path)
+        return httpx.Response(400, json={"code": 99991672, "msg": "Access denied. One of the following scopes"})
+
+    mock_http(monkeypatch, handler)
+    client = FeishuAppClient("cli_test", "secret")
+    with pytest.raises(FeishuUploadRejected) as exc:
+        client.send_file(b"PK", "x.xlsx", receive_id="oc_group", idempotency_key="k",
+                         before_submit=lambda evidence: pytest.fail("no message may be started"))
+    assert exc.value.code == 99991672 and posted == ["/open-apis/im/v1/files"]
+    assert "Access denied" not in str(exc.value)  # provider text is never stored
+    with pytest.raises(ValueError):
+        client.upload_file(b"", "x.xlsx")
+    with pytest.raises(ValueError):
+        client.upload_file(b"PK", "../x.xlsx")

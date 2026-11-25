@@ -1,7 +1,10 @@
 """Queueing the lanes (DeepSeek's answers stubbed) and re-checking each frozen recipient before sending."""
 import copy
 from datetime import timedelta
+import io
 import json
+import re
+import zipfile
 
 import pytest
 from sqlalchemy import select
@@ -31,13 +34,19 @@ def map_operators(settings, mapping):
                            for pid, (uid, name) in mapping.items()}, directory["revision"])
 
 
-def rows(db):
-    return list(db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)))
+def rows(db, *, excel=False):
+    """Queued card messages (or, with ``excel``, their Excel copies), in queue order."""
+    found = db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id))
+    return [row for row in found if (row.payload.get("transport") == lanes.FILE_TRANSPORT) == excel]
 
 
 def routes(db):
     return [(row.payload["delivery"]["role"], row.chat_id, row.payload["delivery"].get("open_ids", []))
             for row in rows(db)]
+
+
+def files(db):
+    return [(row.payload["delivery"]["role"], row.chat_id, row.payload["file"]["name"]) for row in rows(db, excel=True)]
 
 
 def test_every_lane_is_on_by_default_and_reaches_the_group():
@@ -53,8 +62,10 @@ def test_daily_report_goes_to_the_group_and_the_company_lead_once(settings, sess
     with session_factory() as db:
         result = lanes.queue_morning_lane(db, settings, "daily", now=SEND, runner=runner_for(calls=calls))
         db.commit()
-        assert result["status"] == "QUEUED" and len(result["outbox_ids"]) == 2
+        assert result["status"] == "QUEUED" and len(result["outbox_ids"]) == 4  # a card and its Excel copy each
         assert routes(db) == [("jx_daily_group", GROUP_CHAT, []), ("jx_daily_lead", LEAD, [])]
+        assert files(db) == [("jx_daily_group", GROUP_CHAT, "广告日报_2026-11-22.xlsx"),
+                             ("jx_daily_lead", LEAD, "广告日报_2026-11-22.xlsx")]
         row = rows(db)[1]
         assert row.payload["jx_lane"] == "daily" and row.payload["jx_day"] == "2026-11-24"
         card = row.payload["card"]
@@ -121,6 +132,8 @@ def test_review_group_message_mentions_the_operators_of_affected_stores(settings
         assert group.payload["delivery"]["mentions"] == {"ou_op1": ["101"], "ou_op2": ["102"]}
         assert group.payload["delivery"]["mention_names"] == {"101": "香港川页", "102": "Campx"}
         assert lead.payload["delivery"]["open_ids"] == [] and len(rows(db)) == 2  # private operator copies are off
+        # The Excel copies never @ anyone.
+        assert all(row.payload["delivery"]["open_ids"] == [] for row in rows(db, excel=True))
         overview = next(element for element in group.payload["card"]["body"]["elements"] if element["tag"] == "table")
         # The model wrote 运营 as the second column; the card shows it last.
         assert [column["display_name"] for column in overview["columns"]][-1] == "运营"
@@ -167,6 +180,10 @@ def test_optional_private_operator_copies_hold_only_their_stores(settings, sessi
         assert asked == [["香港川页"], ["Campx"]]  # 高爽's copy had nothing left, so none was queued
         assert "只含 香港川页 的复盘" in json.dumps(queued[2].payload["card"], ensure_ascii=False)
         assert queued[2].payload["delivery"]["profiles"] == ["101"]
+        # The operator's Excel holds their own copy (its own file), the others share the full one.
+        assert files(db) == [("jx_review_group", GROUP_CHAT, "广告异常复盘_2026-11-16至2026-11-22.xlsx"),
+                             ("jx_review_lead", AD_LEAD, "广告异常复盘_2026-11-16至2026-11-22.xlsx"),
+                             ("jx_review_operator", "ou_op1", "广告异常复盘_2026-11-16至2026-11-22_皮泽霖.xlsx")]
 
 
 def test_a_lead_who_also_operates_a_store_gets_one_private_message(settings, session_factory):
@@ -373,6 +390,115 @@ def test_a_hourly_test_send_never_counts_as_an_alert(settings, session_factory, 
                                    to_group=True, to_lead=True, mention=False)
         assert missing == {"status": "NO_RECIPIENT", "missing": ["lead"]}  # nothing is queued half-way
         assert not [row for row in rows(db) if "job-3" in row.idempotency_key]
+
+
+def two_leads(settings, routing):
+    """A second 总负责人 and a second 广告负责人 (both report-group members), as the console stores them."""
+    changed = copy.deepcopy(routing)
+    changed["company_executive_digest"]["more_recipients"] = [
+        {"open_id": "ou_op1", "name": "皮泽霖", "generation": "d" * 32}]
+    changed["ad_alert_subscribers"]["more_recipients"] = [{"open_id": "ou_op2", "name": "高爽", "generation": "e" * 32}]
+    write_private(settings_path(settings), changed)
+    return changed
+
+
+def test_every_lead_gets_the_message_and_its_excel(settings, session_factory, routing):
+    """Owner (Nov 2026): 总负责人 and 广告负责人 can be several people; each one gets a private copy."""
+    changed = two_leads(settings, routing)
+    with session_factory() as db:
+        lanes.queue_morning_lane(db, settings, "daily", now=SEND, runner=runner_for())
+        lanes.run_hourly(db, settings, now=HOUR, runner=runner_for())
+        db.commit()
+        assert routes(db) == [("jx_daily_group", GROUP_CHAT, []), ("jx_daily_lead", LEAD, []),
+                              ("jx_daily_lead", "ou_op1", []), ("jx_hourly_group", GROUP_CHAT, []),
+                              ("jx_hourly_lead", AD_LEAD, []), ("jx_hourly_lead", "ou_op2", [])]
+        # The Excel copy goes exactly where its message goes.
+        assert [(role, chat) for role, chat, _ in files(db)] == [(role, chat) for role, chat, _ in routes(db)]
+        hourly_files = {name for role, _, name in files(db) if role.startswith("jx_hourly")}
+        assert hourly_files == {"广告实时监控_2026-11-23_2205_美西.xlsx"}
+        second = next(row for row in rows(db) if row.chat_id == "ou_op1")
+    assert lanes.delivery_blocked(settings, second.idempotency_key, second.payload, SEND) is None
+    changed["company_executive_digest"].pop("more_recipients")  # the owner removed the second lead
+    write_private(settings_path(settings), changed)
+    assert "负责人已变更" in lanes.delivery_blocked(settings, second.idempotency_key, second.payload, SEND)
+
+
+def test_operator_copies_of_the_hourly_monitor_carry_their_own_excel(settings, session_factory):
+    enable(settings, hourly={"to_operators": True})
+    map_operators(settings, {"102": ("ou_op2", "高爽")})
+    with session_factory() as db:
+        lanes.run_hourly(db, settings, now=HOUR, runner=runner_for())
+        db.commit()
+        assert files(db) == [("jx_hourly_group", GROUP_CHAT, "广告实时监控_2026-11-23_2205_美西.xlsx"),
+                             ("jx_hourly_lead", AD_LEAD, "广告实时监控_2026-11-23_2205_美西.xlsx"),
+                             ("jx_hourly_operator", "ou_op2", "广告实时监控_2026-11-23_2205_美西_高爽.xlsx")]
+        receipt = db.scalar(select(SyncJob).where(SyncJob.job_type == "jx_hourly"))
+        assert receipt.metadata_json["files"] == ["广告实时监控_2026-11-23_2205_美西.xlsx",
+                                                  "广告实时监控_2026-11-23_2205_美西_高爽.xlsx"]
+        own = rows(db, excel=True)[2]
+    from jx_alert.reports import archive
+    with zipfile.ZipFile(io.BytesIO(archive.read(settings, own.payload["file"]))) as book:
+        strings = book.read("xl/sharedStrings.xml").decode()
+    assert "Campaign 9001" in strings and "Campaign 9002" not in strings  # only 高爽's store
+
+
+def test_excel_copies_are_dated_and_hold_the_report_tables(settings, session_factory):
+    from jx_alert.reports import archive
+    with session_factory() as db:
+        lanes.queue_morning_lane(db, settings, "daily", now=SEND, runner=runner_for())
+        db.commit()
+        row = rows(db, excel=True)[0]
+    meta = row.payload["file"]
+    assert meta["path"] == "daily/2026-11/广告日报_2026-11-22.xlsx" and len(meta["sha256"]) == 64
+    assert row.payload["text"] == "Excel：广告日报_2026-11-22.xlsx" and "card" not in row.payload
+    with zipfile.ZipFile(io.BytesIO(archive.read(settings, meta))) as book:
+        workbook_xml = book.read("xl/workbook.xml").decode()
+        strings = re.findall(r"<t xml:space=\"preserve\">([^<]*)</t>", book.read("xl/sharedStrings.xml").decode())
+        detail = book.read("xl/worksheets/sheet3.xml").decode()
+        styles = book.read("xl/styles.xml").decode()
+
+    def cell(reference):
+        found = re.search(rf'<c r="{reference}"[^>]*?(t="s")?><v>([^<]+)</v>', detail)
+        return strings[int(found.group(2))] if found.group(1) else found.group(2)
+
+    assert re.findall(r'<sheet name="([^"]+)"', workbook_xml) == ["摘要", "全公司核心指标", "有花费店铺明细"]
+    assert {"统计日（美西）：2026-11-22", "对比日：2026-11-21"} <= set(strings)
+    assert any(text.startswith("生成时间（北京）：2026-11-24 08:30") for text in strings)
+    # Store table: the date first (sheets of many days stack), 运营 last as on the card, money as numbers.
+    assert [cell(f"{column}1") for column in "ABCK"] == ["统计日（美西）", "店铺", "广告花费", "运营"]
+    assert cell("A2") == "2026-11-22" and cell("B2") == "香港川页" and cell("C2") == "3217.7"
+    assert 'autoFilter ref="A1:K3"' in detail and "&quot;$&quot;#,##0.00" in styles
+
+
+def test_a_message_without_its_excel_still_goes_out(settings, session_factory, monkeypatch):
+    from jx_alert.reports import archive
+
+    def broken(*args, **kwargs):
+        raise archive.ArchiveError("disk full")
+
+    monkeypatch.setattr(archive, "save", broken)
+    with session_factory() as db:
+        assert lanes.queue_morning_lane(db, settings, "daily", now=SEND, runner=runner_for())["status"] == "QUEUED"
+        db.commit()
+        assert len(rows(db)) == 2 and rows(db, excel=True) == []
+
+
+def test_a_test_send_reaches_every_lead_with_its_excel(settings, session_factory, routing):
+    two_leads(settings, routing)
+    values = cards.report_cards("广告日报 · 2026-11-22", "**全公司核心指标**\n正文")
+    book = lanes.report_book("daily", lane_result("daily"), "**全公司核心指标**\n正文", SEND, title="广告日报 · 2026-11-22")
+    with session_factory() as db:
+        result = lanes.queue_test(db, settings, "daily", values, now=SEND, preview_id="job-9", stores={},
+                                  to_group=False, to_lead=True, mention=False, book=book)
+        db.commit()
+        assert result["status"] == "QUEUED" and result["cards"] == 2 and result["files"] == 2
+        assert routes(db) == [("jx_daily_lead", LEAD, []), ("jx_daily_lead", "ou_op1", [])]
+        assert files(db) == [("jx_daily_lead", LEAD, "【测试】广告日报_2026-11-22.xlsx"),
+                             ("jx_daily_lead", "ou_op1", "【测试】广告日报_2026-11-22.xlsx")]
+        copy_row = rows(db, excel=True)[0]
+        assert copy_row.payload["file"]["path"].startswith("tests/") and copy_row.payload["jx_test"] is True
+        assert copy_row.idempotency_key.startswith("jx:test:daily:job-9:") and copy_row.idempotency_key.endswith(":file")
+    assert lanes.delivery_window(copy_row.idempotency_key, copy_row.payload, SEND)[0] == "READY"
 
 
 def test_a_file_from_the_previous_release_loads_with_new_defaults(settings):

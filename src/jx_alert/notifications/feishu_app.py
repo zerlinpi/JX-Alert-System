@@ -6,6 +6,7 @@ Official contracts:
 https://open.feishu.cn/document/server-docs/authentication-management/access-token/tenant_access_token_internal
 https://open.feishu.cn/document/server-docs/im-v1/message/create
 https://open.feishu.cn/document/server-docs/im-v1/message-content-description/create_json
+https://open.feishu.cn/document/server-docs/im-v1/file/create
 """
 import hashlib
 import html
@@ -39,12 +40,21 @@ class FeishuRejected(FeishuAppError):
         self.code = code
 
 
+class FeishuUploadRejected(FeishuRejected):
+    """Feishu refused to store a file before any message was sent (e.g. a missing upload scope).
+
+    https://open.feishu.cn/document/server-docs/im-v1/file/create (错误码)
+    """
+
+
 class FeishuAppClient:
     """Send as one app identity; cache its tenant token only in server memory."""
 
     _TOKEN_PATH = "/open-apis/auth/v3/tenant_access_token/internal"
     _MESSAGE_PATH = "/open-apis/im/v1/messages"
+    _FILE_PATH = "/open-apis/im/v1/files"
     _EXPIRED_TOKEN_CODE = 99991663
+    MAX_FILE_BYTES = 30 * 1024 * 1024
 
     def __init__(self, app_id: str, app_secret: str, timeout: int = 20,
                  base_url: str = "https://open.feishu.cn"):
@@ -252,6 +262,63 @@ class FeishuAppClient:
                    "reply_in_thread": reply_in_thread}
         return self._send_message_payload(payload, None, path=f"{self._MESSAGE_PATH}/{message_id}/reply",
                                           before_submit=before_submit)
+
+    def upload_file(self, data: bytes, file_name: str, file_type: str = "xls") -> str:
+        """Store a file with Feishu and return its file_key; uploading sends nothing to anyone.
+
+        https://open.feishu.cn/document/server-docs/im-v1/file/create (im:resource or im:resource:upload)
+        """
+        if not isinstance(data, bytes) or not 0 < len(data) <= self.MAX_FILE_BYTES:
+            raise ValueError("Feishu files must be 1 byte to 30 MB")
+        if not isinstance(file_name, str) or not re.fullmatch(r"[^/\\\x00-\x1f]{1,200}", file_name):
+            raise ValueError("Feishu file name is invalid")
+        if file_type not in {"xls", "pdf", "doc", "ppt", "stream"}:
+            raise ValueError("Feishu file type is invalid")
+        token = self._get_token()
+        for attempt in range(2):
+            try:
+                with httpx.Client(timeout=max(self.timeout, 60), follow_redirects=False) as client:
+                    response = client.post(self.base_url + self._FILE_PATH, headers={"Authorization": f"Bearer {token}"},
+                                           data={"file_type": file_type, "file_name": file_name},
+                                           files={"file": (file_name, data, "application/octet-stream")})
+            except httpx.HTTPError as exc:
+                raise FeishuAppError(f"Feishu file upload failed: {type(exc).__name__}") from None
+            try:
+                body = strict_response_json(response)
+            except ValueError:
+                raise FeishuAppError("Feishu file upload returned invalid JSON") from None
+            code = body.get("code") if isinstance(body, dict) else None
+            if not isinstance(code, int) or isinstance(code, bool):
+                raise FeishuAppError("Feishu file upload response did not contain a valid status code")
+            if code == self._EXPIRED_TOKEN_CODE and attempt == 0:
+                token = self._get_token(rejected_token=token)
+                continue
+            if code != 0:
+                if response.status_code < 500:
+                    raise FeishuUploadRejected(f"Feishu file upload rejected: code={code}", code)
+                raise FeishuAppError(f"Feishu file upload failed: HTTP {response.status_code}, code={code}")
+            result = body.get("data")
+            key = result.get("file_key") if isinstance(result, dict) else None
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", key):
+                raise FeishuAppError("Feishu file upload response did not contain a file_key")
+            return key
+        raise FeishuAppError("Feishu file could not be uploaded")
+
+    def send_file(self, data: bytes, file_name: str, *, receive_id: str, receive_id_type: str = "chat_id",
+                  idempotency_key: str, before_submit=None) -> dict:
+        """Upload the file, then send it as one file message (msg_type=file); no mentions, no text."""
+        if receive_id_type not in {"chat_id", "open_id"}:
+            raise ValueError("Feishu message receive_id_type is invalid")
+        prefix = "oc_" if receive_id_type == "chat_id" else "ou_"
+        if not isinstance(receive_id, str) or not re.fullmatch(prefix + r"[A-Za-z0-9_-]+", receive_id):
+            raise ValueError("Feishu message recipient has an invalid ID")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("Feishu message idempotency_key is required")
+        file_key = self.upload_file(data, file_name)
+        payload = {"receive_id": receive_id, "msg_type": "file",
+                   "content": json.dumps({"file_key": file_key}, ensure_ascii=False),
+                   "uuid": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:40]}
+        return self._send_message_payload(payload, receive_id_type, before_submit=before_submit)
 
     def add_reaction(self, message_id: str, emoji_type: str = "OK") -> str:
         """Put one emoji reaction on a message and return its reaction_id.

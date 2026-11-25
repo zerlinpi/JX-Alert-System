@@ -28,6 +28,36 @@
                    "acos_good", "min_orders_good"];
   const INTEGERS = ["start_hour", "end_hour", "min_clicks", "min_orders_good"];
   const MAX_OPERATORS = 10;
+  const MAX_LEADS = 10;
+  const SKILL_STATES = {
+    on: ["使用中", "ok"], off: ["已停用", ""], missing_tools: ["需开通工具", "warn"],
+    not_installed: ["未安装", "warn"], write: ["需要写入工具，不安装", "bad"],
+  };
+
+  // Leads are lists since multiple leads (older servers answered one object or null).
+  function leadList(value) {
+    return Array.isArray(value) ? value : value ? [value] : [];
+  }
+
+  function leadNames(value) {
+    return leadList(value).map((person) => person.name).join("、");
+  }
+
+  function skillState(entry) {
+    const found = SKILL_STATES[entry && entry.state] || [entry && entry.state ? entry.state : "—", ""];
+    const tools = (entry && entry.tools) || [];
+    const detail = entry && entry.state === "missing_tools" ? "当前 SparkX Token 没有提供：" + tools.join("、")
+      : entry && entry.state === "write" ? "需要：" + tools.join("、") : entry && entry.state === "not_installed"
+        ? "点「安装 / 更新」后可用" : "";
+    return { text: found[0], tone: found[1], detail };
+  }
+
+  function fileSize(bytes) {
+    const number = Number(bytes);
+    if (!Number.isFinite(number) || number < 0) return "—";
+    return number < 1024 ? `${number} B` : number < 1024 * 1024 ? `${(number / 1024).toFixed(1)} KB`
+      : `${(number / 1024 / 1024).toFixed(1)} MB`;
+  }
 
   function statusLabel(status) {
     const found = OUTBOX[status];
@@ -169,7 +199,7 @@
     const csrf = doc.querySelector('meta[name="jx-console-csrf"]').content;
     const state = { view: "overview", overview: null, stores: null, filter: "all", site: "", selected: new Set(), members: null,
                     dialog: null, reports: null, saved: null, recipients: null, groups: null, sparkx: null,
-                    deepseek: null };
+                    deepseek: null, skills: null };
     // Latest preview job per lane (kept while the drawer is closed) and the lane shown in the drawer.
     const previews = {};
     const drawer = { lane: null, rendered: null, attention: false };
@@ -489,11 +519,10 @@
       container.replaceChildren(...(legend ? [legend] : []), ...items.map((person) => {
         const label = el("label", null, "check");
         const input = doc.createElement("input");
-        input.type = dialog.mode === "lead" ? "radio" : "checkbox";
+        input.type = "checkbox";
         input.name = "member"; input.value = person.id; input.checked = dialog.selected.has(person.id);
         input.addEventListener("change", () => {
-          if (input.type === "radio") { dialog.selected.clear(); dialog.selected.add(person.id); }
-          else if (input.checked) dialog.selected.add(person.id); else dialog.selected.delete(person.id);
+          if (input.checked) dialog.selected.add(person.id); else dialog.selected.delete(person.id);
           renderMemberHint();
         });
         label.append(input, doc.createTextNode(person.name));
@@ -506,17 +535,17 @@
     function renderMemberHint() {
       const dialog = state.dialog;
       const count = dialog.selected.size;
-      $("member-hint").textContent = dialog.mode === "lead" ? "只能选择一位通知群成员。"
+      $("member-hint").textContent = dialog.mode === "lead" ? `已选 ${count} 位（最多 ${MAX_LEADS} 位），每人都私聊接收。`
         : `已选 ${count} 位（每家店最多 ${MAX_OPERATORS} 位）` + (dialog.stores.length > 1 ? "；保存后替换所选店铺的运营。" : "");
     }
 
     async function openMembers(options) {
       try { await members(options.mode === "lead"); } catch (error) { toast(error.message, "error"); return; }
-      const initial = options.mode === "lead" ? (options.current ? [options.current.id] : [])
+      const initial = options.mode === "lead" ? leadList(options.current).map((person) => person.id)
         : options.stores.length === 1 ? options.stores[0].operators.map((person) => person.id) : [];
       state.dialog = { ...options, selected: new Set(initial) };
       $("member-dialog-title").textContent = options.mode === "lead" ? (options.kind === "company" ? "选择总负责人" : "选择广告负责人") : "指定运营";
-      $("member-dialog-subtitle").textContent = options.mode === "lead" ? "从通知群成员中选择，私聊接收。"
+      $("member-dialog-subtitle").textContent = options.mode === "lead" ? "从通知群成员中选择，可多选，私聊接收。"
         : options.stores.length === 1 ? `${options.stores[0].short_name} · ${options.stores[0].country_label}` : `批量设置 ${options.stores.length} 家店铺`;
       $("member-clear").hidden = options.mode !== "lead";
       $("member-search").value = "";
@@ -529,10 +558,10 @@
       const data = state.recipients;
       $("current-group").textContent = (data.group_detail && data.group_detail.name) || data.group || "未设置";
       for (const kind of ["company", "ad"]) {
-        const person = data[kind];
+        const names = leadNames(data[kind]);
         const chip = $("lead-" + kind);
-        chip.textContent = person ? person.name : "未设置";
-        chip.className = "chip" + (person ? "" : " empty");
+        chip.textContent = names || "未设置";
+        chip.className = "chip" + (names ? "" : " empty");
       }
     }
 
@@ -706,10 +735,10 @@
       $("test-send").disabled = !cards;
       const kind = lane === "daily" ? "company" : "ad";
       const known = Boolean(state.recipients);
-      const lead = known ? state.recipients[kind] : null;
-      $("test-lead-label").textContent = (lane === "daily" ? "总负责人" : "广告负责人") + (lead ? `（${lead.name}）` : known ? "（未设置）" : "");
-      $("test-to-lead").disabled = known && !lead;
-      if (known && !lead) $("test-to-lead").checked = false;
+      const names = known ? leadNames(state.recipients[kind]) : "";
+      $("test-lead-label").textContent = (lane === "daily" ? "总负责人" : "广告负责人") + (names ? `（${names}）` : known ? "（未设置）" : "");
+      $("test-to-lead").disabled = known && !names;
+      if (known && !names) $("test-to-lead").checked = false;
       const mentions = result && result.info ? result.info.mentions || [] : [];
       $("test-mention-label").textContent = mentions.length ? "@ 对应运营：" + mentionText(mentions) : "@ 对应运营（这份预览没有可 @ 的运营）";
       $("test-mention").disabled = !mentions.length;
@@ -717,7 +746,8 @@
       const sent = (entry.sent || []).map((name) => (name === "group" ? "通知群" : lane === "daily" ? "总负责人" : "广告负责人"));
       $("test-send-hint").textContent = !result ? "预览生成后可以发送测试。" : !cards ? "这份预览没有内容，无法发送测试。"
         : sent.length ? `已发送测试到：${sent.join("、")}。同一份预览不会重复发给同一对象；需要新内容请「重新生成」。`
-          : "发送的就是上面这份预览（标题带【测试】），不会再调用 DeepSeek，也不计入定时发送。";
+          : "发送的就是上面这份预览（标题带【测试】）" + (result.info && result.info.excel ? "和它的 Excel 文件" : "") +
+            "，不会再调用 DeepSeek，也不计入定时发送。";
       if (drawer.attention && cards) {
         drawer.attention = false;
         $("test-send").classList.remove("lane-attention");
@@ -752,7 +782,8 @@
       const data = await guarded(() => api("/console/api/reports/test-send", { method: "POST", body }), button);
       if (!data) return;
       trackPreview(lane, { sent: data.sent });
-      if (data.status === "QUEUED") toast(`测试消息已排队（${data.queued} 张卡片` + (data.mentions ? `，@ ${data.mentions} 位运营` : "") +
+      if (data.status === "QUEUED") toast(`测试消息已排队（${data.cards === undefined ? data.queued : data.cards} 张卡片` +
+        (data.files ? ` + ${data.files} 个 Excel` : "") + (data.mentions ? `，@ ${data.mentions} 位运营` : "") +
         "），约 10 秒内发出，可在「发送记录」查看结果。");
       else toast("这份预览已经发送过测试，没有重复发送。", "warn");
     }
@@ -778,9 +809,41 @@
       }
       if (data.error) entries.push(["检查结果", data.error]);
       facts("skills-facts", entries);
-      fill("skills-rows", (data.skills || []).map((skill) => row([skill.name, skill.version || "—", (skill.mcp_tools || []).join("、"),
-        skill.description || "—"])), "尚未安装：点「安装 / 更新」从 GitHub 获取官方只读 Skills。", 4);
+      state.skills = data;
+      const catalog = data.catalog && data.catalog.length ? data.catalog
+        : (data.skills || []).map((skill) => ({ ...skill, state: "on", tools: [] }));
+      fill("skills-rows", catalog.map((skill) => {
+        const label = skillState(skill);
+        const box = doc.createElement("input");
+        box.type = "checkbox";
+        box.dataset.skill = skill.name;
+        box.checked = skill.state === "on" || skill.state === "missing_tools" || (skill.required && skill.state !== "write");
+        box.disabled = Boolean(skill.required) || skill.state === "write" || skill.state === "not_installed";
+        box.setAttribute("aria-label", "启用 " + skill.name);
+        const name = el("div", null, "skill-name");
+        name.append(el("strong", skill.name), el("span", skill.required ? "基础（始终启用）" : "选装", "muted"));
+        const status = el("div", null, "skill-state");
+        status.append(badge(label));
+        if (label.detail) status.append(el("span", label.detail, "muted"));
+        return row([box, name, skill.version || "—", status, (skill.mcp_tools || []).join("、"), skill.description || "—"]);
+      }), "尚未安装：点「安装 / 更新」从 GitHub 获取官方只读 Skills。", 6);
+      const used = catalog.filter((skill) => skill.state === "on").length;
+      const present = catalog.filter((skill) => skill.state !== "write" && skill.state !== "not_installed").length;
+      const blocked = catalog.filter((skill) => skill.state === "write").length;
+      $("skills-summary").textContent = catalog.length ? `已安装 ${present} 个，使用中 ${used} 个` +
+        (blocked ? `；${blocked} 个需要写入工具，未安装` : "") : "";
       $("tool-chips").replaceChildren(...(data.read_tools || []).map((name) => el("span", name, "chip mono")));
+    }
+
+    async function saveSkillChoice(box) {
+      const data = state.skills;
+      if (!data || !data.choices) return;
+      const disabled = [...doc.querySelectorAll("#skills-rows input[data-skill]")]
+        .filter((input) => !input.disabled && !input.checked).map((input) => input.dataset.skill);
+      const saved = await guarded(() => api("/console/api/skills/choices", {
+        method: "POST", body: { revision: data.choices.revision, disabled } }), box);
+      if (saved) { renderSkills(saved); toast(`${box.checked ? "已启用" : "已停用"} ${box.dataset.skill}，下次运行生效。`); }
+      else renderSkills(data);
     }
 
     async function loadSparkx() {
@@ -815,11 +878,21 @@
     }
 
     async function loadDeliveries() {
-      const data = await guarded(() => api("/console/api/deliveries"));
-      if (!data) return;
-      fill("delivery-rows", data.rows.map((item) => row([formatTime(item.created_at), item.lane, item.recipient, item.title,
-        badge(statusLabel(item.status)), item.error || (item.delivered_at ? "送达 " + formatTime(item.delivered_at) : "—")])),
-        "还没有发送记录。", 6);
+      const [data, files] = await Promise.all([guarded(() => api("/console/api/deliveries")),
+        guarded(() => api("/console/api/archive"))]);
+      if (data) {
+        fill("delivery-rows", data.rows.map((item) => row([formatTime(item.created_at), item.lane, item.recipient, item.title,
+          badge(statusLabel(item.status)), item.error || (item.delivered_at ? "送达 " + formatTime(item.delivered_at) : "—")])),
+          "还没有发送记录。", 6);
+      }
+      if (files) {
+        fill("archive-rows", files.rows.map((item) => {
+          const link = el("a", "下载", "button ghost small");
+          link.href = "/console/api/archive/file?path=" + encodeURIComponent(item.path);
+          link.setAttribute("download", item.name);
+          return row([formatTime(item.saved_at), item.lane_label || item.lane, item.name, fileSize(item.size), link]);
+        }), "还没有保存的 Excel 文件。", 5);
+      }
     }
 
     // ---------------------------------------------------------------- navigation
@@ -889,9 +962,10 @@
       if (!dialog) return;
       const ids = [...dialog.selected];
       if (dialog.mode === "lead") {
+        if (ids.length > MAX_LEADS) { toast(`每类负责人最多 ${MAX_LEADS} 位。`, "warn"); return; }
         const data = await guarded(() => api("/console/api/recipients/" + dialog.kind, {
-          method: "POST", body: { open_ids: ids.slice(0, 1), revision: state.recipients.revision } }), event.currentTarget);
-        if (data) { closeOverlay("member-dialog"); toast("负责人已保存。"); loadNotifications(); }
+          method: "POST", body: { open_ids: ids, revision: state.recipients.revision } }), event.currentTarget);
+        if (data) { closeOverlay("member-dialog"); toast(ids.length > 1 ? `已保存 ${ids.length} 位负责人。` : "负责人已保存。"); loadNotifications(); }
         return;
       }
       if (ids.length > MAX_OPERATORS) { toast(`每家店最多 ${MAX_OPERATORS} 位运营。`, "warn"); return; }
@@ -1000,6 +1074,10 @@
       const data = await guarded(() => api("/console/api/skills/check", { method: "POST" }), event.currentTarget);
       if (data) renderSkills(data);
     });
+    $("skills-rows").addEventListener("change", (event) => {
+      const box = event.target.closest("input[data-skill]");
+      if (box) saveSkillChoice(box);
+    });
 
     // deepseek
     $("deepseek-form").addEventListener("submit", async (event) => {
@@ -1022,5 +1100,6 @@
   }
 
   return { start, statusLabel, runLabel, formatTime, parseBold, cardText, filterStores, storeCounts, siteOptions, promptValue,
-           lanePayload, setupSteps, formatTokens, previewStateText, mentionText, LANES };
+           lanePayload, setupSteps, formatTokens, previewStateText, mentionText, leadList, leadNames, skillState, fileSize,
+           LANES };
 });

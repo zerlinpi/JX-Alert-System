@@ -1,10 +1,10 @@
 """Who receives each lane, resolved from the owner's routing file and store directory.
 
-Every lane goes to the report group; for the review and the hourly monitor the
-group message @-mentions the operators of the affected stores once they are
-mapped. 总负责人 (company lead) also receives the daily report and 广告负责人
-(ad lead) the review and the hourly monitor privately; private operator copies
-(only their own stores) are optional. A recipient is re-verified before each send.
+Every lane goes to the report group; the group message @-mentions the operators of
+the affected stores once they are mapped. The 总负责人 (company leads, one or more)
+also receive the daily report and the 广告负责人 (ad leads, one or more) the review
+and the hourly monitor privately; private operator copies (only their own stores)
+are optional. A recipient is re-verified before each send.
 """
 import hashlib
 import re
@@ -115,49 +115,76 @@ def _app_identity(settings):
         return None
 
 
-def company_lead(settings, routing_data):
-    """总负责人, bound to the Feishu app that verified the choice."""
+MAX_LEADS = 10
+
+
+def _people(rows):
+    """Valid, distinct {open_id, name, generation} entries, in order."""
+    found, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        uid, generation = row.get("open_id"), row.get("generation")
+        if (not isinstance(uid, str) or not OPEN_ID.fullmatch(uid) or uid in seen
+                or not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{32}", generation)):
+            continue
+        seen.add(uid)
+        name = row.get("name") if isinstance(row.get("name"), str) else uid
+        found.append({"open_id": uid, "name": name[:100], "generation": generation})
+    return found[:MAX_LEADS]
+
+
+def _more(section):
+    rows = section.get("more_recipients")
+    return rows if isinstance(rows, list) else []
+
+
+def company_leads(settings, routing_data):
+    """总负责人 (one or more), bound to the Feishu app that verified the choice.
+
+    The first person keeps the single-person fields of earlier releases; the others are
+    in ``more_recipients`` (so an older release still reaches the first one).
+    """
     binding = routing_data.get(COMPANY_LEAD) if isinstance(routing_data, dict) else None
-    if not isinstance(binding, dict):
-        return None
-    uid, app_id, generation = binding.get("open_id"), binding.get("app_id"), binding.get("generation")
-    if (not isinstance(uid, str) or not OPEN_ID.fullmatch(uid) or not isinstance(app_id, str)
-            or not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{32}", generation)):
-        return None
-    if _app_identity(settings) != hashlib.sha256(app_id.encode()).hexdigest():
-        return None
-    name = binding.get("name") if isinstance(binding.get("name"), str) else uid
-    return {"open_id": uid, "name": name[:100], "generation": generation}
+    if not isinstance(binding, dict) or not isinstance(binding.get("app_id"), str):
+        return []
+    if _app_identity(settings) != hashlib.sha256(binding["app_id"].encode()).hexdigest():
+        return []
+    return _people([binding, *_more(binding)])
+
+
+def ad_leads(routing_data):
+    """广告负责人 (one or more): ``recipients`` holds the first, ``more_recipients`` the others."""
+    section = routing_data.get(AD_LEAD) if isinstance(routing_data, dict) else None
+    if not isinstance(section, dict):
+        return []
+    rows = section.get("recipients")
+    return _people([*(rows if isinstance(rows, list) else []), *_more(section)])
+
+
+def company_lead(settings, routing_data):
+    """The first 总负责人, or None."""
+    people = company_leads(settings, routing_data)
+    return people[0] if people else None
 
 
 def ad_lead(routing_data):
-    """广告负责人 (exactly one recipient), or None."""
-    section = routing_data.get(AD_LEAD) if isinstance(routing_data, dict) else None
-    rows = section.get("recipients") if isinstance(section, dict) else None
-    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
-        return None
-    row = rows[0]
-    if (not isinstance(row.get("open_id"), str) or not OPEN_ID.fullmatch(row["open_id"])
-            or not isinstance(row.get("generation"), str) or not re.fullmatch(r"[0-9a-f]{32}", row["generation"])):
-        return None
-    name = row.get("name") if isinstance(row.get("name"), str) else row["open_id"]
-    return {"open_id": row["open_id"], "name": name[:100], "generation": row["generation"]}
+    """The first 广告负责人, or None."""
+    people = ad_leads(routing_data)
+    return people[0] if people else None
 
 
-def lead(settings, routing_data, lane):
-    person = company_lead(settings, routing_data) if lane == "daily" else ad_lead(routing_data)
+def leads(settings, routing_data, lane):
+    """The lane's leads who are still in the report group (总负责人 for the daily report, else 广告负责人)."""
+    people = company_leads(settings, routing_data) if lane == "daily" else ad_leads(routing_data)
     roster = verified_members(routing_data, settings)
-    if person is None or (roster is not None and person["open_id"] not in roster):
-        return None
-    return person
+    return [person for person in people if roster is None or person["open_id"] in roster]
 
 
-def lead_delivery(settings, routing_data, lane):
-    person = lead(settings, routing_data, lane)
-    if person is None:
-        return None
-    return {"role": role(lane, "lead"), "receive_id_type": "open_id", "receive_id": person["open_id"],
-            "open_ids": [], "generation": person["generation"], "name": person["name"]}
+def lead_deliveries(settings, routing_data, lane):
+    return [{"role": role(lane, "lead"), "receive_id_type": "open_id", "receive_id": person["open_id"],
+             "open_ids": [], "generation": person["generation"], "name": person["name"]}
+            for person in leads(settings, routing_data, lane)]
 
 
 def operator_deliveries(settings, routing_data, directory, lane, pids, *, exclude=()):
@@ -189,9 +216,9 @@ def delivery_current(settings, lane, delivery):
             return "通知群已更换，保留记录不补发"
         return None
     if kind == role(lane, "lead"):
-        current = lead_delivery(settings, routing_data, lane)
-        if (current is None or current["receive_id"] != delivery.get("receive_id")
-                or current["generation"] != delivery.get("generation")):
+        current = {item["receive_id"]: item for item in lead_deliveries(settings, routing_data, lane)}
+        match = current.get(delivery.get("receive_id"))
+        if match is None or match["generation"] != delivery.get("generation"):
             return "负责人已变更，保留记录不补发"
         return None
     if kind == role(lane, "operator"):

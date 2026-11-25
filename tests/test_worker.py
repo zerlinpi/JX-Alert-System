@@ -36,6 +36,17 @@ class FakeClient:
     def reply_card(self, message_id, card, *, idempotency_key, reply_in_thread, before_submit):
         return self._post("reply", before_submit, message_id=message_id, thread=reply_in_thread)
 
+    def send_file(self, data, file_name, *, receive_id, receive_id_type, idempotency_key, before_submit):
+        if self.upload_error:
+            raise self.upload_error  # refused while uploading: before any message
+        return self._post("file", before_submit, receive_id=receive_id, name=file_name, data=data)
+
+    upload_error = None
+
+
+def cards_sent(client):
+    return [details for kind, details in client.sent if kind == "create"]
+
 
 @pytest.fixture
 def at_send(monkeypatch):
@@ -73,9 +84,13 @@ def test_queued_daily_report_is_delivered_after_the_intent_is_committed(settings
     row_id = queue_daily(settings, session_factory)
     client = FakeClient()
     result = run(settings, session_factory, client)
-    assert result["sent"] == 2
-    assert [(details["receive_id"], details["open_ids"]) for _, details in client.sent] == [
+    assert result["sent"] == 4  # two cards, each followed by its Excel copy
+    assert [(kind, details["receive_id"]) for kind, details in client.sent] == [
+        ("create", "oc_reports"), ("file", "oc_reports"), ("create", "ou_lead"), ("file", "ou_lead")]
+    assert [(details["receive_id"], details["open_ids"]) for details in cards_sent(client)] == [
         ("oc_reports", []), ("ou_lead", [])]
+    excel = [details for kind, details in client.sent if kind == "file"]
+    assert excel[0]["name"] == "广告日报_2026-11-22.xlsx" and excel[0]["data"][:2] == b"PK"
     delivered = row(session_factory, row_id)
     assert delivered.status == "DELIVERED" and delivered.payload["delivery_intent"]["destination"] == "oc_reports"
     assert delivered.payload["delivery_intent"]["body_sha256"] == "f" * 64
@@ -94,7 +109,7 @@ def test_group_alerts_mention_only_the_operators_still_mapped_when_sending(setti
     map_operators(settings, {"101": ("ou_new", "新运营")})  # 101 changed hands after queueing
     client = FakeClient()
     run(settings, session_factory, client)
-    assert [(details["receive_id"], details["open_ids"], details["labels"]) for _, details in client.sent] == [
+    assert [(details["receive_id"], details["open_ids"], details["labels"]) for details in cards_sent(client)] == [
         ("oc_reports", ["ou_op2"], {"ou_op2": "Campx"}), ("ou_adlead", [], {})]
 
 
@@ -154,10 +169,53 @@ def test_a_definite_feishu_refusal_is_recorded_with_its_reason_and_never_resent(
     refusal = FeishuRejected("Feishu app HTTP request rejected: HTTP 400, code=230013", 230013)
     result = run(settings, session_factory, FakeClient(fail_after_fence=refusal))
     refused = row(session_factory, row_id)
-    assert refused.status == "REJECTED" and result["failed"] == 2 and result["unknown"] == 0
+    assert refused.status == "REJECTED" and result["failed"] == 4 and result["unknown"] == 0  # cards and Excel
     assert "飞书拒绝，未送达（code=230013" in refused.last_error and "可用范围" in refused.last_error
     client = FakeClient()
     assert run(settings, session_factory, client)["claimed"] == 0 and client.sent == []
+
+
+def test_an_excel_copy_is_sent_only_while_its_file_is_unchanged(settings, session_factory, at_send):
+    from pathlib import Path
+
+    queue_daily(settings, session_factory)
+    with session_factory() as db:
+        files = [item for item in db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id))
+                 if item.payload["transport"] == lanes.FILE_TRANSPORT]
+    Path(settings.report_archive_dir, files[0].payload["file"]["path"]).write_bytes(b"PK changed")
+    client = FakeClient()
+    run(settings, session_factory, client)
+    # Both copies point at the same saved file: neither goes out once it changed; the cards still do.
+    assert len(cards_sent(client)) == 2 and [kind for kind, _ in client.sent].count("file") == 0
+    for item in files:
+        kept = row(session_factory, item.id)
+        assert kept.status == "SKIPPED" and "Excel 文件缺失或内容已变化" in kept.last_error
+
+
+def test_a_refused_excel_upload_is_recorded_with_its_reason(settings, session_factory, at_send):
+    from jx_alert.notifications.feishu_app import FeishuUploadRejected
+
+    queue_daily(settings, session_factory)
+    client = FakeClient()
+    client.upload_error = FeishuUploadRejected("Feishu file upload rejected: code=99991672", 99991672)
+    run(settings, session_factory, client)
+    with session_factory() as db:
+        found = list(db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)))
+    assert [item.status for item in found] == ["DELIVERED", "REJECTED", "DELIVERED", "REJECTED"]
+    assert "飞书拒绝接收 Excel 文件" in found[1].last_error and "im:resource" in found[1].last_error
+    assert run(settings, session_factory, FakeClient())["claimed"] == 0  # a refusal is not retried
+
+
+def test_a_file_row_without_its_file_record_is_never_sent(settings, session_factory, at_send):
+    with session_factory() as db:
+        forged = enqueue_notification(db, idempotency_key="jx:daily:2026-11-24:forged:file", text="Excel", delivery={
+            "role": "jx_daily_group", "receive_id_type": "chat_id", "receive_id": "oc_reports", "open_ids": []},
+            extra={"jx_lane": "daily", "jx_day": "2026-11-24", "transport": lanes.FILE_TRANSPORT})
+        db.commit()
+    pin_times(session_factory, SEND)
+    client = FakeClient()
+    run(settings, session_factory, client)
+    assert row(session_factory, forged.id).status == "SKIPPED" and client.sent == []
 
 
 def test_failure_before_any_post_is_retried_with_backoff(settings, session_factory, at_send):

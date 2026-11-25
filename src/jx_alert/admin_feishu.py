@@ -306,38 +306,57 @@ def verified_people(settings, open_ids):
 
 # ---------------------------------------------------------------- leads
 
-def _lead_entry(routing, kind):
-    if kind == "company":
-        binding = routing.get(COMPANY_LEAD)
-        if isinstance(binding, dict) and isinstance(binding.get("open_id"), str):
-            return {"id": binding["open_id"], "name": clean_name(binding.get("name"), 100) or binding["open_id"]}
-        return None
-    rows = (routing.get(AD_LEAD) or {}).get("recipients") if isinstance(routing.get(AD_LEAD), dict) else None
-    if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) and isinstance(rows[0].get("open_id"), str):
-        return {"id": rows[0]["open_id"], "name": clean_name(rows[0].get("name"), 100) or rows[0]["open_id"]}
-    return None
+MAX_LEADS = 10
+
+
+def _stored_people(section, first):
+    """{open_id: stored row} of a lead section: the first person's row and ``more_recipients``."""
+    rows = [*first, *(section.get("more_recipients") or [])] if isinstance(section, dict) else []
+    return {row["open_id"]: row for row in rows if isinstance(row, dict) and isinstance(row.get("open_id"), str)}
+
+
+def _company_rows(routing):
+    binding = routing.get(COMPANY_LEAD)
+    return _stored_people(binding, [binding] if isinstance(binding, dict) else [])
+
+
+def _ad_rows(routing):
+    section = routing.get(AD_LEAD)
+    rows = section.get("recipients") if isinstance(section, dict) else None
+    return _stored_people(section, rows if isinstance(rows, list) else [])
+
+
+def _lead_entries(routing, kind):
+    rows = _company_rows(routing) if kind == "company" else _ad_rows(routing)
+    return [{"id": uid, "name": clean_name(row.get("name"), 100) or uid} for uid, row in rows.items()][:MAX_LEADS]
 
 
 def leads(settings):
+    """Both lead lists for the console: {"company": [{id, name}], "ad": [...]} (empty when not set)."""
     _, routing, revision = snapshot(settings)
     try:
         alias, group = report_group(settings, routing)
         group_name = group_label(group, alias)
     except ApplicationRoutingError:
         group_name = None
-    return {"revision": revision, "group": group_name, "company": _lead_entry(routing, "company"),
-            "ad": _lead_entry(routing, "ad")}
+    return {"revision": revision, "group": group_name, "company": _lead_entries(routing, "company"),
+            "ad": _lead_entries(routing, "ad"), "max": MAX_LEADS}
 
 
 def save_lead(settings, kind, open_ids, revision):
-    """kind=company: 总负责人 (daily report); kind=ad: 广告负责人 (review and hourly)."""
-    if kind not in {"company", "ad"} or not isinstance(open_ids, list) or len(open_ids) > 1:
-        raise MappingError(400, "请选择一位负责人。")
+    """kind=company: 总负责人 (daily report); kind=ad: 广告负责人 (review and hourly); up to 10 people each.
+
+    The first person is stored where earlier releases read the single lead, the others in
+    ``more_recipients``; a person who stays keeps their generation (queued messages stay valid).
+    """
+    if kind not in {"company", "ad"} or not isinstance(open_ids, list) or len(open_ids) > MAX_LEADS:
+        raise MappingError(400, f"每类负责人最多选择 {MAX_LEADS} 位。")
     raw, routing, current = snapshot(settings)
     if current != revision:
         raise MappingError(409, _CONFLICT)
     people = verified_people(settings, open_ids)
     raw, routing, current = snapshot(settings)  # The roster refresh may have rewritten the file.
+    now = datetime.now(timezone.utc)
     if kind == "company":
         if not people:
             routing.pop(COMPANY_LEAD, None)
@@ -347,17 +366,23 @@ def save_lead(settings, kind, open_ids, revision):
             except (FeishuAppError, OSError, TypeError, ValueError):
                 raise MappingError(503, "飞书自建应用凭据不可用，暂不能绑定私聊接收人。") from None
             old = routing.get(COMPANY_LEAD) if isinstance(routing.get(COMPANY_LEAD), dict) else {}
-            same = old.get("open_id") == people[0]["open_id"] and old.get("app_id") == app_id
-            stamp = datetime.now(timezone.utc) - timedelta(seconds=5)
-            routing[COMPANY_LEAD] = {"open_id": people[0]["open_id"], "name": people[0]["name"], "app_id": app_id,
-                                     "generation": old["generation"] if same else uuid.uuid4().hex,
-                                     "verified_at": old.get("verified_at") if same else stamp.isoformat()}
+            kept = _company_rows(routing) if old.get("app_id") == app_id else {}
+            stamp = (now - timedelta(seconds=5)).isoformat()
+            rows = []
+            for person in people:
+                previous = kept.get(person["open_id"], {})
+                same = isinstance(previous.get("generation"), str)
+                rows.append({"open_id": person["open_id"], "name": person["name"],
+                             "generation": previous["generation"] if same else uuid.uuid4().hex,
+                             "verified_at": previous.get("verified_at") if same else stamp})
+            routing[COMPANY_LEAD] = {**rows[0], "app_id": app_id,
+                                     **({"more_recipients": rows[1:]} if len(rows) > 1 else {})}
     else:
-        old = {row.get("open_id"): row for row in ((routing.get(AD_LEAD) or {}).get("recipients") or [])
-               if isinstance(row, dict)} if isinstance(routing.get(AD_LEAD), dict) else {}
-        routing[AD_LEAD] = {"recipients": [{"open_id": person["open_id"], "name": person["name"],
-                                            "generation": old.get(person["open_id"], {}).get("generation")
-                                            or uuid.uuid4().hex} for person in people],
-                            "updated_at": datetime.now(timezone.utc).isoformat()}
+        old = _ad_rows(routing)
+        rows = [{"open_id": person["open_id"], "name": person["name"],
+                 "generation": old.get(person["open_id"], {}).get("generation") or uuid.uuid4().hex}
+                for person in people]
+        routing[AD_LEAD] = {"recipients": rows[:1], **({"more_recipients": rows[1:]} if len(rows) > 1 else {}),
+                            "updated_at": now.isoformat()}
     write_routing(settings, raw, routing, f"{kind}-lead")
     return leads(settings)
