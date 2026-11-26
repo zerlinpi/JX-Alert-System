@@ -5,7 +5,7 @@ import re
 import pytest
 
 from jx_alert.ai import agent
-from jx_alert.reports import cards
+from jx_alert.reports import cards, figures
 from jx_alert.reports import settings as lane_settings
 from jx_alert.reports import tasks
 from jx_alert.sparkx import skills as skill_store
@@ -49,8 +49,10 @@ def test_the_daily_report_tells_ad_and_store_totals_apart():
     """Owner (Nov 2026): 总销量 is shown, and 广告订单/总订单, 广告销量/总销量 are never mixed up."""
     daily = tasks.DEFAULT_PROMPTS["daily"]
     stores_table = _table_spec(daily, "**有花费店铺明细**")
-    assert stores_table == ["店铺", "广告花费", "广告销售额", "总销售额", "广告订单", "总订单", "广告销量", "总销量",
-                            "ACOS", "TACOS", "花费日环比", "运营"]
+    # Owner (Nov 26 2026): the figures read first come right after the store name.
+    assert stores_table == ["店铺", "广告花费", "ACOS", "TACOS", "CPC", "ROAS", "CVR", "广告销售额", "总销售额",
+                            "广告订单", "总订单", "广告销量", "总销量", "花费日环比", "运营"]
+    assert stores_table[1:7] == list(figures.LEADING)  # the same order the system enforces
     core = re.search(r"依次为([^。]+)。", daily).group(1).split("、")
     assert core[:7] == ["总销售额", "广告销售额", "总订单", "广告订单", "总销量", "广告销量", "广告花费"]
     site = _table_spec(daily, "**站点汇总**")
@@ -63,11 +65,25 @@ def test_the_daily_report_tells_ad_and_store_totals_apart():
     assert "总订单为 0 但总销量大于 0" in daily and "写「—」，不当成 0" in daily
     # A store without store totals must not inflate TACOS: its ad spend stays out of the numerator too.
     assert "全公司 TACOS = 有总销售额数据的店铺的广告花费合计 ÷ 这些店铺的总销售额合计" in daily
-    # Owner (Nov 2026): lean texts, but what the SparkX Skills require readers to be told stays, in one phrase.
-    assert "注明金额为 USD、广告订单和广告销售额等转化数据是暂定值" in daily and "不超过 60 字" in daily
-    assert "暂定值" in tasks.DEFAULT_PROMPTS["review"]
-    # Stores without data are listed once, under the store table, by the system (see test_coverage).
-    assert "「暂无广告数据：…」" in daily and "缺数据或数据未更新的店铺不写进开头和须知" in daily
+    assert "不超过 60 字" in daily and "CPC 写两位小数的金额" in daily
+
+
+def test_reports_carry_only_sentences_with_information():
+    """Owner (Nov 26 2026): no 「对比 …，监控 19 家店铺…；金额已统一折算为 USD，…为暂定值…」, no 「今日数据仍在累计…」."""
+    daily, review = tasks.DEFAULT_PROMPTS["daily"], tasks.DEFAULT_PROMPTS["review"]
+    for old in ("开头一句话", "注明金额为 USD", "用半句话注明", "在开头注明一次", "「暂无广告数据：…」", "N 个店铺中，M 个有投放数据"):
+        assert old not in daily + review, old
+    assert "前面不写任何概述" in daily and "表格下方不写说明或店铺名单" in daily and "没有发现的问题不写" in daily
+    assert "开头不写店铺总数、有投放数据的店铺数、币种、暂定值" in review and "没有检出的类型整段不写" in review
+    assert "「K 个店铺检出 X 个异常 campaign，合计浪费约 $Y。」" in review
+    for lane in ("daily", "review"):
+        message = tasks.task_message(lane, {"prompt": "自定义说明"}, now=SEND, monitored={"101"})
+        assert "每句话都要有信息量" in message and "不写统计范围、监控或有数据的店铺数、币种" in message
+        assert "照写，但只用一句短话" not in message  # the old rule asked for the notes
+    assert "一律不写" in agent.PRIORITY and "要求向读者说明的事项（例如" not in agent.PRIORITY
+    chat = agent.system_prompt(now=SEND, tool_names=[], skills_index=None, roster={}, directory={"profiles": {}},
+                               mode="chat")
+    assert "不写币种、暂定值、数据仍在累计之类的提醒" in chat and "一句话带过" not in chat
 
 
 def test_the_review_judges_anomalies_by_the_products_own_history_and_value():
@@ -95,7 +111,6 @@ def test_sparkx_data_and_skills_rank_above_the_jx_task_text():
     for lane in ("daily", "review"):
         message = tasks.task_message(lane, {"prompt": ""}, now=SEND, monitored={"101"})
         assert "不写数据来源、生成方式、查询次数和查询或分析过程" in message
-        assert "SparkX 结果和官方 Skill 要求说明的事项" in message and "只用一句短话" in message
         assert "不重复标题里已有的报告名称和日期" in message
     assert "不重复判定条件" in tasks.DEFAULT_PROMPTS["review"]  # section titles name the problem type only
     for mode in ("report", "chat"):
@@ -178,29 +193,34 @@ def test_daily_run_lets_deepseek_query_sparkx_with_the_servers_own_tools(monkeyp
     assert fake.calls[-1] == ("get_ads_perf", query)
 
 
-def test_the_daily_stores_without_data_are_named_from_sparkx_rows(monkeypatch, settings):
-    """Live slip (Nov 2026): the model's own list missed a store and called a store with sales 「暂无数据」."""
-    ads = [{"profileId": 101, "date": "20261122", "Spend": 300.0, "Sales": 900.0},
-           {"profileId": 102, "date": "20261122", "Spend": 41.2, "Sales": 0},
-           {"profileId": 106, "date": "20261121", "Spend": 35.3, "Sales": 0}]
+def test_the_system_settles_the_daily_report_from_sparkx_rows(monkeypatch, settings):
+    """Owner (Nov 26 2026): no overview, no store lists or data remarks, the lead figures first; and the
+    model's own lists were unreliable (Nov 2026), so the one store statement left comes from SparkX's rows."""
+    ads = [{"profileId": 101, "date": "20261122", "Spend": 300.0, "Sales": 900.0, "Clicks": 200},
+           {"profileId": 102, "date": "20261122", "Spend": 41.2, "Sales": 0, "Clicks": 30},
+           {"profileId": 106, "date": "20261121", "Spend": 35.3, "Sales": 0}]  # OCTORA stopped spending
     totals = [{"profileId": 101, "date": "20261122", "TotalSalesAmount": 1500.0, "OrderCount": 30, "UnitCount": 32},
               {"profileId": 102, "date": "20261122", "TotalSalesAmount": 27.99, "OrderCount": 1, "UnitCount": 1}]
     install(monkeypatch, FakeSparkX(rows={"campaign": ads, "asin": totals}), agent)
     window = {"profileIds": [101, 102, 103, 104, 105, 106, 201], "dateStart": "2026-11-21", "dateEnd": "2026-11-22",
               "select": ["profile.profileId_", "date"], "userContext": "JX 日报"}
-    written = ("**有花费店铺明细**\n| 店铺 | 广告花费 | 总销售额 | 运营 |\n|---|---|---|---|\n"
-               "| 香港川页 | $300.00 | $1,500.00 | 未映射运营 |\n| Campx | $41.20 | $27.99 | 未映射运营 |\n"
-               "当日无广告花费：FITFIZZ、陈子俊。\n\n**须知**\n1. 花费集中在香港川页。\n"
-               "2. Campx 总销售额暂无数据，昌泉也暂无数据。\nJX_STORES: 102")
+    written = ("对比 2026-11-21，监控 7 家店铺、当日有广告花费 2 家；金额已统一折算为 USD，转化数据为暂定值。\n\n"
+               "**有花费店铺明细**\n| 店铺 | 广告花费 | 总销售额 | ROAS | 运营 | ACOS | PPC |\n|---|---|---|---|---|---|---|\n"
+               "| 香港川页 | $300.00 | $1,500.00 | 3.00 | 未映射运营 | 33.3% | $1.50 |\n"
+               "| Campx | $41.20 | $27.99 | 0.00 | 未映射运营 | — |\n"
+               "当日无广告花费：FITFIZZ、陈子俊。\n注：金额为 USD。\n\n**须知**\n1. 花费集中在香港川页。\n"
+               "2. Campx 总销售额暂无数据，昌泉也暂无数据。\n3. 有广告花费但无广告订单的店铺：无。\nJX_STORES: 102")
     client = ScriptedDeepSeek([reply(calls=[("get_ads_perf", {**window, "factEntity": "campaign"}),
                                             ("get_ads_perf", {**window, "factEntity": "asin"})]), reply(written)])
     result = tasks.run_lane(settings, "daily", lane_settings.DEFAULTS["daily"], now=SEND,
                             directory=stores.load(settings), client_factory=lambda s: client)
     assert result["content"] == (
-        "**有花费店铺明细**\n| 店铺 | 广告花费 | 总销售额 | 运营 |\n|---|---|---|---|\n"
-        "| 香港川页 | $300.00 | $1,500.00 | 未映射运营 |\n| Campx | $41.20 | $27.99 | 未映射运营 |\n"
-        "暂无广告数据：FITFIZZ、OCTORA、川页（加拿大）、昌泉、陈子俊。\n\n**须知**\n1. 花费集中在香港川页。")
-    assert result["stores"] == ["102"] and "requests" not in result["summary"] and "evidence" not in result["summary"]
+        "**有花费店铺明细**\n| 店铺 | 广告花费 | ACOS | PPC | ROAS | 总销售额 | 运营 |\n|---|---|---|---|---|---|---|\n"
+        "| 香港川页 | $300.00 | 33.3% | $1.50 | 3.00 | $1,500.00 | 未映射运营 |\n"
+        "| Campx | $41.20 | — | — | 0.00 | $27.99 | 未映射运营 |\n"
+        "当日无广告花费（前一日有）：OCTORA（前一日 $35.30）。\n\n**须知**\n1. 花费集中在香港川页。")
+    # The store that stopped spending is flagged too, so its operator is named and mentioned that day.
+    assert result["stores"] == ["102", "106"] and "requests" not in result["summary"] and "evidence" not in result["summary"]
 
 
 def test_a_daily_report_without_the_store_line_asks_which_stores_it_flags(monkeypatch, settings):

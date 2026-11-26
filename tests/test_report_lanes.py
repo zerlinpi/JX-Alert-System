@@ -526,10 +526,13 @@ def test_excel_copies_are_dated_and_hold_the_report_tables(settings, session_fac
     assert re.findall(r'<sheet name="([^"]+)"', workbook_xml) == ["完整内容", "全公司核心指标", "有花费店铺明细"]
     assert {"统计日（美西）：2026-11-22", "对比日：2026-11-21"} <= set(strings)
     assert any(text.startswith("生成时间（北京）：2026-11-24 08:30") for text in strings)
-    # Store table: the date first (sheets of many days stack), 运营 last as on the card, money as numbers.
-    assert [cell(f"{column}1") for column in "ABCK"] == ["统计日（美西）", "店铺", "广告花费", "运营"]
+    # Store table: the date first (sheets of many days stack), the owner's lead figures, 运营 last as on the
+    # card, money as numbers.
+    assert [cell(f"{column}1") for column in "ABCDEFGHP"] == ["统计日（美西）", "店铺", "广告花费", "ACOS", "TACOS", "CPC",
+                                                            "ROAS", "CVR", "运营"]
     assert cell("A2") == "2026-11-22" and cell("B2") == "香港川页" and cell("C2") == "3217.7"
-    assert 'autoFilter ref="A1:K3"' in detail and "&quot;$&quot;#,##0.00" in styles
+    assert cell("F2") == "1.52" and cell("G2") == "2.8"  # CPC and ROAS are numbers too
+    assert 'autoFilter ref="A1:P3"' in detail and "&quot;$&quot;#,##0.00" in styles
 
 
 def test_a_message_without_its_excel_still_goes_out(settings, session_factory, monkeypatch):

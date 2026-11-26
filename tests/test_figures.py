@@ -45,6 +45,29 @@ def test_rounding_points_and_other_ways_of_writing_a_change_are_accepted():
     assert figures.check_changes(table) == (table, 0)
 
 
+def test_the_store_table_is_led_by_the_figures_the_owner_reads_first():
+    """Owner (Nov 26 2026): 广告花费、ACOS、TACOS、CPC、ROAS、CVR right after 店铺, whatever order the model wrote."""
+    written = ("| 指标 | 当日 | 前一日 | 环比 |\n|---|---|---|---|\n| ACOS | 27.9% | 25.3% | +2.6pp |\n\n"
+               "**有花费店铺明细**\n"
+               "| **店铺** | 广告花费 | 广告销售额 | 总销售额 | ACOS | TACOS | 花费日环比 | 运营 | PPC（CPC） | ROAS | CVR |\n"
+               "|:---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|\n"
+               "| 香港川页 | $2,990.52 | $12,235.71 | $23,932.80 | 24.4% | 12.5% | -11.6% | 未映射运营 | $1.33 | 4.09 | 11.0% |\n"
+               "| 汤宝 | $408.72 | $1,092.77 | — | 37.4% | — | -27.0% | 姚文婷 |\n\n**须知**\n1. 花费集中。")
+    text = figures.arrange_store_table(written)
+    lines = text.split("\n")
+    assert lines[:5] == written.split("\n")[:5]  # the company table is not touched
+    assert lines[5] == ("| **店铺** | 广告花费 | ACOS | TACOS | PPC（CPC） | ROAS | CVR | 广告销售额 | 总销售额 | 花费日环比 "
+                        "| 运营 |")
+    assert lines[6] == "|---|---|---|---|---|---|---|---|---|---|---|"
+    assert lines[7] == ("| 香港川页 | $2,990.52 | 24.4% | 12.5% | $1.33 | 4.09 | 11.0% | $12,235.71 | $23,932.80 "
+                        "| -11.6% | 未映射运营 |")
+    assert lines[8] == "| 汤宝 | $408.72 | 37.4% | — | — | — | — | $1,092.77 | — | -27.0% | 姚文婷 |"  # short row
+    assert lines[9:] == ["", "**须知**", "1. 花费集中。"]
+    assert figures.arrange_store_table(text) == text  # already in order: unchanged
+    site = "| 站点 | 总销售额 | 广告花费 |\n|---|---|---|\n| 美国 | $1 | $2 |"
+    assert figures.arrange_store_table(site) == site  # only the store table is arranged
+
+
 def test_a_wrong_number_that_is_also_a_table_figure_is_left_in_the_text():
     text = ("| 指标 | 当日 | 前一日 | 环比 |\n|---|---|---|---|\n| 广告花费 | $6,072.34 | $7,093.46 | -22.7% |\n\n"
             "| 店铺 | ACOS |\n|---|---|\n| Campx | 22.7% |\n\n花费降 22.7%。")

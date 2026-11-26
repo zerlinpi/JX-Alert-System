@@ -1,10 +1,13 @@
-"""The daily report's 环比 column, checked against the 当日 and 前一日 values of the same row.
+"""The daily report's tables, checked and arranged by the system.
 
 DeepSeek writes every figure. A slip in its arithmetic (live, Nov 2026: 广告花费 $6,072.34 against
 $7,093.46 written as -22.7% instead of -14.4%, and the -22.7% repeated in 须知) is corrected from
 the two values of that row, and text repeating the wrong percentage follows the table. A change
 is only corrected when no rounding of the two shown values can give it; nothing is recomputed
 from SparkX.
+
+The store table shows the figures the owner reads first right after the store name (owner,
+Nov 26 2026): 广告花费, ACOS, TACOS, CPC, ROAS, CVR, whatever order the model wrote.
 """
 import itertools
 import re
@@ -70,6 +73,46 @@ def _fix(cell, today, before):
     # Only a percentage with the same direction is followed in the text; other numbers are too ambiguous there.
     follow = (relative or points) and (value < 0) == (right < 0)
     return fixed, ((wrong, number) if follow else None)
+
+
+# The columns of the daily store table that come right after 店铺, in this order (owner, Nov 26 2026).
+LEADING = ("广告花费", "ACOS", "TACOS", "CPC", "ROAS", "CVR")
+_ALIASES = {"PPC": "CPC", "CPC(PPC)": "CPC", "PPC(CPC)": "CPC"}
+
+
+def _column(name):
+    """A header as LEADING names it: no markup or spaces, ASCII upper case, 「PPC（CPC）」 → CPC."""
+    key = name.replace("**", "").replace("（", "(").replace("）", ")").replace(" ", "").strip().upper()
+    return _ALIASES.get(key, key)
+
+
+def arrange_store_table(text):
+    """The daily report with its store table (header 「店铺 | … 广告花费 …」) led by the LEADING columns.
+
+    Every other column keeps its place in the written order after them (the cards still put 运营
+    last). Rows shorter than the header get 「—」, as the cards show them; other tables are untouched.
+    """
+    lines = (text or "").split("\n")
+    for index in range(len(lines) - 1):
+        if not lines[index].strip().startswith("|") or not _SEPARATOR.match(lines[index + 1].strip()):
+            continue
+        keys = [_column(cell) for cell in _cells(lines[index])]
+        if keys[0] != "店铺" or "广告花费" not in keys:
+            continue
+        lead = [keys.index(name) for name in LEADING if name in keys]
+        order = [0, *lead, *(position for position in range(1, len(keys)) if position not in lead)]
+        if order == list(range(len(keys))):
+            return text
+        row = index
+        while row < len(lines) and lines[row].strip().startswith("|"):
+            if row == index + 1:
+                lines[row] = "|" + "|".join(["---"] * len(keys)) + "|"
+            else:
+                cells = _cells(lines[row]) + [" — "] * len(keys)
+                lines[row] = "|" + "|".join(cells[position] for position in order) + "|"
+            row += 1
+        return "\n".join(lines)
+    return text
 
 
 def check_changes(text):

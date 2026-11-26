@@ -44,9 +44,12 @@
   contract around the owner's editable task text. Hourly findings must name a
   campaign ID that SparkX returned and satisfy the owner's thresholds, or they are
   dropped; each campaign/category is alerted once per marketplace day. Missing data
-  stays missing, never zero. The daily report's line of stores without data is
-  written by the system from that run's SparkX rows (`reports/coverage.py`), not
-  by the model.
+  stays missing, never zero. The system, not the model, settles the daily report
+  (`reports/coverage.py`, `reports/figures.py`): no overview before the first
+  section, the store table led by 广告花费, ACOS, TACOS, CPC, ROAS, CVR (owner, Nov
+  26 2026), nothing under it but the system's line of stores that spent the day
+  before and nothing on the day (from that run's SparkX rows), no 须知 sentence
+  without information, and every 环比 checked against its row.
 - The Feishu bot chats freely (any topic) and uses SparkX only when data is needed;
   it keeps the recent turns of one conversation. Group replies stay in the report
   group; private replies only for leads, operators and report-group members. It
@@ -77,9 +80,11 @@
   come second and give way on conflict. Texts are lean: conclusions, data and
   suggestions, with no footer or line about the data source, how the text was
   generated, query counts or the query/analysis process, and titles do not say
-  "SparkX". What the Skills require readers to be told (provisional recent
-  conversions, USD for multi-store money, incomplete or missing data) stays, in one
-  short phrase. The bot puts an 「OK」 reaction on each question it is about to
+  "SparkX". Every sentence must carry information (owner, Nov 26 2026, replacing
+  the earlier one-phrase rule): no reader notes even when a Skill or `meta.hint`
+  asks for them (provisional or still-accumulating conversions, USD, data not
+  updated), no overview of scope or store counts, no empty findings (「无」「本期无
+  检出」); missing figures are 「—」. The bot puts an 「OK」 reaction on each question it is about to
   answer (once per question, never on one it will not answer). The console session
   is renewed while it is used (12 hours idle, 7 days at most).
 - Console previews never queue anything. A test send (owner's explicit click)

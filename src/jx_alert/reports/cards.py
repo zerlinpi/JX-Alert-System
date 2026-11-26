@@ -17,7 +17,8 @@ from jx_alert.notifications.cards import MAX_MENTION_LINE_BYTES, card_fits, mark
 # Room for the send-time line "对应运营：<at id=…></at>（店铺） …" (see notifications.cards).
 MENTION_RESERVE = 2048
 MAX_CARDS = 4
-MAX_COLUMNS = 14
+# Feishu shows up to 50 columns; the daily store table has 15 since the owner's lead metrics (Nov 26 2026).
+MAX_COLUMNS = 16
 MAX_ROWS = 60
 _SEPARATOR = re.compile(r"^\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?$")
 _LINK = re.compile(r"\[([^\]\n]{1,200})\]\((?:https?://|mailto:)[^)\s]{1,500}\)")
@@ -146,7 +147,7 @@ HOURLY_ORDER = ("high_spend_no_conversion", "high_spend_low_conversion", "low_sp
                 "low_spend_high_conversion")
 HOURLY_LABELS = {"high_spend_no_conversion": "高花费无转化", "high_spend_low_conversion": "高花费低转化",
                  "low_spend_no_conversion": "低花费无转化", "low_spend_high_conversion": "低花费高转化"}
-INTRADAY_NOTE = "今日数据仍在累计，广告订单会延迟回补；金额 USD。"
+NO_CONVERSION = ("high_spend_no_conversion", "low_spend_no_conversion")
 
 
 def _money(value):
@@ -166,17 +167,20 @@ def hourly_title(day, time):
 
 
 def hourly_lead(findings, *, scoped=False):
-    """The first line of an hourly alert: counts plus the one data note the SparkX Skill requires."""
+    """The first line of an hourly alert: what triggered, and what the campaigns without a single ad
+    order have spent. No reader notes (owner, Nov 26 2026: 「今日数据仍在累计…金额 USD」 says nothing)."""
     stores = len({item["pid"] for item in findings})
-    return (("你负责的店铺中，" if scoped else "") + f"{stores} 个店铺 {len(findings)} 个广告活动触发提醒。"
-            + INTRADAY_NOTE)
+    line = ("你负责的店铺中，" if scoped else "") + f"{stores} 个店铺 {len(findings)} 个广告活动触发提醒"
+    wasted = [item for item in findings if item["category"] in NO_CONVERSION]
+    if wasted:
+        line += f"，其中 {len(wasted)} 个无转化活动共花费 {_money(sum(item['spend'] for item in wasted))}"
+    return line + "。"
 
 
 def hourly_card(findings, *, day, time, names, operators, scoped=False, cap=10):
     """The alert table of new findings, grouped by category; None when there is nothing to send.
 
-    The title carries the marketplace day and time; the body is the alerts plus the one data note
-    the SparkX Skill requires (intraday figures are not final; multi-store money is USD).
+    The title carries the marketplace day and time; the body is the lead line and the alerts.
     """
     if not findings:
         return None

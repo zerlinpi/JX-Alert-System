@@ -95,7 +95,7 @@ def test_the_first_sheet_holds_the_whole_message_with_every_table():
     lines = [row[0] for row in found if len(row) == 1]
     assert lines[:5] == ["广告日报 · 2026-11-22", "统计日（美西）：2026-11-22", "对比日：2026-11-21",
                          "对应运营：高爽（Campx）；未映射运营：香港川页", "生成时间（北京）：2026-11-25 08:31"]
-    assert "全公司核心指标" in lines and "须知" in lines and lines[-1] == "3. 总订单还没更新，暂记「—」。"
+    assert "全公司核心指标" in lines and "须知" in lines and lines[-1] == "3. Campx ACOS 22.1%、ROAS 4.52，可加预算放量。"
     # Both tables are on this sheet, with every row, numbers as numbers and 运营 last.
     header = found.index(["指标", "当日", "前一日", "环比"])
     assert found[header - 1] == ["全公司核心指标"] and found[header + 1] == ["总销售额", 12345.0, 11000.0, 0.122]

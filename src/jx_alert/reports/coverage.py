@@ -1,14 +1,17 @@
-"""The daily report's list of stores without data, stated by the system from SparkX's own rows.
+"""The daily report's statements about stores, made by the system from SparkX's own rows.
 
-DeepSeek writes the daily report from SparkX. Which monitored stores it could not show
-(no ad rows that day, no store totals, store orders not updated yet) is decided here,
-from the SparkX results the report was written from, so the list is complete and never
-contradicts the tables. In a live run the model's own list once missed a store and said
-a store had no total sales while its table showed them (owner, Nov 2026).
+Every sentence of a report must carry information (owner, Nov 26 2026). So the report no
+longer lists the monitored stores without ad data or spend (mostly the same dormant
+stores every day), nor explains which store totals are not updated (the table shows
+「—」). What stays is the change a reader acts on: stores that spent on the day before and
+nothing on the report day. It is decided here, from the SparkX results the report was
+written from, because the model's own lists were unreliable (a live run missed a store
+and called a store with sales 「暂无数据」, Nov 2026).
 
-Missing data stays missing: a store only counts as having no data when a complete,
-unfiltered query that covered it returned no row for the day. When the results cannot
-settle every monitored store, the report stays exactly as DeepSeek wrote it.
+Missing data stays missing: a store only counts as having no spend when SparkX returned
+a zero-spend row for it, or a complete, unfiltered query that covered it returned no row
+for the day. Stores the rows cannot settle are never named. Remarks on missing data that
+DeepSeek writes anyway are removed, and so is any overview before the first section.
 """
 from collections import defaultdict
 from datetime import datetime
@@ -16,11 +19,14 @@ import json
 import re
 
 TOOL = "get_ads_perf"
-DASH_NOTE = "（表中记「—」）"
-# A line DeepSeek wrote under the store table to list the stores without spend or data.
+STOPPED_LABEL = "当日无广告花费（前一日有）："
+# A line DeepSeek wrote under the store-table heading (no table) to list the stores without spend or data.
 _LIST_LINE = re.compile(r"无广告花费|无花费|没有(?:广告)?花费|暂无|无数据|没有数据|未返回|没有返回|缺数据|未更新|没更新")
-# A 须知 sentence about missing or not yet updated data: the system's line states that instead.
-_CLAIM = re.compile(r"暂无\S{0,6}数据|无数据|没有数据|缺(?:失)?数据|数据缺失|未返回|没有返回|未更新|没更新|没有更新")
+# A 须知 sentence without information for the reader (owner, Nov 26 2026): a remark on missing or not yet
+# updated data, a reader note (provisional, still accumulating, currency) or an empty finding (「…：无。」).
+_CLAIM = re.compile(r"暂无\S{0,6}数据|无数据|没有数据|缺(?:失)?数据|数据缺失|未返回|没有返回|未更新|没更新|没有更新"
+                    r"|暂定|仍在累计|还在累计|回补|折算|金额[^。；;]{0,10}USD|USD\s*计"
+                    r"|[：:]\s*(?:无|没有|暂无)\s*[。.；;]?\s*$")
 _SENTENCE = re.compile(r"[^。；;]+[。；;]?|[。；;]")
 _MARKER = re.compile(r"^(\s*(?:[-*+]\s+|\d+[.、．]\s*))")
 _NUMBERED = re.compile(r"^(\s*)\d+([.、．]\s*)")
@@ -67,33 +73,37 @@ def _result(text):
 
 
 def observe(summary, entity, day, monitored):
-    """({store: its rows of that day}, {stores a complete unfiltered query showed without a row that day})."""
-    found, without = defaultdict(list), set()
+    """({store: its rows of that day}, {stores a query showed without a row that day}).
+
+    Only complete, unfiltered answers whose rows all name their store count: a partial answer can
+    hide a store's other rows. A store's rows come from one answer, so a day queried twice is not
+    added up twice.
+    """
+    found, without = {}, set()
     calls = zip(summary.get("tools_used") or (), summary.get("requests") or (), summary.get("evidence") or ())
     for name, arguments, text in calls:
         if name != TOOL or not isinstance(arguments, dict) or arguments.get("factEntity") != entity:
             continue
         start, end = _day(arguments.get("dateStart")), _day(arguments.get("dateEnd"))
         rows, complete = _result(text)
-        if rows is None or start is None or end is None or not start <= day <= end:
+        if (rows is None or not complete or arguments.get("filters") or start is None or end is None
+                or not start <= day <= end):
             continue
+        pids = [_pid(row.get("profileId")) for row in rows]
+        if None in pids:
+            continue  # rows that cannot be told apart by store settle nothing
         single = start == end
         dated = single or any("date" in row for row in rows)
-        on_day, in_range, attributable = set(), set(), True
-        for row in rows:
-            pid = _pid(row.get("profileId"))
-            if pid is None:
-                attributable = False
-                continue
-            in_range.add(pid)
+        on_day = defaultdict(list)
+        for pid, row in zip(pids, rows):
             if pid in monitored and (single or _day(row.get("date")) == day):
-                on_day.add(pid)
-                found[pid].append(row)
-        if complete and attributable and not arguments.get("filters"):
-            covered = {_pid(value) for value in arguments.get("profileIds") or ()} & set(monitored)
-            # Totals over several days without a date: only a store without any row had nothing that day.
-            without |= covered - (on_day if dated else in_range)
-    return dict(found), without - set(found)
+                on_day[pid].append(row)
+        for pid, values in on_day.items():
+            found.setdefault(pid, values)
+        covered = {_pid(value) for value in arguments.get("profileIds") or ()} & set(monitored)
+        # Totals over several days without a date: only a store without any row had nothing that day.
+        without |= covered - (set(on_day) if dated else set(pids))
+    return found, without - set(found)
 
 
 def _sum(rows, field):
@@ -102,61 +112,33 @@ def _sum(rows, field):
     return sum(values) if values else None
 
 
-def classify(summary, *, monitored, day):
-    """Which monitored stores had spend, no spend, or no ad data that day, and the gaps in store totals.
-
-    None when SparkX's rows in this run cannot settle every monitored store.
-    """
+def stopped(summary, *, monitored, day, previous):
+    """{store: its ad spend on ``previous``} of the monitored stores that spent on ``previous`` and,
+    by SparkX's rows, nothing on ``day``. A store the rows cannot settle is left out."""
     monitored = set(monitored)
     ads, no_ads = observe(summary, "campaign", day, monitored)
-    spent, idle = set(), set()
-    for pid in monitored:
+    before, _ = observe(summary, "campaign", previous, monitored)
+    found = {}
+    for pid, rows in before.items():
+        spend = _sum(rows, "Spend")
+        if spend is None or spend <= 0:
+            continue
         if pid in ads:
-            spend = _sum(ads[pid], "Spend")
-            if spend is None:
-                return None
-            (spent if spend > 0 else idle).add(pid)
+            today = _sum(ads[pid], "Spend")
+            if today is None or today > 0:
+                continue
         elif pid not in no_ads:
-            return None
-    totals, no_totals = observe(summary, "asin", day, monitored)
-    totals_missing, lagging, counted = set(), set(), set()
-    for pid in spent:
-        sales = _sum(ads[pid], "Sales") or 0
-        rows = totals.get(pid)
-        if rows:
-            amount = _sum(rows, "TotalSalesAmount")
-            if amount is not None and amount <= 0 < sales:
-                totals_missing.add(pid)  # ad sales but no store sales: SparkX has no store totals
-            orders, units = _sum(rows, "OrderCount"), _sum(rows, "UnitCount")
-            if orders is not None and units is not None and units > 0:
-                counted.add(pid)
-                if orders <= 0:
-                    lagging.add(pid)  # units sold but no orders yet: store orders are not updated
-        elif pid in no_totals and sales > 0:
-            totals_missing.add(pid)
-    return {"spent": spent, "idle": idle, "missing": monitored - spent - idle, "totals_missing": totals_missing,
-            "orders_lagging": lagging, "orders_counted": counted}
+            continue
+        found[pid] = spend
+    return found
 
 
-def note(found, names):
-    """One line: stores without ad data or spend, then gaps in the store totals; "" when there are none."""
-    def listed(pids):
-        return "、".join(sorted(names.get(pid, pid) for pid in pids))
-
-    parts = []
-    if found["missing"]:
-        parts.append("暂无广告数据：" + listed(found["missing"]))
-    if found["idle"]:
-        parts.append("当日无广告花费：" + listed(found["idle"]))
-    gaps = []
-    if found["totals_missing"]:
-        gaps.append("暂无店铺总数据：" + listed(found["totals_missing"]))
-    if found["orders_lagging"]:
-        every = found["orders_lagging"] == found["orders_counted"] and len(found["orders_counted"]) > 1
-        gaps.append("各店总订单尚未更新" if every else "总订单尚未更新：" + listed(found["orders_lagging"]))
-    if gaps:
-        parts.append("；".join(gaps) + DASH_NOTE)
-    return "；".join(parts) + "。" if parts else ""
+def note(stopped_stores, names):
+    """「当日无广告花费（前一日有）：OCTORA（前一日 $47.80）、…。」, largest spend first; "" when none."""
+    if not stopped_stores:
+        return ""
+    ranked = sorted(stopped_stores.items(), key=lambda item: (-item[1], names.get(item[0], item[0])))
+    return STOPPED_LABEL + "、".join(f"{names.get(pid, pid)}（前一日 ${spend:,.2f}）" for pid, spend in ranked) + "。"
 
 
 # ---------------------------------------------------------------- the report text
@@ -213,17 +195,29 @@ def _without_claims(line):
     return prefix + re.sub(r"[；;，,、]$", "。", kept)
 
 
+def without_preamble(text):
+    """The daily report from its first section heading or table on: an overview before it only restated
+    the scope, the currency and that conversions are provisional (owner, Nov 26 2026: no such text).
+    Unchanged when the report has no heading or table at all."""
+    lines = (text or "").split("\n")
+    first = next((index for index, value in enumerate(lines) if _heading(value) or value.strip().startswith("|")),
+                 None)
+    return "\n".join(lines[first:] if first else lines).strip()
+
+
 def apply(text, line):
-    """The report with the system's ``line`` under the store table instead of DeepSeek's own list,
-    and the 须知 without remarks on missing data (the line states them)."""
+    """The report with the system's ``line`` under the store table and nothing else there (the task asks
+    for no notes or store lists under it), and the 须知 without sentences that carry no information."""
     lines = (text or "").split("\n")
     anchor = _anchor(lines)
     if anchor is not None:
+        under_table = lines[anchor].strip().startswith("|")
         end = anchor + 1
         while end < len(lines) and not _heading(lines[end]) and not lines[end].strip().startswith("|"):
             end += 1
+        # Under the table nothing stays; under a heading without a table only DeepSeek's store lists go.
         lines[anchor + 1:end] = [value for value in lines[anchor + 1:end]
-                                 if not (value.strip() and _LIST_LINE.search(value))]
+                                 if not value.strip() or not under_table and not _LIST_LINE.search(value)]
     notes = _notes(lines)
     if notes is not None:
         start, end = notes

@@ -155,15 +155,19 @@ def directory_table(roster, directory, *, only_monitored=False):
     return "\n".join(lines)
 
 
-# Owner decision (Nov 2026): SparkX's data and its official Skills come first, JX's own task texts second.
+# Owner decisions (Nov 2026): SparkX's data and its official Skills come first, JX's own task texts second;
+# every sentence must carry information, so the reader notes the Skills ask for are not written (Nov 26).
 PRIORITY = (
     "要求的优先级（有冲突时按顺序取舍）：\n"
-    "1. 第一优先级：SparkX 返回的数据，以及 SparkX 官方 Skill 和结果 meta.hint 的要求——查询方法、指标口径、"
-    "数据解读，以及它们要求向读者说明的事项（例如最近几天的广告订单、广告销售额和 ACOS 是暂定值，多店金额是 USD，"
-    "分页没取完或数据缺失、不足以下结论，相关不等于因果）。Skill 里的示例报告格式只是示意，不算这里的要求。\n"
+    "1. 第一优先级：SparkX 返回的数据，以及 SparkX 官方 Skill 和结果 meta.hint 里关于查询方法、指标口径和数据解读的要求"
+    "（例如分页没取完不当作全部、查不到的数据不是 0、比率由基础指标重新计算、相关不等于因果）。"
+    "Skill 里的示例报告格式只是示意，不算这里的要求。\n"
     "2. 第二优先级：JX 的任务说明和输出要求——写哪些内容、结构、表格和列、篇幅和措辞；"
     "在不违背第 1 条的前提下照做，冲突时以第 1 条为准。\n"
-    "3. 从简：第 1 条要求说明的事项用一句短话或在表格里标注，不展开；不写数据来源、生成方式、查询次数和查询过程。"
+    "3. 每句话都要有信息量（所有者要求）：只写结论、数据和建议。Skill 和 meta.hint 要求提醒读者的话"
+    "（例如近期数据是暂定值、仍在累计或会回补，金额是 USD，部分数据未更新）一律不写；查不到的数据在表格里写「—」，"
+    "数据不足以支撑的结论不写。不写统计范围、监控或有数据的店铺数、数据来源、生成方式、查询次数和查询过程，"
+    "不写「无」「无检出」这类没有内容的句子。"
 )
 
 
@@ -222,7 +226,7 @@ def system_prompt(*, now, tool_names, skills_index, roster, directory, instructi
     if mode == "chat":
         parts.append(
             "对话方式：你在飞书里与同事自由交流，可以回答任何问题，不限于广告；只有需要数据时才调用 SparkX 工具。"
-            "用自然、简洁的中文回答，先说结论；SparkX 和 Skill 要求说明的事项一句话带过，"
+            "用自然、简洁的中文回答，先说结论，每句话都要有信息量；不写币种、暂定值、数据仍在累计之类的提醒，"
             "不介绍数据来源、查询过程和分析方法，除非对方问起；"
             "展示数据时用 Markdown 表格（每张不超过 20 行）。"
             "不要输出代码块或 JSON，不要 @ 任何人，不要附链接。")

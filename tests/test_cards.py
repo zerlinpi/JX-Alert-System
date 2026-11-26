@@ -49,8 +49,10 @@ def test_hourly_card_groups_findings_and_names_operators_in_the_last_column():
     text = plain_text(value)
     assert value["header"]["title"]["content"] == "广告实时监控 · 美西 2026-11-23 22:05"
     assert value["header"]["template"] == "red"
-    # One line: the alert count plus the data note the SparkX Skill requires; no source or method.
-    assert value["body"]["elements"][0]["content"] == "2 个店铺 3 个广告活动触发提醒。今日数据仍在累计，广告订单会延迟回补；金额 USD。"
+    # One line with information only (owner, Nov 26 2026): what triggered and what campaigns without an ad
+    # order spent; no 「今日数据仍在累计…金额 USD」 note, no source or method.
+    assert value["body"]["elements"][0]["content"] == "2 个店铺 3 个广告活动触发提醒，其中 2 个无转化活动共花费 $53.70。"
+    assert cards.hourly_lead(HOURLY_FINDINGS[2:], scoped=True) == "你负责的店铺中，1 个店铺 1 个广告活动触发提醒。"
     assert "店铺 | 广告活动 | 花费 | 点击 | 广告订单 | ACOS | CVR | 建议 | 运营" in text
     assert "**高花费无转化（1）**" in text and "低花费高转化（1）" in text
     assert "Campx | Campaign 9001 | $41.20 | 28 | 0 | — | 0.0% | 先看今日搜索词 | 高爽" in text

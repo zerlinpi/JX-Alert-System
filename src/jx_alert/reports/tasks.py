@@ -34,18 +34,17 @@ DEFAULT_PROMPTS = {
 口径：订单、销量、销售额都分「广告」和「总」两种，表格和正文都照下面的名称写：
 - 广告花费、广告销售额、广告订单、广告销量、点击：factEntity=campaign 的 Spend、Sales、Conversions、Units、Clicks（含 SP、SB、SD 全部广告）。
 - 总销售额、总订单、总销量（店铺全部销售，含自然单）：factEntity=asin 的 TotalSalesAmount、OrderCount、UnitCount。asin 表只取这三项，广告指标一律用 campaign 的合计。
-- ACOS = 广告花费 ÷ 广告销售额；TACOS = 广告花费 ÷ 总销售额；CVR = 广告订单 ÷ 点击；PPC = 广告花费 ÷ 点击；ROAS = 广告销售额 ÷ 广告花费；比率类的环比写百分点。
+- ACOS = 广告花费 ÷ 广告销售额；TACOS = 广告花费 ÷ 总销售额；CVR = 广告订单 ÷ 点击；CPC（PPC）= 广告花费 ÷ 点击；ROAS = 广告销售额 ÷ 广告花费；比率类的环比写百分点。
 - 店铺总数据（总销售额、总订单、总销量）比广告数据更新得晚，也可能缺失：某店总订单为 0 但总销量大于 0，是总订单还没更新；总销售额为 0 但广告销售额大于 0，是 SparkX 没有返回这家店的店铺总数据。这两种情况写「—」，不当成 0。全公司的总销售额、总订单、总销量只加有数据的店铺；全公司 TACOS = 有总销售额数据的店铺的广告花费合计 ÷ 这些店铺的总销售额合计（不能用全公司广告花费去除）。
-结构（按下面的顺序写，不加别的段落）：
-1. 开头一句话：对比日、监控店铺数、当日有广告花费的店铺数，并按 Skill 要求注明金额为 USD、广告订单和广告销售额等转化数据是暂定值。
-2. **全公司核心指标**：表格「指标 | 当日 | 前一日 | 环比」，依次为总销售额、广告销售额、总订单、广告订单、总销量、广告销量、广告花费、ACOS、TACOS、CVR、PPC（CPC）、ROAS。
-3. **站点汇总**（监控店铺分布在两个及以上站点时才写，只有一个站点时省略）：表格「站点 | 店铺数 | 有数据 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费环比」。
-4. **有花费店铺明细**：表格「店铺 | 广告花费 | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | ACOS | TACOS | 花费日环比 | 运营」，按广告花费从高到低；表格下方一行写「暂无广告数据：…」（SparkX 没有返回当日广告数据的店铺）和「当日无广告花费：…」（有数据但当日没有花费的店铺）。
-5. **须知**：2–4 条编号短评，每条一两句话、不超过 60 字，先下结论再给关键数字：花费是否集中、ACOS 明显偏高的店铺、有广告花费但没有广告订单的店铺。缺数据或数据未更新的店铺不写进开头和须知：系统会按 SparkX 返回的数据，在明细表下方统一列出。
-订单和销量写整数，百分比保留一位小数。""",
-    "review": """判定方法（金额 USD）：先按 campaign 找出候选，再结合主推产品以往的数据和产品的价值、类型，判断是否真的异常、有多严重。
+结构（按下面的顺序写，不加别的段落；第一行就是「全公司核心指标」，前面不写任何概述）：
+1. **全公司核心指标**：表格「指标 | 当日 | 前一日 | 环比」，依次为总销售额、广告销售额、总订单、广告订单、总销量、广告销量、广告花费、ACOS、TACOS、CVR、PPC（CPC）、ROAS。
+2. **站点汇总**（监控店铺分布在两个及以上站点时才写，只有一个站点时省略）：表格「站点 | 广告花费 | ACOS | TACOS | CPC | ROAS | CVR | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | 花费环比」。
+3. **有花费店铺明细**：表格「店铺 | 广告花费 | ACOS | TACOS | CPC | ROAS | CVR | 广告销售额 | 总销售额 | 广告订单 | 总订单 | 广告销量 | 总销量 | 花费日环比 | 运营」，按广告花费从高到低，只列当日有广告花费的店铺；表格下方不写说明或店铺名单。
+4. **须知**：2–4 条编号短评，每条一两句话、不超过 60 字，先下结论再给关键数字：花费是否集中、ACOS 明显偏高的店铺、有广告花费但没有广告订单的店铺、整体效率的变化。没有发现的问题不写（不写「无」）；不写数据缺失、未更新、暂定值或币种之类的说明。
+订单和销量写整数，百分比保留一位小数，CPC 写两位小数的金额，ROAS 保留两位小数。""",
+    "review": """判定方法：先按 campaign 找出候选，再结合主推产品以往的数据和产品的价值、类型，判断是否真的异常、有多严重。
 - 主推产品：只对候选 campaign 查（不扫全店）。用 factEntity=productAd、select campaign.campaignId_ 和 productAd.asin_，取每个候选 campaign 花费最多的 ASIN；再查这些 ASIN 在基准期（前 7 日之前的 30 天）的广告花费、广告销售额、广告订单、点击，以及售价 asin.asinPrice_、类目 asin.asinCategoryInfo_、SP 上线日 asin.asinOpenDate_。
-- 产品价值：客单价 = 基准期广告销售额 ÷ 广告订单（基准期没有广告订单时用售价）。单笔允许花费 T = 客单价 × 目标 ACOS；没有给定目标 ACOS 时用该店近 30 天的 ACOS（Skill 规则），在开头注明一次。
+- 产品价值：客单价 = 基准期广告销售额 ÷ 广告订单（基准期没有广告订单时用售价）。单笔允许花费 T = 客单价 × 目标 ACOS；没有给定目标 ACOS 时用该店近 30 天的 ACOS（Skill 规则）。
 - 产品历史：基准期 CVR = 广告订单 ÷ 点击，ACOS = 广告花费 ÷ 广告销售额，CPA = 广告花费 ÷ 广告订单。基准期广告订单少于 3 单为样本不足：只按 T 判断，标注「样本不足」。
 - 产品类型：SP 上线不足 90 天的新品、客单价 ≥ $150 的高客单产品转化慢、单量少，照常按 T 判断，但标注「新品期」「高客单」并把严重程度降一级；季节性明显的类目注明。
 判定口径：
@@ -58,10 +57,10 @@ DEFAULT_PROMPTS = {
 - 托管组里的 campaign（campaign.aiGroupId_ 不为 0）由 AI 调价：只给托管组层面的建议（目标 ACOS、组预算），不给出价数字。
 - 同类问题按浪费的金额排序：浪费 = 花费 − 广告订单 × 产品历史 CPA（没有历史时用 T）。
 结构：
-开头一句加粗：「N 个店铺中，M 个有投放数据，K 个检出 X 个异常 campaign。」，再一句整体广告花费、广告销售额、ACOS 的变化，并按 Skill 要求用半句话注明近 7 日的转化数据是暂定值、T 用的是哪个 ACOS。
+开头一句加粗：「K 个店铺检出 X 个异常 campaign，合计浪费约 $Y。」，紧接一句写近 7 日广告花费、广告销售额、ACOS 和它们较前 7 日的变化。开头不写店铺总数、有投放数据的店铺数、币种、暂定值和判定阈值的取法。
 **一、最严重**：最需要马上处理的问题，一两句话说明为什么严重（带浪费金额和产品客单价）。
 **二、异常店铺总览**：表格「店铺 | 近7日花费 | ACOS 近7日 | 前7日 | 异常数 | 主要问题 | 运营」。
-**三、按问题类型看具体 campaign**：每类一张表，表前只写类型名称（例如「① 高花费零出单」），不重复判定条件；表格「店铺 | Campaign | 主推产品 | 客单价 | 近7日花费 | 点击 | 广告订单 | ACOS | 产品历史 | 建议 | 运营」：主推产品写 ASIN（可带简短品名），产品历史写基准期 CVR 和 ACOS（例如「CVR 6.2% / ACOS 28%」，样本不足写「样本不足」），建议写建议 CPC（例如 2.45 → 1.80；托管组写组层面建议）；⑤ 机会单独列出。
+**三、按问题类型看具体 campaign**：每类一张表，表前只写类型名称（例如「① 高花费零出单」），不重复判定条件；表格「店铺 | Campaign | 主推产品 | 客单价 | 近7日花费 | 点击 | 广告订单 | ACOS | 产品历史 | 建议 | 运营」：主推产品写 ASIN（可带简短品名），产品历史写基准期 CVR 和 ACOS（例如「CVR 6.2% / ACOS 28%」，样本不足写「样本不足」），建议写建议 CPC（例如 2.45 → 1.80；托管组写组层面建议）；⑤ 机会单独列出。没有检出的类型整段不写（不写「本期无检出」），也不写排查过程（例如「已确认处于暂停状态」）。
 **四、建议动作**：3–5 条，每条针对上面已列出的一个异常店铺、不超过 60 字，先说动作再说理由，带具体的出价或预算建议（托管组除外）；没有列出的店铺不写。
 口吻直接，像资深投手在群里复盘。""",
     "hourly": "",
@@ -91,9 +90,10 @@ def _scope(monitored):
 
 
 _OUTPUT = ("输出要求：直接输出发到飞书群的正文（Markdown），不要开场白和结束语，不要代码块、链接或 @ 任何人；"
-           "篇幅从简，只写结论、数据和建议：不写数据来源、生成方式、查询次数和查询或分析过程，不复述口径和公式，"
-           "不重复标题里已有的报告名称和日期；SparkX 结果和官方 Skill 要求说明的事项（例如近期的广告订单、"
-           "广告销售额是暂定值，多店金额是 USD，数据不全）照写，但只用一句短话；"
+           "每句话都要有信息量，只写结论、数据和建议（所有者要求）：不写统计范围、监控或有数据的店铺数、币种、"
+           "数据是暂定值、仍在累计或会回补、数据缺失或未更新之类的说明，不写「无」「无检出」这类没有内容的句子；"
+           "不写数据来源、生成方式、查询次数和查询或分析过程，不复述口径和公式，"
+           "不重复标题里已有的报告名称和日期；"
            "表格用标准 Markdown 表格；金额带 $ 符号，保留整数或两位小数；店铺写目录里的简称；有「运营」列的表格把「运营」放在最后一列，"
            "写目录里的运营（未指定写「未映射运营」）；订单、销量、销售额写明是广告的还是店铺总的"
            "（广告订单/总订单、广告销量/总销量、广告销售额/总销售额），不要只写「订单」「销量」「销售额」；"
@@ -249,15 +249,32 @@ def _strip(summary):
     return {key: value for key, value in summary.items() if key not in {"evidence", "requests"}}
 
 
-def state_coverage(text, summary, *, monitored, roster, day):
-    """The daily report with the stores without data named by the system from SparkX's rows (see coverage)."""
-    found = coverage.classify(summary, monitored=monitored, day=day)
-    if found is None:
-        _LOG.info("Daily report: SparkX rows do not settle every store; the store list stays as written")
-        return text
-    _LOG.info("Daily report coverage: %d with spend, %d idle, %d without ad data, %d without store totals",
-              len(found["spent"]), len(found["idle"]), len(found["missing"]), len(found["totals_missing"]))
-    return coverage.apply(text, coverage.note(found, directory_module.display_names(roster)))
+def state_coverage(text, summary, *, monitored, roster, day, previous):
+    """(the daily report as the system settles it, the stores that stopped spending; see coverage).
+
+    DeepSeek's own notes under the store table and remarks without information in 须知 go; the stores
+    that spent on ``previous`` and nothing on ``day`` are named from SparkX's rows.
+    """
+    found = coverage.stopped(summary, monitored=monitored, day=day, previous=previous)
+    if found:
+        _LOG.info("Daily report: %d store(s) spent the day before and nothing on the day", len(found))
+    return coverage.apply(text, coverage.note(found, directory_module.display_names(roster))), sorted(found, key=int)
+
+
+def settle_daily(text, summary, *, monitored, roster, dates):
+    """(the daily report as sent, the stores the system adds to the flagged ones).
+
+    The system's part of the daily report (owner, Nov 2026): no overview before the first section,
+    every 环比 agrees with its row, the store table is led by the figures the owner reads first, and
+    the statements about stores come from SparkX's rows.
+    """
+    text = coverage.without_preamble(text)
+    text, corrected = figures.check_changes(text)
+    if corrected:
+        _LOG.info("Daily report: corrected %d 环比 figure(s) that did not match their own row", corrected)
+    text = figures.arrange_store_table(text)
+    return state_coverage(text, summary, monitored=monitored, roster=roster, day=dates["report_date"],
+                          previous=dates["previous_date"])
 
 
 def run_lane(settings, lane, config, *, now, directory, alerted=frozenset(), on_roster=None, token=None,
@@ -313,17 +330,17 @@ def run_lane(settings, lane, config, *, now, directory, alerted=frozenset(), on_
             _LOG.info("Hourly monitor dropped %d untraceable or inconsistent finding(s)", dropped)
         return result
     text, stores = split_stores(summary["content"], monitored)
+    dates = report_dates(now)
+    stopped = []
+    if lane == "daily" and text:
+        text, stopped = settle_daily(text, summary, monitored=monitored, roster=context["roster"], dates=dates)
     if not text:
         raise ValueError("empty report")
-    dates = report_dates(now)
-    if lane == "daily":
-        text, corrected = figures.check_changes(text)
-        if corrected:
-            _LOG.info("Daily report: corrected %d 环比 figure(s) that did not match their own row", corrected)
-        text = state_coverage(text, summary, monitored=monitored, roster=context["roster"], day=dates["report_date"])
     if stores is None:
         stores = affected_stores(client, text, context["roster"], monitored, lane=lane)
-    result.update(content=text, stores=stores or [], report_date=dates["report_date"].isoformat(),
+    # A store that stopped spending is flagged too: its operator is named (and @-mentioned) once, that day.
+    stores = list(dict.fromkeys([*(stores or []), *stopped]))
+    result.update(content=text, stores=stores, report_date=dates["report_date"].isoformat(),
                   window=[value.isoformat() for value in dates["window"]])
     return result
 
