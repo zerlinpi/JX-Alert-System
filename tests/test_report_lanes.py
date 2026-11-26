@@ -154,6 +154,65 @@ def test_daily_report_mentions_the_operators_of_the_stores_it_flags(settings, se
     assert lanes.mention_plan(settings, group.payload) == ([], {})
 
 
+def first_line(row):
+    first = row.payload["card"]["body"]["elements"][0]
+    return first["content"] if first["tag"] == "markdown" else None
+
+
+def excel_strings(settings, row):
+    from jx_alert.reports import archive
+
+    with zipfile.ZipFile(io.BytesIO(archive.read(settings, row.payload["file"]))) as book:
+        return re.findall(r"<t xml:space=\"preserve\">([^<]*)</t>", book.read("xl/sharedStrings.xml").decode())
+
+
+def test_a_leads_private_copy_names_the_operators_of_the_flagged_stores(settings, session_factory):
+    """Owner (Nov 26 2026): the group copy @-mentions the operators; the private lead copy names them."""
+    map_operators(settings, {"102": ("ou_op2", "高爽")})
+    with session_factory() as db:
+        lanes.queue_morning_lane(db, settings, "review", now=SEND, runner=runner_for())
+        db.commit()
+        group, lead = rows(db)
+        assert first_line(lead) == "对应运营：高爽（Campx）；未映射运营：香港川页"
+        assert first_line(group) != first_line(lead)  # the group copy gets its @-line at send time instead
+        assert lanes.send_mentions(settings, lead.payload) == []  # naming is not mentioning
+        group_body, lead_body = (row.payload["card"]["body"]["elements"] for row in (group, lead))
+        assert lead_body[1:] == group_body  # nothing else differs
+        # The shared Excel copy carries the same line, as plain text.
+        assert "对应运营：高爽（Campx）；未映射运营：香港川页" in excel_strings(settings, rows(db, excel=True)[1])
+
+
+def test_hourly_lead_copies_name_the_operators_too(settings, session_factory):
+    map_operators(settings, {"102": ("ou_op2", "高爽")})
+    with session_factory() as db:
+        lanes.run_hourly(db, settings, now=HOUR, runner=runner_for())
+        db.commit()
+        group, lead = rows(db)
+        assert first_line(lead) == "对应运营：高爽（Campx）；未映射运营：香港川页"
+        assert first_line(group) == cards.hourly_lead(HOURLY_FINDINGS)  # the group copy is @-mentioned instead
+        assert lead.payload["card"]["body"]["elements"][1:] == group.payload["card"]["body"]["elements"]
+    # A daily report that flags no store names nobody.
+    with session_factory() as db:
+        lanes.queue_morning_lane(db, settings, "daily", now=SEND, runner=runner_for())
+        db.commit()
+        daily_lead = [row for row in rows(db) if row.payload["delivery"]["role"] == "jx_daily_lead"][0]
+        assert "运营：" not in (first_line(daily_lead) or "")
+
+
+def test_the_operator_line_is_shortened_to_fit():
+    people = [(f"运营{number}", [f"店铺{number}-{store}" for store in range(9)]) for number in range(30)]
+    full = cards.operator_line(people[:2], ["昌泉"] * 8)
+    assert full.startswith("对应运营：运营0（店铺0-0、") and "等 9 家" in full and "未映射运营：昌泉" in full
+    short = cards.operator_line(people, [])
+    assert len(json.dumps(short, ensure_ascii=False).encode()) <= 1800 and "店铺" not in short  # names only
+    assert cards.operator_line([], []) == ""
+    assert cards.operator_line([("<at id=all>", ["[x](https://evil.example)"])], []).count("<") == 0
+    assert cards.operator_line([("高爽", ["A_B"])], [], markup=False) == "对应运营：高爽（A_B）"  # Excel: plain
+    values = cards.report_cards("复盘", "正文")
+    assert cards.with_operator_line(values, "对应运营：" + "很长" * 5000) == values  # does not fit: unchanged
+    assert cards.with_operator_line(values, "")[0] is values[0]
+
+
 def test_operators_outside_the_group_are_not_mentioned(settings, session_factory):
     map_operators(settings, {"101": ("ou_outsider", "外部人员")})
     with session_factory() as db:
@@ -359,6 +418,7 @@ def test_a_test_send_queues_unmarked_copies_outside_the_lane_schedule(settings, 
         # Owner (Nov 2026): the test send reads like the real message; only its key and receipt differ.
         assert group.payload["card"]["header"]["title"]["content"] == "广告日报 · 2026-11-22"
         assert group.payload["card"]["body"] == values[0]["body"]
+        assert first_line(lead) == "对应运营：高爽（Campx）"  # like a real lead copy
         again = lanes.queue_test(db, settings, "daily", values, now=later, preview_id="job-1",
                                  stores={"102": "Campx"}, to_group=True, to_lead=False, mention=False)
         assert again["status"] == "ALREADY_QUEUED" and len(rows(db)) == 2
@@ -462,7 +522,8 @@ def test_excel_copies_are_dated_and_hold_the_report_tables(settings, session_fac
         found = re.search(rf'<c r="{reference}"[^>]*?(t="s")?><v>([^<]+)</v>', detail)
         return strings[int(found.group(2))] if found.group(1) else found.group(2)
 
-    assert re.findall(r'<sheet name="([^"]+)"', workbook_xml) == ["摘要", "全公司核心指标", "有花费店铺明细"]
+    # The whole message first (owner, Nov 26 2026: the tables are what the file is for), then each table.
+    assert re.findall(r'<sheet name="([^"]+)"', workbook_xml) == ["完整内容", "全公司核心指标", "有花费店铺明细"]
     assert {"统计日（美西）：2026-11-22", "对比日：2026-11-21"} <= set(strings)
     assert any(text.startswith("生成时间（北京）：2026-11-24 08:30") for text in strings)
     # Store table: the date first (sheets of many days stack), 运营 last as on the card, money as numbers.

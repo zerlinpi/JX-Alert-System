@@ -63,6 +63,23 @@ def with_operator_mentions(delivery, mentions, names=None):
             "mention_names": {key: str(names[key])[:40] for key in sorted(keys, key=int) if names.get(key)}}
 
 
+def responsible(directory, pids, names):
+    """([(operator name, [store names])], [store names without an operator]) for the monitored stores
+    among ``pids``, in profile order. Private lead copies show this line (owner, Nov 2026): the group
+    copy @-mentions the operators, a private chat names them."""
+    people, unmapped = {}, []
+    for key in sorted(pids, key=int):
+        if not directory_module.monitored(directory, key):
+            continue
+        store = str(names.get(key) or key)
+        owners = directory_module.operators(directory, key)
+        if not owners:
+            unmapped.append(store)
+        for person in owners:
+            people.setdefault(person["open_id"], (person["name"], []))[1].append(store)
+    return list(people.values()), unmapped
+
+
 def current_mention_stores(settings, delivery):
     """[(open_id, [profile ids])] of the frozen @-mentions that are still valid now.
 

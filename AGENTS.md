@@ -63,7 +63,10 @@
   and hourly alerts privately, each row labelled with its operator (the 运营
   column is always the last column). Every lane message is followed by its Excel
   copy (same content, dated, kept in `data/reports/`) to exactly the same
-  recipients (owner, Nov 2026). The owner set all lanes on by default: stores without an operator
+  recipients (owner, Nov 2026); its first sheet holds the whole message, every
+  table with all its rows, because the owner reads the tables in the file (Nov 26
+  2026). A lead's private copy names the operators of the affected stores in its
+  first line (「对应运营：…；未映射运营：…」, no @). The owner set all lanes on by default: stores without an operator
   are still notified (labelled 未映射运营, nobody @-mentioned); once operators are
   mapped, the group message @-mentions only the operators of the affected stores
   (daily: stores the report flags; review: anomalies; hourly: new alerts), naming

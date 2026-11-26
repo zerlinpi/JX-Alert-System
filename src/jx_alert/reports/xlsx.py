@@ -13,7 +13,12 @@ from xml.sax.saxutils import escape
 
 # Cell looks: (font, fill, alignment). Fonts: 0 normal, 1 bold, 2 title, 3 small grey.
 LOOKS = {"text": (0, 0, None), "title": (2, 0, None), "header": (1, 2, "center"), "bold": (1, 0, None),
-         "wrap": (0, 0, "wrap"), "muted": (3, 0, None)}
+         "wrap": (0, 0, "wrap"), "muted": (3, 0, None), "top": (0, 0, "top"), "boldwrap": (1, 0, "wrap"),
+         "mutedwrap": (3, 0, "wrap"), "middle": (0, 0, "middle"), "right": (0, 0, "right")}
+_ALIGNMENTS = {"wrap": '<alignment wrapText="1" vertical="top"/>',
+               "center": '<alignment horizontal="center" vertical="center" wrapText="1"/>',
+               "top": '<alignment vertical="top"/>', "middle": '<alignment horizontal="center" vertical="top"/>',
+               "right": '<alignment horizontal="right" vertical="top"/>'}
 _BUILTIN_FORMATS = {"0": 1, "0.00": 2, "#,##0": 3, "#,##0.00": 4, "0%": 9, "0.00%": 10}
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 _SHEET_NAME = re.compile(r"[\[\]:*?/\\]")
@@ -36,13 +41,26 @@ class Cell:
 
 
 class Sheet:
-    """Rows of cells. ``header_row`` (1-based) stays visible and filters the rows below it."""
+    """Rows of cells. ``header_row`` (1-based) stays visible and filters the rows below it.
+
+    ``merge(row, columns)`` spans the row's first cell over that many columns (long text reads
+    across the sheet); ``heights`` holds explicit row heights in points, which merged wrapped
+    text needs because spreadsheet programs do not grow such rows by themselves.
+    """
 
     def __init__(self, name, rows=(), *, header_row=None, widths=None):
         self.name, self.rows, self.header_row, self.widths = name, [list(row) for row in rows], header_row, widths
+        self.merges, self.heights = [], {}
 
     def append(self, row):
         self.rows.append(list(row))
+        return len(self.rows)
+
+    def merge(self, row, columns, height=None):
+        if columns > 1:
+            self.merges.append(f"A{row}:{column_letter(columns - 1)}{row}")
+        if height:
+            self.heights[row] = float(height)
 
 
 def column_letter(index):
@@ -129,8 +147,7 @@ class _Styles:
             attributes = (f'numFmtId="{number}" fontId="{font}" fillId="{fill}" borderId="0" xfId="0"'
                           + (' applyNumberFormat="1"' if number else "") + (' applyFont="1"' if font else "")
                           + (' applyFill="1"' if fill else "") + (' applyAlignment="1"' if alignment else ""))
-            inner = {"wrap": '<alignment wrapText="1" vertical="top"/>',
-                     "center": '<alignment horizontal="center" vertical="center"/>'}.get(alignment)
+            inner = _ALIGNMENTS.get(alignment)
             records.append(f"<xf {attributes}>{inner}</xf>" if inner else f"<xf {attributes}/>")
         return (f'{_DECLARATION}<styleSheet xmlns="{NS}">'
                 + (f'<numFmts count="{len(self.formats)}">{formats}</numFmts>' if self.formats else "")
@@ -155,7 +172,8 @@ def _cell_xml(reference, value, strings, styles):
     return f'<c r="{reference}"{attribute} t="s"><v>{strings.get(clean_text(value))}</v></c>'
 
 
-def _widths(sheet):
+def column_widths(sheet):
+    """Column widths in character units: the given ones, else fitted to the cells of multi-cell rows."""
     if sheet.widths:
         return list(sheet.widths)
     widths = [8.0] * max((len(row) for row in sheet.rows), default=0)
@@ -165,7 +183,8 @@ def _widths(sheet):
         for index, value in enumerate(row):
             raw = value.value if isinstance(value, Cell) else value
             if raw is not None:
-                widths[index] = max(widths[index], min(60.0, display_width(raw) + 2.0))
+                # CJK glyphs render a little wider than two digits; the extra tenth avoids needless wraps.
+                widths[index] = max(widths[index], min(60.0, display_width(raw) * 1.1 + 2.0))
     return widths
 
 
@@ -188,18 +207,25 @@ def _sheet_xml(sheet, strings, styles, selected):
                  f'<selection pane="bottomLeft" activeCell="{top}" sqref="{top}"/>')
     view += "</sheetView>"
     cols = "".join(f'<col min="{index}" max="{index}" width="{width:.1f}" customWidth="1"/>'
-                   for index, width in enumerate(_widths(sheet), 1))
+                   for index, width in enumerate(column_widths(sheet), 1))
     body = []
     for number, row in enumerate(rows, 1):
         cells = "".join(_cell_xml(f"{column_letter(index)}{number}", value, strings, styles)
                         for index, value in enumerate(row))
-        body.append(f'<row r="{number}">{cells}</row>' if cells else f'<row r="{number}"/>')
+        height = sheet.heights.get(number)
+        attributes = f' ht="{height:.1f}" customHeight="1"' if height else ""
+        body.append(f'<row r="{number}"{attributes}>{cells}</row>' if cells else f'<row r="{number}"{attributes}/>')
+    merges = "".join(f'<mergeCell ref="{reference}"/>' for reference in sheet.merges)
+    used = f"A1:{column_letter(columns - 1)}{max(len(rows), 1)}"
     return (f'{_DECLARATION}<worksheet xmlns="{NS}" xmlns:r="{REL}">'
-            f'<dimension ref="A1:{column_letter(columns - 1)}{max(len(rows), 1)}"/><sheetViews>{view}</sheetViews>'
+            f'<dimension ref="{used}"/><sheetViews>{view}</sheetViews>'
             '<sheetFormatPr defaultRowHeight="16"/>' + (f"<cols>{cols}</cols>" if cols else "")
             + f"<sheetData>{''.join(body)}</sheetData>"
             + (f'<autoFilter ref="{_filter_range(sheet)}"/>' if _filtered(sheet) else "")
-            + '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>')
+            + (f'<mergeCells count="{len(sheet.merges)}">{merges}</mergeCells>' if merges else "")
+            + '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+            # Campaign and profile IDs are text on purpose: no 「number stored as text」 flags.
+            + f'<ignoredErrors><ignoredError sqref="{used}" numberStoredAsText="1"/></ignoredErrors></worksheet>')
 
 
 def _absolute(reference):

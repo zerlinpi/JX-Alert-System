@@ -1,17 +1,22 @@
 """Excel copies of the lane messages (owner, Nov 2026): the content of the cards, dated, as .xlsx.
 
-Daily report and review: a 「摘要」 sheet with the dates and the text, then one sheet per
-table. Hourly monitor: the alert rows, with the campaign IDs. Every table sheet starts with
-the period it covers, so sheets of many days can be stacked into one list. The workbook is
-built from exactly what the card shows: it never says more or less than its message.
+Tables are hard to read in a group card, so the file must show everything at a glance
+(owner, Nov 26 2026). The first sheet, 「完整内容」, is the whole message in reading order:
+title, dates, the responsible operators, every text line and every table with all its rows.
+After it, each table also has a sheet of its own, led by the period it covers, for
+filtering and for stacking many days into one list. Hourly monitor: the alerts per
+category on the first sheet, and all of them in 「提醒明细」, with the campaign IDs.
 """
 from datetime import timezone
+import math
 import re
 from zoneinfo import ZoneInfo
 
 from jx_alert.reports import cards, xlsx
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+CONTENT_SHEET = "完整内容"
+_LINE_HEIGHT = 16.0  # points per wrapped line of 11 pt text (CJK fallback fonts included)
 _MONEY = re.compile(r"([+\-−]?)\s?\$\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?")
 _PERCENT = re.compile(r"([+\-−]?)\s?(\d+)(?:\.(\d+))?\s?%")
 _PLAIN = re.compile(r"([+\-−]?)\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?")
@@ -91,28 +96,84 @@ def blocks(text):
 
 
 def _details(rows, created):
+    """The lines under the title: (label, value) pairs and ready lines (e.g. 「对应运营：…」), then the time."""
     stamp = created.astimezone(BEIJING).strftime("%Y-%m-%d %H:%M")
-    return [*rows, ("生成时间（北京）", stamp)]
+    lines = [row if isinstance(row, str) else f"{row[0]}：{row[1]}" for row in rows if row]
+    return [*lines, f"生成时间（北京）：{stamp}"]
+
+
+_FIGURE_TEXT = re.compile(r"[+\-−]?\$?\d[\d,]*(?:\.\d+)?\s?(?:pp|%|个百分点)?")
+
+
+def _inline(cell):
+    """A table cell on the content sheet: Markdown text is typed like on the table sheets; text wraps,
+    「—」 sits in the middle and figures written as text (「+2.6pp」) line up with the numbers."""
+    shown = value(cell) if isinstance(cell, str) else cell
+    if isinstance(shown, xlsx.Cell):
+        shown = shown if not isinstance(shown.value, str) else shown.value
+    if isinstance(shown, xlsx.Cell):
+        return xlsx.Cell(shown.value, "top", shown.fmt)
+    if shown is None or shown == "" or shown == "—":
+        return xlsx.Cell("—", "middle")
+    if not isinstance(shown, str):
+        return xlsx.Cell(shown, "top")
+    return xlsx.Cell(shown, "right" if _FIGURE_TEXT.fullmatch(shown.strip()) else "wrap")
+
+
+class _Content:
+    """The whole message on one sheet in reading order (see the module docstring)."""
+
+    def __init__(self, name):
+        self.sheet = xlsx.Sheet(name)
+        self.texts = []
+
+    def text(self, line, look="wrap"):
+        self.texts.append((self.sheet.append([xlsx.Cell(line, look)]), line, look))
+
+    def blank(self):
+        self.sheet.append([])
+
+    def head(self, title, details, created):
+        self.text(title, "title")
+        for line in _details(details, created):
+            self.text(line, "mutedwrap")
+        self.blank()
+
+    def table(self, headers, rows):
+        self.sheet.append([xlsx.Cell(name, "header") for name in headers])
+        for row in rows:
+            self.sheet.append([_inline(cell) for cell in row])
+        self.blank()
+
+    def finish(self):
+        """Text rows read across the tables' width, with room for their wrapped lines."""
+        sheet = self.sheet
+        if not any(len(row) > 1 for row in sheet.rows):
+            sheet.widths = [100.0]
+        widths = xlsx.column_widths(sheet)
+        span, total = len(widths), sum(widths)
+        for row, line, look in self.texts:
+            scale = 14 / 11 if look == "title" else 1.0
+            lines = max(1, math.ceil(xlsx.display_width(line) * scale / max(total - 2.0, 10.0)))
+            height = 22.0 if look == "title" else (lines * _LINE_HEIGHT + 4.0 if lines > 1 else None)
+            sheet.merge(row, span, height)
+        return sheet
 
 
 def report_book(title, text, *, period_label, period, details=(), created):
-    """Daily report or review: 「摘要」 (dates and text) plus one sheet per table, each led by the period."""
+    """Daily report or review: 「完整内容」 (the whole message, every table inline), then one sheet per table."""
     parts = blocks(text)
     tables = [part for part in parts if part[0] == "table"]
-    names = xlsx.sheet_names(["摘要"] + [part[1] or f"表格{number}" for number, part in enumerate(tables, 1)])
-    summary = xlsx.Sheet(names[0], widths=[120])
-    summary.append([xlsx.Cell(title, "title")])
-    for label, shown in _details([(period_label, period), *details], created):
-        summary.append([xlsx.Cell(f"{label}：{shown}", "muted")])
-    summary.append([])
-    sheets, number = [summary], 0
+    names = xlsx.sheet_names([CONTENT_SHEET] + [part[1] or f"表格{number}" for number, part in enumerate(tables, 1)])
+    content = _Content(names[0])
+    content.head(title, [(period_label, period), *details], created)
     for part in parts:
         if part[0] == "text":
-            summary.append([xlsx.Cell(part[1], "bold" if part[2] else "wrap")])
-            continue
-        number += 1
-        _, _, headers, rows = part
-        summary.append([xlsx.Cell(f"表格见工作表「{names[number]}」（{len(rows)} 行）", "muted")])
+            content.text(part[1], "boldwrap" if part[2] else "wrap")
+        else:
+            content.table(part[2], part[3])
+    sheets = [content.finish()]
+    for number, (_, _, headers, rows) in enumerate(tables, 1):
         sheet = xlsx.Sheet(names[number], header_row=1)
         sheet.append([xlsx.Cell(name, "header") for name in [period_label, *headers]])
         for row in rows:
@@ -125,32 +186,45 @@ ALERT_HEADERS = ["统计时间（美西）", "提醒类型", "店铺", "广告�
                  "广告销售额", "ACOS", "CVR", "建议", "运营"]
 
 
-def alerts_book(title, lead, findings, *, names, operators, period, note="", created):
-    """Hourly monitor: 「摘要」 plus 「提醒明细」 with one row per alerted campaign (same order as the card)."""
-    summary = xlsx.Sheet("摘要", widths=[120])
-    summary.append([xlsx.Cell(title, "title")])
-    for label, shown in _details([("统计时间（美西）", period)], created):
-        summary.append([xlsx.Cell(f"{label}：{shown}", "muted")])
-    summary.append([])
-    summary.append([xlsx.Cell(lead, "wrap")])
-    if note:
-        summary.append([xlsx.Cell(note, "wrap")])
-    summary.append([xlsx.Cell(f"明细见工作表「提醒明细」（{len(findings)} 行）", "muted")])
-    sheet = xlsx.Sheet("提醒明细", header_row=1)
-    sheet.append([xlsx.Cell(name, "header") for name in ALERT_HEADERS])
+def _alert_cells(item, names, operators):
+    """店铺 … 运营 of one alert (ALERT_HEADERS without the time and type); missing figures read 「—」."""
+    def money(number):
+        return "—" if number is None else xlsx.Cell(number, fmt='"$"#,##0.00')
+
+    def count(number):
+        return "—" if number is None else xlsx.Cell(int(number), fmt="#,##0")
 
     def percent(number):
-        return None if number is None else xlsx.Cell(_fraction(number), fmt="0.0%")
+        return "—" if number is None else xlsx.Cell(_fraction(number), fmt="0.0%")
 
+    return [xlsx.Cell(names.get(item["pid"], item["pid"])), xlsx.Cell(item["campaign"]),
+            xlsx.Cell(str(item["campaign_id"])), money(item.get("spend")), count(item.get("clicks")),
+            count(item.get("orders")), money(item.get("sales")), percent(item.get("acos")), percent(item.get("cvr")),
+            xlsx.Cell(item.get("suggestion") or "—"), xlsx.Cell(operators.get(item["pid"], "未映射运营"))]
+
+
+def alerts_book(title, lead, findings, *, names, operators, period, note="", details=(), created):
+    """Hourly monitor: 「完整内容」 (the card's lines and one table per category, every alert) plus
+    「提醒明细」, one filterable row per alerted campaign in the card's order."""
+    content = _Content(CONTENT_SHEET)
+    content.head(title, [("统计时间（美西）", period), *details], created)
+    content.text(lead)
+    if note:
+        content.text(note)
+    content.blank()
+    ordered = []
     for code in cards.HOURLY_ORDER:
-        for item in sorted((item for item in findings if item["category"] == code), key=lambda item: -item["spend"]):
-            sheet.append([period, cards.HOURLY_LABELS[code], names.get(item["pid"], item["pid"]), item["campaign"],
-                          str(item["campaign_id"]), xlsx.Cell(item["spend"], fmt='"$"#,##0.00'),
-                          xlsx.Cell(int(item["clicks"]), fmt="#,##0"), xlsx.Cell(int(item["orders"]), fmt="#,##0"),
-                          None if item.get("sales") is None else xlsx.Cell(item["sales"], fmt='"$"#,##0.00'),
-                          percent(item.get("acos")), percent(item.get("cvr")), item.get("suggestion") or "—",
-                          operators.get(item["pid"], "未映射运营")])
-    return xlsx.workbook([summary, sheet], title=title, created=created)
+        items = sorted((item for item in findings if item["category"] == code), key=lambda item: -item["spend"])
+        if not items:
+            continue
+        ordered += [(code, item) for item in items]
+        content.text(f"{cards.HOURLY_LABELS[code]}（{len(items)}）", "boldwrap")
+        content.table(ALERT_HEADERS[2:], [_alert_cells(item, names, operators) for item in items])
+    sheet = xlsx.Sheet("提醒明细", header_row=1)
+    sheet.append([xlsx.Cell(name, "header") for name in ALERT_HEADERS])
+    for code, item in ordered:
+        sheet.append([period, cards.HOURLY_LABELS[code], *_alert_cells(item, names, operators)])
+    return xlsx.workbook([content.finish(), sheet], title=title, created=created)
 
 
 def file_name(base, *, who=None):

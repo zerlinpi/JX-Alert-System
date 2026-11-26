@@ -9,9 +9,10 @@ The 运营 column is always the last column of a table (owner decision, Nov 2026
 whatever order the model wrote.
 """
 import copy
+import json
 import re
 
-from jx_alert.notifications.cards import card_fits, markdown, md_safe, shell, table
+from jx_alert.notifications.cards import MAX_MENTION_LINE_BYTES, card_fits, markdown, md_safe, shell, table
 
 # Room for the send-time line "对应运营：<at id=…></at>（店铺） …" (see notifications.cards).
 MENTION_RESERVE = 2048
@@ -200,6 +201,48 @@ def hourly_card(findings, *, day, time, names, operators, scoped=False, cap=10):
         return hourly_card(findings, day=day, time=time, names=names, operators=operators, scoped=scoped,
                            cap=cap // 2)
     return None
+
+
+# ---------------------------------------------------------------- the responsible operators
+
+def operator_line(people, unmapped, *, markup=True, limit=6):
+    """「对应运营：高爽（Campx、XPE）、皮泽霖（香港川页）；未映射运营：昌泉」, or "" when nobody is concerned.
+
+    ``people`` and ``unmapped`` come from recipients.responsible. With ``markup`` the names are made
+    safe for card markdown (they are provider text) and the line is shortened (fewer store names,
+    then none) until it fits the room kept for the mention line; without it, plain text for Excel.
+    """
+    safe = (lambda text: md_safe(text, 60)) if markup else (lambda text: str(text)[:60])
+
+    def listed(stores, cap):
+        shown = "、".join(safe(store) for store in stores[:cap])
+        return shown + (f" 等 {len(stores)} 家" if len(stores) > cap else "")
+
+    line = ""
+    for cap in (limit, 3, 0):
+        parts = []
+        if people:
+            parts.append("对应运营：" + "、".join(safe(name) + (f"（{listed(stores, cap)}）" if cap else "")
+                                                for name, stores in people))
+        if unmapped:
+            parts.append("未映射运营：" + listed(unmapped, cap or 3))
+        line = "；".join(parts)
+        if not markup or len(json.dumps(line, ensure_ascii=False).encode()) <= MAX_MENTION_LINE_BYTES:
+            break
+    return line
+
+
+def with_operator_line(values, line):
+    """Copies of the cards with ``line`` first on the first card (private lead copies, owner Nov 2026).
+
+    A private copy gets no @-mention line at send time, so the room kept for it takes this line;
+    when it still does not fit, the cards go out unchanged.
+    """
+    if not line or not values:
+        return values
+    first = copy.deepcopy(values[0])
+    first["body"]["elements"].insert(0, markdown(line))
+    return [first, *values[1:]] if card_fits(first) else values
 
 
 # ---------------------------------------------------------------- console test sends
